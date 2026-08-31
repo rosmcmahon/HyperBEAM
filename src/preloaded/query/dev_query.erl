@@ -44,6 +44,7 @@ info(_Opts) ->
     }.
 
 %% @doc Serve the node's query UI for GET, or execute a GraphQL query.
+-spec graphql(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 graphql(_Base, #{ <<"method">> := <<"GET">> }, Opts) ->
     hb_cache:read(
         hb_opts:get(
@@ -59,6 +60,8 @@ graphql(Base, Req, Opts) ->
 %% @doc Return whether a GraphQL esponse in a message has transaction results.
 %% This key is used in HB's gateway client multirequest configuration to
 %% determine if the response from the node should be considered admissible.
+-spec has_results(#{ body => binary(), _ => _ }, #{ body => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, boolean()}.
 has_results(Base, Req, Opts) ->
     JSON =
         hb_ao:get_first(
@@ -79,22 +82,30 @@ has_results(Base, Req, Opts) ->
     end.
 
 %% @doc Search for the keys specified in the request message.
+-spec default(_, #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 default(_, Base, Req, Opts) ->
     all(Base, Req, Opts).
 
 %% @doc Search the node's store for all of the keys and values in the request,
 %% aside from the `commitments' and `path' keys.
+-spec all(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 all(Base, Req, Opts) ->
     match(Req, Base, Req, Opts).
 
 %% @doc Search the node's store for all of the keys and values in the base
 %% message, aside from the `commitments' and `path' keys.
+-spec base(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 base(Base, Req, Opts) ->
     match(Base, Base, Req, Opts).
 
 %% @doc Search only for the (list of) key(s) specified in `only' in the request.
 %% The `only' key can be a binary, a map, or a list of keys. See the moduledoc
 %% for semantics.
+-spec only(
+    #{ _ => _ },
+    #{ only => binary() | [binary()] | #{ _ => _ }, exclude => [binary()], return => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, _} | {error, _}.
 only(Base, Req, Opts) ->
     case hb_maps:get(<<"only">>, Req, not_found, Opts) of
         KeyBin when is_binary(KeyBin) ->
