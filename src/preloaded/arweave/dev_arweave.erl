@@ -744,7 +744,11 @@ get_chunk(Offset, Opts) ->
 %% block is used. `include-proofs' defaults to true; false omits `poa' and
 %% `poa2' from the returned and cached header after fetching from Arweave.
 %% A full request refetches a cached header whose proofs are absent.
--spec block(#{ _ => _ }, #{ _ => _ }, map()) -> term().
+-spec block(
+    #{ block => binary(), _ => _ } | {id, binary()} | {height, integer()},
+    #{ block => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _}.
 block(Base, RawRequest, Opts) when is_map(Base) ->
     Request = RawRequest#{ <<"include-proofs">> =>
         hb_util:bool(
