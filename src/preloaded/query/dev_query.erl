@@ -60,8 +60,11 @@ graphql(Base, Req, Opts) ->
 %% @doc Return whether a GraphQL esponse in a message has transaction results.
 %% This key is used in HB's gateway client multirequest configuration to
 %% determine if the response from the node should be considered admissible.
--spec has_results(#{ body => binary(), _ => _ }, #{ body => binary(), _ => _ }, #{ _ => _ }) ->
-    {ok, boolean()}.
+-spec has_results(
+    #{ body => binary(), _ => _ },
+    #{ body => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, boolean()}.
 has_results(Base, Req, Opts) ->
     JSON =
         hb_ao:get_first(
@@ -103,7 +106,12 @@ base(Base, Req, Opts) ->
 %% for semantics.
 -spec only(
     #{ _ => _ },
-    #{ only => [binary()] | binary() | #{ _ => _ }, exclude => [binary()], return => binary(), _ => _ },
+    #{
+        only => [binary()] | binary() | #{ _ => _ },
+        exclude => [binary()],
+        return => binary(),
+        _ => _
+    },
     #{ _ => _ }
 ) -> {ok, _} | {error, _}.
 only(Base, Req, Opts) ->
