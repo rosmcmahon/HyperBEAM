@@ -5,8 +5,8 @@ compile:
 
 WAMR_VERSION = 2.2.0
 WAMR_DIR = _build/wamr
-BUILD_SOURCE = $(shell git rev-parse HEAD)
-BUILD_SOURCE_SHORT = $(shell git rev-parse --short HEAD)
+BUILD_SOURCE ?= $(shell git rev-parse HEAD)
+BUILD_SOURCE_SHORT ?= $(shell git rev-parse --short HEAD)
 
 GENESIS_WASM_BRANCH = feat/hb-unit
 GENESIS_WASM_REPO = https://github.com/permaweb/ao.git
