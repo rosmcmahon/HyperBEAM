@@ -12,6 +12,9 @@ const { config } = await import(`../../../config.${stackName}.ts`) as { config: 
 const provider = new docker.Provider('remote', { host: config.dockerHost })
 const opts = { provider }
 
+const infraRef = new pulumi.StackReference(`${pulumi.getOrganization()}/shepherd-infra/${stackName}`)
+const networkName = infraRef.getOutput('networkName') as pulumi.Output<string>
+
 const addonName = new URL('..', import.meta.url).pathname.split('/').at(-2)!
 
-new AddonComponent(addonName, { config, stackName }, opts)
+new AddonComponent(addonName, { config, stackName, networkName }, opts)
