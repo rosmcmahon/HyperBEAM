@@ -30,7 +30,7 @@ RUN touch config.flat \
     BUILD_SOURCE_SHORT="$(printf '%.7s' "$GIT_SHA")" \
     rebar3 release
 
-FROM --platform=linux/amd64 debian:bookworm-slim
+FROM --platform=linux/amd64 debian:bookworm-slim AS hyperbeam
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
