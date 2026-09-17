@@ -1,0 +1,17 @@
+import * as pulumi from '@pulumi/pulumi'
+import * as docker from '@pulumi/docker'
+import { type Config } from '../../../Config'
+import { AddonComponent } from './components/AddonComponent'
+import { protectStacksIfNeeded } from '../../../protect-stacks'
+
+protectStacksIfNeeded()
+
+const stackName = pulumi.getStack()
+const { config } = await import(`../../../config.${stackName}.ts`) as { config: Config }
+
+const provider = new docker.Provider('remote', { host: config.dockerHost })
+const opts = { provider }
+
+const addonName = new URL('..', import.meta.url).pathname.split('/').at(-2)!
+
+new AddonComponent(addonName, { config, stackName }, opts)

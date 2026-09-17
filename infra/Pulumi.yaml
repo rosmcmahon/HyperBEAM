@@ -1,0 +1,6 @@
+name: shepherd-hyperbeam
+runtime:
+  name: nodejs
+  options:
+    nodeargs: "--import tsx"
+description: Shepherd HyperBEAM sidecar addon
