@@ -1,0 +1,25 @@
+# VCS and CI metadata. The build commit is passed in via `--build-arg GIT_SHA`.
+.git
+.github
+
+# Local build output: rebuilt inside the image for Linux.
+_build
+priv
+**/*.o
+**/*.d
+native/lib/secp256k1/build
+rebar3.crashdump
+
+# Node state, logs and secrets: never bake these into an image.
+cache-*
+logs
+hyperbeam-key.json
+config.flat
+
+# Not needed to build or run a node.
+docs
+metrics
+MY-STUFFS
+node_modules
+package.json
+package-lock.json
