@@ -1102,14 +1102,39 @@ verify_test_() ->
 	{foreach, fun () -> ok end, fun (_) -> ok end, [
 		{"RSA", fun () -> test_verify(?RSA_KEY_TYPE) end},
 		{"EDDSA", fun () -> test_verify(?EDDSA_KEY_TYPE) end},
-        {"Solana", fun () -> test_verify(?SOLANA_KEY_TYPE) end},
+        {"Solana", fun () -> test_unsupported_key(?SOLANA_KEY_TYPE) end},
         {"Ethereum", fun () -> test_verify(?ETHEREUM_KEY_TYPE) end}
 	]}.
+
+%% @doc The commitment spec for a key type: `httpsig@1.0' signs with RSA keys,
+%% `ans104@1.0' with the others it supports.
+commitment_spec(?RSA_KEY_TYPE) -> #{};
+commitment_spec(?EDDSA_KEY_TYPE) ->
+    #{ <<"device">> => <<"ans104@1.0">>, <<"type">> => ?EDDSA_SIGN_TYPE };
+commitment_spec(?ETHEREUM_KEY_TYPE) ->
+    #{ <<"device">> => <<"ans104@1.0">>, <<"type">> => ?ETHEREUM_SIGN_TYPE }.
+
+%% @doc No commitment device signs with the key type, so the commitment is
+%% refused rather than made without a verifiable signature.
+test_unsupported_key(KeyType) ->
+    Wallet = ar_wallet:new(KeyType),
+    ?assertThrow(
+        {cannot_commit, 'unsupported-key-type', _},
+        hb_message:commit(
+            #{ <<"a">> => <<"b">> },
+            #{ <<"priv-wallet">> => Wallet }
+        )
+    ).
 
 test_verify(KeyType) ->
     Unsigned = #{ <<"a">> => <<"b">> },
     Wallet = ar_wallet:new(KeyType),
-    Signed = hb_message:commit(Unsigned, #{ <<"priv-wallet">> => Wallet }),
+    Signed =
+        hb_message:commit(
+            Unsigned,
+            #{ <<"priv-wallet">> => Wallet },
+            commitment_spec(KeyType)
+        ),
     ?event_debug({signed, Signed}),
     BadSigned = Signed#{ <<"a">> => <<"c">> },
     ?event_debug({bad_signed, BadSigned}),

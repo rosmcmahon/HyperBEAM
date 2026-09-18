@@ -288,7 +288,16 @@ is_idempotent(Func, Msg, Opts) ->
 
 %% @doc Ensure that converting a message to/from TABM multiple times repeatedly 
 %% does not alter the message's contents.
-tabm_conversion_is_idempotent_test(_Codec, Opts) ->
+tabm_conversion_is_idempotent_test(Codec, Opts) ->
+    % L1 TXs can not be nested inside each other, so we'll commit the nested
+    % message as an ANS104 message instead.
+    NestedCodec =
+        case Codec of
+            <<"tx@1.0">> -> <<"ans104@1.0">>;
+            #{ <<"device">> := <<"tx@1.0">> } ->
+                Codec#{ <<"device">> => <<"ans104@1.0">> };
+            _ -> Codec
+        end,
     From = fun(M) -> hb_message:convert(M, <<"structured@1.0">>, tabm, Opts) end,
     To = fun(M) -> hb_message:convert(M, tabm, <<"structured@1.0">>, Opts) end,
     SimpleMsg = #{ <<"a">> => <<"x">>, <<"b">> => <<"y">>, <<"c">> => <<"z">> },
@@ -315,7 +324,7 @@ tabm_conversion_is_idempotent_test(_Codec, Opts) ->
                                 >>
                         },
                         Opts,
-                        <<"structured@1.0">>
+                        NestedCodec
                     )
             },
     ?assert(is_idempotent(From, SimpleMsg, Opts)),

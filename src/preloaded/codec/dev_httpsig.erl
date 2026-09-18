@@ -146,6 +146,12 @@ verify(Base, Req, RawOpts) ->
             {failure, Info}
     end.
 
+%% @doc Whether a wallet holds an RSA key, in either of the forms that
+%% `ar_wallet' signs with.
+rsa_wallet({{rsa, 65537}, _, _}) -> true;
+rsa_wallet({{{rsa, 65537}, _, _}, {{rsa, 65537}, _}}) -> true;
+rsa_wallet(_) -> false.
+
 %% @doc Commit to a message using the HTTP-Signature format. We use the `type'
 %% parameter to determine the type of commitment to use. If the `type' parameter
 %% is `signed', we default to the rsa-pss-sha512 algorithm. If the `type'
@@ -174,6 +180,12 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
         throw({cannot_commit, no_viable_wallet, MsgToSign});
     true ->
         ok
+    end,
+    % The algorithm signs with an RSA key; a wallet of another type cannot
+    % produce a commitment that this device verifies.
+    case rsa_wallet(Wallet) of
+        true -> ok;
+        false -> throw({cannot_commit, 'unsupported-key-type', MsgToSign})
     end,
     % Utilize the hashpath, if present, as the tag for the commitment.
     MaybeTagMap =
