@@ -346,25 +346,26 @@ to_siginfo_keys(Msg, Commitment, Opts) ->
 
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
 %% format. There are three stages:
-%% 1. Remove the @ prefix from the component identifiers, if present.
-%% 2. Replace `content-digest' with the body keys, if present.
-%% 3. Replace the `body' key again with the value of the `ao-body-key' key, if
+%% 1. Replace `content-digest' with the body keys, if present, and remove the
+%%    @ prefix from the other component identifiers.
+%% 2. Replace the `body' key again with the value of the `ao-body-key' key, if
 %%    present. This is possible because the keys derived from the body often
 %%    contain the `body' key itself.
-%% 4. If the `content-type' starts with `multipart/', we remove it.
+%% 3. If the `content-type' starts with `multipart/', we remove it.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
-    % 1. Remove specifiers from the list and decode percent-encoded keys.
-    BaseCommitted =
-        lists:map(
-            fun(<<"@", Key/binary>>) -> hb_escape:decode(Key);
-               (Key) -> hb_escape:decode(Key)
+    % 1. Replace the `content-digest' component with the body keys, then remove
+    %    specifiers from the other keys and decode them. Only the raw component
+    %    is the digest of the body: a key of the message with that name is
+    %    percent-encoded on the wire.
+    WithBody =
+        lists:flatmap(
+            fun(<<"content-digest">>) -> BodyKeys;
+               (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
+               (Key) -> [hb_escape:decode(Key)]
             end,
             SigInfoCommitted
         ),
-    % 2. Replace the `content-digest' key with the `body' key, if present.
-    WithBody =
-        hb_util:list_replace(BaseCommitted, <<"content-digest">>, BodyKeys),
-    % 3. Replace the `body' key again with the value of the `ao-body-key' key,
+    % 2. Replace the `body' key again with the value of the `ao-body-key' key,
     %    if present.
     ?event_debug(
         {from_siginfo_keys,
@@ -387,7 +388,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
             false ->
                 WithBody
         end,
-    % 4. If the `content-type' starts with `multipart/', we remove it.
+    % 3. If the `content-type' starts with `multipart/', we remove it.
     ListWithoutContentType =
         case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
             <<"multipart/", _/binary>> ->

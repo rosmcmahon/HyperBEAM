@@ -15,7 +15,7 @@
 %% @doc List of special keys that are used in the AO-Core protocol.
 -define(AO_CORE_KEYS, [<<"path">>, <<"hashpath">>, <<"priv">>]).
 %% @doc Keys that can be regenerated losslessly.
--define(REGEN_KEYS, [<<"unsigned_id">>, <<"content-digest">>]).
+-define(REGEN_KEYS, [<<"unsigned_id">>]).
 %% @doc Prefix for ans104 and tx fields that are committed.
 -define(FIELD_PREFIX, <<"field-">>).
 

@@ -102,6 +102,10 @@ test_suite() ->
             fun structured_field_decimal_parsing_test/2},
         {<<"Header escaping">>,
             fun header_escaping_test/2},
+        {<<"Signature as a data key">>,
+            fun signature_data_key_test/2},
+        {<<"Content-digest as a data key">>,
+            fun content_digest_data_key_test/2},
         {<<"Unsigned id">>,
             fun unsigned_id_test/2},
         % Nested structures
@@ -592,6 +596,55 @@ header_escaping_test(Codec, Opts) ->
     Msg = hb_message:commit(#{ <<"description">> => <<"line 1\nline 2">> }, Opts, Codec),
     Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
     Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+
+%% @doc A message's own `signature' key is data, as on an Arweave block. It
+%% is committed, survives the wire beside the signature headers of the same
+%% name, and is not read back as a commitment.
+signature_data_key_test(Codec, Opts) ->
+    Msg =
+        hb_message:commit(
+            #{ <<"signature">> => <<"abc">>, <<"height">> => 1 },
+            Opts,
+            Codec
+        ),
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"abc">>,
+        hb_maps:get(<<"signature">>, Decoded, not_found, Opts)
+    ),
+    ?assertEqual(
+        hb_message:signers(Msg, Opts),
+        hb_message:signers(Decoded, Opts)
+    ),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+
+%% @doc A key of a message named `content-digest' is data, at any depth. It is
+%% distinct from the digest of the body that `httpsig@1.0' derives.
+content_digest_data_key_test(Codec, Opts) ->
+    Msg =
+        hb_message:commit(
+            #{
+                <<"content-digest">> => <<"abc">>,
+                <<"body">> => <<"hello">>,
+                <<"nested">> => #{ <<"content-digest">> => <<"def">> }
+            },
+            Opts,
+            Codec
+        ),
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"abc">>,
+        hb_maps:get(<<"content-digest">>, Decoded, not_found, Opts)
+    ),
+    ?assertEqual(
+        hb_message:signers(Msg, Opts),
+        hb_message:signers(Decoded, Opts)
+    ),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
 

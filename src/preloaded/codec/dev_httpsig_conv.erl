@@ -58,21 +58,28 @@ from(HTTP, _Req, Opts) ->
     {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
     % Merge the body keys with the headers.
     WithBodyKeys = maps:merge(Headers, BodyTABM),
-    % Decode percent-encoded headers.
-    WithIDs = decode_ids(WithBodyKeys, Opts),
-    % Remove the signature-related headers, such that they can be reconstructed
-    % from the commitments.
-    MsgWithoutSigs =
-        hb_maps:without(
-            [<<"signature">>, <<"signature-input">>, <<"commitments">>],
-            WithIDs,
-            Opts
-        ),
-    % Finally, we need to add the signatures to the TABM.
+    % Reconstruct the commitments from the signature headers, then remove the
+    % headers and the digest of the body. A key of the message that shares
+    % their name is data and arrives percent-encoded, so the keys are decoded
+    % afterwards.
     Commitments =
         dev_httpsig_siginfo:siginfo_to_commitments(
-            WithIDs,
+            WithBodyKeys,
             OrderedBodyKeys,
+            Opts
+        ),
+    MsgWithoutSigs =
+        decode_ids(
+            hb_maps:without(
+                [
+                    <<"signature">>,
+                    <<"signature-input">>,
+                    <<"content-digest">>,
+                    <<"commitments">>
+                ],
+                WithBodyKeys,
+                Opts
+            ),
             Opts
         ),
     MsgWithSigs =
@@ -85,7 +92,6 @@ from(HTTP, _Req, Opts) ->
         hb_maps:without(
             Removed =
                 hb_maps:keys(Commitments) ++
-                [<<"content-digest">>] ++
                 case maps:get(<<"content-type">>, MsgWithSigs, undefined) of
                     <<"multipart/", _/binary>> -> [<<"content-type">>];
                     _ -> []
@@ -263,11 +269,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                 ),
             RestHeaders =
                 hb_maps:without(
-                    [
-                        <<"ao-body-key">>,
-                        <<"content-digest">>,
-                        <<"content-disposition">>
-                    ],
+                    [<<"ao-body-key">>, <<"content-disposition">>],
                     Headers,
                     Opts
                 ),
@@ -405,28 +407,9 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
             Opts
         ),
     % Finally, add the signatures to the encoded HTTP message with the
-    % commitments from the original message.
-    CommitmentsMap =
-        case maps:get(<<"commitments">>, Msg, undefined) of
-            undefined ->
-                case maps:get(<<"signature">>, Msg, undefined) of
-                    undefined -> #{};
-                    Signature ->
-                        MaybeBundleTag = maps:with([<<"bundle">>], Msg),
-                        #{
-                            Signature => MaybeBundleTag#{
-                                <<"signature">> => Signature,
-                                <<"keyid">> => maps:get(<<"keyid">>, Msg, <<>>),
-                                <<"commitment-device">> => <<"httpsig@1.0">>,
-                                <<"type">> => maps:get(<<"type">>, Msg, <<>>),
-                                <<"committed">> =>
-                                    maps:get(<<"committed">>, Msg, #{})
-                            }
-                        }
-                end;
-            Commitments ->
-                Commitments
-        end,
+    % commitments from the original message. A `signature' key of the message
+    % itself is data, as on an Arweave block, not a commitment.
+    CommitmentsMap = maps:get(<<"commitments">>, Msg, #{}),
     ?event_debug({converting_commitments_to_siginfo, Msg}),
     {ok,
         maps:merge(
@@ -558,12 +541,19 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
 
-%% @doc Transform all ID fields into their percent-encoded form.
+%% @doc Transform all ID fields into their percent-encoded form, as well as
+%% the keys that share a name with the signature headers or the digest of the
+%% body: a message's own `signature' or `content-digest' is data on the wire,
+%% not a commitment or a digest.
 encode_ids(Msg) ->
     % Find all keys that are IDs.
     maps:from_list(
         lists:map(
             fun({K, V}) when ?IS_ID(K) -> {hb_escape:encode(K), V};
+                ({<<"signature", Rest/binary>>, V})
+                        when Rest =:= <<>>; Rest =:= <<"-input">> ->
+                    {<<"%73ignature", Rest/binary>>, V};
+                ({<<"content-digest">>, V}) -> {<<"%63ontent-digest">>, V};
                 ({K, V}) -> {K, V}
             end,
             maps:to_list(Msg)
