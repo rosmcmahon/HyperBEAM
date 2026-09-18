@@ -33,10 +33,12 @@ assignments_to_bundle(ProcID, Assignments, More, TimeInfo, RawOpts) ->
                     lists:map(
                         fun(Assignment) ->
                             {
-                                hb_ao:get(
-                                    <<"slot">>,
-                                    Assignment,
-                                    Opts#{ <<"hashpath">> => ignore }
+                                hb_ao:normalize_key(
+                                    hb_ao:get(
+                                        <<"slot">>,
+                                        Assignment,
+                                        Opts#{ <<"hashpath">> => ignore }
+                                    )
                                 ),
                                 Assignment
                             }
