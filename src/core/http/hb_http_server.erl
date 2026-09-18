@@ -498,13 +498,14 @@ handle_request(RawReq, Body, ServerID) ->
         )
     end.
 
-%% @doc Return a 500 error response to the client.
+%% @doc Return an error response to the client: a message the node cannot
+%% accept is the client's error, anything else is the server's.
 handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     DetailsStr = hb_util:bin(hb_format:message(Details, NodeMsg, 1)),
     StacktraceStr = hb_util:bin(hb_format:trace(Stacktrace)),
     ErrorMsg =
         #{
-            <<"status">> => 500,
+            <<"status">> => error_status(Type, Details),
             <<"type">> => hb_util:bin(hb_format:message(Type)),
             <<"details">> => DetailsStr,
             <<"stacktrace">> => StacktraceStr
@@ -512,7 +513,7 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     ErrorBin = hb_format:error(ErrorMsg, NodeMsg),
     ?event(
         http_error,
-        {returning_500_error,
+        {returning_error,
             {method, cowboy_req:method(Req)},
             {path, {string, cowboy_req:path(Req)}},
             {string,
@@ -532,6 +533,12 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
             <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_noise(DetailsStr)), ErrorDetailsMaxSize)
         },
     hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
+
+%% @doc The status of an error response. A request whose commitments do not
+%% verify is refused as the client's error.
+error_status(throw, {invalid_commitments, _}) -> 400;
+error_status(throw, {invalid_ans104_signature, _}) -> 400;
+error_status(_Type, _Details) -> 500.
 
 %% @doc Return the list of allowed methods for the HTTP server.
 allowed_methods(Req, State) ->

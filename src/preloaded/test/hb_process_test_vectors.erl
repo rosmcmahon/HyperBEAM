@@ -393,8 +393,7 @@ aos_state_access_via_http_test_parallel_() ->
             <<"port">> => 10000 + rand:uniform(10000),
             <<"priv-wallet">> => Wallet,
             <<"cache-control">> => <<"always">>,
-            <<"store">> => hb_test_utils:test_store(),
-            <<"force-signed-requests">> => true
+            <<"store">> => hb_test_utils:test_store()
         })),
         Proc = aos_process(Opts),
         ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),

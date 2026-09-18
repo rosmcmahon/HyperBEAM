@@ -1597,11 +1597,10 @@ invalid_item_test_parallel() ->
         TamperedItem = Item#tx{data = <<"tampereddata">>},
         StructuredItem = hb_message:convert(
             TamperedItem, <<"structured@1.0">>, <<"ans104@1.0">>, TestOpts),
+        % The node refuses the item when it arrives: its commitment does not
+        % verify.
         PostResult = post_data_item(Node, TamperedItem, ClientOpts),
-        ?assertMatch({error, #{
-            <<"status">> := 400,
-            <<"error">> := <<"invalid-item">>,
-            <<"details">> := <<"signature-verification-failed">>}}, PostResult),
+        ?assertMatch({error, #{ <<"status">> := 400 }}, PostResult),
         DirectResult = dev_bundler:item(#{}, StructuredItem, TestOpts),
         ?assertMatch({error, #{
             <<"status">> := 400,

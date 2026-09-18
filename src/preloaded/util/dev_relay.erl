@@ -390,10 +390,7 @@ commit_request_test() ->
     Wallet = ar_wallet:new(),
     Executor =
         hb_http_server:start_node(
-            #{
-                <<"port">> => Port,
-                <<"force-signed-requests">> => true
-            }
+            #{ <<"port">> => Port }
         ),
     Node =
         hb_http_server:start_node(#{

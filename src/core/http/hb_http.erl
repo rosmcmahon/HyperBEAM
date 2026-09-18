@@ -1005,9 +1005,10 @@ req_to_tabm_singleton(Req, Body, Opts) ->
 
 %% @doc HTTPSig messages are inherently mixed into the transport layer, so they
 %% require special handling in order to be converted to a normalized message.
-%% In particular, the signatures are verified if present and required by the 
-%% node configuration. Additionally, non-committed fields are removed from the
-%% message if it is signed, with the exception of the `path' and `method' fields.
+%% Every commitment the message carries, including those of its nested
+%% messages, is verified: a committer is trusted only once its commitment
+%% verifies. Additionally, non-committed fields are removed from the message
+%% if it is signed, with the exception of the `path' and `method' fields.
 httpsig_to_tabm_singleton(PrimMsg, Req, Body, Opts) ->
     {ok, Decoded} =
         hb_message:with_only_committed(
@@ -1020,8 +1021,10 @@ httpsig_to_tabm_singleton(PrimMsg, Req, Body, Opts) ->
             Opts
         ),
     ?event(debug_http, {decoded, Decoded}, Opts),
-    ForceSignedRequests = hb_opts:get(force_signed_requests, false, Opts),
-    case (not ForceSignedRequests) orelse hb_message:verify(Decoded, all, Opts) of
+    % The message is verified with the request's cookie and peer details in
+    % place: a commitment may be keyed by a secret the cookie carries.
+    Normalized = normalize_unsigned(PrimMsg, Req, Decoded, Opts),
+    case verified(Normalized, Opts) of
         true ->
             ?event(http_verify, {verified_signature, Decoded}),
             Signers = hb_message:signers(Decoded, Opts),
@@ -1041,15 +1044,22 @@ httpsig_to_tabm_singleton(PrimMsg, Req, Body, Opts) ->
                 false ->
                     do_nothing
             end,
-            normalize_unsigned(PrimMsg, Req, Decoded, Opts);
+            Normalized;
         false ->
-            ?event(http_verify,
-                {invalid_signature,
-                    {signed, Decoded},
-                    {force, ForceSignedRequests}
-                }
-            ),
+            ?event(http_verify, {invalid_signature, {signed, Decoded}}),
             throw({invalid_commitments, Decoded})
+    end.
+
+%% @doc Whether every commitment of a message and of its nested messages
+%% verifies.
+verified(Msg, Opts) ->
+    try
+        hb_message:paranoid_verify(
+            inbound,
+            Msg,
+            Opts#{ <<"paranoid-verify">> => true }
+        )
+    catch throw:{paranoid_verification_failure, _, _, _, _} -> false
     end.
 
 %% @doc Add the method and path to a message, if they are not already present.
@@ -1262,6 +1272,51 @@ simple_ao_resolve_signed_test() ->
         ),
     ?assertEqual(<<"Value1">>, Res).
 
+%% @doc A request whose commitment carries the operator's address but was not
+%% made with the operator's key is refused, and the node message stays as it
+%% is.
+forged_commitment_rejected_test() ->
+    Opts = test_opts(),
+    Node = hb_http_server:start_node(Opts),
+    Update =
+        #{
+            <<"path">> => <<"/~meta@1.0/info">>,
+            <<"method">> => <<"POST">>,
+            <<"short-trace-len">> => 7
+        },
+    Genuine = hb_message:commit(Update, Opts),
+    [{_, GenuineComm}] =
+        maps:to_list(hb_maps:get(<<"commitments">>, Genuine, Opts)),
+    Attacker = isolated_test_opts(),
+    Signed = hb_message:commit(Update, Attacker),
+    [{ID, Comm}] = maps:to_list(hb_maps:get(<<"commitments">>, Signed, Opts)),
+    Forged =
+        Signed#{
+            <<"commitments">> =>
+                #{
+                    ID =>
+                        Comm#{
+                            <<"keyid">> =>
+                                hb_maps:get(<<"keyid">>, GenuineComm, Opts),
+                            <<"committer">> =>
+                                hb_maps:get(<<"committer">>, GenuineComm, Opts)
+                        }
+                }
+        },
+    ?assertEqual(
+        hb_message:signers(Genuine, Opts),
+        hb_message:signers(Forged, Opts)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        post(Node, Forged, Attacker)
+    ),
+    {ok, Unchanged} = get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertNotEqual(7, hb_ao:get(<<"short-trace-len">>, Unchanged, Opts)),
+    ?assertMatch({ok, _}, post(Node, Genuine, Opts)),
+    {ok, Changed} = get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertEqual(7, hb_ao:get(<<"short-trace-len">>, Changed, Opts)).
+
 paranoid_http_result_test() ->
     % The `http_result' topic verifies each response at the reply boundary (in
     % `encode_reply', before wire conversion): a validly committed result
@@ -1347,20 +1402,20 @@ run_wasm_unsigned_test() ->
 
 run_wasm_signed_test() ->
     Opts = test_opts(),
-    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
+    URL = hb_http_server:start_node(),
     Msg = wasm_compute_request(<<"test/test-64.wasm">>, <<"fac">>, [3.0], <<"">>, Opts),
     {ok, Res} = post(URL, hb_message:commit(Msg, Opts), Opts),
     ?assertEqual(6.0, hb_ao:get(<<"output/1">>, Res, Opts)).
 
 get_deep_unsigned_wasm_state_test() ->
-    URL = hb_http_server:start_node(#{ <<"force-signed">> => false }),
+    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
     LocalOpts = test_opts(),
     Msg = wasm_compute_request(<<"test/test-64.wasm">>, <<"fac">>, [3.0], <<"">>, LocalOpts),
     {ok, Res} = post(URL, Msg, LocalOpts),
     ?assertEqual(6.0, hb_ao:get(<<"/output/1">>, Res, LocalOpts)).
 
 get_deep_signed_wasm_state_test() ->
-    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
+    URL = hb_http_server:start_node(#{ <<"force-signed">> => false }),
     LocalOpts = test_opts(),
     Msg =
         wasm_compute_request(
@@ -1374,7 +1429,7 @@ get_deep_signed_wasm_state_test() ->
     ?assertEqual(6.0, hb_ao:get(<<"1">>, Res, LocalOpts)).
 
 cors_get_test() ->
-    URL = hb_http_server:start_node(),
+    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
     LocalOpts = test_opts(),
     {ok, Res} = get(URL, <<"/~meta@1.0/info">>, LocalOpts),
     ?assertEqual(
@@ -1386,7 +1441,6 @@ ans104_wasm_test() ->
     ServerStore = [hb_test_utils:test_store()],
     ServerOpts =
         #{
-            <<"force-signed">> => true,
             <<"store">> => ServerStore,
             <<"priv-wallet">> => ar_wallet:new()
         },
@@ -1453,6 +1507,7 @@ nested_signed_bundle_over_http_test() ->
             ClientOpts,
             #{
                 <<"commitment-device">> => <<"httpsig@1.0">>,
+            <<"force-signed">> => true,
                 <<"bundle">> => true
             }
         ),
