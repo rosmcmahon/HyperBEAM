@@ -223,7 +223,8 @@ from_body_part(InlinedKey, Part, Opts) ->
             fun(<<>>) -> false;
                (RawHeader) -> 
                     case binary:split(RawHeader, [<<": ">>]) of
-                        [Name, Value] -> {true, {Name, Value}};
+                        [Name, Value] ->
+                            {true, {Name, hb_escape:decode_header(Value)}};
                         _ ->
                             % skip lines that aren't properly formatted headers
                             false
@@ -690,11 +691,21 @@ encode_body_part(PartName, BodyPart, InlineKey, Opts) ->
     % HB message field that resolves to the sub-message
     case BodyPart of
         BPMap when is_map(BPMap) ->
+            % The fields of the part other than its body are its headers, so
+            % their values are escaped as the headers of the message itself
+            % are.
             WithDisposition =
                 hb_maps:put(
                     <<"content-disposition">>,
                     Disposition,
-                    BPMap,
+                    maps:map(
+                        fun(<<"body">>, Value) -> Value;
+                           (_Key, Value) when is_binary(Value) ->
+                                hb_escape:encode_header(Value);
+                           (_Key, Value) -> Value
+                        end,
+                        BPMap
+                    ),
                     Opts
                 ),
             encode_http_flat_msg(WithDisposition, Opts);
