@@ -28,8 +28,8 @@
 %%% with `exclude-data=true', then converted to a structured message. This
 %%% requires a byte-addressable item and a device supporting header decoding;
 %%% it cannot identify a base-layer transaction by offset alone. Header reads
-%%% may span chunks. The payload is omitted, so `data.size' is zero for these
-%%% header-only results, not the size of the original payload.
+%%% may span chunks. The payload is omitted, so `data.size' is null for these
+%%% header-only results: its original length is unknown.
 %%%
 %%% Indexed pagination orders by offset and ID and returns `member=' cursors.
 %%% One ID at two offsets can produce two edges. Unreadable entries are omitted
@@ -55,9 +55,14 @@
 %%% and owner fields come from a signed commitment; recipient and anchor come
 %%% from commitment field mappings. `fee' (falling back to `reward') and
 %%% `quantity' default to zero, projected as winston and exact AR strings.
-%%% `data.size' measures `data', falling back to `body',
-%%% then an empty binary; `data.type' reads `content-type'. These projections
+%%% `data.size' prefers an L1 transaction's declared or indexed payload size,
+%%% then measures binary `data', falling back to `body', then an empty binary.
+%%% Structured bodies and omitted payloads have unknown size (null).
+%%% `data.type' reads `content-type'. These projections
 %%% do not reconstruct an Arweave transaction or its original tag list.
+%%% Transaction `block' uses the matched weave position and cached block
+%%% ranges, searching remote block heights on a miss when remote block reads
+%%% are enabled. L1 IDs resolve shared boundaries; pending positions return null.
 %%%
 %%% `blocks' pages by height, descending by default or `HEIGHT_ASC', within
 %%% inclusive `height.min/max' bounds. Height enumeration defaults to zero and
@@ -72,7 +77,7 @@
 %%% or a GraphQL type error. Schema acceptance does not imply filter support.
 -module(dev_query_arweave).
 %%% AO-Core API:
--export([query/4]).
+-export([query/4, block_opts/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -162,9 +167,9 @@ query(Obj, <<"transactions">>, RawArgs, Opts) ->
         unservable -> cached_transactions(Args, Opts);
         Result -> Result
     end;
-query(_Obj, <<"block">>, Args, Opts) ->
+query(Obj, <<"block">>, Args, Opts) ->
     case hb_maps:get(<<"id">>, Args, null, Opts) of
-        null -> {ok, null};
+        null -> transaction_block(Obj, Opts);
         ID -> read_block(ID, Opts)
     end;
 query(_Obj, <<"networkInfo">>, _Args, Opts) ->
@@ -217,9 +222,9 @@ query(#{ <<"key">> := Key }, <<"key">>, _Args, _Opts) ->
 query(#{ <<"address">> := Address }, <<"address">>, _Args, _Opts) ->
     {ok, Address};
 query(Msg, <<"fee">>, _Args, Opts) ->
-    {ok, hb_maps:get_first([{Msg, <<"fee">>}, {Msg, <<"reward">>}], 0, Opts)};
+    transaction_amount(Msg, <<"field-reward">>, [<<"fee">>, <<"reward">>], Opts);
 query(Msg, <<"quantity">>, _Args, Opts) ->
-    {ok, hb_maps:get(<<"quantity">>, Msg, 0, Opts)};
+    transaction_amount(Msg, <<"field-quantity">>, [<<"quantity">>], Opts);
 query(Number, <<"winston">>, _Args, _Opts) ->
     {ok, hb_util:bin(Number)};
 query(Number, <<"ar">>, _Args, _Opts) ->
@@ -244,18 +249,32 @@ query(Msg, <<"anchor">>, _Args, Opts) ->
     end;
 query(Msg, <<"data">>, _Args, Opts) ->
     Data =
-        hb_ao:get_first(
-            [
-                {{as, <<"message@1.0">>, Msg}, <<"data">>},
-                {{as, <<"message@1.0">>, Msg}, <<"body">>}
-            ],
-            <<>>,
-            Opts
-        ),
+        case hb_private:get(<<"query-data-omitted">>, Msg, false, Opts) of
+            true -> null;
+            false ->
+                hb_ao:get_first(
+                    [
+                        {{as, <<"message@1.0">>, Msg}, <<"data">>},
+                        {{as, <<"message@1.0">>, Msg}, <<"body">>}
+                    ],
+                    <<>>,
+                    Opts
+                )
+        end,
     Type = hb_maps:get(<<"content-type">>, Msg, null, Opts),
-    {ok, #{ <<"data">> => Data, <<"type">> => Type }};
-query(#{ <<"data">> := Data }, <<"size">>, _Args, _Opts) ->
+    Size =
+        case find_field_key(<<"field-data_size">>, Msg, Opts) of
+            {ok, null} -> indexed_data_size(Msg, Opts);
+            {ok, DeclaredSize} -> DeclaredSize
+        end,
+    {ok, #{ <<"data">> => Data, <<"type">> => Type, <<"size">> => Size }};
+query(#{ <<"size">> := Size }, <<"size">>, _Args, _Opts) when Size =/= null ->
+    {ok, Size};
+query(#{ <<"data">> := Data }, <<"size">>, _Args, _Opts)
+        when is_binary(Data) ->
     {ok, byte_size(Data)};
+query(_Data, <<"size">>, _Args, _Opts) ->
+    {ok, null};
 query(#{ <<"type">> := Type }, <<"type">>, _Args, _Opts) ->
     {ok, Type};
 query(_Msg, Field, _Args, _Opts)
@@ -321,8 +340,18 @@ encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 43 -> {ok, Bin};
 encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 64 -> {ok, Bin};
 encode_anchor(Other) -> {error, <<"invalid_anchor: ", Other/binary>>}.
 
-%% @doc Find and return a value from the fields of a message (from its
-%% commitments).
+%% @doc L1 amounts use commitment fields; other messages use their own keys.
+transaction_amount(Msg, Field, Keys, Opts) ->
+    case find_field_key(<<"commitment-device">>, Msg, Opts) of
+        {ok, <<"tx@1.0">>} ->
+            case find_field_key(Field, Msg, Opts) of
+                {ok, null} -> {ok, 0};
+                Amount -> Amount
+            end;
+        _ -> {ok, hb_maps:get_first([{Msg, Key} || Key <- Keys], 0, Opts)}
+    end.
+
+%% @doc Find a field preserved by a message's commitment.
 find_field_key(Field, Msg, Opts) ->
     case hb_message:commitments(#{ Field => '_' }, Msg, Opts) of
         not_found -> {ok, null};
@@ -335,6 +364,28 @@ find_field_key(Field, Msg, Opts) ->
                         {ok, Value} -> {ok, Value};
                         error -> {ok, null}
                     end
+            end
+    end.
+
+%% @doc The offset index length is the payload size for an L1 transaction.
+indexed_data_size(Msg, Opts) ->
+    case hb_private:get(<<"query-match">>, Msg, #{}, Opts) of
+        #{ <<"commitment-device">> := <<"tx@1.0">>,
+            <<"length">> := Length } -> Length;
+        #{ <<"commitment-device">> := Device }
+                when Device =/= <<>>, Device =/= <<"tx@1.0">> -> null;
+        #{ <<"id">> := ID } when ID =/= <<>> -> indexed_l1_size(ID, Opts);
+        _ -> null
+    end.
+
+indexed_l1_size(ID, Opts) ->
+    case hb_store_arweave:store_from_opts(Opts) of
+        no_store -> null;
+        Store ->
+            case hb_store_arweave:read_offset(Store, ID, Opts) of
+                {ok, #{ <<"codec-device">> := <<"tx@1.0">>,
+                    <<"length">> := Length }} -> Length;
+                _ -> null
             end
     end.
 
@@ -377,7 +428,9 @@ read_ids(_, 0, _Opts) -> [];
 read_ids([AnnotatedID = #{ <<"id">> := ID } | Rest], Count, Opts) ->
     case hb_cache:read(ID, Opts) of
         {ok, Msg} ->
-            [AnnotatedID#{ <<"node">> => Msg } | read_ids(Rest, Count - 1, Opts)];
+            [AnnotatedID#{ <<"node">> =>
+                hb_private:set(Msg, <<"query-match">>, AnnotatedID, Opts)
+            } | read_ids(Rest, Count - 1, Opts)];
         _ ->
             read_ids(Rest, Count, Opts)
     end.
@@ -461,7 +514,8 @@ sort_offset_annotated(AnnotatedIDs, SortOrder, _Opts) ->
     {Pending, Confirmed} =
         lists:partition(fun(#{ <<"offset">> := Offset }) -> pending_offset(Offset) end, WithOffset),
     ByID = fun(#{ <<"id">> := A }, #{ <<"id">> := B }) -> A < B end,
-    ByOffset = fun(#{ <<"offset">> := A }, #{ <<"offset">> := B }) -> A < B end,
+    ByOffset = fun(#{ <<"offset">> := A, <<"id">> := AID },
+        #{ <<"offset">> := B, <<"id">> := BID }) -> {A, AID} =< {B, BID} end,
     UserOrderSorted =
         case SortOrder of
             <<"HEIGHT_ASC">> ->
@@ -483,6 +537,86 @@ sort_offset_annotated(AnnotatedIDs, SortOrder, _Opts) ->
     UserOrderSorted.
 
 %%% Block pages.
+
+%% @doc Find a transaction's block, trying cached headers before remote ones.
+%% Use the matched position, so pending entries cannot inherit a confirmed block.
+transaction_block(Msg, Opts) ->
+    Match = hb_private:get(<<"query-match">>, Msg, #{}, Opts),
+    match_block(Match, Opts).
+
+%% @doc Resolve the containing block from a match's position and signed ID.
+match_block(Match, Opts) ->
+    case Match of
+        #{ <<"offset">> := Offset } when is_integer(Offset), Offset >= 0 ->
+            Sorted = maps:get(<<"query-block-heights">>, block_opts(Opts)),
+            case block_at_offset(Match, Sorted, 1, tuple_size(Sorted), Opts) of
+                {ok, null} -> remote_transaction_block(Match, Opts);
+                Result -> Result
+            end;
+        _ -> {ok, null}
+    end.
+
+%% @doc Search all heights only when the node allows remote block reads.
+remote_transaction_block(Match, Opts) ->
+    case hb_opts:get(query_arweave_remote_block_ranges, true, Opts) of
+        true ->
+            maybe
+                {ok, Status} ?= query(undefined, <<"networkInfo">>, #{}, Opts),
+                Height = hb_util:int(hb_maps:get(<<"height">>, Status, 0, Opts)),
+                block_at_offset(Match, remote, 0, Height, Opts)
+            end;
+        _ -> {ok, null}
+    end.
+
+%% @doc Binary-search blocks by their weave ranges. L1 membership
+%% disambiguates zero-data transactions at shared block boundaries.
+block_at_offset(_Match, _Heights, Low, High, _Opts) when Low > High ->
+    {ok, null};
+block_at_offset(Match = #{ <<"offset">> := Offset }, Heights, Low, High, Opts) ->
+    Mid = (Low + High) div 2,
+    maybe
+        {ok, Block} ?=
+            case Heights of
+                remote -> read_block(Mid, Opts);
+                _ -> read_cached_block(element(Mid, Heights), Opts)
+            end,
+        End = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+        Start = End - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+        case {Offset < Start, Offset > End} of
+            {true, _} -> block_at_offset(Match, Heights, Low, Mid - 1, Opts);
+            {_, true} -> block_at_offset(Match, Heights, Mid + 1, High, Opts);
+            _ ->
+                case block_contains(Match, Block, End, Opts) of
+                    true -> {ok, Block};
+                    false ->
+                        maybe
+                            {ok, null} ?=
+                                case Offset =:= Start of
+                                    true -> block_at_offset(
+                                        Match, Heights, Low, Mid - 1, Opts);
+                                    false -> {ok, null}
+                                end,
+                            case Offset =:= End of
+                                true -> block_at_offset(
+                                    Match, Heights, Mid + 1, High, Opts);
+                                false -> {ok, null}
+                            end
+                        end
+                end
+        end
+    else
+        {error, not_found} -> {ok, null};
+        Error -> Error
+    end.
+
+%% @doc L1s must occur in the block's TX list; bundled items occupy bytes
+%% before its end. Zero-data L1s can also sit exactly at the end.
+block_contains(Match = #{ <<"commitment-device">> := <<"tx@1.0">> },
+        Block, _End, Opts) ->
+    lists:member(hb_maps:get(<<"id">>, Match, <<>>, Opts),
+        hb_maps:get(<<"txs">>, Block, [], Opts));
+block_contains(#{ <<"offset">> := Offset }, _Block, End, _Opts) ->
+    Offset < End.
 
 %% @doc Read a bounded page of blocks by height, or from explicit block IDs.
 block_connection(RawArgs, Opts) ->
@@ -656,19 +790,20 @@ read_cached_block(Height, Opts) ->
 
 %% @doc Return the latest block height indexed in the Arweave pseudo-path cache.
 latest_cached_block(Opts) ->
-    Blocks =
-        hb_cache:list_numbered(
-            hb_path:to_binary([
-                <<"~arweave@2.9">>,
-                <<"block">>,
-                <<"height">>
-            ]),
-            Opts
-        ),
-    case Blocks of
+    case cached_block_heights(Opts) of
         [] -> not_found;
-        _ -> {ok, lists:max(Blocks)}
+        Blocks -> {ok, lists:max(Blocks)}
     end.
+
+%% @doc List block heights already available in the Arweave pseudo-path cache.
+cached_block_heights(Opts) ->
+    hb_cache:list_numbered(<<"~arweave@2.9/block/height">>, Opts).
+
+%% @doc Share the sorted block catalog between resolvers in one request.
+block_opts(Opts = #{ <<"query-block-heights">> := _ }) -> Opts;
+block_opts(Opts) ->
+    Opts#{ <<"query-block-heights">> =>
+        list_to_tuple(lists:sort(cached_block_heights(Opts))) }.
 
 %%% Index-served pages
 
@@ -769,15 +904,22 @@ index_ranges(Direction, Args, Opts) ->
             {asc, {Start, infinity}} ->
                 [#{ <<"from">> => Start }];
             {asc, {Start, End}} ->
-                [#{ <<"from">> => Start, <<"to">> => End }];
+                [#{ <<"from">> => Start, <<"to">> => End + 1 }];
             {desc, open} ->
                 [#{ <<"from">> => infinity }];
             {desc, {Start, infinity}} ->
                 [#{ <<"from">> => infinity, <<"to">> => Start - 1 }];
             {desc, {Start, End}} ->
-                [#{ <<"from">> => End - 1, <<"to">> => Start - 1 }]
+                [#{ <<"from">> => End, <<"to">> => Start - 1 }]
         end,
-    [ Range#{ <<"direction">> => Direction } || Range <- Bounds ].
+    Filter =
+        case Window of
+            open -> #{};
+            {Low, High} -> #{ <<"block">> => Heights,
+                <<"block-start">> => Low, <<"block-end">> => High }
+        end,
+    [ (maps:merge(Range, Filter))#{ <<"direction">> => Direction }
+        || Range <- Bounds ].
 
 %% @doc The matches of a page: the ranges read in order from the cursor,
 %% which lies in the range holding its key.
@@ -789,7 +931,12 @@ index_matches(Predicates, Ranges, After, Limit, Opts) ->
             {<<"-1", _/binary>>, [_Weave, Unmined]} -> [Unmined];
             _ -> Ranges
         end,
-    locate_ranges(Predicates, Ahead, After, Limit, Opts).
+    QueryOpts =
+        case lists:any(fun(Range) -> maps:is_key(<<"block">>, Range) end, Ahead) of
+            true -> block_opts(Opts);
+            false -> Opts
+        end,
+    locate_ranges(Predicates, Ahead, After, Limit, QueryOpts).
 
 %% @doc The matches of the ranges in order from the cursor, as far as the
 %% page has room.
@@ -804,11 +951,56 @@ locate_ranges(Predicates, [Range | Rest], After, Limit, Opts) ->
         end,
     maybe
         {ok, Matches} ?=
-            locate(Predicates, Bounds#{ <<"limit">> => Limit }, Opts),
+            locate_range(Predicates, Bounds, Limit, Opts),
         {ok, More} ?=
             locate_ranges(Predicates, Rest, none, Limit - length(Matches), Opts),
         {ok, Matches ++ More}
     end.
+
+%% @doc Filter boundary candidates before counting the page, refilling it
+%% from the last examined member with bounded reads until full or exhausted.
+locate_range(Predicates, Bounds, Limit, Opts) ->
+    maybe
+        {ok, Matches} ?= locate(Predicates, Bounds#{ <<"limit">> => Limit }, Opts),
+        Accepted = [Match || Match <- Matches, in_block_range(Match, Bounds, Opts)],
+        case length(Matches) =:= Limit andalso length(Accepted) < Limit of
+            false -> {ok, Accepted};
+            true ->
+                Next = (maps:remove(<<"from">>, Bounds))#{
+                    <<"after">> => maps:get(<<"member">>, lists:last(Matches)) },
+                maybe
+                    {ok, More} ?= locate_range(
+                        Predicates, Next, Limit - length(Accepted), Opts),
+                    {ok, Accepted ++ More}
+                end
+        end
+    end.
+
+%% @doc Byte ranges identify bundled items, but L1s at shared boundaries
+%% require block membership to distinguish zero-data transactions.
+in_block_range(Match, #{ <<"block">> := Heights, <<"block-start">> := Start,
+        <<"block-end">> := End }, Opts) ->
+    Offset = maps:get(<<"offset">>, Match, undefined),
+    Min = case maps:get(<<"min">>, Heights, 0) of null -> 0; Low -> Low end,
+    Max = case maps:get(<<"max">>, Heights, infinity) of
+        null -> infinity; High -> High end,
+    case pending_offset(Offset) of
+        true -> End =:= infinity;
+        false when is_integer(Offset), Offset >= Start, Offset =< End ->
+            case maps:get(<<"commitment-device">>, Match, <<>>) of
+                <<"tx@1.0">> when Offset =:= End;
+                        Offset =:= Start, Min > 0 ->
+                    case hb_util:ok(match_block(Match, Opts)) of
+                        null -> false;
+                        Block ->
+                            Height = hb_maps:get(<<"height">>, Block, -1, Opts),
+                            Height >= Min andalso Height =< Max
+                    end;
+                _ -> Offset < End
+            end;
+        false -> false
+    end;
+in_block_range(_Match, _Range, _Opts) -> true.
 
 %% @doc The matches of the predicates through `~match@1.0'. A node without
 %% stores of the index is `unservable'; a failing store is an error, as
@@ -838,11 +1030,12 @@ match_edges(Matches, Opts) ->
             hb_opts:get(arweave_chunk_fetch_concurrency, 10, Opts)
         ),
     lists:filtermap(
-        fun({#{ <<"member">> := Member }, {ok, Node}}) ->
+        fun({Match = #{ <<"member">> := Member }, {ok, Node}}) ->
                 {true,
                     #{
                         <<"cursor">> => <<?MEMBER_CURSOR, Member/binary>>,
-                        <<"node">> => Node
+                        <<"node">> =>
+                            hb_private:set(Node, <<"query-match">>, Match, Opts)
                     }};
             ({Match, Error}) ->
                 ?event(warning,
@@ -892,13 +1085,8 @@ header_message({ok, Bytes}, Device, Opts) ->
                 Device, <<"deserialize">>, #{ <<"body">> => Bytes },
                 #{ <<"exclude-data">> => true }, Opts
             ),
-        {ok,
-            hb_message:convert(
-                TABM,
-                <<"structured@1.0">>,
-                tabm,
-                Opts
-            )}
+        Msg = hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts),
+        {ok, hb_private:set(Msg, <<"query-data-omitted">>, true, Opts)}
     catch _:Reason ->
         {error, {'invalid-item', Reason}}
     end;
@@ -1013,34 +1201,38 @@ native_tags(Tags, Opts) ->
 annotate_ids(IDs, Opts) ->
     case hb_store_arweave:store_from_opts(Opts) of
         no_store -> unavailable;
-        StoreOpts -> annotate_offsets(IDs, StoreOpts, undefined, 0, Opts)
+        StoreOpts -> annotate_offsets(lists:sort(IDs), StoreOpts, #{}, Opts)
     end.
-annotate_offsets([], _StoreOpts, _LastOffset, _Ordinate, _Opts) -> [];
-annotate_offsets([ID|IDs], StoreOpts, LastOffset, Ordinate, Opts) ->
+annotate_offsets([], _StoreOpts, _Ordinals, _Opts) -> [];
+annotate_offsets([ID|IDs], StoreOpts, Ordinals, Opts) ->
     {Offset, Annotated} =
         case hb_store_arweave:read_offset(StoreOpts, ID, Opts) of
-            {ok, #{ <<"start">> := StartOffset, <<"length">> := Length }} ->
+            {ok, Location = #{ <<"start">> := StartOffset, <<"length">> := Length }} ->
                 {
                     StartOffset,
                     #{
                         <<"id">> => ID,
                         <<"offset">> => StartOffset,
+                        <<"commitment-device">> =>
+                            hb_maps:get(<<"codec-device">>, Location, <<>>, Opts),
                         <<"length">> => Length
                     }
                 };
             _ ->
                 {undefined, #{ <<"id">> => ID }}
         end,
-    {NewOrdinate, Postfix} =
-        case Offset =/= undefined andalso not pending_offset(Offset) andalso Offset =:= LastOffset of
-            true -> {Ordinate + 1, <<"-", (hb_util:bin(Ordinate + 1))/binary>>};
-            false -> {0, <<>>}
+    Ordinate = maps:get(Offset, Ordinals, 0),
+    Postfix =
+        case is_integer(Offset) andalso Ordinate > 0 of
+            true -> <<"-", (hb_util:bin(Ordinate))/binary>>;
+            false -> <<>>
         end,
     WithCursor =
         Annotated#{
             <<"cursor">> => << (offset_cursor(ID, Offset))/binary, Postfix/binary >>
         },
-    [WithCursor | annotate_offsets(IDs, StoreOpts, Offset, NewOrdinate, Opts)].
+    [WithCursor | annotate_offsets(IDs, StoreOpts,
+        Ordinals#{ Offset => Ordinate + 1 }, Opts)].
 
 offset_cursor(ID, undefined) when is_binary(ID) -> <<"ephemeral=", ID/binary>>;
 offset_cursor(ID, Offset) when is_binary(ID) ->
@@ -1049,6 +1241,7 @@ offset_cursor(ID, Offset) when is_binary(ID) ->
         false -> <<"offset=", (hb_util:bin(Offset))/binary>>
     end.
 
+pending_offset(infinity) -> true;
 pending_offset(relative) -> true;
 pending_offset(#{ <<"relative">> := _, <<"offset">> := _ }) -> true;
 pending_offset(_) -> false.
@@ -1069,20 +1262,19 @@ filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
 do_filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
     {StartOffset, EndOffset} =
         block_range_to_offset_range(Heights, Opts),
+    Range = #{ <<"block">> => Heights, <<"block-start">> => StartOffset,
+        <<"block-end">> => EndOffset },
+    QueryOpts = block_opts(Opts),
     Filtered =
         lists:filter(
-            fun(#{ <<"offset">> := Offset }) when Offset =:= relative ->
-                    EndOffset =:= infinity;
-                (#{ <<"offset">> := Offset }) when is_map(Offset) ->
-                    EndOffset =:= infinity;
-                (#{ <<"offset">> := IDOffset, <<"length">> := Length })
-                        when is_integer(IDOffset) ->
-                    ((StartOffset =:= 0) orelse (IDOffset >= StartOffset)) andalso
-                        (
-                            (EndOffset =:= infinity) orelse
-                                (IDOffset + Length =< EndOffset)
-                        );
-                (_) -> false
+            fun(Match) ->
+                in_block_range(Match, Range, QueryOpts) andalso
+                    case Match of
+                        #{ <<"offset">> := Offset, <<"length">> := Length }
+                                when is_integer(Offset), is_integer(EndOffset) ->
+                            Offset + Length =< EndOffset;
+                        _ -> true
+                    end
             end,
             AnnotatedIDs
         ),
@@ -1287,7 +1479,7 @@ published_pages() ->
                 ) {
                     count
                     pageInfo { hasNextPage }
-                    edges { cursor node { id tags { name value } } }
+                    edges { cursor node { id data { size } tags { name value } } }
                 }
             }
         """>>,
@@ -1327,7 +1519,8 @@ published_pages() ->
     ?assertEqual(24, length(lists:usort(IDs))),
     ?assert(
         lists:all(
-            fun(#{ <<"node">> := #{ <<"tags">> := Tags } }) ->
+            fun(#{ <<"node">> := #{ <<"tags">> := Tags,
+                    <<"data">> := #{ <<"size">> := null } } }) ->
                 lists:member(
                     #{
                         <<"name">> => <<"action">>,
