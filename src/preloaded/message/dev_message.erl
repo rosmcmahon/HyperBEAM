@@ -533,12 +533,20 @@ with_relevant_commitments(Base, Req, Opts) ->
 %% the default is `all' for commitments -- also implying `all' for committers.
 commitment_ids_from_request(Base, Req, Opts) ->
     Commitments = maps:get(<<"commitments">>, Base, #{}),
+    % A request with neither `committers' nor `commitment-ids' selects every
+    % commitment of the message.
+    Selection =
+        case maps:with([<<"committers">>, <<"commitment-ids">>], Req) of
+            None when map_size(None) == 0 ->
+                #{ <<"commitment-ids">> => <<"all">> };
+            Given -> Given
+        end,
     ReqCommitters =
-        case maps:get(<<"committers">>, Req, <<"none">>) of
+        case maps:get(<<"committers">>, Selection, <<"none">>) of
             X when is_list(X) -> X;
             CommitterDescriptor -> hb_ao:normalize_key(CommitterDescriptor)
         end,
-    RawReqCommitments = maps:get(<<"commitment-ids">>, Req, <<"none">>),
+    RawReqCommitments = maps:get(<<"commitment-ids">>, Selection, <<"none">>),
     ReqCommitments =
         case RawReqCommitments of
             X2 when is_list(X2) -> X2;
@@ -1139,18 +1147,19 @@ test_verify(KeyType) ->
     BadSigned = Signed#{ <<"a">> => <<"c">> },
     ?event_debug({bad_signed, BadSigned}),
     ?assertEqual(false, hb_message:verify(BadSigned)),
+    % The message is the target of its own `verify' key, so a request without
+    % `committers' verifies every commitment it carries.
     ?assertEqual({ok, true},
         hb_ao:resolve(
-            #{ <<"device">> => <<"message@1.0">> },
-            #{ <<"path">> => <<"verify">>, <<"body">> => Signed },
+            Signed,
+            #{ <<"path">> => <<"verify">> },
             #{ <<"hashpath">> => ignore }
         )
     ),
-    % Test that we can verify a message without specifying the device explicitly.
-    ?assertEqual({ok, true},
+    ?assertEqual({ok, false},
         hb_ao:resolve(
-            #{},
-            #{ <<"path">> => <<"verify">>, <<"body">> => Signed },
+            BadSigned,
+            #{ <<"path">> => <<"verify">> },
             #{ <<"hashpath">> => ignore }
         )
     ).
