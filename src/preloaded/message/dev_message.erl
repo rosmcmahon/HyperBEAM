@@ -315,6 +315,13 @@ commit(Self, Req, Opts) ->
     Res = Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) },
     {ok, hb_private:merge(Res, Committed, Opts)}.
 
+%% @doc The keys a commitment lists as committed, in their normalized form.
+committed_keys(Commitment, Opts) ->
+    hb_util:message_to_ordered_list(
+        maps:get(<<"committed">>, Commitment),
+        Opts
+    ).
+
 %% @doc Verify a message. By default, all commitments are verified. The
 %% `committers' key in the request can be used to specify that only the 
 %% commitments from specific committers should be verified. Similarly, specific
@@ -376,8 +383,26 @@ verify(Self, Req, Opts) ->
                         },
                         Opts
                     ),
-                Base = hb_message:convert(
-                    CommitmentBase, tabm, SourceSpec, Opts),
+                % A commitment is verified over the keys it lists and as the
+                % only commitment of the base: keys given alongside the
+                % committed ones do not enter its signature base, and the
+                % bundle state of another commitment does not set the
+                % encoding of this one.
+                Covered =
+                    hb_message:with_links(
+                        [
+                            <<"commitments">>,
+                            <<"priv">>
+                        |
+                            committed_keys(Commitment, Opts)
+                        ],
+                        CommitmentBase#{
+                            <<"commitments">> =>
+                                maps:with([CommitmentID], Commitments)
+                        },
+                        Opts
+                    ),
+                Base = hb_message:convert(Covered, tabm, SourceSpec, Opts),
                 ?event(verify, {verify, {base_found, Base}}),
                 {ok, Res} =
                     verify_commitment(

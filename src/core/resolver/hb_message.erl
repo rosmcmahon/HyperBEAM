@@ -65,7 +65,7 @@
 -export([normalize_commitments/2, normalize_commitments/3]).
 -export([normalize_commitments/4, is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
--export([with_only_committed/2, without_unless_signed/3]).
+-export([with_only_committed/2, with_links/3, without_unless_signed/3]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
