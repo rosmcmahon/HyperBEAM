@@ -757,11 +757,14 @@ check_id(Value, ID, Opts) ->
         {ok, Value}
     end.
 
-%% @doc Check the commitments of every message layer of a value.
+%% @doc Check the commitments of every message layer of a value. A challenge
+%% loads the value in full first: paranoid verification checks the messages
+%% it is given and does not follow links, and a forged layer may be stored
+%% behind one.
 verify_all_commitments(Value, Opts) ->
     try
         hb_message:paranoid_verify(
-            Value,
+            hb_cache:ensure_all_loaded(Value, Opts),
             Opts#{ <<"paranoid-verify">> => true }
         )
     catch throw:{paranoid_verification_failure, _, _, _, _} -> false
