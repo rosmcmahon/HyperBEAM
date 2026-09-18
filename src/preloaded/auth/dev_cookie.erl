@@ -14,16 +14,17 @@
 %%% this device to generate and store secrets in the cookies of the caller,
 %%% which are then used with the `~proxy-wallet@1.0' device to sign requests.
 %%% 
-%%% The `commit' and `verify' keys utilize the `~httpsig@1.0''s HMAC `secret'
-%%% commitment scheme, which uses a secret key to commit to a message, with the
-%%% `committer' being listed as a hash of the secret.
+%%% The `commit' and `verify' keys implement the access-control interface of
+%%% the `~secret@1.0' device: a secret is bound to a message by recording its
+%%% `committer' (the hash of the secret), and verified by hashing the secret
+%%% presented by the caller.
 %%% 
 %%% This device supports the following paths:
 %%% 
 %%% `/commit': Sets a `secret' key in the cookies of the caller. The name of 
 %%% the cookie is calculated as the hash of the secret. 
-%%% `/verify': Verifies the caller's request by checking the committer in the
-%%% request matches the secret in the cookies of the base message.
+%%% `/verify': Verifies the caller's request by checking the secret in its
+%%% cookies hashes to the committer recorded in the base message.
 %%% `/store': Sets the keys in the request message in the cookies of the caller.
 %%% `/extract': Extracts the cookies from a base message.
 %%% `/reset': Removes all cookie keys from the base message.
