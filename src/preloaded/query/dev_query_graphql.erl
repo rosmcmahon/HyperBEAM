@@ -200,9 +200,9 @@ selects_block([_ | Rest]) -> selects_block(Rest).
 %% for the Arweave-compatible API.
 execute(#{object_type := <<"Block">>, opts := Opts}, Block, <<"id">>, _Args) ->
     {ok, hb_maps:get(<<"indep_hash">>, Block, null, Opts)};
-execute(#{object_type := Type}, _Obj, <<"id">>, _Args)
+execute(#{object_type := Type, opts := Opts}, Bundle, <<"id">>, _Args)
         when Type =:= <<"Bundle">>; Type =:= <<"Parent">> ->
-    {ok, <<>>};
+    {ok, hb_maps:get(<<"bundle-id">>, Bundle, <<>>, Opts)};
 execute(Ctx = #{opts := Opts}, Obj, Field, Args) ->
     ?event({graphql_query, {object, Obj}, {field, Field}, {args, Args}}),
     case lists:member(Field, ?MESSAGE_QUERY_KEYS) of

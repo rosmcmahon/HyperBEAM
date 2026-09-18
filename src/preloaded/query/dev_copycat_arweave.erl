@@ -466,6 +466,7 @@ process_tx({{TX, _TXDataRoot}, EndOffset}, BlockStartOffset, IndexMode, Opts) ->
                                 {TotalTime, IndexRes} = timer:tc(
                                     fun() ->
                                         index_full_bundle_bytes(
+                                            TXID,
                                             BundleData,
                                             TXStartOffset,
                                             IndexMode,
@@ -511,14 +512,21 @@ process_tx({{TX, _TXDataRoot}, EndOffset}, BlockStartOffset, IndexMode, Opts) ->
                                         (_Item, {error, _} = Error) ->
                                             Error;
                                         ({ItemID, Size}, {ItemStartOffset, ItemsCountAcc}) ->
+                                            EncodedItemID = hb_util:encode(ItemID),
                                             case hb_store_arweave:write_offset(
                                                 ArweaveStore,
-                                                hb_util:encode(ItemID),
+                                                EncodedItemID,
                                                 <<"ans104@1.0">>,
                                                 ItemStartOffset,
                                                 Size
                                             ) of
                                                 ok ->
+                                                    ok = write_bundled_in(
+                                                        EncodedItemID,
+                                                        TXID,
+                                                        ArweaveStore,
+                                                        Opts
+                                                    ),
                                                     {add_data_offset(ItemStartOffset, Size),
                                                         ItemsCountAcc + 1};
                                                 WriteError ->
@@ -593,13 +601,15 @@ skip_bundle(EncodedTXID, Reason) ->
     ),
     counters(0, 1, 1).
 
-index_full_bundle_bytes(BundleData, BundleStartOffset, IndexMode, Store, Opts) ->
+index_full_bundle_bytes(
+        ParentID, BundleData, BundleStartOffset, IndexMode, Store, Opts) ->
     case ar_bundles:decode_bundle_header(BundleData) of
         invalid_bundle_header ->
             {error, invalid_bundle_header};
         {ItemsBin, BundleIndex} ->
             HeaderSize = byte_size(BundleData) - byte_size(ItemsBin),
             index_full_bundle_items(
+                ParentID,
                 BundleIndex,
                 ItemsBin,
                 add_data_offset(BundleStartOffset, HeaderSize),
@@ -712,7 +722,7 @@ index_pending_children(TXID, TX, IndexMode, Store, Opts) ->
             case hb_store_arweave:read_chunks(Offset, TX#tx.data_size, Opts) of
                 {ok, BundleData} ->
                     case index_full_bundle_bytes(
-                        BundleData, Offset, IndexMode, Store, Opts) of
+                        TXID, BundleData, Offset, IndexMode, Store, Opts) of
                         {ok, ItemsCount} -> counters(ItemsCount, 1, 0);
                         {error, Reason} -> skip_bundle(TXID, Reason)
                     end;
@@ -722,9 +732,11 @@ index_pending_children(TXID, TX, IndexMode, Store, Opts) ->
     end.
 
 index_full_bundle_items(
-        [], _ItemsBin, _ItemStartOffset, _IndexMode, _Store, _Opts, Count) ->
+        _ParentID, [], _ItemsBin, _ItemStartOffset, _IndexMode, _Store, _Opts,
+        Count) ->
     {ok, Count};
 index_full_bundle_items(
+    ParentID,
     [{ItemID, Size} | Rest],
     ItemsBin,
     ItemStartOffset,
@@ -755,6 +767,7 @@ index_full_bundle_items(
             % The item's header precedes its payload, so the bytes the two
             % lengths differ by are the payload a query reports.
             ok = write_data_size(EncodedItemID, Size, ParseResult, Store, Opts),
+            ok = write_bundled_in(EncodedItemID, ParentID, Store, Opts),
             ok =
                 case {IndexMode, ParseResult} of
                     {full, {ok, _, Parsed}} ->
@@ -775,6 +788,7 @@ index_full_bundle_items(
                         case is_bundle_tx(ParsedItem, Opts) of
                             true ->
                                 index_full_bundle_bytes(
+                                    EncodedItemID,
                                     ParsedItem#tx.data,
                                     add_data_offset(ItemStartOffset, HeaderSize),
                                     IndexMode,
@@ -792,6 +806,7 @@ index_full_bundle_items(
             case DescendantRes of
                 {ok, DescendantCount} ->
                     index_full_bundle_items(
+                        ParentID,
                         Rest,
                         RestBin,
                         add_data_offset(ItemStartOffset, Size),
@@ -807,7 +822,7 @@ index_full_bundle_items(
             {error, {write_offset_failed, WriteError}}
     end;
 index_full_bundle_items(
-        _BundleIndex, _ItemsBin, _ItemStartOffset, _IndexMode,
+        _ParentID, _BundleIndex, _ItemsBin, _ItemStartOffset, _IndexMode,
         _Store, _Opts, _Count) ->
     {error, invalid_bundle_header}.
 
@@ -837,6 +852,29 @@ write_data_size(_EncodedItemID, _DataSize, _Store, _Opts) ->
 %% @doc The index path holding an item's payload size, beside its offset.
 data_size_path(EncodedItemID) ->
     <<"~arweave@2.9/data-size=", EncodedItemID/binary>>.
+
+%% @doc Record the bundle an item is carried by: the transaction for an item
+%% of an L1 bundle, and the containing item for one nested deeper.
+write_bundled_in(
+        EncodedItemID, ParentID, #{ <<"index-store">> := IndexStore }, Opts)
+        when is_binary(ParentID), ParentID =/= <<>> ->
+    ?event(debug_copycat,
+        {writing_bundled_in,
+            {id, {string, EncodedItemID}},
+            {parent, {string, ParentID}}
+        }
+    ),
+    hb_store:write(
+        IndexStore,
+        #{ bundled_in_path(EncodedItemID) => ParentID },
+        Opts
+    );
+write_bundled_in(_EncodedItemID, _ParentID, _Store, _Opts) ->
+    ok.
+
+%% @doc The index path holding the ID of the bundle an item is carried by.
+bundled_in_path(EncodedItemID) ->
+    <<"~arweave@2.9/bundled-in=", EncodedItemID/binary>>.
 
 add_data_offset(#{ <<"relative">> := TXID, <<"offset">> := Offset }, Add) ->
     #{ <<"relative">> => TXID, <<"offset">> => Offset + Add };

@@ -439,8 +439,8 @@ simple_ans104_query_test_parallel() ->
                             <<"node">> :=
                                 #{
                                     <<"id">> := ExpectedID,
-                                    <<"bundledIn">> := #{ <<"id">> := <<>> },
-                                    <<"parent">> := #{ <<"id">> := <<>> },
+                                    <<"bundledIn">> := null,
+                                    <<"parent">> := null,
                                     <<"quantity">> := #{
                                         <<"winston">> := <<"0">>,
                                         <<"ar">> := <<"0.000000000000">>
@@ -1575,3 +1575,70 @@ transaction_query_item_data_size_test_parallel() ->
             Opts
         ),
     ?assertEqual(<<"4242">>, Size(ItemLength)).
+
+%% @doc `parent' and `bundledIn' name the bundle an index run recorded for an
+%% item, and are null for an item no run recorded.
+transaction_query_bundled_in_test_parallel() ->
+    Store = hb_test_utils:test_store(),
+    ArweaveStore =
+        #{ <<"store-module">> => hb_store_arweave, <<"index-store">> => [Store] },
+    Opts =
+        #{
+            <<"priv-wallet">> => Wallet = ar_wallet:new(),
+            <<"store">> => [Store],
+            <<"arweave-index-store">> => ArweaveStore
+        },
+    Node = hb_http_server:start_node(Opts),
+    {ok, _UnsignedID} =
+        hb_cache:write(
+            Msg =
+                hb_message:convert(
+                    ar_bundles:sign_item(
+                        #tx { data = <<"carried-item">> }, Wallet
+                    ),
+                    <<"structured@1.0">>,
+                    <<"ans104@1.0">>,
+                    Opts
+                ),
+            Opts
+        ),
+    SignedID = hb_message:id(Msg, signed, Opts),
+    ParentID = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Query =
+        <<"""
+            query($id: ID!) {
+                transaction(id: $id) {
+                    parent { id }
+                    bundledIn { id }
+                }
+            }
+        """>>,
+    Transaction =
+        fun() ->
+            hb_util:deep_get(
+                <<"data/transaction">>,
+                dev_query_graphql:test_query(
+                    Node, Query, #{ <<"id">> => SignedID }, Opts
+                ),
+                not_found,
+                Opts
+            )
+        end,
+    % An item no index run recorded is carried by nothing the node knows of.
+    ?assertMatch(
+        #{ <<"parent">> := null, <<"bundledIn">> := null },
+        Transaction()
+    ),
+    ok =
+        hb_store:write(
+            [Store],
+            #{ <<"~arweave@2.9/bundled-in=", SignedID/binary>> => ParentID },
+            Opts
+        ),
+    ?assertMatch(
+        #{
+            <<"parent">> := #{ <<"id">> := ParentID },
+            <<"bundledIn">> := #{ <<"id">> := ParentID }
+        },
+        Transaction()
+    ).

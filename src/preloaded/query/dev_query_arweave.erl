@@ -77,8 +77,11 @@
 %%% return errors. `block(id: ...)' reads one block. Reads use the same local
 %%% and remote policy as transaction block bounds. Bundle and ingestion-time
 %%% filters and ingestion-time ordering are not implemented. `networkInfo.height'
-%%% reads the configured Arweave node's status. `parent { id }' and `bundledIn { id }'
-%%% return empty IDs. Other unsupported fields may return a placeholder
+%%% reads the configured Arweave node's status. `parent { id }' and
+%%% `bundledIn { id }' name the bundle an index run recorded for the item: the
+%%% transaction carrying an L1 bundle's item, and the containing item for one
+%%% nested deeper. A transaction, and an item no index run recorded, are null.
+%%% Other unsupported fields may return a placeholder
 %%% or a GraphQL type error. Schema acceptance does not imply filter support.
 -module(dev_query_arweave).
 %%% AO-Core API:
@@ -268,9 +271,9 @@ query(_Data, <<"size">>, _Args, _Opts) ->
     {ok, null};
 query(#{ <<"type">> := Type }, <<"type">>, _Args, _Opts) ->
     {ok, Type};
-query(_Msg, Field, _Args, _Opts)
+query(Msg, Field, _Args, Opts)
         when Field =:= <<"bundledIn">>; Field =:= <<"parent">> ->
-    {ok, #{}};
+    {ok, bundled_in(Msg, Opts)};
 query(Obj, Field, Args, _Opts) ->
     ?event({unimplemented_transactions_query,
         {object, Obj},
@@ -423,6 +426,40 @@ item_data_size(ID, Length, Msg, Store, Opts) ->
                 HeaderSize when is_integer(HeaderSize), Length >= HeaderSize ->
                     Length - HeaderSize;
                 _ -> null
+            end
+    end.
+
+%% @doc The bundle an item is carried by, as an index run recorded it: the
+%% transaction of an L1 bundle's item, and the containing item for one nested
+%% deeper. A transaction, and an item no index run recorded, carry none.
+bundled_in(Msg, Opts) ->
+    case hb_store_arweave:store_from_opts(Opts) of
+        no_store -> null;
+        Store -> bundled_in(match_id(Msg, Opts), Store, Opts)
+    end.
+bundled_in(<<>>, _Store, _Opts) ->
+    null;
+bundled_in(ID, #{ <<"index-store">> := IndexStore }, Opts) ->
+    case hb_store:read(IndexStore, bundled_in_path(ID), Opts) of
+        {ok, ParentID} when is_binary(ParentID), ParentID =/= <<>> ->
+            #{ <<"bundle-id">> => ParentID };
+        _ -> null
+    end;
+bundled_in(_ID, _Store, _Opts) ->
+    null.
+
+%% @doc The index path holding the ID of the bundle an item is carried by.
+bundled_in_path(ID) ->
+    <<"~arweave@2.9/bundled-in=", ID/binary>>.
+
+%% @doc The signed ID a result was matched by, else the one its message
+%% carries. An unsigned message has none.
+match_id(Msg, Opts) ->
+    case hb_private:get(<<"query-match">>, Msg, #{}, Opts) of
+        #{ <<"id">> := ID } when ID =/= <<>> -> ID;
+        _ ->
+            try hb_message:id(Msg, signed, Opts)
+            catch _:_ -> <<>>
             end
     end.
 
