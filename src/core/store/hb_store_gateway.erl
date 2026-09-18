@@ -248,7 +248,8 @@ avoid_double_read_test() ->
     hb_http_server:start_node(#{}),
     %% Setup local node
     ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
-    Data = <<"123">>,
+    % The item's data as the gateway serves it, so that the item verifies.
+    Data = <<"1984">>,
     DefaultResponse = {200, Data},
     Endpoints = [{<<"/arweave/raw/", ID/binary>>, raw, DefaultResponse}],
     %% Start MockServer
@@ -268,9 +269,17 @@ avoid_double_read_test() ->
                 }
             ]
     },
+    LocalOpts = #{ <<"store">> => [Local] },
     {ok, Written} = hb_cache:read(ID, WriteOpts),
-    {ok, Read} = hb_cache:read(ID, #{ <<"store">> => [Local] }),
+    {ok, Read} = hb_cache:read(ID, LocalOpts),
     try
+        % The item verifies, so it is cached under its ID with its commitment.
+        ?assertEqual(
+            [<<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>],
+            hb_message:signers(Written, WriteOpts)
+        ),
+        Loaded = hb_cache:ensure_all_loaded(Read, LocalOpts),
+        ?assert(hb_message:verify(Loaded, all, LocalOpts)),
         ?assert(hb_message:match(Read, Written)),
         %% Check number of requests make to raw
         TXs = hb_mock_server:get_requests(raw, 1, ServerHandle),
@@ -354,7 +363,11 @@ specific_route_test() ->
     {ok, Response} = hb_cache:read(ID, Opts),
     %% If the result returns <<"1984">>, it is using the default route, 
     %% not the custom one we defined
-    ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)).
+    ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)),
+    % The custom route serves data that the item's signature does not cover,
+    % so the item is served without its commitment.
+    ?assertEqual([], hb_message:signers(Response, Opts)),
+    ?assertNot(maps:is_key(<<"commitments">>, Response)).
 
 %% @doc Test that the default node config allows for data to be accessed.
 external_http_access_test() ->

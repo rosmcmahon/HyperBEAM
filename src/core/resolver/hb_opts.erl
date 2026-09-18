@@ -516,9 +516,10 @@ raw_default_message() ->
         <<"process-now-from-cache">> => false,
         % Maximum age, in seconds, for `/now' to serve from the process cache.
         <<"process-now-max-age">> => infinity,
-        % Should we trust the GraphQL API when converting to ANS-104? Some GQL
-        % services do not provide the `anchor' or `last_tx' fields, so their
-        % responses are not verifiable.
+        % Should the node serve ANS-104 items from GraphQL indexes whose
+        % signatures it cannot verify? Gateways serve only an item's data and
+        % may leave out its `anchor', so such items are served without commitments
+        % when this is enabled, and refused otherwise.
         <<"ans104-trust-gql">> => true,
         % Number of chunks to fetch in parallel when loading a TX or dataitem.
         <<"arweave-chunk-fetch-concurrency">> => 5,
