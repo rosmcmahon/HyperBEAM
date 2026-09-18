@@ -66,6 +66,7 @@
 -export([normalize_commitments/4, is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
 -export([with_only_committed/2, with_links/3, without_unless_signed/3]).
+-export([without_commitments_unless_verified/2]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -293,21 +294,7 @@ do_normalize_commitments(Msg, Opts, passive) ->
         {maybe_signed_commitment, SignedCommitments}
     }),
     case {UnsignedCommitments, SignedCommitments} of
-        {[], _} ->
-            {ok, #{ <<"commitments">> := NewCommitments }} =
-                hb_ao:raw(
-                    <<"message@1.0">>,
-                    <<"commit">>,
-                    uncommitted(Msg),
-                    #{ <<"type">> => <<"unsigned">> },
-                    Opts
-                ),
-            MergedCommitments = hb_maps:merge(
-                NewCommitments,
-                hb_maps:from_list(SignedCommitments),
-                Opts
-            ),
-            Msg#{ <<"commitments">> => MergedCommitments };
+        {[], _} -> with_unsigned_commitment(Msg, Opts);
         _ -> Msg
     end;
 do_normalize_commitments(Msg, Opts, verify) ->
@@ -333,16 +320,7 @@ do_normalize_commitments(Msg, Opts, verify) ->
             attach_phash2(Msg, Opts);
         {undefined, _NewID} ->
             % We did not have an unsigned ID to begin with, so we need to add it.
-            attach_phash2(
-                Msg#{
-                    <<"commitments">> =>
-                        hb_maps:merge(
-                            NormCommitments,
-                            hb_maps:get(<<"commitments">>, Msg, #{}, Opts)
-                        )
-                },
-                Opts
-            );
+            attach_phash2(with_unsigned_commitment(Msg, Opts), Opts);
         {_OldID, _NewID} ->
             {ok, #{ <<"commitments">> := NewCommitments }} =
                 hb_ao:raw(
@@ -373,6 +351,43 @@ do_normalize_commitments(Msg, Opts, fast) when is_map(Msg) ->
         _DifferingHash ->
             MsgWithHash = attach_phash2(Msg, ExpectedHash, Opts),
             do_normalize_commitments(MsgWithHash, Opts, verify)
+    end.
+
+%% @doc Add the unsigned commitment to a message that has none. A cache write
+%% trusts the unsigned commitment and links every commitment ID of the message
+%% to the content, so a signed commitment that does not verify is dropped
+%% before the unsigned commitment is added: no ID is linked to content that
+%% its commitment does not cover.
+with_unsigned_commitment(Msg, Opts) ->
+    Held = without_commitments_unless_verified(Msg, Opts),
+    {ok, #{ <<"commitments">> := Unsigned }} =
+        hb_ao:raw(
+            <<"message@1.0">>,
+            <<"commit">>,
+            uncommitted(Held, Opts),
+            #{ <<"type">> => <<"unsigned">> },
+            Opts
+        ),
+    Held#{
+        <<"commitments">> =>
+            hb_maps:merge(
+                Unsigned,
+                hb_maps:get(<<"commitments">>, Held, #{}, Opts),
+                Opts
+            )
+    }.
+
+%% @doc The message with its signed commitments if every one of them
+%% verifies, and without any commitment otherwise: a commitment that does not
+%% verify is not kept.
+without_commitments_unless_verified(Msg, Opts) ->
+    case signers(Msg, Opts) of
+        [] -> Msg;
+        _ ->
+            case verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts) of
+                true -> Msg;
+                false -> uncommitted(Msg, Opts)
+            end
     end.
 
 %% @doc The spec to regenerate the unsigned commitment of a message with. A

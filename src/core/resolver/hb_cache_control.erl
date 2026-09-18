@@ -484,3 +484,34 @@ read_content(ID, Opts) ->
         hb_private:reset(hb_cache:ensure_all_loaded(Msg, Opts)),
         Opts
     ).
+
+%% @doc A signed request is split into steps that change its `path', and its
+%% `cache-control' has the node store their results. The cache keeps the
+%% signed content under the request's ID: a step that changes a signed key is
+%% written under its own ID.
+split_signed_request_does_not_poison_cache_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Node = hb_http_server:start_node(Opts),
+    Path = <<"/~meta@1.0/info/address">>,
+    Signed =
+        hb_message:commit(
+            #{
+                <<"path">> => Path,
+                <<"x">> => <<"1">>,
+                <<"cache-control">> => [<<"always">>]
+            },
+            Opts
+        ),
+    ID = hb_message:id(Signed, all, Opts),
+    {ok, _} = hb_cache:write(Signed, Opts),
+    {ok, Address} = hb_http:get(Node, Signed, Opts),
+    ?assertEqual(
+        hb_util:human_id(
+            ar_wallet:to_address(hb_opts:get(priv_wallet, none, Opts))
+        ),
+        Address
+    ),
+    ?assertEqual(Path, hb_maps:get(<<"path">>, read_content(ID, Opts), Opts)).

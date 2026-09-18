@@ -284,9 +284,9 @@ generate_binary_path(Bin, Opts) ->
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    hb_message:paranoid_verify(cache_write, RawMsg, Opts),
-    {ok, Msg} =
-        hb_message:with_only_committed(verified_unsigned(RawMsg, Opts), Opts),
+    Verified = verified_unsigned(RawMsg, Opts),
+    hb_message:paranoid_verify(cache_write, Verified, Opts),
+    {ok, Msg} = hb_message:with_only_committed(Verified, Opts),
     TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
     ?event_debug(debug_cache, {writing_full_message, {msg, TABM}}),
     try
@@ -317,10 +317,12 @@ write(Bin, Opts) when is_binary(Bin) ->
 %% @doc Re-check the unsigned commitment that a write would trust as the
 %% address of a message, unless `priv/last-phash2' shows that the message is
 %% unchanged since it was normalized. A message without an unsigned
-%% commitment is written as it is: its ID is calculated from its content.
+%% commitment is written as it is, its ID calculated from its content. The
+%% write links the ID of each signed commitment to the content, so such a
+%% commitment is kept only if it verifies.
 verified_unsigned(Msg, Opts) ->
     case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Msg, Opts) of
-        not_found -> Msg;
+        not_found -> hb_message:without_commitments_unless_verified(Msg, Opts);
         _ -> hb_message:normalize_commitments(Msg, Opts, fast, shallow)
     end.
 
@@ -1166,6 +1168,27 @@ test_store_ans104_message(Store) ->
     ?assert(hb_message:match(Committed, RetrievedItemU, strict, Opts)),
     ok.
 
+%% @doc A signed message whose committed key changed after it was signed is
+%% written without its signature: the signed ID is never linked to content
+%% that the signature does not cover, while the message as signed is.
+test_store_modified_signed_message(Store) ->
+    Opts = #{ <<"store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    hb_store:reset(Store),
+    Signed =
+        hb_message:commit(
+            #{ <<"path">> => <<"/~meta@1.0/info">>, <<"x">> => <<"1">> },
+            Opts
+        ),
+    SignedID = hb_message:id(Signed, signed, Opts),
+    {ok, _} = write(Signed#{ <<"x">> => <<"2">> }, Opts),
+    ?assertEqual({error, not_found}, read(SignedID, Opts)),
+    {ok, _} = write(Signed, Opts),
+    {ok, Stored} = read(SignedID, Opts),
+    Loaded = ensure_all_loaded(Stored, Opts),
+    ?assertEqual(<<"1">>, hb_maps:get(<<"x">>, Loaded, not_found, Opts)),
+    ?assert(hb_message:verify(Loaded, all, Opts)),
+    ok.
+
 %% @doc Test storing and retrieving a simple unsigned item
 test_store_simple_signed_message(Store) ->
     ?event_debug(debug_store_test, {store, Store}),
@@ -1438,6 +1461,8 @@ cache_suite_test_() ->
             fun test_store_unsigned_nested_empty_message/1},
         {"store simple unsigned message", fun test_store_simple_unsigned_message/1},
         {"store simple signed message", fun test_store_simple_signed_message/1},
+        {"store modified signed message",
+            fun test_store_modified_signed_message/1},
         {"deeply nested complex message", fun test_deeply_nested_complex_message/1},
         {"message with list", fun test_message_with_list/1},
         {"match message", fun test_match_message/1},
