@@ -752,6 +752,9 @@ index_full_bundle_items(
         Size
     ) of
         ok ->
+            % The item's header precedes its payload, so the bytes the two
+            % lengths differ by are the payload a query reports.
+            ok = write_data_size(EncodedItemID, Size, ParseResult, Store, Opts),
             ok =
                 case {IndexMode, ParseResult} of
                     {full, {ok, _, Parsed}} ->
@@ -807,6 +810,33 @@ index_full_bundle_items(
         _BundleIndex, _ItemsBin, _ItemStartOffset, _IndexMode,
         _Store, _Opts, _Count) ->
     {error, invalid_bundle_header}.
+
+%% @doc Record the payload size of a parsed item: the bytes of its location
+%% that its header does not occupy. An item whose header the index run did not
+%% parse has no recorded size, and a query derives one from its fields instead.
+write_data_size(EncodedItemID, Size, {ok, HeaderSize, _Parsed}, Store, Opts)
+        when Size >= HeaderSize ->
+    write_data_size(EncodedItemID, Size - HeaderSize, Store, Opts);
+write_data_size(_EncodedItemID, _Size, _ParseResult, _Store, _Opts) ->
+    ok.
+write_data_size(EncodedItemID, DataSize, #{ <<"index-store">> := IndexStore }, Opts) ->
+    ?event(debug_copycat,
+        {writing_data_size,
+            {id, {string, EncodedItemID}},
+            {data_size, DataSize}
+        }
+    ),
+    hb_store:write(
+        IndexStore,
+        #{ data_size_path(EncodedItemID) => hb_util:bin(DataSize) },
+        Opts
+    );
+write_data_size(_EncodedItemID, _DataSize, _Store, _Opts) ->
+    ok.
+
+%% @doc The index path holding an item's payload size, beside its offset.
+data_size_path(EncodedItemID) ->
+    <<"~arweave@2.9/data-size=", EncodedItemID/binary>>.
 
 add_data_offset(#{ <<"relative">> := TXID, <<"offset">> := Offset }, Add) ->
     #{ <<"relative">> => TXID, <<"offset">> => Offset + Add };

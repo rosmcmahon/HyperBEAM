@@ -28,8 +28,9 @@
 %%% with `exclude-data=true', then converted to a structured message. This
 %%% requires a byte-addressable item and a device supporting header decoding;
 %%% it cannot identify a base-layer transaction by offset alone. Header reads
-%%% may span chunks. The payload is omitted, so `data.size' is null for these
-%%% header-only results: its original length is unknown.
+%%% may span chunks. The payload is omitted, so `data.size' for a header-only
+%%% result is its location's length without its encoded header, and null when
+%%% neither is available.
 %%%
 %%% Indexed pagination orders by offset and ID and returns `member=' cursors.
 %%% One ID at two offsets can produce two edges. Unreadable entries are omitted
@@ -56,8 +57,12 @@
 %%% from commitment field mappings. `fee' (falling back to `reward') and
 %%% `quantity' default to zero, projected as winston and exact AR strings.
 %%% `data.size' prefers an L1 transaction's declared or indexed payload size,
-%%% then measures binary `data', falling back to `body', then an empty binary.
-%%% Structured bodies and omitted payloads have unknown size (null).
+%%% and a data item's recorded size, else its indexed length without its
+%%% encoded header. `~copycat@1.0' records the size of every item whose header
+%%% it parses, beside that item's offset. Failing both, a local read measures
+%%% binary `data', falling back to `body', then an empty binary; a payload the
+%%% node does not hold is never fetched to measure it. Structured bodies and
+%%% payloads neither measured nor indexed have unknown size (null).
 %%% `data.type' reads `content-type'. These projections
 %%% do not reconstruct an Arweave transaction or its original tag list.
 %%% Transaction `block' uses the matched weave position and cached block
@@ -248,31 +253,17 @@ query(Msg, <<"anchor">>, _Args, Opts) ->
         {ok, Anchor} -> encode_anchor(Anchor)
     end;
 query(Msg, <<"data">>, _Args, Opts) ->
-    Data =
-        case hb_private:get(<<"query-data-omitted">>, Msg, false, Opts) of
-            true -> null;
-            false ->
-                hb_ao:get_first(
-                    [
-                        {{as, <<"message@1.0">>, Msg}, <<"data">>},
-                        {{as, <<"message@1.0">>, Msg}, <<"body">>}
-                    ],
-                    <<>>,
-                    Opts
-                )
-        end,
     Type = hb_maps:get(<<"content-type">>, Msg, null, Opts),
     Size =
         case find_field_key(<<"field-data_size">>, Msg, Opts) of
             {ok, null} -> indexed_data_size(Msg, Opts);
             {ok, DeclaredSize} -> DeclaredSize
         end,
-    {ok, #{ <<"data">> => Data, <<"type">> => Type, <<"size">> => Size }};
+    {ok, #{ <<"message">> => Msg, <<"type">> => Type, <<"size">> => Size }};
 query(#{ <<"size">> := Size }, <<"size">>, _Args, _Opts) when Size =/= null ->
     {ok, Size};
-query(#{ <<"data">> := Data }, <<"size">>, _Args, _Opts)
-        when is_binary(Data) ->
-    {ok, byte_size(Data)};
+query(#{ <<"message">> := Msg }, <<"size">>, _Args, Opts) ->
+    {ok, measured_data_size(Msg, Opts)};
 query(_Data, <<"size">>, _Args, _Opts) ->
     {ok, null};
 query(#{ <<"type">> := Type }, <<"type">>, _Args, _Opts) ->
@@ -367,26 +358,104 @@ find_field_key(Field, Msg, Opts) ->
             end
     end.
 
-%% @doc The offset index length is the payload size for an L1 transaction.
+%% @doc The size of a payload the node already holds, read only when no
+%% declared or indexed size answers for it. The read stays in the node's local
+%% stores, so measuring a size never fetches the payload it measures. A result
+%% whose read omitted the payload, and a structured body, have no measurable
+%% size.
+measured_data_size(Msg, Opts) ->
+    case hb_private:get(<<"query-data-omitted">>, Msg, false, Opts) of
+        true -> null;
+        false ->
+            LocalOpts = hb_store:scope(Opts, local),
+            Data =
+                hb_ao:get_first(
+                    [
+                        {{as, <<"message@1.0">>, Msg}, <<"data">>},
+                        {{as, <<"message@1.0">>, Msg}, <<"body">>}
+                    ],
+                    <<>>,
+                    LocalOpts
+                ),
+            case Data of
+                Bin when is_binary(Bin) -> byte_size(Bin);
+                _ -> null
+            end
+    end.
+
+%% @doc The payload size an index entry gives: an L1 transaction's length, or
+%% a data item's length without the header that precedes its payload.
 indexed_data_size(Msg, Opts) ->
     case hb_private:get(<<"query-match">>, Msg, #{}, Opts) of
         #{ <<"commitment-device">> := <<"tx@1.0">>,
             <<"length">> := Length } -> Length;
         #{ <<"commitment-device">> := Device }
-                when Device =/= <<>>, Device =/= <<"tx@1.0">> -> null;
-        #{ <<"id">> := ID } when ID =/= <<>> -> indexed_l1_size(ID, Opts);
+                when Device =/= <<>>, Device =/= <<"tx@1.0">>,
+                    Device =/= <<"ans104@1.0">> -> null;
+        #{ <<"id">> := ID } when ID =/= <<>> -> indexed_id_size(ID, Msg, Opts);
         _ -> null
     end.
 
-indexed_l1_size(ID, Opts) ->
+%% @doc The payload size of an indexed ID, from the codec its location names.
+indexed_id_size(ID, Msg, Opts) ->
     case hb_store_arweave:store_from_opts(Opts) of
         no_store -> null;
         Store ->
             case hb_store_arweave:read_offset(Store, ID, Opts) of
                 {ok, #{ <<"codec-device">> := <<"tx@1.0">>,
                     <<"length">> := Length }} -> Length;
+                {ok, #{ <<"codec-device">> := <<"ans104@1.0">>,
+                    <<"length">> := Length }} ->
+                    item_data_size(ID, Length, Msg, Store, Opts);
                 _ -> null
             end
+    end.
+
+%% @doc A data item's payload size: the size an index run recorded for it, or
+%% its location's length without the header the item's own fields encode to.
+%% An item whose header cannot be encoded, or is longer than its location, has
+%% an unknown size.
+item_data_size(ID, Length, Msg, Store, Opts) ->
+    case recorded_data_size(ID, Store, Opts) of
+        DataSize when is_integer(DataSize) -> DataSize;
+        null ->
+            case item_header_size(Msg, Opts) of
+                HeaderSize when is_integer(HeaderSize), Length >= HeaderSize ->
+                    Length - HeaderSize;
+                _ -> null
+            end
+    end.
+
+%% @doc The payload size an index run recorded beside an item's offset.
+recorded_data_size(ID, #{ <<"index-store">> := IndexStore }, Opts) ->
+    case hb_store:read(IndexStore, data_size_path(ID), Opts) of
+        {ok, DataSize} when is_binary(DataSize) -> hb_util:int(DataSize);
+        _ -> null
+    end;
+recorded_data_size(_ID, _Store, _Opts) ->
+    null.
+
+%% @doc The index path holding an item's payload size, beside its offset.
+data_size_path(ID) ->
+    <<"~arweave@2.9/data-size=", ID/binary>>.
+
+%% @doc The encoded length of a data item's header: the item as ANS-104 bytes,
+%% carrying no payload. The payload keys are dropped before the codec runs, so
+%% a header measurement never loads the bytes it is measuring around.
+item_header_size(Msg, Opts) ->
+    try
+        Header =
+            hb_maps:without([<<"data">>, <<"body">>], Msg, Opts),
+        TX =
+            hb_message:convert(
+                Header, <<"ans104@1.0">>, <<"structured@1.0">>, Opts
+            ),
+        byte_size(ar_bundles:serialize(TX#tx{ data = <<>>, data_size = 0 }))
+    catch Class:Reason ->
+        ?event(warning,
+            {item_header_size_failed, {class, Class}, {reason, Reason}}
+        ),
+        null
     end.
 
 %% @doc Generate the connection response for a ordered, annotated list of 

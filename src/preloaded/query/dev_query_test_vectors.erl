@@ -1506,3 +1506,72 @@ transaction_query_with_anchor_test_parallel() ->
         },
         Res
     ).
+
+%% @doc A data item's `data.size' is the length its location spans, without
+%% the header that precedes the payload in the weave.
+transaction_query_item_data_size_test_parallel() ->
+    Store = hb_test_utils:test_store(),
+    ArweaveStore =
+        #{ <<"store-module">> => hb_store_arweave, <<"index-store">> => [Store] },
+    Opts =
+        #{
+            <<"priv-wallet">> => Wallet = ar_wallet:new(),
+            <<"store">> => [Store],
+            <<"arweave-index-store">> => ArweaveStore
+        },
+    Node = hb_http_server:start_node(Opts),
+    Item =
+        ar_bundles:sign_item(
+            #tx { data = Payload = <<"item-payload">> },
+            Wallet
+        ),
+    {ok, _UnsignedID} =
+        hb_cache:write(
+            Msg =
+                hb_message:convert(
+                    Item, <<"structured@1.0">>, <<"ans104@1.0">>, Opts
+                ),
+            Opts
+        ),
+    SignedID = hb_message:id(Msg, signed, Opts),
+    ItemLength = byte_size(ar_bundles:serialize(Item)),
+    Query =
+        <<"""
+            query($id: ID!) {
+                transaction(id: $id) {
+                    data { size }
+                }
+            }
+        """>>,
+    Size =
+        fun(Length) ->
+            ok =
+                hb_store_arweave:write_offset(
+                    ArweaveStore, SignedID, <<"ans104@1.0">>, 1000, Length
+                ),
+            hb_util:deep_get(
+                <<"data/transaction/data/size">>,
+                dev_query_graphql:test_query(
+                    Node, Query, #{ <<"id">> => SignedID }, Opts
+                ),
+                not_found,
+                Opts
+            )
+        end,
+    % The item as the weave holds it: its payload is what remains of its
+    % location once its header is accounted for.
+    ?assertEqual(hb_util:bin(byte_size(Payload)), Size(ItemLength)),
+    % A longer location is a longer payload behind the same header.
+    ?assertEqual(
+        hb_util:bin(byte_size(Payload) + 100),
+        Size(ItemLength + 100)
+    ),
+    % A size an index run recorded answers for the item, without deriving one
+    % from its location.
+    ok =
+        hb_store:write(
+            [Store],
+            #{ <<"~arweave@2.9/data-size=", SignedID/binary>> => <<"4242">> },
+            Opts
+        ),
+    ?assertEqual(<<"4242">>, Size(ItemLength)).
