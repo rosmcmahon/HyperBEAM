@@ -868,9 +868,16 @@ store(HP, Ctx, Opts) ->
         )
     of
         #{ <<"store">> := true } ->
-            maps:foreach(
-                fun(_Name, Witness) -> hb_cache:write(Witness, Opts) end,
-                maps:with([<<"base">>, <<"request">>, <<"dependencies">>], Ctx)
+            % The dependencies link to the base and the request by ID, so
+            % those witnesses are written first.
+            lists:foreach(
+                fun(Name) -> hb_cache:write(maps:get(Name, Ctx), Opts) end,
+                [<<"base">>, <<"request">>] ++
+                    [
+                        <<"dependencies">>
+                    ||
+                        is_map_key(<<"dependencies">>, Ctx)
+                    ]
             ),
             case maps:get(<<"varied-result">>, Ctx) of
                 Patch when is_map(Patch); is_binary(Patch); is_list(Patch) ->
@@ -1310,7 +1317,12 @@ signed_dependencies_test() ->
     ?assertNot(
         verify_all([#{ <<"base-id">> => ID, <<"base">> => Forged }], Opts)
     ),
-    ForgedOpts = Opts#{ <<"store">> => hb_test_utils:test_store() },
+    % The forged messages test this module's own checks, so the cache is not
+    % asked to verify them.
+    ForgedOpts = Opts#{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"paranoid-verify">> => false
+    },
     hb_cache:write(Forged, ForgedOpts),
     ?assertNot(verify_all(<<"ao://", ID/binary>>, ForgedOpts)),
     ?assertMatch({error, _}, load(<<"ao://", ID/binary>>, ForgedOpts)),
@@ -1324,7 +1336,7 @@ signed_dependencies_test() ->
                     Opts
                 ),
             ForgedParent = Parent#{ <<"child">> => ForgedValue },
-            ?assert(hb_message:verify(ForgedParent, all, Opts)),
+            ?assert(hb_message:verify(ForgedParent, all, ForgedOpts)),
             {ok, ForgedResult} =
                 hb_ao:resolve(ForgedParent, <<"vary-unspecified">>, ForgedOpts),
             ?assertNot(verify_all(
