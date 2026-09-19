@@ -11,7 +11,13 @@
 %%% `WILDCARD' takes each as a shape, where `*' stands for any run of bytes,
 %%% naming the values of that tag the index lists. A shape matches only the
 %%% values an index run listed, at most `query-arweave-max-wildcard' (default
-%%% 256) of them, and `FUZZY_AND' and `FUZZY_OR' are errors. Owners are
+%%% 256) of them, and `FUZZY_AND' and `FUZZY_OR' are errors. A tag's `op'
+%%% selects what its matches carry: `EQ' keeps the messages carrying one of
+%%% its values, and `NEQ' takes them away from the page. A tag carrying no
+%%% value list names every value of its name the index lists, so `NEQ' alone
+%%% excludes every message carrying the name; an empty list names no value,
+%%% and matches nothing. A query naming only `NEQ' tags selects nothing, as
+%%% the index cannot enumerate itself. Owners are
 %%% committers and recipients are targets. A query without a selecting filter
 %%% does not enumerate the store; a block range alone is not a selecting filter.
 %%%
@@ -455,13 +461,38 @@ matched_tags(Args, Opts) ->
 matched_tags([], Acc, _Opts) ->
     {ok, lists:reverse(Acc)};
 matched_tags([Tag | Rest], Acc, Opts) ->
+    maybe
+        {ok, Named} ?= named_values(Tag, Opts),
+        {ok, Matched} ?= shaped_values(Named, Opts),
+        matched_tags(Rest, [Matched | Acc], Opts)
+    end.
+
+%% @doc A filter carrying no value list takes every value of its name the
+%% index lists, so that it selects, or excludes, every message carrying the
+%% name. A filter naming values keeps the ones it was given, and an empty
+%% list stays empty: it names no value, and so matches no message.
+named_values(Tag, Opts) ->
+    case {hb_maps:get(<<"op">>, Tag, <<"EQ">>, Opts),
+            hb_maps:get(<<"values">>, Tag, null, Opts)} of
+        {Op, null} when Op =:= <<"EQ">>; Op =:= <<"NEQ">> ->
+            {ok, Tag#{ <<"values">> => listed_values(Tag, Opts) }};
+        {Op, _Values} when Op =:= <<"EQ">>; Op =:= <<"NEQ">> ->
+            {ok, Tag};
+        {Op, _Values} ->
+            {error,
+                <<"Unsupported tag operator `", (hb_util:bin(Op))/binary, "`.">>}
+    end.
+
+%% @doc A filter matching by shape names the values of its name the index
+%% lists that its patterns match; one matching exactly is left as it is.
+shaped_values(Tag, Opts) ->
     case hb_maps:get(<<"match">>, Tag, <<"EXACT">>, Opts) of
         <<"EXACT">> ->
-            matched_tags(Rest, [Tag | Acc], Opts);
+            {ok, Tag};
         <<"WILDCARD">> ->
             maybe
                 {ok, Values} ?= wildcard_values(Tag, Opts),
-                matched_tags(Rest, [Tag#{ <<"values">> => Values } | Acc], Opts)
+                {ok, Tag#{ <<"values">> => Values }}
             end;
         Match ->
             {error,
@@ -476,13 +507,7 @@ wildcard_values(Tag, Opts) ->
     Patterns = hb_maps:get(<<"values">>, Tag, [], Opts),
     Limit =
         hb_opts:get(query_arweave_max_wildcard, ?DEFAULT_MAX_WILDCARD, Opts),
-    {ok, Listing} =
-        hb_ao:raw(
-            <<"match@1.0">>, #{},
-            #{ <<"path">> => <<"values">>, <<"name">> => Name },
-            Opts
-        ),
-    Known = hb_maps:get(<<"values">>, Listing, [], Opts),
+    Known = listed_values(Tag, Opts),
     Matched =
         lists:usort(
             [ Value
@@ -500,6 +525,17 @@ wildcard_values(Tag, Opts) ->
         false ->
             {ok, Matched}
     end.
+
+%% @doc The values of a filter's name, as the index lists them.
+listed_values(Tag, Opts) ->
+    Name = hb_maps:get(<<"name">>, Tag, not_found, Opts),
+    {ok, Listing} =
+        hb_ao:raw(
+            <<"match@1.0">>, #{},
+            #{ <<"path">> => <<"values">>, <<"name">> => Name },
+            Opts
+        ),
+    hb_maps:get(<<"values">>, Listing, [], Opts).
 
 %% @doc Whether a value has the shape a pattern names: `*' stands for any run
 %% of bytes, and every other byte stands for itself.
@@ -1084,9 +1120,23 @@ index_predicates(Args, Opts) ->
         Predicates = Tags ++
             [ #{ <<"name">> => Pair, <<"values">> => Values }
             || {Pair, Values} <- Fields, Values =/= null ],
-        true ?= Predicates =/= [] orelse unservable,
+        % A negated predicate narrows a page, so one selects nothing on its
+        % own: the index cannot enumerate itself.
+        true ?= selecting(Predicates, Opts) =/= [] orelse unservable,
         {ok, Predicates}
     end.
+
+%% @doc The predicates whose pairs a match carries.
+selecting(Predicates, Opts) ->
+    [ Predicate
+    || Predicate <- Predicates,
+        hb_maps:get(<<"op">>, Predicate, <<"EQ">>, Opts) =:= <<"EQ">> ].
+
+%% @doc The predicates whose pairs a match must not carry.
+negating(Predicates, Opts) ->
+    [ Predicate
+    || Predicate <- Predicates,
+        hb_maps:get(<<"op">>, Predicate, <<"EQ">>, Opts) =:= <<"NEQ">> ].
 
 %% @doc The match the page resumes after, from the cursor of an
 %% index-served edge with its terminal marker dropped; a cursor of another
@@ -1374,15 +1424,12 @@ match(<<"id">>, ID, _Opts) ->
 match(<<"ids">>, IDs, _Opts) ->
     {ok, IDs};
 match(<<"tags">>, Tags, Opts) ->
-    case hb_opts:get(match_index, false, Opts) =:= false orelse
-            hb_opts:get(cache_read_mode, normal, Opts) =:= raw of
-        true -> native_tags(Tags, Opts);
-        false ->
-            hb_ao:raw(
-                <<"match@1.0">>, #{},
-                #{ <<"path">> => <<"all">>, <<"predicates">> => Tags },
-                Opts
-            )
+    % The pairs a match carries select it; those it must not carry are taken
+    % away from them.
+    maybe
+        {ok, Selected} ?= tag_ids(selecting(Tags, Opts), Opts),
+        {ok, Excluded} ?= tag_ids(negating(Tags, Opts), Opts),
+        {ok, hb_util:list_without(Excluded, Selected)}
     end;
 match(<<"owners">>, Owners, Opts) ->
     {ok, matching_commitments(<<"committer">>, Owners, Opts)};
@@ -1394,6 +1441,21 @@ match(<<"recipients">>, Recipients, Opts) ->
     {ok, matching_commitments(<<"target">>, Recipients, Opts)};
 match(UnsupportedFilter, _, _) ->
     throw({unsupported_query_filter, UnsupportedFilter}).
+
+%% @doc The IDs a set of tag filters matches, through the index or the cache.
+tag_ids([], _Opts) ->
+    {ok, []};
+tag_ids(Tags, Opts) ->
+    case hb_opts:get(match_index, false, Opts) =:= false orelse
+            hb_opts:get(cache_read_mode, normal, Opts) =:= raw of
+        true -> native_tags(Tags, Opts);
+        false ->
+            hb_ao:raw(
+                <<"match@1.0">>, #{},
+                #{ <<"path">> => <<"all">>, <<"predicates">> => Tags },
+                Opts
+            )
+    end.
 
 %% @doc OR each tag's native cache matches, then AND the tags. Used when the
 %% node disables indexed matching or requests raw cache matching.

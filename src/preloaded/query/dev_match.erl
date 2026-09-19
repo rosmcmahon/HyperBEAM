@@ -24,8 +24,10 @@
 %%% including `device', are predicates.
 %%% The request may add `predicates': a list of messages with `name' and
 %%% `values'. Values within each predicate are ORed; predicates and the base's
-%%% pairs are ANDed. An empty values list matches nothing. Ordinary template
-%%% values, including lists, retain their literal meaning.
+%%% pairs are ANDed. An empty values list matches nothing. A predicate whose
+%%% `op' is `NEQ' names pairs a match must not carry: each is read at the
+%%% position of every match, which is passed over when one carries it.
+%%% Ordinary template values, including lists, retain their literal meaning.
 %%% With no base pairs or request predicates, there are no matches.
 %%% With predicates but no index stores, `locate' returns `not_found'.
 %%%
@@ -489,6 +491,7 @@ locate(Base, Req, Opts) ->
         ||
             Paths <- groups(Base, Req, Opts)
         ],
+    Excluded = [ {Paths, Stores} || Paths <- negated(Req, Opts) ],
     case {Groups, Stores} of
         {[], _} ->
             {ok, []};
@@ -498,8 +501,8 @@ locate(Base, Req, Opts) ->
             maybe
                 {ok, Matches} ?=
                     locate(
-                        Direction, Groups, Cursor, Exclusive, To, Limit,
-                        [], Opts
+                        Direction, Groups, Excluded, Cursor, Exclusive, To,
+                        Limit, [], Opts
                     ),
                 {ok, [ Match#{ <<"member">> => key(Match) } || Match <- Matches ]}
             end
@@ -509,16 +512,38 @@ locate(Base, Req, Opts) ->
 groups(Base, Req, Opts) ->
     [ [group(Name, Value, Opts)] || {Name, Value} <- template(Base, Opts) ] ++
         [
-            lists:usort([
-                group(Key, Value, Opts)
-            ||
-                Alternative <- hb_maps:get(<<"values">>, Predicate, not_found, Opts),
-                {Key, Value} <- template(#{ Name => Alternative }, Opts)
-            ])
+            predicate_groups(Predicate, Opts)
         ||
-            Predicate <- hb_maps:get(<<"predicates">>, Req, [], Opts),
-            Name <- [hb_maps:get(<<"name">>, Predicate, not_found, Opts)]
+            Predicate <- predicates(Req, Opts),
+            matching(Predicate, Opts) =:= <<"EQ">>
         ].
+
+%% @doc The alternative group paths of the predicates a match must not carry.
+negated(Req, Opts) ->
+    [
+        predicate_groups(Predicate, Opts)
+    ||
+        Predicate <- predicates(Req, Opts),
+        matching(Predicate, Opts) =:= <<"NEQ">>
+    ].
+
+%% @doc The predicates of a request.
+predicates(Req, Opts) ->
+    hb_maps:get(<<"predicates">>, Req, [], Opts).
+
+%% @doc Whether a predicate's matches carry its pair, or must not carry it.
+matching(Predicate, Opts) ->
+    hb_maps:get(<<"op">>, Predicate, <<"EQ">>, Opts).
+
+%% @doc One predicate's alternative group paths.
+predicate_groups(Predicate, Opts) ->
+    Name = hb_maps:get(<<"name">>, Predicate, not_found, Opts),
+    lists:usort([
+        group(Key, Value, Opts)
+    ||
+        Alternative <- hb_maps:get(<<"values">>, Predicate, not_found, Opts),
+        {Key, Value} <- template(#{ Name => Alternative }, Opts)
+    ]).
 
 %% @doc The pairs a base message names: every key but its commitments and
 %% private keys, in the wire form the index is written from.
@@ -572,26 +597,64 @@ cursor(Key) -> parse(Key).
 %% exclusive past it -- until the page is full, the `to' bound is reached
 %% or a group runs out. Each group's keys are read from every store a page
 %% at a time, as the cursor passes them.
-locate(_Direction, _Groups, _Cursor, _Exclusive, _To, 0, Acc, _Opts) ->
+locate(_Direction, _Groups, _Excluded, _Cursor, _Exclusive, _To, 0, Acc, _Opts) ->
     {ok, lists:reverse(Acc)};
-locate(Direction, Groups, Cursor, Exclusive, To, Limit, Acc, Opts) ->
+locate(Direction, Groups, Excluded, Cursor, Exclusive, To, Limit, Acc, Opts) ->
     case step(Direction, Groups, Cursor, Exclusive, Opts) of
         {Status, Key, Read} ->
+            Matched = Status =:= match andalso not excluded(Key, Excluded, Opts),
             case reached(Direction, Key, To) of
                 true ->
                     {ok, lists:reverse(Acc)};
-                false when Status =:= match ->
+                false when Matched ->
                     locate(
-                        Direction, Read, Key, true, To, remaining(Limit),
-                        [Key | Acc], Opts
+                        Direction, Read, Excluded, Key, true, To,
+                        remaining(Limit), [Key | Acc], Opts
+                    );
+                false when Status =:= match ->
+                    % A key a negated predicate carries is passed over, so the
+                    % page resumes beyond it rather than reading it again.
+                    locate(
+                        Direction, Read, Excluded, Key, true, To, Limit, Acc,
+                        Opts
                     );
                 false ->
-                    locate(Direction, Read, Key, false, To, Limit, Acc, Opts)
+                    locate(
+                        Direction, Read, Excluded, Key, false, To, Limit, Acc,
+                        Opts
+                    )
             end;
         exhausted ->
             {ok, lists:reverse(Acc)};
         {error, _} = Error ->
             Error
+    end.
+
+%% @doc Whether a key carries any pair a negated predicate names: its
+%% position is read in each of that predicate's groups, and a group holding
+%% the key, or an ID-less row at its offset, carries it.
+excluded(_Key, [], _Opts) ->
+    false;
+excluded(Key, [{Paths, Stores} | Rest], Opts) ->
+    case lists:any(fun(Path) -> carries(Key, Path, Stores, Opts) end, Paths) of
+        true -> true;
+        false -> excluded(Key, Rest, Opts)
+    end.
+
+%% @doc Whether one group holds a key's position.
+carries(Key = #{ <<"offset">> := Offset }, Path, Stores, Opts) ->
+    Request =
+        #{
+            <<"list">> => Path,
+            <<"from">> => Key,
+            <<"limit">> => 1,
+            <<"direction">> => asc
+        },
+    case hb_store:list(Stores, Request, Opts) of
+        {ok, [Found = #{ <<"offset">> := Offset } | _]} ->
+            position(asc, Found) =:= position(asc, Key) orelse
+                maps:get(<<"id">>, Found, <<>>) =:= <<>>;
+        _ -> false
     end.
 
 %% @doc The matches a page has room for after one.
@@ -1086,6 +1149,40 @@ weave_order_test() ->
     Literal = #{ <<"literal">> => [<<"1">>, <<"2">>] },
     LiteralID = Cache(Literal, 9),
     ?assertEqual([{9, LiteralID}], matches(Literal, #{}, Opts)).
+
+%% @doc A negated predicate takes its matches away from the located page.
+negated_test() ->
+    Opts = (test_opts())#{ <<"priv-wallet">> => ar_wallet:new() },
+    Keep =
+        hb_message:commit(#{ <<"type">> => <<"Neq">>, <<"role">> => <<"keep">> }, Opts),
+    Drop =
+        hb_message:commit(#{ <<"type">> => <<"Neq">>, <<"role">> => <<"drop">> }, Opts),
+    cache(Keep, 5, Opts),
+    cache(Drop, 9, Opts),
+    [KeepID] = ids(Keep, Opts),
+    Located =
+        fun(Predicates) ->
+            {ok, Matches} =
+                hb_ao:raw(
+                    <<"match@1.0">>, <<"locate">>, #{},
+                    #{ <<"predicates">> => Predicates },
+                    Opts
+                ),
+            lists:usort([ maps:get(<<"id">>, Match) || Match <- Matches ])
+        end,
+    Type = #{ <<"name">> => <<"type">>, <<"values">> => [<<"Neq">>] },
+    ?assertEqual(2, length(Located([Type]))),
+    ?assertEqual(
+        [KeepID],
+        Located([
+            Type,
+            #{
+                <<"name">> => <<"role">>,
+                <<"values">> => [<<"drop">>],
+                <<"op">> => <<"NEQ">>
+            }
+        ])
+    ).
 
 %% @doc A name's listed values are served over HTTP, as they are in process.
 values_test() ->

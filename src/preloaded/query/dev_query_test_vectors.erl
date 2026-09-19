@@ -1680,6 +1680,83 @@ wildcard_tags(Store) ->
         )
     ).
 
+%% @doc A tag filter with `NEQ' takes its matches away from the page: by
+%% value, or by name alone when it gives none.
+transactions_query_neq_tags_test_parallel() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts =
+        #{
+            <<"priv-wallet">> => Wallet = ar_wallet:new(),
+            <<"store">> => [Store],
+            <<"match-index">> => [Store]
+        },
+    Node = hb_http_server:start_node(Opts),
+    Write =
+        fun(Msg) ->
+            Signed =
+                hb_message:commit(
+                    Msg#{ <<"type">> => <<"NeqTest">> },
+                    Opts#{ <<"priv-wallet">> => Wallet },
+                    <<"ans104@1.0">>
+                ),
+            {ok, _} = hb_cache:write(Signed, Opts),
+            hb_message:id(Signed, signed, Opts)
+        end,
+    Plain = Write(#{ <<"role">> => <<"keep">> }),
+    Oracle = Write(#{ <<"role">> => <<"drop">> }),
+    Marked = Write(#{ <<"role">> => <<"keep">>, <<"marker">> => <<"yes">> }),
+    IDs =
+        fun(Filters) ->
+            Query =
+                <<
+                    "query { transactions(tags: [",
+                    "{ name: \"type\", values: [\"NeqTest\"] }",
+                    Filters/binary,
+                    "] first: 100) { edges { node { id } } } }"
+                >>,
+            lists:sort(
+                [
+                    hb_util:deep_get(<<"node/id">>, Edge, not_found, Opts)
+                ||
+                    Edge <-
+                        hb_util:deep_get(
+                            <<"data/transactions/edges">>,
+                            dev_query_graphql:test_query(Node, Query, #{}, Opts),
+                            [],
+                            Opts
+                        )
+                ]
+            )
+        end,
+    ?assertEqual(lists:sort([Plain, Oracle, Marked]), IDs(<<>>)),
+    % A value a match must not carry.
+    ?assertEqual(
+        lists:sort([Plain, Marked]),
+        IDs(<<"{ name: \"role\", values: [\"drop\"], op: NEQ }">>)
+    ),
+    % A name a match must not carry at all: its values are the ones the index
+    % lists for it.
+    Listed =
+        fun(Name) ->
+            hb_maps:get(
+                <<"values">>,
+                hb_util:ok(
+                    hb_ao:raw(
+                        <<"match@1.0">>, #{},
+                        #{ <<"path">> => <<"values">>, <<"name">> => Name },
+                        Opts
+                    )
+                ),
+                [],
+                Opts
+            )
+        end,
+    ?assertEqual([<<"yes">>], Listed(<<"marker">>)),
+    ?assertEqual(
+        lists:sort([Plain, Oracle]),
+        IDs(<<"{ name: \"marker\", op: NEQ }">>)
+    ).
+
 %% @doc An index run over a real block lists the values of every tag its
 %% items carry, so a shape matches them.
 transactions_query_wildcard_real_block_test_parallel() ->

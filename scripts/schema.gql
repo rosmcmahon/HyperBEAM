@@ -243,10 +243,11 @@ input TagFilter {
   # `{name: "app-name", values: ["app-1", "app-2", "app-3"]}`
   #
   # Returns all transactions where the `app-name` tag has a value of either `app-1` _or_ `app-2` _or_ `app-3`.
-  values: [String!]!
+  # Omitting them matches every value the tag is known by.
+  values: [String!]
 
   # The operator to apply to to the tag filter. Defaults to EQ (equal).
-  #op: TagOperator! = EQ
+  op: TagOperator! = EQ
 
   # How tag names and values are matched. Defaults to EXACT.
   match: TagMatch! = EXACT
