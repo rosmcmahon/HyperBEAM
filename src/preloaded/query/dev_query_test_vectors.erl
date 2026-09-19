@@ -1576,6 +1576,173 @@ transaction_query_item_data_size_test_parallel() ->
         ),
     ?assertEqual(<<"4242">>, Size(ItemLength)).
 
+%% @doc A tag filter matching by shape names the values the index lists, from
+%% every store the index is held in.
+transactions_query_wildcard_tags_test_parallel() ->
+    lists:foreach(
+        fun(StoreModule) -> wildcard_tags(hb_test_utils:test_store(StoreModule)) end,
+        [hb_store_volatile, hb_store_lmdb, hb_store_fs]
+    ).
+wildcard_tags(Store) ->
+    Opts =
+        #{
+            <<"priv-wallet">> => Wallet = ar_wallet:new(),
+            <<"store">> => [Store],
+            <<"match-index">> => [Store]
+        },
+    Node = hb_http_server:start_node(Opts),
+    Write =
+        fun(Type) ->
+            Msg =
+                hb_message:commit(
+                    #{
+                        <<"content-type">> => Type,
+                        <<"type">> => <<"WildcardTest">>
+                    },
+                    Opts#{ <<"priv-wallet">> => Wallet },
+                    <<"ans104@1.0">>
+                ),
+            {ok, _} = hb_cache:write(Msg, Opts),
+            hb_message:id(Msg, signed, Opts)
+        end,
+    PNG = Write(<<"image/png">>),
+    JPEG = Write(<<"image/jpeg">>),
+    MP4 = Write(<<"video/mp4">>),
+    Query =
+        <<"""
+            query($patterns: [String!]!) {
+                transactions(
+                    tags: [
+                        {
+                            name: "content-type",
+                            values: $patterns,
+                            match: WILDCARD
+                        },
+                        { name: "type", values: ["WildcardTest"] }
+                    ]
+                    first: 100
+                ) {
+                    edges { node { id } }
+                }
+            }
+        """>>,
+    IDs =
+        fun(Patterns) ->
+            Edges =
+                hb_util:deep_get(
+                    <<"data/transactions/edges">>,
+                    dev_query_graphql:test_query(
+                        Node, Query, #{ <<"patterns">> => Patterns }, Opts
+                    ),
+                    [],
+                    Opts
+                ),
+            lists:sort(
+                [ hb_util:deep_get(<<"node/id">>, Edge, not_found, Opts)
+                || Edge <- Edges ]
+            )
+        end,
+    ?assertEqual(lists:sort([PNG, JPEG]), IDs([<<"image/*">>])),
+    ?assertEqual([MP4], IDs([<<"video/*">>])),
+    ?assertEqual(
+        lists:sort([PNG, JPEG, MP4]),
+        IDs([<<"image/*">>, <<"video/*">>])
+    ),
+    ?assertEqual([PNG], IDs([<<"*/png">>])),
+    ?assertEqual([JPEG], IDs([<<"image/jpeg">>])),
+    ?assertEqual([], IDs([<<"audio/*">>])),
+    % Every name's values are listed, so a shape matches any tag.
+    TypeQuery =
+        <<"""
+            query {
+                transactions(
+                    tags: [
+                        { name: "type", values: ["Wildcard*"], match: WILDCARD }
+                    ]
+                    first: 100
+                ) {
+                    edges { node { id } }
+                }
+            }
+        """>>,
+    ByType =
+        hb_util:deep_get(
+            <<"data/transactions/edges">>,
+            dev_query_graphql:test_query(Node, TypeQuery, #{}, Opts),
+            [],
+            Opts
+        ),
+    ?assertEqual(
+        lists:sort([PNG, JPEG, MP4]),
+        lists:sort(
+            [ hb_util:deep_get(<<"node/id">>, Edge, not_found, Opts)
+            || Edge <- ByType ]
+        )
+    ).
+
+%% @doc An index run over a real block lists the values of every tag its
+%% items carry, so a shape matches them.
+transactions_query_wildcard_real_block_test_parallel() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    ArweaveStore =
+        #{
+            <<"store-module">> => hb_store_arweave,
+            <<"index-store">> => [Store],
+            <<"local-store">> => [Store]
+        },
+    Opts =
+        #{
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"store">> => [Store, ArweaveStore],
+            <<"match-index">> => [Store],
+            <<"arweave-index-blocks">> => true
+        },
+    Node = hb_http_server:start_node(Opts),
+    {ok, _} =
+        hb_http:get(
+            Node,
+            <<"/~copycat@1.0/arweave&from=2001426&to=2001426&mode=full">>,
+            Opts
+        ),
+    {ok, Listing} =
+        hb_http:get(
+            Node,
+            <<"/~match@1.0/values&name=random-seed">>,
+            Opts
+        ),
+    Seeds = hb_maps:get(<<"values">>, Listing, [], Opts),
+    ?event({listed_seeds, Seeds}),
+    ?assert(lists:member(<<"969028394">>, Seeds)),
+    Query =
+        <<"""
+            query {
+                transactions(
+                    tags: [
+                        {
+                            name: "random-seed",
+                            values: ["969028*"],
+                            match: WILDCARD
+                        }
+                    ]
+                ) {
+                    edges { node { id } }
+                }
+            }
+        """>>,
+    IDs =
+        [
+            hb_util:deep_get(<<"node/id">>, Edge, not_found, Opts)
+        ||
+            Edge <-
+                hb_util:deep_get(
+                    <<"data/transactions/edges">>,
+                    dev_query_graphql:test_query(Node, Query, #{}, Opts),
+                    [],
+                    Opts
+                )
+        ],
+    ?assertEqual([<<"365Mlyx4ANx9LEzA5aAgAcbU-W3r8TEaTtL5H6rO38M">>], IDs).
+
 %% @doc `parent' and `bundledIn' name the bundle an index run recorded for an
 %% item, and are null for an item no run recorded.
 transaction_query_bundled_in_test_parallel() ->

@@ -249,7 +249,7 @@ input TagFilter {
   #op: TagOperator! = EQ
 
   # How tag names and values are matched. Defaults to EXACT.
-  #match: TagMatch! = EXACT
+  match: TagMatch! = EXACT
 }
 
 # The operator to apply to a tag value.

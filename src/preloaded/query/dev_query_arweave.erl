@@ -6,7 +6,12 @@
 %%% `edges' containing `node' and `cursor', `pageInfo.hasNextPage', and an
 %%% optional string `count'. Supported filters are `ids', `tags', `owners',
 %%% `recipients' and `block'. Tag names address message keys. Values within a
-%%% tag are ORed; separate tags and other filters are ANDed. Owners are
+%%% tag are ORed; separate tags and other filters are ANDed. A tag's `match'
+%%% selects how its values are read: `EXACT' takes each value as itself, and
+%%% `WILDCARD' takes each as a shape, where `*' stands for any run of bytes,
+%%% naming the values of that tag the index lists. A shape matches only the
+%%% values an index run listed, at most `query-arweave-max-wildcard' (default
+%%% 256) of them, and `FUZZY_AND' and `FUZZY_OR' are errors. Owners are
 %%% committers and recipients are targets. A query without a selecting filter
 %%% does not enumerate the store; a block range alone is not a selecting filter.
 %%%
@@ -94,6 +99,8 @@
 -define(DEFAULT_MAX_PAGE_SIZE, 100).
 %% The cursor of an index-served edge: its match's key in the index.
 -define(MEMBER_CURSOR, "member=").
+%% The most values a tag filter matching by shape names by default.
+-define(DEFAULT_MAX_WILDCARD, 256).
 %% The most matches a page's `count' reads by default.
 -define(DEFAULT_MAX_INDEX_COUNT, 1000).
 %% The bytes read past an offset when the item's header runs beyond its
@@ -158,7 +165,7 @@ query(Obj, <<"transaction">>, Args, Opts) ->
         {ok, #{ <<"edges">> := [#{ <<"node">> := Msg } | _] }} -> {ok, Msg}
     end;
 query(Obj, <<"transactions">>, RawArgs, Opts) ->
-    Args = maps:map(
+    Named = maps:map(
         fun(<<"tags">>, Tags) when is_list(Tags) ->
             [Tag#{ <<"name">> := hb_util:to_lower(Name) }
                 || Tag = #{ <<"name">> := Name } <- Tags];
@@ -166,14 +173,17 @@ query(Obj, <<"transactions">>, RawArgs, Opts) ->
         end,
         RawArgs
     ),
-    ?event({transactions_query,
-        {object, Obj},
-        {field, <<"transactions">>},
-        {args, Args}
-    }),
-    case index_connection(Args, Opts) of
-        unservable -> cached_transactions(Args, Opts);
-        Result -> Result
+    maybe
+        {ok, Args} ?= matched_tags(Named, Opts),
+        ?event({transactions_query,
+            {object, Obj},
+            {field, <<"transactions">>},
+            {args, Args}
+        }),
+        case index_connection(Args, Opts) of
+            unservable -> cached_transactions(Args, Opts);
+            Result -> Result
+        end
     end;
 query(Obj, <<"block">>, Args, Opts) ->
     case hb_maps:get(<<"id">>, Args, null, Opts) of
@@ -428,6 +438,108 @@ item_data_size(ID, Length, Msg, Store, Opts) ->
                 _ -> null
             end
     end.
+
+%% @doc The query's tag filters with every value they match named: a filter
+%% matching by shape names the values of its name the index lists, and one
+%% matching exactly keeps the values it was given. A filter matching nothing
+%% keeps an empty list, which matches no message.
+matched_tags(Args, Opts) ->
+    case hb_maps:get(<<"tags">>, Args, null, Opts) of
+        null -> {ok, Args};
+        Tags ->
+            maybe
+                {ok, Matched} ?= matched_tags(Tags, [], Opts),
+                {ok, Args#{ <<"tags">> => Matched }}
+            end
+    end.
+matched_tags([], Acc, _Opts) ->
+    {ok, lists:reverse(Acc)};
+matched_tags([Tag | Rest], Acc, Opts) ->
+    case hb_maps:get(<<"match">>, Tag, <<"EXACT">>, Opts) of
+        <<"EXACT">> ->
+            matched_tags(Rest, [Tag | Acc], Opts);
+        <<"WILDCARD">> ->
+            maybe
+                {ok, Values} ?= wildcard_values(Tag, Opts),
+                matched_tags(Rest, [Tag#{ <<"values">> => Values } | Acc], Opts)
+            end;
+        Match ->
+            {error,
+                <<"Unsupported tag match `", (hb_util:bin(Match))/binary, "`.">>}
+    end.
+
+%% @doc The values of a filter's name that its patterns match, as the index
+%% lists them. A page reads at most the node's `query-arweave-max-wildcard'
+%% values, as each becomes an alternative of the query.
+wildcard_values(Tag, Opts) ->
+    Name = hb_maps:get(<<"name">>, Tag, not_found, Opts),
+    Patterns = hb_maps:get(<<"values">>, Tag, [], Opts),
+    Limit =
+        hb_opts:get(query_arweave_max_wildcard, ?DEFAULT_MAX_WILDCARD, Opts),
+    {ok, Listing} =
+        hb_ao:raw(
+            <<"match@1.0">>, #{},
+            #{ <<"path">> => <<"values">>, <<"name">> => Name },
+            Opts
+        ),
+    Known = hb_maps:get(<<"values">>, Listing, [], Opts),
+    Matched =
+        lists:usort(
+            [ Value
+            ||
+                Value <- Known,
+                Pattern <- Patterns,
+                matches_pattern(Pattern, Value)
+            ]
+        ),
+    case length(Matched) > Limit of
+        true ->
+            {error,
+                <<"Tag `", (hb_util:bin(Name))/binary, "` matches more than ",
+                    (hb_util:bin(Limit))/binary, " values.">>};
+        false ->
+            {ok, Matched}
+    end.
+
+%% @doc Whether a value has the shape a pattern names: `*' stands for any run
+%% of bytes, and every other byte stands for itself.
+matches_pattern(Pattern, Value) ->
+    matches_parts(binary:split(Pattern, <<"*">>, [global]), Value, true).
+
+%% @doc Match a pattern's literal parts in order: the first must open the
+%% value unless a `*' precedes it, and the last must close it unless a `*'
+%% follows it.
+matches_parts([Last], Value, Open) ->
+    case Open of
+        true -> Last =:= Value;
+        false -> suffix(Last, Value)
+    end;
+matches_parts([Part | Rest], Value, true) ->
+    case Value of
+        <<Part:(byte_size(Part))/binary, Tail/binary>> ->
+            matches_parts(Rest, Tail, false);
+        _ -> false
+    end;
+matches_parts([<<>> | Rest], Value, false) ->
+    matches_parts(Rest, Value, false);
+matches_parts([Part | Rest], Value, false) ->
+    case binary:match(Value, Part) of
+        {Start, Length} ->
+            Skip = Start + Length,
+            <<_:Skip/binary, Tail/binary>> = Value,
+            matches_parts(Rest, Tail, false);
+        nomatch -> false
+    end.
+
+%% @doc Whether a value ends with a part. An empty part closes every value.
+suffix(<<>>, _Value) ->
+    true;
+suffix(Part, Value) when byte_size(Value) >= byte_size(Part) ->
+    Skip = byte_size(Value) - byte_size(Part),
+    <<_:Skip/binary, Tail/binary>> = Value,
+    Tail =:= Part;
+suffix(_Part, _Value) ->
+    false.
 
 %% @doc The bundle an item is carried by, as an index run recorded it: the
 %% transaction of an L1 bundle's item, and the containing item for one nested

@@ -13,6 +13,8 @@
 %%%              messages, each with an additional `member' cursor.
 %%%     all:     Match the base's pairs in stores of local scope. Return the
 %%%              distinct nonempty IDs of the resulting entries.
+%%%     values:  The values the request's `name' is indexed by, as the index
+%%%              lists them.
 %%%     <key>:   As `all', matching only the base's value at the requested key.
 %%%              Device keys and `set', `remove', `id', `verify' are reserved.
 %%% '''
@@ -50,6 +52,12 @@
 %%% (default `-1'). Commitments themselves and messages without signed IDs are
 %%% skipped. Success returns the hook request unchanged, including when no
 %%% configured store accepts the entries.
+%%%
+%%% A group's path hashes its value, so each indexed value is also listed as
+%%% itself under `~match@1.0-values/<name>', for queries that match values by
+%%% shape. Every name is listed unless a node names a subset in
+%%% `match-value-names'. Values longer than `match-value-size' (default 256
+%%% bytes) are not listed.
 %%%
 %%% Indexed pairs comprise the body's public fields without its commitments,
 %%% plus values computed with only the indexed ID's commitment present.
@@ -111,6 +119,7 @@
 %%% known commitment device, for example with `/set&commitment-device=ans104@1.0'.
 -module(dev_match).
 -export([info/0, all/3, index/3, locate/3, row/3, member/3, entry/3, key/3]).
+-export([values/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -124,6 +133,12 @@
 -define(DEFAULT_ALL_PATHS,
     #{ <<"committer">> => <<"committers~message@1.0">> }
 ).
+%% The store path listing the values each name is indexed by.
+-define(VALUES_PREFIX, <<"~match@1.0-values/">>).
+%% The names whose values are listed, unless a node names a subset.
+-define(DEFAULT_VALUE_NAMES, all).
+%% The longest value a listing holds.
+-define(MAX_VALUE_SIZE, 256).
 
 %% @doc Default all non-message@1.0 and device keys to match a single key in the
 %% index.
@@ -283,18 +298,24 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
         ||
             ID <- IDs
         ],
+    Indexed =
+        [
+            {Member, Name, Value}
+        ||
+            Member = #{ <<"id">> := ID } <- Members,
+            {Name, Value} <-
+                pairs(
+                    Handler,
+                    hb_message:with_commitments(ID, Msg, Opts),
+                    Opts
+                )
+        ],
     Keys =
         maps:from_list(
             [
                 {Member#{ <<"path">> => group(Name, Value, Opts) }, <<>>}
             ||
-                Member = #{ <<"id">> := ID } <- Members,
-                {Name, Value} <-
-                    pairs(
-                        Handler,
-                        hb_message:with_commitments(ID, Msg, Opts),
-                        Opts
-                    )
+                {Member, Name, Value} <- Indexed
             ]
         ),
     Groups = lists:uniq([Group || #{ <<"path">> := Group } <- maps:keys(Keys)]),
@@ -302,11 +323,85 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
         fun(Group) -> hb_store:group(Stores, Group, Opts) end,
         Groups
     ),
+    % A group's path hashes its value, so the values a name is known by are
+    % listed separately, for the queries that match a name's values by shape.
+    ok = index_values(Indexed, Stores, Opts),
     case hb_store:write(Stores, Keys, Opts) of
         ok -> {ok, Req};
         {error, not_found} -> {ok, Req};
         Error -> Error
     end.
+
+%% @doc List each indexed value under the name it is indexed by, so that a
+%% query can match the values of a name by shape. Every name is listed unless
+%% a node names a subset in `match-value-names'. Values longer than
+%% `match-value-size' are not listed. A store that takes none of the keys
+%% leaves the listing as it is.
+index_values(Indexed, Stores, Opts) ->
+    Listings = listings(Stores),
+    Names = hb_opts:get(match_value_names, ?DEFAULT_VALUE_NAMES, Opts),
+    Limit = hb_opts:get(match_value_size, ?MAX_VALUE_SIZE, Opts),
+    Listed =
+        [
+            {Name, Value}
+        ||
+            {_Member, RawName, Value} <- Indexed,
+            Name <- [hb_ao:normalize_key(RawName)],
+            listed(Name, Names),
+            is_binary(Value),
+            byte_size(Value) =< Limit
+        ],
+    Values =
+        maps:from_list([ {value_key(Name, Value), Value} || {Name, Value} <- Listed ]),
+    case map_size(Values) of
+        0 -> ok;
+        _ ->
+            lists:foreach(
+                fun(Name) ->
+                    hb_store:group(Listings, value_group(Name), Opts)
+                end,
+                lists:uniq([ Name || {Name, _Value} <- Listed ])
+            ),
+            hb_store:write(Listings, Values, Opts),
+            ok
+    end.
+
+%% @doc Whether a name's values are listed: every name, or those a node names.
+listed(_Name, all) -> true;
+listed(Name, Names) -> lists:member(Name, Names).
+
+%% @doc The index's stores as plain key/value stores: a listing holds values
+%% under their own names, not the entries the index's pipelines encode.
+listings(Stores) ->
+    [ maps:without([<<"to-key">>, <<"from-key">>], Store) || Store <- Stores ].
+
+%% @doc The listing a name's values are known by.
+value_group(Name) ->
+    <<?VALUES_PREFIX/binary, (hb_ao:normalize_key(Name))/binary>>.
+
+%% @doc The key a value is listed under: its own bytes, encoded so that every
+%% value is one key of its name's listing.
+value_key(Name, Value) ->
+    <<(value_group(Name))/binary, "/", (hb_util:encode(Value))/binary>>.
+
+%% @doc The values a name is known by, as the index lists them, under
+%% `values'. A name no store lists has none.
+values(_Base, Req, Opts) ->
+    Name = hb_maps:get(<<"name">>, Req, not_found, Opts),
+    Listed =
+        case hb_store:list(listings(store(Opts)), value_group(Name), Opts) of
+            {ok, Keys} ->
+                lists:filtermap(
+                    fun(Key) ->
+                        try {true, hb_util:decode(Key)}
+                        catch _:_ -> false
+                        end
+                    end,
+                    Keys
+                );
+            _ -> []
+        end,
+    {ok, #{ <<"values">> => Listed }}.
 
 %% @doc The pairs a message carries: its own keys, but its commitments and
 %% private keys; the value each path of `match-paths' resolves to; and each
@@ -991,6 +1086,38 @@ weave_order_test() ->
     Literal = #{ <<"literal">> => [<<"1">>, <<"2">>] },
     LiteralID = Cache(Literal, 9),
     ?assertEqual([{9, LiteralID}], matches(Literal, #{}, Opts)).
+
+%% @doc A name's listed values are served over HTTP, as they are in process.
+values_test() ->
+    Opts = (test_opts())#{ <<"priv-wallet">> => ar_wallet:new() },
+    Node = hb_http_server:start_node(Opts),
+    cache(
+        hb_message:commit(
+            #{ <<"content-type">> => <<"image/png">> }, Opts
+        ),
+        5,
+        Opts
+    ),
+    Listed =
+        fun(Result) ->
+            hb_maps:get(<<"values">>, hb_util:ok(Result), not_found, Opts)
+        end,
+    ?assertEqual(
+        [<<"image/png">>],
+        Listed(
+            hb_ao:raw(
+                <<"match@1.0">>, #{},
+                #{ <<"path">> => <<"values">>, <<"name">> => <<"content-type">> },
+                Opts
+            )
+        )
+    ),
+    ?assertEqual(
+        [<<"image/png">>],
+        Listed(
+            hb_http:get(Node, <<"/~match@1.0/values&name=content-type">>, Opts)
+        )
+    ).
 
 %% @doc Each signed ID is indexed under its own committer, and a
 %% `match-all-paths' map in the node's options names the pair over the
