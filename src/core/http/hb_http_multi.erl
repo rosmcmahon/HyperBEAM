@@ -377,11 +377,8 @@ multirequest_test_() ->
                     multi([dead_node(), maps:get(fast, N)], #{}))
             end},
             {"parallel race", fun() ->
-                T0 = erlang:monotonic_time(millisecond),
-                ?assertMatch({ok, _},
-                    multi([maps:get(fast, N), maps:get(slow1, N), maps:get(slow2, N)],
-                        #{<<"parallel">> => true, <<"stop-after">> => true})),
-                ?assert(erlang:monotonic_time(millisecond) - T0 < 750)
+                assert_first_response(
+                    #{ <<"parallel">> => true, <<"stop-after">> => true })
             end},
             {"parallel broadcast", fun() ->
                 ?assertMatch([_, _, _],
@@ -404,23 +401,38 @@ multirequest_test_() ->
 parallel_race_stops_at_first_admissible_test_() ->
     {timeout, 30, fun parallel_race_stops_at_first_admissible/0}.
 parallel_race_stops_at_first_admissible() ->
-    Delay = 750,
-    FastURL = hb_http_server:start_node(#{}),
-    SlowURL1 = hb_http_server:start_node(slow_node_opts(Delay)),
-    SlowURL2 = hb_http_server:start_node(slow_node_opts(Delay)),
     Routes = maps:get(<<"routes">>, hb_opts:default_message()),
     [ArweaveRoute] =
         [R || R <- Routes,
             maps:get(<<"template">>, R, undefined) =:= <<"^/arweave">>,
             maps:is_key(<<"nodes">>, R)],
-    Config = ArweaveRoute#{
-        <<"nodes">> => [ao_node(FastURL), ao_node(SlowURL1), ao_node(SlowURL2)]
-    },
-    T0 = erlang:monotonic_time(millisecond),
-    Result = hb_http_multi:request(Config, <<"GET">>, <<"/">>, #{}, #{}),
-    Elapsed = erlang:monotonic_time(millisecond) - T0,
-    ?assertMatch({ok, _}, Result),
-    ?assert(Elapsed < Delay).
+    assert_first_response(ArweaveRoute).
+
+%% @doc Release one real HTTP response while the other requests stay blocked.
+assert_first_response(Config) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Gate = #{ <<"on">> => #{ <<"request">> => #{ <<"device">> => #{
+        <<"request">> => fun(_, #{ <<"body">> := Msgs }, _) ->
+            Parent ! {Ref, self()},
+            receive {Ref, release} -> {ok, #{ <<"body">> => Msgs }}
+            after 10000 -> error(response_not_released)
+            end
+        end } } } },
+    Nodes = [ao_node(hb_http_server:start_node(Gate)) || _ <- lists:seq(1, 3)],
+    Caller = spawn(fun() -> Parent ! {Ref, result, multi(Nodes, Config)} end),
+    Requests = [receive {Ref, Pid} -> Pid
+        after 5000 -> error(request_not_started)
+        end || _ <- Nodes],
+    try
+        hd(Requests) ! {Ref, release},
+        receive {Ref, result, Result} -> ?assertMatch({ok, _}, Result)
+        after 5000 -> error(waiting_for_other_responses)
+        end
+    after
+        [Pid ! {Ref, release} || Pid <- Requests],
+        exit(Caller, kill)
+    end.
 
 %% @doc Serial fallback: unreachable nodes are skipped until a live one
 %% responds with 200.

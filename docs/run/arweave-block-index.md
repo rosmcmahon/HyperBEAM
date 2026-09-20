@@ -61,8 +61,7 @@ start with `"list-batch-size": 256`; retain its name and other settings:
   "store-module": "hb_store_lmdb",
   "ao-types": "store-module=\"atom\"",
   "name": "/var/lib/hyperbeam/match-index",
-  "list-batch-size": 256,
-  "from-list": "~match@1.0/entries"
+  "list-batch-size": 256
 }
 ```
 
@@ -72,21 +71,8 @@ Volatile and filesystem stores honor the same setting and bounded default.
 `match-batch-size` tuning to this store setting. ArLMDB retains its natural
 pages. No reindex is needed.
 
-`from-list` normalizes a returned batch in one AO-Core call. Add the native
-`~match@1.0/entries` path to each native `match-index` read definition, including
-the pending index view. Leave the message `store` and `pending-store` writer
-definitions as they are. On the published index with 39/40/49-bit fields, add:
-
-```json
-{
-  "from-list": "~match@1.0/members&key-hash-size=39&value-hash-size=40&offset-size=49&commitment-device=ans104@1.0"
-}
-```
-
-Retain its existing `from-key`, `to-key`, root, prefix and other settings.
-`from-list` replaces per-child normalization only for listing. Deploy updated
-`hb_store` and rebuilt `match@1.0` before enabling it. Custom encodings need
-their own equivalent batch decoder; omitting `from-list` keeps per-key decoding.
+Each returned key uses the store's `from-key` pipeline.
+Retain existing `from-key`, `to-key`, root, prefix and other settings.
 GraphQL count remains capped at `query-arweave-max-index-count` (default 1000),
 and an exhausted first page supplies its count without another index traversal.
 

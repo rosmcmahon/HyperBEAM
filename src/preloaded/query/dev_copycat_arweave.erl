@@ -1802,12 +1802,24 @@ auto_stop_partial_index_test_parallel() ->
     ok.
 
 negative_parse_range_test_parallel() ->
-    {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
-    {ok, Tip} =
+    {_TestStore, _StoreOpts, NetworkOpts} = setup_index_opts(),
+    {ok, Block} =
         hb_ao:resolve(
-            <<?ARWEAVE_DEVICE/binary, "/current/height">>,
-            Opts
+            <<?ARWEAVE_DEVICE/binary, "/current">>,
+            NetworkOpts
         ),
+    Tip = hb_maps:get(<<"height">>, Block, not_found, NetworkOpts),
+    % All range requests see the same real header, even if the tip advances.
+    Header = hb_json:encode(hb_cache:ensure_all_loaded(Block, NetworkOpts)),
+    Node = hb_http_server:start_node(#{ <<"on">> => #{ <<"request">> => #{
+        <<"device">> => #{ <<"request">> => fun(_, _, _) ->
+            {ok, #{ <<"body">> => [#{ <<"body">> => Header,
+                <<"content-type">> => <<"application/json">> }] }}
+        end } } } }),
+    Opts = NetworkOpts#{ <<"routes">> => [#{
+        <<"template">> => <<"^/arweave">>, <<"nodes">> => [#{
+            <<"match">> => <<"^/arweave">>, <<"with">> => Node,
+            <<"opts">> => #{ <<"http-client">> => httpc } }] }] },
     {ok, {false, NegativeFrom, UndefinedTo}} =
         parse_range(#{ <<"from">> => <<"-3">> }, Opts),
     ?assertEqual(hb_util:int(Tip) - 3, NegativeFrom),

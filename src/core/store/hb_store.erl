@@ -87,10 +87,6 @@
 %%%                         store sees.
 %%%     `[to|from]-value`:  An AO-Core path, resolved in `raw' mode with a
 %%%                         successful result as the `Base/body`.
-%%%     `from-list`:        An AO-Core path receiving all enumerated children
-%%%                         as `Base/body', returning their normalized list.
-%%%                         Replaces per-child `from-key' and `from-value'
-%%%                         for `list' results.
 %%% '''
 -module(hb_store).
 -export([behavior_info/1]).
@@ -147,8 +143,7 @@ behavior_info(callbacks) ->
 
 %% @doc The store message keys that describe a normalization pipeline.
 -define(PIPELINE_KEYS, [
-    <<"prefix">>, <<"to-key">>, <<"from-key">>, <<"to-value">>, <<"from-value">>,
-    <<"from-list">>
+    <<"prefix">>, <<"to-key">>, <<"from-key">>, <<"to-value">>, <<"from-value">>
 ]).
 
 %%% Store named terms registry functions.
@@ -631,8 +626,6 @@ from_store(Store, read, {composite, Children}, Opts) ->
         {ok, Norm} ?= from_children(Store, Children, Opts),
         {composite, Norm}
     end;
-from_store(Store = #{ <<"from-list">> := _ }, list, {ok, Children}, Opts) ->
-    execute_normalizer(<<"from-list">>, Store, Children, Opts);
 from_store(Store, list, {ok, Children}, Opts) ->
     from_children(Store, Children, Opts);
 from_store(Store, resolve, {ok, Path}, Opts) ->
@@ -1469,6 +1462,26 @@ normalize_without_body_store_test() ->
         )
     ).
 
+%% @doc Listed keys and paired values retain scalar singleton semantics.
+normalize_children_test() ->
+    Opts = #{ <<"store">> => [], <<"linkify-mode">> => false },
+    lists:foreach(
+        fun({Path, Terms}) ->
+            Store = #{ <<"from-key">> => Path, <<"from-value">> => Path },
+            Scalar = fun(Term) ->
+                hb_ao:raw(#{ <<"path">> => Path, <<"0.body">> => Term }, Opts)
+            end,
+            Expected = [begin {ok, Value} = Scalar(Term), Value end || Term <- Terms],
+            ?assertEqual({ok, Expected}, from_children(Store, Terms, Opts)),
+            ?assertEqual({ok, lists:zip(Expected, Expected)},
+                from_children(Store, lists:zip(Terms, Terms), Opts))
+        end,
+        [{<<"~message@1.0/body">>, [<<"abc">>, <<0, 255>>, 17, [<<"a">>]]},
+            {<<"~message@1.0&body=fixed/body">>, [<<"abc">>]},
+            {<<"~message@1.0/set&value=constant/body">>, [<<"abc">>]},
+            {<<"~message@1.0&ao-types=body%3D%22integer%22/body">>, [<<"12">>]}]
+    ).
+
 %% @doc Test that `to-key' and `to-value' rewrite a request's paths and
 %% values ahead of the store -- for writes and reads alike -- and that
 %% `from-key' and `from-value' normalize its answers: a read's value, each
@@ -1552,14 +1565,9 @@ normalize_pipeline_test() ->
         {ok, [hb_util:encode(<<"a">>)]},
         list([Store], <<"b64/", EncodedGroup/binary>>, #{})
     ),
-    BatchStore = Store#{ <<"from-list">> => <<"~message@1.0/body">> },
-    ?assertEqual(
-        {ok, [<<"a">>]},
-        list([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
-    ),
     ?assertEqual(
         {composite, [hb_util:encode(<<"a">>)]},
-        read([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
+        read([Store], <<"b64/", EncodedGroup/binary>>, #{})
     ),
     ?assertEqual(
         {ok, <<"b64/", EncodedChild/binary>>},
