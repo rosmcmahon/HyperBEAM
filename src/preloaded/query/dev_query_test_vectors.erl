@@ -1061,6 +1061,40 @@ transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
         [{<<"tx@1.0">>, 0}, {<<"tx@1.0">>, 5}, {<<"ans104@1.0">>, 0}]
     ).
 
+%% @doc L1 metadata does not load or cache its bundle payload.
+transactions_header_only_test_parallel() ->
+    Local = hb_test_utils:test_store(hb_store_volatile),
+    Store = #{ <<"store-module">> => hb_store_arweave,
+        <<"index-store">> => hb_test_utils:test_store(hb_store_volatile),
+        <<"local-store">> => [Local] },
+    Opts = #{ <<"store">> => [Local, Store],
+        <<"arweave-index-store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    ID = <<"VJhGCNOw2zB0c9apKBs_LKXpPx6rctrw2kSlSSyI_SQ">>,
+    ok = hb_store_arweave:write_offset(Store, ID, <<"tx@1.0">>,
+        386086672048374, 2283569),
+    {ok, Header} = hb_ao:resolve(#{ <<"path">> => <<"~arweave@2.9/tx">>,
+        <<"tx">> => ID, <<"exclude-data">> => true }, Opts),
+    TX = hb_message:convert(Header, <<"tx@1.0">>, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Result = dev_query_graphql:test_query(Node,
+        <<"query($id: ID!) { transaction(id: $id) { id anchor recipient",
+            " owner { address } tags { name value } data { size }",
+            " quantity { winston } fee { winston } } }">>,
+        #{ <<"id">> => ID }, Opts),
+    ?assertMatch(#{ <<"data">> := #{ <<"transaction">> := #{
+        <<"id">> := ID, <<"data">> := #{ <<"size">> := <<"2283569">> }
+    }}}, Result),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, hb_store:scope(Opts, local))),
+    #{ <<"data">> := #{ <<"transaction">> := Projected }} = Result,
+    ?assertEqual(hb_util:encode(TX#tx.anchor), maps:get(<<"anchor">>, Projected)),
+    ?assertEqual(hb_util:encode(TX#tx.target), maps:get(<<"recipient">>, Projected)),
+    ?assertEqual(#{ <<"winston">> => hb_util:bin(TX#tx.quantity) },
+        maps:get(<<"quantity">>, Projected)),
+    ?assertEqual(#{ <<"winston">> => hb_util:bin(TX#tx.reward) },
+        maps:get(<<"fee">>, Projected)),
+    ?assertEqual(lists:sort([#{ <<"name">> => K, <<"value">> => V }
+        || {K, V} <- TX#tx.tags]), lists:sort(maps:get(<<"tags">>, Projected))).
+
 transactions_query_cursor_by_offset_test_parallel() ->
     {ok, Node, Opts} = test_env_with_blocks(1892159, 1892158),
     EarlierID = <<"xBpOR2KOjYEgv5HmddMlAgYa-yMvfEVl-0XzRIfm2uY">>,

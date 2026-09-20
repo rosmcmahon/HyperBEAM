@@ -16,7 +16,7 @@
 %%% `block=...&tx=...' cursors resume exclusively within that height. Missing
 %%% headers return errors; empty blocks are skipped. `count' has the same cap
 %%% as indexed queries and ignores `after'. Selected nodes read by ID from the
-%%% configured stores, falling back to `~arweave@2.9/tx' with `exclude-data=true'.
+%%% local stores, then `~arweave@2.9/tx' with `exclude-data=true'.
 %%% Their block fields reuse the containing header.
 %%%
 %%% `first' limits the page, clamped between zero and node option
@@ -31,8 +31,8 @@
 %%% Queries with at least one indexed predicate and no explicit IDs or bundle
 %%% filter can use `~match@1.0/locate' with a compatible cursor. Its store
 %%% pipelines supply entries with `offset', `id' and `commitment-device'.
-%%% A nonempty ID is read
-%%% through `hb_cache', using the node's configured stores. An entry without
+%%% A known L1 ID reads locally, then requests its native header; other IDs
+%%% read through `hb_cache', using the node's configured stores. An entry without
 %%% an ID is read at its weave offset and deserialized by its commitment device
 %%% with `exclude-data=true', then converted to a structured message. This
 %%% requires a byte-addressable item and a device supporting header decoding;
@@ -238,9 +238,16 @@ query(Msg, <<"tags">>, Args, Opts) ->
                     [Key || <<"field-", Key/binary>> <- hb_maps:keys(C, Opts)];
                 [] -> []
             end,
+            BundleTags = case Native of
+                [BundleCommitment | _] ->
+                    hb_maps:with(?BUNDLE_KEYS, BundleCommitment, Opts);
+                [] -> #{}
+            end,
             dev_query_graphql:execute(
                 #{opts => Opts},
-                hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
+                hb_maps:merge(
+                    hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
+                    BundleTags, Opts),
                 <<"keys">>,
                 Args
             )
@@ -502,8 +509,8 @@ read_id(#{ <<"offset">> := _, <<"cursor">> := Cursor },
     [#{ <<"cursor">> => Cursor }];
 read_id(#{ <<"node">> := _ } = Edge, _Opts) ->
     [Edge];
-read_id(AnnotatedID = #{ <<"id">> := ID }, Opts) ->
-    case hb_cache:read(ID, Opts) of
+read_id(AnnotatedID, Opts) ->
+    case match_message(AnnotatedID, Opts) of
         {ok, Msg} ->
             [AnnotatedID#{ <<"node">> =>
                 hb_private:set(Msg, <<"query-match">>, AnnotatedID, Opts)
@@ -1219,17 +1226,30 @@ locate_ranges(_Predicates, Ranges, _After, Limit, _Opts)
         when Ranges =:= []; Limit =:= 0 ->
     {ok, []};
 locate_ranges(Predicates, [Range | Rest], After, Limit, Opts) ->
-    Bounds =
-        case After of
-            none -> Range;
-            _ -> (maps:remove(<<"from">>, Range))#{ <<"after">> => After }
-        end,
     maybe
+        {ok, Bounds} ?= range_cursor(Range, After, Opts),
         {ok, Matches} ?=
             locate_range(Predicates, Bounds, Limit, Opts),
         {ok, More} ?=
             locate_ranges(Predicates, Rest, none, Limit - length(Matches), Opts),
         {ok, Matches ++ More}
+    end.
+
+%% @doc A cursor cannot start a range before its inclusive near boundary.
+range_cursor(Range, none, _Opts) -> {ok, Range};
+range_cursor(Range = #{ <<"from">> := From, <<"direction">> := Direction },
+        After, Opts) ->
+    try
+        {ok, #{ <<"offset">> := Offset }} = hb_ao:raw(
+            <<"match@1.0">>, <<"entry">>, #{ <<"body">> => After }, #{}, Opts),
+        case (Direction =:= asc andalso Offset < From) orelse
+                (Direction =:= desc andalso Offset > From) of
+            true -> {ok, Range};
+            false ->
+                {ok, (maps:remove(<<"from">>, Range))#{ <<"after">> => After }}
+        end
+    catch error:badarg ->
+        {error, <<"Invalid cursor.">>}
     end.
 
 %% @doc Filter boundary candidates before counting the page, refilling it
@@ -1329,19 +1349,26 @@ match_edges(Matches, Opts) ->
 match_cursor(#{ <<"cursor">> := Cursor }) -> Cursor;
 match_cursor(#{ <<"member">> := Member }) -> <<?MEMBER_CURSOR, Member/binary>>.
 
-%% @doc A match's message: through `hb_cache' by its ID, or from the weave
-%% by its offset.
+%% @doc L1 metadata needs only its native header, not an expanded bundle.
+%% Other messages read by ID, or decode their header at a weave offset.
+match_message(#{ <<"id">> := ID, <<"commitment-device">> := <<"tx@1.0">>,
+        <<"offset">> := Offset }, Opts) when is_integer(Offset), Offset >= 0 ->
+    l1_message(ID, Opts);
 match_message(#{ <<"id">> := ID, <<"cursor">> := <<"block=", _/binary>> }, Opts) ->
-    case hb_cache:read(ID, Opts) of
-        {ok, Msg} -> {ok, Msg};
-        {error, not_found} -> hb_ao:resolve(#{ <<"path">> => <<"~arweave@2.9/tx">>,
-            <<"tx">> => ID, <<"exclude-data">> => true }, Opts);
-        Error -> Error
-    end;
+    l1_message(ID, Opts);
 match_message(#{ <<"id">> := ID }, Opts) when ID =/= <<>> ->
     hb_cache:read(ID, Opts);
 match_message(#{ <<"offset">> := Offset, <<"commitment-device">> := Device }, Opts) ->
     header(Offset, Device, Opts).
+
+%% @doc Keep header-only L1 reads separate from complete-message cache reads.
+l1_message(ID, Opts) ->
+    case hb_cache:read(ID, hb_store:scope(Opts, local)) of
+        {ok, Msg} -> {ok, Msg};
+        {error, not_found} -> hb_ao:resolve(#{ <<"path">> => <<"~arweave@2.9/tx">>,
+            <<"tx">> => ID, <<"exclude-data">> => true }, Opts);
+        Error -> Error
+    end.
 
 %% @doc The message of the item at a weave offset, from its header alone:
 %% parsed from the bytes between the offset and the end of its chunk -- one
@@ -1643,6 +1670,29 @@ explicit_ids(Args, Opts) ->
         end
     ).
 
+%% @doc Clamp only cursors before the near bound, preserving exclusive IDs.
+range_cursor_test() ->
+    lists:foreach(
+        fun({Direction, From, Before, Ahead}) ->
+            Range = #{ <<"direction">> => Direction, <<"from">> => From },
+            ?assertEqual({ok, Range}, range_cursor(Range, none, #{})),
+            ?assertEqual({ok, Range}, range_cursor(Range, Before, #{})),
+            lists:foreach(
+                fun(Cursor) ->
+                    ?assertEqual({ok, #{ <<"direction">> => Direction,
+                        <<"after">> => Cursor }}, range_cursor(Range, Cursor, #{}))
+                end,
+                [hb_util:bin(From),
+                    <<"00000000000000000010",
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAans104@1.0">>,
+                    Ahead]
+            ),
+            ?assertEqual({error, <<"Invalid cursor.">>},
+                range_cursor(Range, <<"nonsense">>, #{}))
+        end,
+        [{asc, 10, <<"9">>, <<"infinity">>}, {desc, 10, <<"11">>, <<"-1">>}]
+    ).
+
 pending_offsets_page_by_cursor_test() ->
     Store = hb_test_utils:test_store(),
     ArweaveStore = #{ <<"store-module">> => hb_store_arweave, <<"index-store">> => [Store] },
@@ -1694,6 +1744,45 @@ pending_offsets_page_by_cursor_test() ->
             " pageInfo { hasNextPage } } }">>,
         #{ <<"ids">> => [PendingA, Missing, NumericID],
             <<"after">> => FirstCursor }, Opts)).
+
+%% @doc Block bounds and exclusive member cursors intersect in either order.
+bounded_member_pages_test() ->
+    Store = (hb_test_utils:test_store(hb_store_lmdb))#{
+        <<"capacity">> => 1024 * 1024 * 1024, <<"list-batch-size">> => 2 },
+    Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new(),
+        <<"match-index">> => [Store#{ <<"from-list">> => <<"~match@1.0/entries">> }] },
+    lists:foreach(
+        fun({N, Offset}) ->
+            Msg = hb_message:commit(#{ <<"type">> => <<"Window">>,
+                <<"n">> => N }, Opts),
+            hb_cache:write(hb_private:set(Msg, <<"offset">>, Offset, Opts), Opts)
+        end,
+        lists:enumerate([9, 10, 10, 19, 20])
+    ),
+    {ok, BlockID} = hb_cache:write(#{ <<"height">> => 1,
+        <<"weave_size">> => 20, <<"block_size">> => 10 }, Opts),
+    hb_cache:link(BlockID, <<"~arweave@2.9/block/height/1">>, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Query = <<"query($after:String,$sort:SortOrder){transactions(first:1,",
+        "block:{min:1,max:1},tags:[{name:\"type\",values:[\"Window\"]}],",
+        "after:$after,sort:$sort){edges{cursor}pageInfo{hasNextPage}}}">>,
+    Page = fun(Sort, After) -> hb_util:deep_get(<<"data/transactions">>,
+        dev_query_graphql:test_query(Node, Query,
+            #{ <<"sort">> => Sort, <<"after">> => After }, Opts), #{}, Opts) end,
+    Pages = fun Pages(Sort, After) ->
+        #{ <<"edges">> := Edges, <<"pageInfo">> := #{ <<"hasNextPage">> := More }} =
+            Page(Sort, After),
+        case More of
+            false -> Edges;
+            true -> Edges ++ Pages(Sort, maps:get(<<"cursor">>, lists:last(Edges)))
+        end
+    end,
+    Asc = Pages(<<"HEIGHT_ASC">>, null),
+    ?assertEqual(3, length(lists:usort(Asc))),
+    ?assertEqual(Asc, Pages(<<"HEIGHT_ASC">>, <<"member=9">>)),
+    ?assertEqual(lists:reverse(Asc), Pages(<<"HEIGHT_DESC">>, <<"member=21">>)),
+    ?assertEqual([], Pages(<<"HEIGHT_ASC">>, <<"member=21">>)),
+    ?assertEqual([], Pages(<<"HEIGHT_DESC">>, <<"member=9">>)).
 
 %% @doc Signed messages the weave never held page out last in either order,
 %% by cursor, from a node's own stores.
