@@ -1459,8 +1459,8 @@ transaction_query_full_test_parallel() ->
         Res
     ).
 
-%% @doc Native fields are not tags, even without an original tag list.
-transaction_literal_tags_test_parallel() ->
+%% @doc Tags use normalized base keys, excluding native commitment fields.
+transaction_tags_exclude_fields_test_parallel() ->
     Wallet = ar_wallet:new(),
     Opts = #{
         <<"priv-wallet">> => Wallet,
@@ -1468,17 +1468,14 @@ transaction_literal_tags_test_parallel() ->
     },
     Node = hb_http_server:start_node(Opts),
     lists:foreach(
-        fun({Codec, Tags}) ->
+        fun({Codec, Amount, Tags, Expected}) ->
             Unsigned = #tx{
                 format = 1,
                 target = crypto:strong_rand_bytes(32),
                 anchor = crypto:strong_rand_bytes(32),
-                quantity = 5,
-                reward = 7,
-                data = case Tags of
-                    [{<<"bundle-format">>, _} | _] -> <<0:256/little>>;
-                    _ -> <<"payload">>
-                end,
+                quantity = Amount,
+                reward = Amount,
+                data = <<"payload">>,
                 tags = Tags
             },
             TX = case Codec of
@@ -1492,7 +1489,6 @@ transaction_literal_tags_test_parallel() ->
             case Tags of
                 [] -> ?assertNot(Original);
                 [{<<"app">>, _} | _] -> ?assertNot(Original);
-                [{<<"bundle-format">>, _} | _] -> ?assertNot(Original);
                 [{<<"quantity">>, _} | _] ->
                     ?assertEqual(Codec =:= <<"tx@1.0">>, Original);
                 _ -> ?assert(Original)
@@ -1503,27 +1499,32 @@ transaction_literal_tags_test_parallel() ->
                     <<"query($id: ID!) { transaction(id: $id) {",
                         " tags { name value } } }">>,
                     #{ <<"id">> => ID }, Opts),
-            Expected = [#{ <<"name">> => Name, <<"value">> => Value }
-                || {Name, Value} <- Tags],
-            case Original of
-                true -> ?assertEqual(Expected, Actual);
-                false -> ?assertEqual(lists:sort(Expected), lists:sort(Actual))
-            end
+            ?assertEqual(
+                lists:sort([#{ <<"name">> => Name, <<"value">> => Value }
+                    || {Name, Value} <- Expected]),
+                lists:sort(Actual)
+            )
         end,
-        [{Codec, Tags} || Codec <- [<<"tx@1.0">>, <<"ans104@1.0">>],
-            Tags <- [
-                [],
-                [{<<"app">>, <<"literal">>}, {<<"body">>, <<"a tag">>}],
-                [{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
-                    {<<"fee">>, <<"3000">>}],
-                [{<<"bundle-format">>, <<"binary">>},
-                    {<<"bundle-version">>, <<"2.0.0">>}],
-                [{<<"ao-data-key">>, <<"payload">>},
-                    {<<"ao-types">>, <<"count=\"integer\"">>},
-                    {<<"count">>, <<"5">>}],
-                [{<<"anchor">>, <<"tag anchor">>}, {<<"target">>, <<"tag target">>},
-                    {<<"data">>, <<"tag data">>}, {<<"App">>, <<"first">>},
-                    {<<"App">>, <<"second">>}, {<<"app">>, <<"third">>}]
+        [{Codec, Amount, Tags, Expected}
+            || Codec <- [<<"tx@1.0">>, <<"ans104@1.0">>], Amount <- [0, 5],
+            {Tags, Expected} <- [
+                {[], []},
+                {[{<<"app">>, <<"literal">>}, {<<"body">>, <<"a tag">>}],
+                    [{<<"app">>, <<"literal">>}]},
+                {[{<<"App">>, <<"literal">>}, {<<"Body">>, <<"a tag">>}],
+                    [{<<"app">>, <<"literal">>}]},
+                {[{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
+                    {<<"fee">>, <<"3000">>}, {<<"field-reward">>, <<"a tag">>}],
+                    [{<<"fee">>, <<"3000">>}, {<<"field-reward">>, <<"a tag">>}] ++
+                        case {Codec, Amount} of
+                            {<<"tx@1.0">>, 5} -> [];
+                            _ -> [{<<"quantity">>, <<"1000">>},
+                                {<<"reward">>, <<"2000">>}]
+                        end},
+                {[{<<"Anchor">>, <<"tag anchor">>},
+                    {<<"Target">>, <<"tag target">>},
+                    {<<"App">>, <<"first">>}, {<<"app">>, <<"second">>}],
+                    [{<<"app">>, <<"\"first\", \"second\"">>}]}
             ]]
     ).
 
