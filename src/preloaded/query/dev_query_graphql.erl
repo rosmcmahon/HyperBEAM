@@ -23,7 +23,6 @@
         <<"id">>,
         <<"message">>,
         <<"keys">>,
-        <<"tags">>,
         <<"name">>,
         <<"value">>,
         <<"cursor">>
@@ -240,7 +239,7 @@ message_query(Obj, <<"message">>, #{<<"keys">> := Keys}, Opts) ->
             ?event(graphql_cache_match_not_found),
             {ok, #{<<"id">> => <<"not-found">>, <<"keys">> => #{}}}
     end;
-message_query(Msg, Field, _Args, Opts) when Field =:= <<"keys">>; Field =:= <<"tags">> ->
+message_query(Msg, <<"keys">>, _Args, Opts) ->
     OnlyKeys =
         hb_maps:to_list(
             hb_private:reset(

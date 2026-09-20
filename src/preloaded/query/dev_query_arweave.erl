@@ -67,16 +67,18 @@
 %%% The AO-Core request's `force-next-page=true' forces `hasNextPage=true' and
 %%% appends `&remaining=0' to the last cursor when no further match is found.
 %%%
-%%% `id' and `tags' use the message projection in `dev_query_graphql'. Signature
-%%% and owner fields come from a signed commitment; recipient and anchor come
-%%% from commitment field mappings. `fee' and `quantity' use `field-reward'
+%%% `id' uses the message projection in `dev_query_graphql'. Native transaction
+%%% tags use the requested commitment's original tags, or its committed keys
+%%% excluding native fields and payload. Signature and owner fields come from
+%%% a signed commitment; recipient and anchor use commitment field mappings.
+%%% `fee' and `quantity' use `field-reward'
 %%% and `field-quantity' on the requested commitment, defaulting to zero.
 %%% Amounts project as winston and exact AR strings.
 %%% `data.size' prefers an L1 transaction's declared or indexed payload size,
 %%% then measures binary `data', falling back to `body', then an empty binary.
 %%% Structured bodies and omitted payloads have unknown size (null).
 %%% `data.type' reads `content-type'. These projections
-%%% do not reconstruct an Arweave transaction or its original tag list.
+%%% do not reconstruct an Arweave transaction.
 %%% Transaction `block' seeks the compact block index at the matched weave
 %%% position, then reads the selected header. Index misses fall back to cached
 %%% block ranges, sharing the height catalogue within the page, then remote
@@ -213,6 +215,21 @@ query(Block, <<"height">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"height">>, Block, null, Opts)};
 query(Block, <<"timestamp">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"timestamp">>, Block, null, Opts)};
+query(Msg, <<"tags">>, Args, Opts) ->
+    Selected =
+        case hb_private:get(<<"query-match/id">>, Msg, <<>>, Opts) of
+            <<>> -> Msg;
+            ID -> hb_message:with_commitments(ID, Msg, Opts)
+        end,
+    Native = [Commitment
+        || Commitment <- hb_maps:values(
+            hb_message:commitments(#{}, Selected, Opts), Opts),
+        lists:member(hb_maps:get(<<"commitment-device">>, Commitment, undefined, Opts),
+            [<<"tx@1.0">>, <<"ans104@1.0">>])],
+    case Native of
+        [Commitment | _] -> transaction_tags(Msg, Commitment, Opts);
+        [] -> dev_query_graphql:execute(#{opts => Opts}, Msg, <<"keys">>, Args)
+    end;
 query(Msg, <<"signature">>, _Args, Opts) ->
     % Return the signature of the transaction.
     % Other TX access methods are defined below.
@@ -365,6 +382,26 @@ encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 48 -> {ok, hb_util:enc
 encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 43 -> {ok, Bin};
 encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 64 -> {ok, Bin};
 encode_anchor(Other) -> {error, <<"invalid_anchor: ", Other/binary>>}.
+
+%% @doc Preserve literal tags; field provenance comes from the commitment.
+transaction_tags(Msg, Commitment, Opts) ->
+    case hb_maps:find(<<"original-tags">>, Commitment, Opts) of
+        {ok, Tags} ->
+            {ok, [{ok, Tag} || Tag <- hb_util:message_to_ordered_list(Tags, Opts)]};
+        error ->
+            Fields = [Key || <<"field-", Key/binary>> <-
+                hb_maps:keys(Commitment, Opts)],
+            Committed = hb_util:message_to_ordered_list(
+                hb_maps:get(<<"committed">>, Commitment, [], Opts), Opts),
+            Tags = hb_maps:merge(
+                hb_maps:with(Committed -- [<<"data">> | Fields], Msg, Opts),
+                hb_maps:with(?BUNDLE_KEYS, Commitment, Opts), Opts),
+            {ok, [
+                {ok, #{ <<"name">> => Name, <<"value">> => Value }}
+                || Name <- hb_maps:keys(Tags, Opts),
+                Value <- [hb_maps:get(Name, Tags, undefined, Opts)], is_binary(Value)
+            ]}
+    end.
 
 %% @doc Native amounts come only from the requested commitment's fields.
 transaction_amount(Msg, Field, Opts) ->

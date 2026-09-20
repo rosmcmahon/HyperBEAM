@@ -1459,6 +1459,74 @@ transaction_query_full_test_parallel() ->
         Res
     ).
 
+%% @doc Native fields are not tags, even without an original tag list.
+transaction_literal_tags_test_parallel() ->
+    Wallet = ar_wallet:new(),
+    Opts = #{
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => [hb_test_utils:test_store()]
+    },
+    Node = hb_http_server:start_node(Opts),
+    lists:foreach(
+        fun({Codec, Tags}) ->
+            Unsigned = #tx{
+                format = 1,
+                target = crypto:strong_rand_bytes(32),
+                anchor = crypto:strong_rand_bytes(32),
+                quantity = 5,
+                reward = 7,
+                data = case Tags of
+                    [{<<"bundle-format">>, _} | _] -> <<0:256/little>>;
+                    _ -> <<"payload">>
+                end,
+                tags = Tags
+            },
+            TX = case Codec of
+                <<"tx@1.0">> -> ar_tx:sign(Unsigned, Wallet);
+                <<"ans104@1.0">> -> ar_bundles:sign_item(Unsigned, Wallet)
+            end,
+            Msg = hb_message:convert(TX, <<"structured@1.0">>, Codec, Opts),
+            ID = hb_util:encode(TX#tx.id),
+            Commitment = hb_maps:get(ID, hb_maps:get(<<"commitments">>, Msg)),
+            Original = hb_maps:is_key(<<"original-tags">>, Commitment, Opts),
+            case Tags of
+                [] -> ?assertNot(Original);
+                [{<<"app">>, _} | _] -> ?assertNot(Original);
+                [{<<"bundle-format">>, _} | _] -> ?assertNot(Original);
+                [{<<"quantity">>, _} | _] ->
+                    ?assertEqual(Codec =:= <<"tx@1.0">>, Original);
+                _ -> ?assert(Original)
+            end,
+            {ok, _} = hb_cache:write(Msg, Opts),
+            #{ <<"data">> := #{ <<"transaction">> := #{ <<"tags">> := Actual } }} =
+                dev_query_graphql:test_query(Node,
+                    <<"query($id: ID!) { transaction(id: $id) {",
+                        " tags { name value } } }">>,
+                    #{ <<"id">> => ID }, Opts),
+            Expected = [#{ <<"name">> => Name, <<"value">> => Value }
+                || {Name, Value} <- Tags],
+            case Original of
+                true -> ?assertEqual(Expected, Actual);
+                false -> ?assertEqual(lists:sort(Expected), lists:sort(Actual))
+            end
+        end,
+        [{Codec, Tags} || Codec <- [<<"tx@1.0">>, <<"ans104@1.0">>],
+            Tags <- [
+                [],
+                [{<<"app">>, <<"literal">>}, {<<"body">>, <<"a tag">>}],
+                [{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
+                    {<<"fee">>, <<"3000">>}],
+                [{<<"bundle-format">>, <<"binary">>},
+                    {<<"bundle-version">>, <<"2.0.0">>}],
+                [{<<"ao-data-key">>, <<"payload">>},
+                    {<<"ao-types">>, <<"count=\"integer\"">>},
+                    {<<"count">>, <<"5">>}],
+                [{<<"anchor">>, <<"tag anchor">>}, {<<"target">>, <<"tag target">>},
+                    {<<"data">>, <<"tag data">>}, {<<"App">>, <<"first">>},
+                    {<<"App">>, <<"second">>}, {<<"app">>, <<"third">>}]
+            ]]
+    ).
+
 %% @doc Test single transaction query with non-existent ID
 transaction_query_not_found_test_parallel() ->
     Opts =
