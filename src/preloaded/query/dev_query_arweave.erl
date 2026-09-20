@@ -1750,7 +1750,7 @@ bounded_member_pages_test() ->
     Store = (hb_test_utils:test_store(hb_store_lmdb))#{
         <<"capacity">> => 1024 * 1024 * 1024, <<"list-batch-size">> => 2 },
     Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new(),
-        <<"match-index">> => [Store] },
+        <<"match-index">> => [Store#{ <<"from-list">> => <<"~match@1.0/entries">> }] },
     lists:foreach(
         fun({N, Offset}) ->
             Msg = hb_message:commit(#{ <<"type">> => <<"Window">>,
@@ -1894,7 +1894,10 @@ published_pages() ->
                         <<"to-key">> => <<"~match@1.0/row", Sizes/binary>>,
                         <<"from-key">> =>
                             <<"~match@1.0/member", Sizes/binary,
-                                "/set&commitment-device=ans104@1.0">>
+                                "/set&commitment-device=ans104@1.0">>,
+                        <<"from-list">> =>
+                            <<"~match@1.0/members", Sizes/binary,
+                                "&commitment-device=ans104@1.0">>
                     }
                 ]
         },
