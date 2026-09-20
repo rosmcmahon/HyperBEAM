@@ -807,7 +807,8 @@ transactions_query_combined_test_parallel() ->
             ?assertEqual([], hb_util:deep_get(<<"data/transactions/edges">>, Empty, Opts))
         end,
         [{Filter, []} || Filter <- [<<"ids">>, <<"owners">>, <<"recipients">>]] ++
-            [{<<"ids">>, [hb_util:encode(crypto:hash(sha256, <<"missing">>))]}]
+            [{<<"ids">>, [hb_util:encode(crypto:hash(sha256, <<"missing">>))]},
+             {<<"ids">>, [hb_message:id(WrittenMsg, none, Opts)]}]
     ),
     ?assertMatch(
         #{

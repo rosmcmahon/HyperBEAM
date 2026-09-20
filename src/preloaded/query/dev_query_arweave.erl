@@ -1385,10 +1385,19 @@ indexed_explicit_ids(Args, Opts) ->
     maybe
         true ?= hb_opts:get(match_index, false, Opts) =/= false,
         true ?= hb_opts:get(cache_read_mode, normal, Opts) =/= raw,
-        [_ | _] = IDs ?= explicit_ids(Args, Opts),
+        [_ | _] = Requested ?= explicit_ids(Args, Opts),
         {ok, [_ | _] = Predicates} ?=
             index_predicates(maps:without([<<"ids">>, <<"id">>], Args), Opts),
-        Annotated = annotate_ids(IDs, Opts),
+        % Only signed commitment IDs can occur in the match index. A local
+        % read miss proves nothing; a readable message identifies its IDs.
+        LocalOpts = hb_store:scope(Opts, local),
+        IDs = [ID || ID <- Requested,
+            case hb_cache:read(ID, LocalOpts) of
+                {ok, Msg} -> hb_maps:is_key(ID, hb_message:commitments(
+                    #{ <<"committer">> => '_' }, Msg, LocalOpts), LocalOpts);
+                _ -> true
+            end],
+        Annotated = case IDs of [] -> []; _ -> annotate_ids(IDs, Opts) end,
         true ?= is_list(Annotated),
         true ?= lists:all(
             fun(#{ <<"id">> := ID, <<"offset">> := Offset }) ->
