@@ -504,6 +504,7 @@ maybe_multiline(X, Opts, Indent) ->
 %% node options.
 maybe_short(X, Opts, _Indent) ->
     MaxLen = hb_opts:get(debug_print_map_line_threshold, 100, Opts),
+    % Probe only far enough to select the multiline formatter.
     SimpleFmt =
         case is_binary(X) of
             true -> binary(X, Opts);
@@ -1030,7 +1031,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
                                 )
                             );
                         Other ->
-                            io_lib:format("~p", [Other])
+                            term(Other, Opts, Indent + 2)
                     end
                 ],
                 Opts,
@@ -1048,7 +1049,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
     end;
 message(Item, Opts, Indent) ->
     % Whatever we have is not a message map.
-    indent("~p", [Item], Opts, Indent).
+    term(Item, Opts, Indent).
 
 %%% Utility functions.
 
@@ -1118,6 +1119,58 @@ max_keys(Opts) ->
     end.
 
 %%% Tests
+
+short_format_test() ->
+    lists:foreach(
+        fun({Limit, Value}) ->
+            Formatted = io_lib:format("~p", [Value]),
+            Expected =
+                case is_multiline(Formatted) orelse
+                        lists:flatlength(Formatted) > Limit of
+                    true -> error;
+                    false -> {ok, Formatted}
+                end,
+            ?assertEqual(Expected,
+                maybe_short(Value,
+                    #{<<"debug-print-map-line-threshold">> => Limit}, 0))
+        end,
+        [{Limit, Value} || Limit <- [0, 1, 16, 80, 100, 256],
+            Value <- [#{}, #{a => b}, [1, 2, 3]] ++
+                [#{<<"data">> => binary:copy(<<0, 255>>, Size)}
+                || Size <- [0, 1, 16, 50, 128]]]
+    ).
+
+bounded_format_test() ->
+    lists:foreach(fun bounded_format/1,
+        [fun term/1, fun message/1, fun(Value) ->
+            term(#{<<"reason">> => Value})
+        end]).
+
+%% @doc Format a large failure within a small worker heap.
+bounded_format(Render) ->
+    Parent = self(),
+    Msg = #{<<"data">> => binary:copy(<<0, 255>>, 524288)},
+    {Pid, Ref} = spawn_opt(
+        fun() ->
+            Parent ! {self(), Render({paranoid_verification_failure,
+                {failed_message, Msg}, {while_verifying, Msg}})}
+        end,
+        [monitor, {max_heap_size,
+            #{size => 2000000, kill => true, error_logger => false}}]
+    ),
+    try
+        receive
+            {Pid, Result} ->
+                ?assert(length(Result) < 1000),
+                ?assertNotEqual(nomatch,
+                    string:find(Result, "paranoid_verification_failure"));
+            {'DOWN', Ref, process, Pid, Reason} -> error({formatter_exit, Reason})
+        after 5000 -> ?assert(false)
+        end
+    after
+        exit(Pid, kill),
+        erlang:demonitor(Ref, [flush])
+    end.
 
 truncate_no_truncation_test() ->
     ?assertEqual(<<"hello">>, truncate(<<"hello">>, 10)).
