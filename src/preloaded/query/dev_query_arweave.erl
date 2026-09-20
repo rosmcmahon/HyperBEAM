@@ -68,8 +68,9 @@
 %%% appends `&remaining=0' to the last cursor when no further match is found.
 %%%
 %%% `id' uses the message projection in `dev_query_graphql'. Native transaction
-%%% tags use the normalized base-message keys, excluding native field keys
-%%% identified by the requested commitment. Signature and owner fields come from
+%%% tags use the requested commitment's original tags when present, otherwise
+%%% normalized base-message keys excluding its native field keys.
+%%% Signature and owner fields come from
 %%% a signed commitment; recipient and anchor use commitment field mappings.
 %%% `fee' and `quantity' use `field-reward'
 %%% and `field-quantity' on the requested commitment, defaulting to zero.
@@ -226,17 +227,24 @@ query(Msg, <<"tags">>, Args, Opts) ->
             hb_message:commitments(#{}, Selected, Opts), Opts),
         lists:member(hb_maps:get(<<"commitment-device">>, Commitment, undefined, Opts),
             [<<"tx@1.0">>, <<"ans104@1.0">>])],
-    Fields = case Native of
-        [Commitment | _] ->
-            [Key || <<"field-", Key/binary>> <- hb_maps:keys(Commitment, Opts)];
-        [] -> []
-    end,
-    dev_query_graphql:execute(
-        #{opts => Opts},
-        hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
-        <<"keys">>,
-        Args
-    );
+    maybe
+        [Commitment | _] ?= Native,
+        {ok, Tags} ?= hb_maps:find(<<"original-tags">>, Commitment, Opts),
+        {ok, [{ok, Tag} || Tag <- hb_util:message_to_ordered_list(Tags, Opts)]}
+    else
+        _ ->
+            Fields = case Native of
+                [C | _] ->
+                    [Key || <<"field-", Key/binary>> <- hb_maps:keys(C, Opts)];
+                [] -> []
+            end,
+            dev_query_graphql:execute(
+                #{opts => Opts},
+                hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
+                <<"keys">>,
+                Args
+            )
+    end;
 query(Msg, <<"signature">>, _Args, Opts) ->
     % Return the signature of the transaction.
     % Other TX access methods are defined below.

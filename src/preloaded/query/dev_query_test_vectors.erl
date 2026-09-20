@@ -1459,7 +1459,7 @@ transaction_query_full_test_parallel() ->
         Res
     ).
 
-%% @doc Tags use normalized base keys, excluding native commitment fields.
+%% @doc Preserve original tags, or exclude native fields from normalized keys.
 transaction_tags_exclude_fields_test_parallel() ->
     Wallet = ar_wallet:new(),
     Opts = #{
@@ -1499,11 +1499,20 @@ transaction_tags_exclude_fields_test_parallel() ->
                     <<"query($id: ID!) { transaction(id: $id) {",
                         " tags { name value } } }">>,
                     #{ <<"id">> => ID }, Opts),
-            ?assertEqual(
-                lists:sort([#{ <<"name">> => Name, <<"value">> => Value }
-                    || {Name, Value} <- Expected]),
-                lists:sort(Actual)
-            )
+            case Original of
+                true ->
+                    ?assertEqual(
+                        [#{ <<"name">> => Name, <<"value">> => Value }
+                            || {Name, Value} <- Tags],
+                        Actual
+                    );
+                false ->
+                    ?assertEqual(
+                        lists:sort([#{ <<"name">> => Name, <<"value">> => Value }
+                            || {Name, Value} <- Expected]),
+                        lists:sort(Actual)
+                    )
+            end
         end,
         [{Codec, Amount, Tags, Expected}
             || Codec <- [<<"tx@1.0">>, <<"ans104@1.0">>], Amount <- [0, 5],
