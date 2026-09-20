@@ -50,6 +50,8 @@
 %%% messages; their cursors identify candidates regardless of readability.
 %%% Other supported queries use cache matching and ID reads; their
 %%% count is the number of candidate IDs before pagination and read failures.
+%%% Cursor-only ID pages with known positions also omit message reads; IDs
+%%% without positions must be readable before they can supply an edge.
 %%% Without an Arweave offset store, that path cannot order or filter by weave
 %%% position.
 %%%
@@ -168,7 +170,8 @@ query(#{ <<"block-range">> := Range }, <<"count">>, _Args, Opts) ->
         {ok, hb_util:bin(length(Matches))}
     end;
 query(Obj, <<"transaction">>, Args, Opts) ->
-    case query(Obj, <<"transactions">>, Args, Opts) of
+    case query(Obj, <<"transactions">>, Args,
+            Opts#{ <<"query-arweave-nodes">> => true }) of
         {ok, #{ <<"edges">> := [] }} -> {ok, null};
         {ok, #{ <<"edges">> := [#{ <<"node">> := Msg } | _] }} -> {ok, Msg}
     end;
@@ -464,7 +467,11 @@ read_ids(IDs, Count, Opts) ->
     )),
     Read ++ read_ids(Rest, Count - length(Read), Opts).
 
-%% @doc Read one annotated ID, omitting messages the stores cannot supply.
+%% @doc Known positions supply cursors without reading unselected nodes.
+%% Otherwise omit messages the stores cannot supply.
+read_id(#{ <<"offset">> := _, <<"cursor">> := Cursor },
+        #{ <<"query-arweave-nodes">> := false }) ->
+    [#{ <<"cursor">> => Cursor }];
 read_id(AnnotatedID = #{ <<"id">> := ID }, Opts) ->
     case hb_cache:read(ID, Opts) of
         {ok, Msg} ->
@@ -1661,7 +1668,16 @@ pending_offsets_page_by_cursor_test() ->
     #{ <<"id">> := NumericID } = Page(BaseArgs#{ <<"sort">> => <<"HEIGHT_ASC">> }),
     #{ <<"id">> := PendingA, <<"cursor">> := FirstCursor } = Page(BaseArgs),
     #{ <<"id">> := NumericID } = Page(BaseArgs#{ <<"after">> => FirstCursor }),
-    ok.
+    % A cursor-only page reports indexed candidates even without their nodes.
+    ?assertMatch(#{ <<"data">> := #{ <<"transactions">> := #{
+        <<"edges">> := [#{ <<"cursor">> := <<"offset=11">> }],
+        <<"pageInfo">> := #{ <<"hasNextPage">> := true }
+    }}}, dev_query_graphql:test_query(hb_http_server:start_node(Opts),
+        <<"query($ids: [ID!], $after: String) { transactions(ids: $ids,",
+            " after: $after, first: 1) { edges { cursor }",
+            " pageInfo { hasNextPage } } }">>,
+        #{ <<"ids">> => [PendingA, Missing, NumericID],
+            <<"after">> => FirstCursor }, Opts)).
 
 %% @doc Signed messages the weave never held page out last in either order,
 %% by cursor, from a node's own stores.
