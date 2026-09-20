@@ -65,8 +65,10 @@
 %%%
 %%% `id' and `tags' use the message projection in `dev_query_graphql'. Signature
 %%% and owner fields come from a signed commitment; recipient and anchor come
-%%% from commitment field mappings. `fee' (falling back to `reward') and
-%%% `quantity' default to zero, projected as winston and exact AR strings.
+%%% from commitment field mappings. L1 `fee' and `quantity' use `field-reward'
+%%% and `field-quantity' on the requested commitment, defaulting to zero.
+%%% Other messages use `fee' (falling back to `reward') and `quantity', also
+%%% defaulting to zero. Amounts project as winston and exact AR strings.
 %%% `data.size' prefers an L1 transaction's declared or indexed payload size,
 %%% then measures binary `data', falling back to `body', then an empty binary.
 %%% Structured bodies and omitted payloads have unknown size (null).
@@ -366,13 +368,16 @@ encode_anchor(Other) -> {error, <<"invalid_anchor: ", Other/binary>>}.
 
 %% @doc L1 amounts use commitment fields; other messages use their own keys.
 transaction_amount(Msg, Field, Keys, Opts) ->
-    case find_field_key(<<"commitment-device">>, Msg, Opts) of
-        {ok, <<"tx@1.0">>} ->
-            case find_field_key(Field, Msg, Opts) of
-                {ok, null} -> {ok, 0};
-                Amount -> Amount
-            end;
-        _ -> {ok, hb_maps:get_first([{Msg, Key} || Key <- Keys], 0, Opts)}
+    Selected =
+        case hb_private:get(<<"query-match/id">>, Msg, <<>>, Opts) of
+            <<>> -> Msg;
+            ID -> hb_message:with_commitments(ID, Msg, Opts)
+        end,
+    Commitments = hb_message:commitments(
+        #{ <<"commitment-device">> => <<"tx@1.0">> }, Selected, Opts),
+    case hb_maps:values(Commitments, Opts) of
+        [] -> {ok, hb_maps:get_first([{Msg, Key} || Key <- Keys], 0, Opts)};
+        [Commitment | _] -> {ok, hb_maps:get(Field, Commitment, 0, Opts)}
     end.
 
 %% @doc Find a field preserved by a message's commitment.

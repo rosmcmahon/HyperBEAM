@@ -1027,6 +1027,35 @@ transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
             #{ <<"ids">> => [ID] },
             Opts
         )
+    ),
+    % Whole-message reads retain unsigned commitments alongside the L1 one.
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    AmountOpts = Opts#{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+    AmountNode = hb_http_server:start_node(AmountOpts),
+    lists:foreach(
+        fun(Amount) ->
+            TX = ar_tx:sign(#tx{
+                format = 2, quantity = Amount, reward = Amount,
+                target = crypto:strong_rand_bytes(32),
+                tags = [{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
+                    {<<"fee">>, <<"3000">>}]
+            }, hb_maps:get(<<"priv-wallet">>, AmountOpts)),
+            Msg = hb_message:normalize_commitments(
+                hb_message:convert(TX, <<"structured@1.0">>, <<"tx@1.0">>, AmountOpts),
+                AmountOpts),
+            TXID = hb_util:encode(TX#tx.id),
+            ok = hb_store:write(Store, #{ TXID => Msg }, AmountOpts),
+            Winston = hb_util:bin(Amount),
+            ?assertMatch(#{ <<"data">> := #{ <<"transaction">> := #{
+                <<"id">> := TXID,
+                <<"quantity">> := #{ <<"winston">> := Winston },
+                <<"fee">> := #{ <<"winston">> := Winston }
+            }}}, dev_query_graphql:test_query(AmountNode,
+                <<"query($id: ID!) { transaction(id: $id) { id",
+                    " quantity { winston } fee { winston } } }">>,
+                #{ <<"id">> => TXID }, AmountOpts))
+        end,
+        [0, 5]
     ).
 
 transactions_query_cursor_by_offset_test_parallel() ->
