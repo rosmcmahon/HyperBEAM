@@ -48,10 +48,12 @@
 %%% (default 1000); it is neither an uncapped total nor a count of readable
 %%% edges. Cursor-only indexed and block-TX pages do not read transaction
 %%% messages; their cursors identify candidates regardless of readability.
-%%% Other supported queries use cache matching and ID reads; their
-%%% count is the number of candidate IDs before pagination and read failures.
-%%% Cursor-only ID pages with known positions also omit message reads; IDs
-%%% without positions must be readable before they can supply an edge.
+%%% Explicit IDs select candidates directly. With predicates, each readable
+%%% candidate is checked by `match@1.0/check', without scanning the index; count
+%%% includes only matching readable candidates. Missing positions do not prevent
+%%% predicate checks. Without predicates, count precedes message read failures;
+%%% cursor-only ID pages with known positions omit message reads. IDs without
+%%% positions must be readable before they can supply an edge.
 %%% Without an Arweave offset store, that path cannot order or filter by weave
 %%% position.
 %%%
@@ -324,14 +326,10 @@ cached_transactions(Args, Opts) ->
     case valid_after_cursor(Args, Opts) of
         true ->
             Matches = match_args(Args, Opts),
-            WithExplicit =
-                case explicit_ids(Args, Opts) of
-                    [] -> Matches;
-                    ExplicitIDs -> hb_util:list_with(Matches, ExplicitIDs)
-                end,
             Ordered =
-                case annotate_ids(WithExplicit, Opts) of
-                    unavailable -> [#{ <<"id">> => ID } || ID <- Matches];
+                case annotate_ids(Matches, Opts) of
+                    unavailable -> [#{ <<"id">> => ID,
+                        <<"cursor">> => offset_cursor(ID, undefined) } || ID <- Matches];
                     Annotated ->
                         Order = maps:get(<<"sort">>, Args, <<"HEIGHT_DESC">>),
                         sort_offset_annotated(
@@ -345,7 +343,7 @@ cached_transactions(Args, Opts) ->
                         )
                 end,
             ?event({transactions_matches, Matches}),
-            {ok, connection(Ordered, Args, Opts)};
+            {ok, connection(check_explicit_ids(Ordered, Args, Opts), Args, Opts)};
         false ->
             ?event(
                 {invalid_after_cursor,
@@ -472,6 +470,8 @@ read_ids(IDs, Count, Opts) ->
 read_id(#{ <<"offset">> := _, <<"cursor">> := Cursor },
         #{ <<"query-arweave-nodes">> := false }) ->
     [#{ <<"cursor">> => Cursor }];
+read_id(#{ <<"node">> := _ } = Edge, _Opts) ->
+    [Edge];
 read_id(AnnotatedID = #{ <<"id">> := ID }, Opts) ->
     case hb_cache:read(ID, Opts) of
         {ok, Msg} ->
@@ -1358,10 +1358,11 @@ header_message(Error, _Device, _Opts) ->
 %% @doc Progressively generate matches from each argument for a transaction
 %% query.  The `block' range is applied as a post-filter over the candidate
 %% set rather than as a set-producing index lookup.
+match_args(#{ <<"ids">> := [] }, _Opts) -> [];
 match_args(Args, Opts) when is_map(Args) ->
-    case indexed_explicit_ids(Args, Opts) of
-        {ok, IDs} -> IDs;
-        unservable ->
+    case explicit_ids(Args, Opts) of
+        [_ | _] = IDs -> IDs;
+        [] ->
             match_args(
                 maps:to_list(maps:with(?SUPPORTED_QUERY_ARGS, Args)),
                 [],
@@ -1386,48 +1387,33 @@ match_args([{Field, X} | Rest], Acc, Opts) ->
         {error, _} = Error -> throw(Error)
     end.
 
-%% @doc Prove requested IDs against bounded index reads. A missed proof retains
-%% the complete plan, as the ID may also be indexed at another position.
-indexed_explicit_ids(Args, Opts) ->
-    maybe
-        true ?= hb_opts:get(match_index, false, Opts) =/= false,
-        true ?= hb_opts:get(cache_read_mode, normal, Opts) =/= raw,
-        [_ | _] = Requested ?= explicit_ids(Args, Opts),
-        {ok, [_ | _] = Predicates} ?=
-            index_predicates(maps:without([<<"ids">>, <<"id">>], Args), Opts),
-        % Only signed commitment IDs can occur in the match index. A local
-        % read miss proves nothing; a readable message identifies its IDs.
-        LocalOpts = hb_store:scope(Opts, local),
-        IDs = [ID || ID <- Requested,
-            case hb_cache:read(ID, LocalOpts) of
-                {ok, Msg} -> hb_maps:is_key(ID, hb_message:commitments(
-                    #{ <<"committer">> => '_' }, Msg, LocalOpts), LocalOpts);
-                _ -> true
-            end],
-        Annotated = case IDs of [] -> []; _ -> annotate_ids(IDs, Opts) end,
-        true ?= is_list(Annotated),
-        true ?= lists:all(
-            fun(#{ <<"id">> := ID, <<"offset">> := Offset }) ->
-                    From = #{
-                        <<"id">> => ID,
-                        <<"offset">> => case pending_offset(Offset) of
-                            true -> infinity;
-                            false -> Offset
-                        end
-                    },
-                    hb_ao:raw(<<"match@1.0">>, #{}, #{
-                        <<"path">> => <<"all">>, <<"predicates">> => Predicates,
-                        <<"from">> => From,
-                        <<"to">> => From#{ <<"id">> := <<ID/binary, 0>> },
-                        <<"limit">> => 1
-                    }, Opts) =:= {ok, [ID]};
-               (_) -> false
+%% @doc Explicit IDs bound the work to candidate reads and predicate checks.
+%% Keep loaded messages for projection; offsets are only ordering metadata.
+check_explicit_ids(Ordered, Args, Opts) ->
+    {ok, Predicates} = index_predicates(
+        maps:with([<<"tags">>, <<"owners">>, <<"recipients">>], Args), Opts),
+    case explicit_ids(Args, Opts) =:= [] orelse Predicates =:= [] of
+        true -> Ordered;
+        false -> lists:append(hb_pmap:parallel_map(
+            Ordered,
+            fun(Annotated = #{ <<"id">> := ID }) ->
+                maybe
+                    [Edge = #{ <<"node">> := Msg }] ?=
+                        read_id(Annotated, Opts#{ <<"query-arweave-nodes">> => true }),
+                    {ok, true} ?= hb_ao:raw(
+                        <<"match@1.0">>, hb_message:with_commitments([ID], Msg, Opts),
+                        #{ <<"path">> => <<"check">>, <<"predicates">> => Predicates },
+                        Opts
+                    ),
+                    [Edge]
+                else
+                    [] -> [];
+                    {ok, false} -> [];
+                    Error -> throw(Error)
+                end
             end,
-            Annotated
-        ),
-        {ok, IDs}
-    else
-        _ -> unservable
+            hb_opts:get(arweave_chunk_fetch_concurrency, 10, Opts)
+        ))
     end.
 
 %% @doc Generate a match upon `tags' in the arguments, if given.

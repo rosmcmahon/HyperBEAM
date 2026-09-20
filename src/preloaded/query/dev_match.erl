@@ -13,6 +13,10 @@
 %%%              messages, each with an additional `member' cursor.
 %%%     all:     Match the base's pairs in stores of local scope. Return the
 %%%              distinct nonempty IDs of the resulting entries.
+%%%     check:   Test request predicates against the base message, without
+%%%              reading the index. Return a boolean. Uses the node's computed
+%%%              paths and its `match@1.0' cache-write handlers; only requested
+%%%              fields are evaluated. An empty predicate list returns true.
 %%%     <key>:   As `all', matching only the base's value at the requested key.
 %%%              Device keys and `set', `remove', `id', `verify' are reserved.
 %%% '''
@@ -24,7 +28,7 @@
 %%% `values'. Values within each predicate are ORed; predicates and the base's
 %%% pairs are ANDed. An empty values list matches nothing. Ordinary template
 %%% values, including lists, retain their literal meaning.
-%%% With no base pairs or request predicates, there are no matches.
+%%% Index lookups with no base pairs or request predicates return no matches.
 %%% With predicates but no index stores, `locate' returns `not_found'.
 %%%
 %%% Entries are ordered by offset, then ID. At an offset, groups with known
@@ -33,7 +37,7 @@
 %%% entry at the same offset. The commitment device is metadata, not an
 %%% additional equality or ordering field.
 %%%
-%%% All three matching forms accept request keys `direction' (`asc' by default
+%%% Index lookups accept request keys `direction' (`asc' by default
 %%% or `desc'), `limit' (a nonnegative integer; omitted means all), `from'
 %%% (inclusive), `after' (exclusive, taking precedence over `from'), and `to'
 %%% (exclusive). Without bounds, traversal starts at `-1' ascending or
@@ -116,7 +120,7 @@
 %%% known commitment device, for example with `/set&commitment-device=ans104@1.0'.
 -module(dev_match).
 -export([info/0, all/3, index/3, locate/3, row/3, member/3, entry/3, key/3]).
--export([entries/3, members/3]).
+-export([entries/3, members/3, check/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -322,10 +326,12 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
 %% private keys; the value each path of `match-paths' resolves to; and each
 %% element of the list each path of `match-all-paths' resolves to.
 pairs(Handler, Msg, Opts) ->
-    Single = resolved(<<"match-paths">>, #{}, Handler, Msg, Opts),
+    pairs(Handler, Msg, all, Opts).
+pairs(Handler, Msg, Names, Opts) ->
+    Single = resolved(<<"match-paths">>, #{}, Handler, Msg, Names, Opts),
     All =
         resolved(
-            <<"match-all-paths">>, ?DEFAULT_ALL_PATHS, Handler, Msg, Opts
+            <<"match-all-paths">>, ?DEFAULT_ALL_PATHS, Handler, Msg, Names, Opts
         ),
     Own =
         hb_maps:without(
@@ -333,7 +339,13 @@ pairs(Handler, Msg, Opts) ->
             hb_message:uncommitted(hb_private:reset(Msg)),
             Opts
         ),
-    hb_maps:to_list(Own, Opts) ++ Single ++
+    OwnPairs = case Names of
+        all -> hb_maps:to_list(Own, Opts);
+        _ -> template(hb_maps:with(Names ++
+            [hb_link:remove_link_specifier(Name) || Name <- Names], Own, Opts),
+            Opts#{ <<"linkify-mode">> => discard })
+    end,
+    OwnPairs ++ Single ++
         [
             {Name, Element}
         ||
@@ -347,12 +359,13 @@ pairs(Handler, Msg, Opts) ->
 %% A computed key may select its device with `KEY~DEVICE'. Without `~DEVICE',
 %% indexing attempts to load each message's device, subject to the node's
 %% trust settings.
-resolved(Key, Default, Handler, Msg, Opts) ->
+resolved(Key, Default, Handler, Msg, Names, Opts) ->
     Paths = hb_opts:get(Key, hb_maps:get(Key, Handler, Default, Opts), Opts),
     [
         {hb_ao:normalize_key(Name), Value}
     ||
         {Name, Path} <- hb_maps:to_list(Paths, Opts),
+        Names =:= all orelse lists:member(hb_ao:normalize_key(Name), Names),
         {ok, Value} <-
             [case binary:split(Path, <<"~">>) of
                 [Part, Device] -> hb_ao:raw(Device, Msg, #{ <<"path">> => Part }, Opts);
@@ -377,6 +390,27 @@ match(Key, Base, Req, Opts) ->
 %% @doc Match the base pairs and request predicates, returning their IDs.
 all(Base, Req, Opts) ->
     ids(Base, Req, Opts).
+
+%% @doc Test only the requested predicates, with the same computed pairs as
+%% indexing. The caller selects the candidate's commitments before checking.
+check(Base, Req, Opts) ->
+    Names = [hb_ao:normalize_key(hb_maps:get(<<"name">>, P, Opts))
+        || P <- hb_maps:get(<<"predicates">>, Req, [], Opts)],
+    Handlers = case [H || H <- hb_hook:find(<<"cache-write">>, Opts),
+            hb_maps:get(<<"device">>, H, undefined, Opts) =:= <<"match@1.0">>] of
+        [] -> [#{}];
+        Found -> Found
+    end,
+    Present = [group(Name, hb_message:convert(hb_cache:ensure_loaded(Value, Opts), tabm,
+        Opts#{ <<"linkify-mode">> => discard }), Opts)
+        || Handler <- Handlers,
+        {Name, Value} <- pairs(Handler, Base, Names, Opts)],
+    {ok, lists:all(
+        fun(Alternatives) ->
+            lists:any(fun(Path) -> lists:member(Path, Present) end, Alternatives)
+        end,
+        groups(#{}, Req, Opts)
+    )}.
 
 %% @doc Unique IDs matching the base pairs and request predicates, within the
 %% request bounds. Only local-scope index stores are read; entries without
@@ -1069,7 +1103,8 @@ paths_test() ->
     ),
     Named =
         Opts#{
-            <<"match-paths">> => #{ <<"computed">> => <<"test-func">> },
+            <<"match-paths">> => #{ <<"computed">> => <<"test-func">>,
+                <<"number">> => <<"c~message@1.0">> },
             <<"match-all-paths">> => #{ signer => <<"committers">> },
             <<"on">> => #{
                 <<"cache-write">> => #{
@@ -1084,13 +1119,14 @@ paths_test() ->
     Second =
         hb_message:commit(
             #{
-                <<"c">> => <<"d">>, <<"signer">> => <<"untrusted">>,
+                <<"c">> => 7, <<"signer">> => <<"untrusted">>,
                 <<"device">> => <<"test-device@1.0">>
             },
             Opts#{ <<"priv-wallet">> => Wallet }
         ),
     cache(Second, 2, Named),
     SecondIDs = ids(Second, Opts),
+    {ok, CachedSecond} = hb_cache:read(hd(SecondIDs), Named),
     ?assertMatch(
         [{2, _}], matches(#{ <<"computed">> => <<"GOOD FUNCTION">> }, #{}, Named)
     ),
@@ -1100,6 +1136,20 @@ paths_test() ->
     {ok, [CommitterID]} = hb_cache:match(#{ <<"committer">> => Address }, Named),
     ?assertEqual(
         Address, hb_util:deep_get([CommitterID, <<"committer">>], Commitments, Opts)
+    ),
+    lists:foreach(
+        fun({Name, Values, Expected}) ->
+            ?assertEqual({ok, Expected}, hb_ao:raw(
+                <<"match@1.0">>, CachedSecond,
+                #{ <<"path">> => <<"check">>, <<"predicates">> =>
+                    [#{ <<"name">> => Name, <<"values">> => Values }] }, Named
+            ))
+        end,
+        [{<<"computed">>, [<<"absent">>, <<"GOOD FUNCTION">>], true},
+         {<<"signer">>, [Address], true},
+         {<<"signer">>, [<<"untrusted">>], false},
+         {<<"number">>, [7], true},
+         {<<"c">>, [7], true}, {<<"c">>, [], false}]
     ).
 
 %% @doc A group's path hashes to the row prefix of a published index, a key

@@ -732,8 +732,6 @@ transactions_query_combined_test_parallel() ->
     {ok, WrittenMsg} = write_test_message(Opts),
     ExpectedID = hb_message:id(WrittenMsg, all, Opts),
     hb_cache:write(hb_private:set(WrittenMsg, <<"offset">>, 10, Opts), Opts),
-    ok = hb_store_arweave:write_offset(
-        ArweaveStore, ExpectedID, <<"ans104@1.0">>, 10, 0),
     ?assertMatch(
         {ok, [_]},
         hb_cache:match(#{<<"type">> => <<"Message">>}, Opts)
@@ -772,7 +770,7 @@ transactions_query_combined_test_parallel() ->
         ),
     ?event({expected_id, ExpectedID}),
     ?event({transactions_query_combined_test, Res}),
-    % A different indexed position must remain discoverable after a bounded miss.
+    % Predicates work without an offset, and when the recorded offset changes.
     ok = hb_store_arweave:write_offset(
         ArweaveStore, ExpectedID, <<"ans104@1.0">>, 20, 0),
     lists:foreach(
@@ -796,7 +794,7 @@ transactions_query_combined_test_parallel() ->
                 ]
             )
         end,
-        [{Node, ExpectedID},
+        [{Node, ExpectedID}, {Node, hb_message:id(WrittenMsg, none, Opts)},
             {hb_http_server:start_node(Opts#{
                 <<"priv-wallet">> => ar_wallet:new(), <<"match-index">> => false
             }), hb_message:id(WrittenMsg, none, Opts)}]
@@ -807,8 +805,7 @@ transactions_query_combined_test_parallel() ->
             ?assertEqual([], hb_util:deep_get(<<"data/transactions/edges">>, Empty, Opts))
         end,
         [{Filter, []} || Filter <- [<<"ids">>, <<"owners">>, <<"recipients">>]] ++
-            [{<<"ids">>, [hb_util:encode(crypto:hash(sha256, <<"missing">>))]},
-             {<<"ids">>, [hb_message:id(WrittenMsg, none, Opts)]}]
+            [{<<"ids">>, [hb_util:encode(crypto:hash(sha256, <<"missing">>))]}]
     ),
     ?assertMatch(
         #{
