@@ -1031,15 +1031,20 @@ transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
     AmountOpts = Opts#{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
     AmountNode = hb_http_server:start_node(AmountOpts),
     lists:foreach(
-        fun(Amount) ->
-            TX = ar_tx:sign(#tx{
+        fun({Codec, Amount}) ->
+            Unsigned = #tx{
                 format = 2, quantity = Amount, reward = Amount,
                 target = crypto:strong_rand_bytes(32),
                 tags = [{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
                     {<<"fee">>, <<"3000">>}]
-            }, hb_maps:get(<<"priv-wallet">>, AmountOpts)),
+            },
+            Wallet = hb_maps:get(<<"priv-wallet">>, AmountOpts),
+            TX = case Codec of
+                <<"tx@1.0">> -> ar_tx:sign(Unsigned, Wallet);
+                <<"ans104@1.0">> -> ar_bundles:sign_item(Unsigned, Wallet)
+            end,
             Msg = hb_message:normalize_commitments(
-                hb_message:convert(TX, <<"structured@1.0">>, <<"tx@1.0">>, AmountOpts),
+                hb_message:convert(TX, <<"structured@1.0">>, Codec, AmountOpts),
                 AmountOpts),
             TXID = hb_util:encode(TX#tx.id),
             ok = hb_store:write(Store, #{ TXID => Msg }, AmountOpts),
@@ -1053,7 +1058,7 @@ transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
                     " quantity { winston } fee { winston } } }">>,
                 #{ <<"id">> => TXID }, AmountOpts))
         end,
-        [0, 5]
+        [{<<"tx@1.0">>, 0}, {<<"tx@1.0">>, 5}, {<<"ans104@1.0">>, 0}]
     ).
 
 transactions_query_cursor_by_offset_test_parallel() ->

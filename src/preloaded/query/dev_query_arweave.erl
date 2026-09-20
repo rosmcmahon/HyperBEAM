@@ -69,10 +69,9 @@
 %%%
 %%% `id' and `tags' use the message projection in `dev_query_graphql'. Signature
 %%% and owner fields come from a signed commitment; recipient and anchor come
-%%% from commitment field mappings. L1 `fee' and `quantity' use `field-reward'
+%%% from commitment field mappings. `fee' and `quantity' use `field-reward'
 %%% and `field-quantity' on the requested commitment, defaulting to zero.
-%%% Other messages use `fee' (falling back to `reward') and `quantity', also
-%%% defaulting to zero. Amounts project as winston and exact AR strings.
+%%% Amounts project as winston and exact AR strings.
 %%% `data.size' prefers an L1 transaction's declared or indexed payload size,
 %%% then measures binary `data', falling back to `body', then an empty binary.
 %%% Structured bodies and omitted payloads have unknown size (null).
@@ -250,9 +249,9 @@ query(#{ <<"key">> := Key }, <<"key">>, _Args, _Opts) ->
 query(#{ <<"address">> := Address }, <<"address">>, _Args, _Opts) ->
     {ok, Address};
 query(Msg, <<"fee">>, _Args, Opts) ->
-    transaction_amount(Msg, <<"field-reward">>, [<<"fee">>, <<"reward">>], Opts);
+    transaction_amount(Msg, <<"field-reward">>, Opts);
 query(Msg, <<"quantity">>, _Args, Opts) ->
-    transaction_amount(Msg, <<"field-quantity">>, [<<"quantity">>], Opts);
+    transaction_amount(Msg, <<"field-quantity">>, Opts);
 query(Number, <<"winston">>, _Args, _Opts) ->
     {ok, hb_util:bin(Number)};
 query(Number, <<"ar">>, _Args, _Opts) ->
@@ -367,17 +366,16 @@ encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 43 -> {ok, Bin};
 encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 64 -> {ok, Bin};
 encode_anchor(Other) -> {error, <<"invalid_anchor: ", Other/binary>>}.
 
-%% @doc L1 amounts use commitment fields; other messages use their own keys.
-transaction_amount(Msg, Field, Keys, Opts) ->
+%% @doc Native amounts come only from the requested commitment's fields.
+transaction_amount(Msg, Field, Opts) ->
     Selected =
         case hb_private:get(<<"query-match/id">>, Msg, <<>>, Opts) of
             <<>> -> Msg;
             ID -> hb_message:with_commitments(ID, Msg, Opts)
         end,
-    Commitments = hb_message:commitments(
-        #{ <<"commitment-device">> => <<"tx@1.0">> }, Selected, Opts),
+    Commitments = hb_message:commitments(#{ Field => '_' }, Selected, Opts),
     case hb_maps:values(Commitments, Opts) of
-        [] -> {ok, hb_maps:get_first([{Msg, Key} || Key <- Keys], 0, Opts)};
+        [] -> {ok, 0};
         [Commitment | _] -> {ok, hb_maps:get(Field, Commitment, 0, Opts)}
     end.
 
