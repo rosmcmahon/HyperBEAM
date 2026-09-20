@@ -78,7 +78,7 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
                             {error, not_found};
                         {ok, Message} ->
                             ?event({read_found, {key, ID}}),
-                            hb_store_remote_node:maybe_cache(StoreOpts, Message, [ID]),
+                            hb_store_remote_node:maybe_cache(StoreOpts, Message),
                             extract_path_value(Message, Rest, ReadOpts)
                     catch Class:Reason:Stacktrace ->
                         ?event(
@@ -284,6 +284,40 @@ avoid_double_read_test() ->
         %% Check number of requests make to raw
         TXs = hb_mock_server:get_requests(raw, 1, ServerHandle),
         ?assert(length(TXs) == 1)
+    after
+        hb_mock_server:stop(ServerHandle)
+    end.
+
+%% @doc An item the node cannot verify is served without commitments and is
+%% not cached under its ID: the next read asks the gateway again.
+unverifiable_item_not_cached_test() ->
+    hb_http_server:start_node(#{}),
+    ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
+    % Data that the item's signature does not cover.
+    Endpoints = [{<<"/arweave/raw/", ID/binary>>, raw, {200, <<"123">>}}],
+    {ok, MockServer, ServerHandle} = hb_mock_server:start(Endpoints),
+    Local = #{
+        <<"store-module">> => hb_store_fs,
+        <<"name">> => <<"cache-TEST/unverifiable_item_not_cached_test">>
+    },
+    hb_store:reset(Local),
+    Opts = #{
+        <<"store">> =>
+            [
+                #{ <<"store-module">> => hb_store_gateway,
+                    <<"local-store">> => [Local],
+                    <<"routes">> => custom_raw_routes(MockServer)
+                }
+            ]
+    },
+    try
+        {ok, First} = hb_cache:read(ID, Opts),
+        ?assertEqual([], hb_message:signers(First, Opts)),
+        ?assertEqual(<<"123">>, hb_ao:get(<<"data">>, First, Opts)),
+        ?assertEqual({error, not_found}, hb_cache:read(ID, #{ <<"store">> => [Local] })),
+        {ok, _} = hb_cache:read(ID, Opts),
+        TXs = hb_mock_server:get_requests(raw, 2, ServerHandle),
+        ?assertEqual(2, length(TXs))
     after
         hb_mock_server:stop(ServerHandle)
     end.
