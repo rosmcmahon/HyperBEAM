@@ -587,10 +587,14 @@ step(Direction, Groups, Cursor, Exclusive, Opts) ->
         end
     end.
 
-%% @doc Each group's next key with its pages as read, in order.
-next_keys(_Direction, [], _Cursor, _Exclusive, _Opts) ->
-    {ok, []};
-next_keys(Direction, [{Group, Pages} | Rest], Cursor, Exclusive, Opts) ->
+%% @doc Align groups before reading further predicates. A group advancing
+%% past an earlier one leads the next seek; their pages remain reusable.
+next_keys(Direction, Groups, Cursor, Exclusive, Opts) ->
+    next_keys(Direction, Groups, Cursor, Exclusive, [], Opts).
+
+next_keys(_Direction, [], _Cursor, _Exclusive, Acc, _Opts) ->
+    {ok, lists:reverse(Acc)};
+next_keys(Direction, [{Group, Pages} | Rest], Cursor, Exclusive, Acc, Opts) ->
     maybe
         {ok, Key, Read} ?=
             next_key(Direction, Group, Pages, Cursor, Exclusive, Opts),
@@ -602,8 +606,14 @@ next_keys(Direction, [{Group, Pages} | Rest], Cursor, Exclusive, Opts) ->
                     {cursor(At), false};
                 _ -> {Cursor, Exclusive}
             end,
-        {ok, Others} ?= next_keys(Direction, Rest, From, Exclude, Opts),
-        {ok, [{Group, Key, Read} | Others]}
+        case Acc =/= [] andalso From =/= Cursor of
+            true ->
+                {next, From, [{Group, Read} |
+                    [{G, P} || {G, _K, P} <- lists:reverse(Acc)]] ++ Rest};
+            false ->
+                next_keys(Direction, Rest, From, Exclude,
+                    [{Group, Key, Read} | Acc], Opts)
+        end
     end.
 
 %% @doc The keys carrying an ID.
@@ -1058,6 +1068,44 @@ weave_order_test() ->
     Literal = #{ <<"literal">> => [<<"1">>, <<"2">>] },
     LiteralID = Cache(Literal, 9),
     ?assertEqual([{9, LiteralID}], matches(Literal, #{}, Opts)).
+
+%% @doc Reject a candidate before reading further predicates, retaining the
+%% advancing group's page. Predicate ordering does not change the intersection.
+alignment_test() ->
+    Opts = (test_opts())#{ <<"priv-wallet">> => ar_wallet:new() },
+    Cache = fun(Msg, Offset) ->
+        Signed = hb_message:commit(Msg, Opts),
+        cache(Signed, Offset, Opts),
+        [ID] = ids(Signed, Opts),
+        ID
+    end,
+    [_, _, Matched] = [Cache(Msg, Offset)
+        || {Offset, Msg} <- [{1, #{ <<"a">> => 1, <<"c">> => 1 }},
+            {2, #{ <<"b">> => 1, <<"c">> => 1 }},
+            {3, #{ <<"a">> => 1, <<"b">> => 1, <<"c">> => 1 }}]],
+    [A, B, C] = [#{ <<"name">> => Name, <<"values">> => [1] }
+        || Name <- [<<"a">>, <<"b">>, <<"c">>]],
+    Groups = [{Paths, [{{Path, Store}, unread}
+        || Path <- Paths, Store <- store(Opts)]}
+        || Paths <- groups(#{}, #{ <<"predicates">> => [A, B, C] }, Opts)],
+    {next, #{ <<"offset">> := 2 }, [BRead, ARead, CUnread]} =
+        next_keys(asc, Groups, cursor(-1), false, Opts),
+    ?assertEqual(lists:last(Groups), CUnread),
+    ?assertEqual(element(1, lists:nth(2, Groups)), element(1, BRead)),
+    ?assertEqual(element(1, hd(Groups)), element(1, ARead)),
+    lists:foreach(
+        fun(Predicates) ->
+            lists:foreach(
+                fun(Direction) ->
+                    ?assertEqual([{3, Matched}], matches(#{},
+                        #{ <<"predicates">> => Predicates,
+                            <<"direction">> => Direction }, Opts))
+                end,
+                [asc, desc]
+            )
+        end,
+        [[A, B, C], [A, C, B], [B, A, C], [B, C, A], [C, A, B], [C, B, A]]
+    ).
 
 %% @doc Each signed ID is indexed under its own committer, and a
 %% `match-all-paths' map in the node's options names the pair over the
