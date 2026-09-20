@@ -63,7 +63,15 @@ verify(Msg, Req, Opts) ->
     ?event({verify, {only_with_commitment, {explicit, OnlyWithCommitment}}}),
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, {explicit, TX}}}),
-    Res = ar_tx:verify(TX),
+    Res =
+        ar_tx:verify(TX) andalso
+            lib_arweave_common:verify_committed(
+                ?BASE_FIELDS,
+                TX,
+                fun dev_tx_from:fields/3,
+                OnlyWithCommitment,
+                Opts
+            ),
     {ok, Res}.
 
 %% @doc Convert a #tx record into a message map recursively.
@@ -1207,6 +1215,36 @@ format_one_roundtrip_test() ->
     ),
     ?assertEqual(Signed#tx.tags, Roundtripped#tx.tags),
     ?assert(ar_tx:verify(Roundtripped)).
+
+%% @doc Ensure that a message does not verify when the values of its committed
+%% keys differ from those of the signed TX. The TX's tags and fields are
+%% restored from its commitment, so the signature alone does not cover them.
+modified_committed_value_test() ->
+    Signed = ar_tx:sign(
+        #tx{
+            format = 2,
+            target = crypto:strong_rand_bytes(32),
+            quantity = 100,
+            reward = 1,
+            tags = [{<<"Content-Type">>, <<"application/json">>}]
+        },
+        hb:wallet()
+    ),
+    Structured = hb_message:convert(
+        Signed,
+        <<"structured@1.0">>,
+        <<"tx@1.0">>,
+        #{}
+    ),
+    ?event({structured, Structured}),
+    ?assert(hb_message:verify(Structured, all, #{})),
+    ModifiedTag =
+        Structured#{
+            <<"content-type">> => <<"application/json; charset=utf-8">>
+        },
+    ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
+    ModifiedField = Structured#{ <<"quantity">> => <<"1">> },
+    ?assertNot(hb_message:verify(ModifiedField, all, #{})).
 
 duplicate_tags_roundtrip_test() ->
     Signed = ar_tx:sign(

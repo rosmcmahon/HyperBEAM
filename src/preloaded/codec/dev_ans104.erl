@@ -104,7 +104,15 @@ verify(Msg, Req, Opts) ->
     ?event({verify, {only_with_commitment, OnlyWithCommitment}}),
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, TX}}),
-    Res = ar_bundles:verify_item(TX),
+    Res =
+        ar_bundles:verify_item(TX) andalso
+            lib_arweave_common:verify_committed(
+                ?BASE_FIELDS,
+                TX,
+                fun lib_arweave_common:fields/3,
+                OnlyWithCommitment,
+                Opts
+            ),
     {ok, Res}.
 
 %% @doc Convert a #tx record into a message map recursively.
@@ -244,6 +252,29 @@ restore_tag_name_case_from_cache_test() ->
     ?event({restored_tx, ReadTX}),
     ?assert(hb_message:match(ReadMsg, SignedMsg)),
     ?assert(ar_bundles:verify_item(ReadTX)).
+
+%% @doc Ensure that a message does not verify when the values of its committed
+%% keys differ from those of the signed item. The item's tags and fields are
+%% restored from its commitment, so the signature alone does not cover them.
+modified_committed_value_test() ->
+    TX =
+        ar_bundles:sign_item(
+            #tx {
+                target = crypto:strong_rand_bytes(32),
+                tags = [{<<"Content-Type">>, <<"application/json">>}],
+                data = <<"{}">>
+            },
+            ar_wallet:new()
+        ),
+    Msg = hb_message:convert(TX, <<"structured@1.0">>, <<"ans104@1.0">>, #{}),
+    ?event({msg, Msg}),
+    ?assert(hb_message:verify(Msg, all, #{})),
+    ModifiedTag =
+        Msg#{ <<"content-type">> => <<"application/json; charset=utf-8">> },
+    ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
+    ModifiedField =
+        Msg#{ <<"target">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
+    ?assertNot(hb_message:verify(ModifiedField, all, #{})).
 
 unsigned_duplicated_tag_name_test() ->
     TX = ar_tx:normalize(#tx {

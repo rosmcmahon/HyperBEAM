@@ -1,7 +1,7 @@
 %%% @doc Shared Arweave codec helpers.
 -module(lib_arweave_common).
 -export([from/3]).
--export([fields/3, tags/2, data/5, committed/6, base/5]).
+-export([fields/3, tags/2, data/5, committed/6, base/5, verify_committed/5]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([to/3, to/6, siginfo/4, fields_to_tx/4]).
@@ -278,6 +278,29 @@ find_key(Key, Map, Opts) ->
                 error -> error
             end
     end.
+
+%% @doc Check that a message holds the values for its committed keys that
+%% decoding the given item yields. The tags and fields of an item encoded from
+%% a commitment are restored from the commitment rather than the message, so
+%% a valid signature does not bind them to the message on its own. Keys found
+%% in the item's data are encoded from the message itself, so the signature
+%% already covers them.
+verify_committed(FieldKeys, Item, FieldsFun, TABM, Opts) ->
+    Fields = FieldsFun(Item, <<>>, Opts),
+    Tags = tags(Item, Opts),
+    DataKeys =
+        case Item#tx.data of
+            ?DEFAULT_DATA -> [];
+            Data when is_map(Data) -> maps:keys(Data);
+            _ -> [maps:get(<<"ao-data-key">>, Tags, <<"data">>)]
+        end,
+    Keys =
+        hb_util:list_without(
+            DataKeys,
+            committed(FieldKeys, Item, Fields, Tags, #{}, Opts)
+        ),
+    Expected = base(Keys, Fields, Tags, #{}, Opts),
+    Expected == maps:with(maps:keys(Expected), TABM).
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
