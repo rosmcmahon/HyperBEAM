@@ -594,6 +594,34 @@ authorized_set_node_msg_succeeds_test() ->
     ?assertEqual(<<"test2">>, hb_ao:get(<<"test-config-item">>, Res, Opts)),
     ?assertEqual(1, length(hb_ao:get(<<"node-history">>, Res, [], Opts))).
 
+%% @doc Optional signatures must still authenticate configuration writes.
+invalid_optional_signature_cannot_update_node_test() ->
+    Owner = ar_wallet:new(),
+    Opts = #{
+        <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"force-signed-requests">> => false,
+        <<"test-config-item">> => <<"original">>,
+        <<"store">> => hb_test_utils:test_store()
+    },
+    Node = hb_http_server:start_node(Opts),
+    Signed = hb_message:commit(
+        #{
+            <<"path">> => <<"/~meta@1.0/info">>,
+            <<"test-config-item">> => <<"authorized">>
+        },
+        Opts#{ <<"priv-wallet">> => Owner }
+    ),
+    Forged = Signed#{ <<"test-config-item">> => <<"forged">> },
+    ?assertNot(hb_message:verify(Forged, all, Opts)),
+    ?assertMatch({failure, #{ <<"status">> := 500 }},
+        hb_http:post(Node, Forged, Opts)),
+    {ok, Before} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertEqual(<<"original">>, hb_ao:get(<<"test-config-item">>, Before, Opts)),
+    ?assertMatch({ok, _}, hb_http:post(Node, Signed, Opts)),
+    {ok, After} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertEqual(<<"authorized">>, hb_ao:get(<<"test-config-item">>, After, Opts)).
+
 %% @doc Test that an uninitialized node will not run computation.
 uninitialized_node_test() ->
     Node = hb_http_server:start_node(#{ <<"initialized">> => false }),
