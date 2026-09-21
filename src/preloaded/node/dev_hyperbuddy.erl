@@ -118,6 +118,19 @@ format(Base, Req, Opts) ->
             SingleScope -> [SingleScope]
         end,
     ?event(debug_format, {using_scope, Scope}),
+    case lists:member(<<"node">>, Scope) andalso
+            hb_opts:get(mode, prod, Opts) =/= debug of
+        true ->
+            {error, #{
+                <<"status">> => 403,
+                <<"body">> => <<"Node formatting requires debug mode.">>
+            }};
+        false ->
+            format(Base, Req, Opts, Scope)
+    end.
+
+%% @doc Format the permitted environment components.
+format(Base, Req, Opts, Scope) ->
     CombinedMsg =
         hb_maps:with(
             Scope,
@@ -200,6 +213,32 @@ return_error(ErrorMsg, Opts) ->
     ).
 
 %%% Tests
+
+node_format_requires_debug_test() ->
+    Base = #{ <<"device">> => <<"hyperbuddy@1.0">>, <<"body">> => <<"base">> },
+    Opts = #{ <<"mode">> => prod, <<"config-marker">> => <<"node-marker">> },
+    lists:foreach(
+        fun(Scope) ->
+            ?assertMatch({error, #{ <<"status">> := 403 }}, hb_ao:resolve(
+                Base, #{ <<"path">> => <<"format">>, <<"format">> => Scope }, Opts
+            ))
+        end,
+        [<<"node">>, <<"all">>, [<<"base">>, <<"node">>]]
+    ),
+    lists:foreach(
+        fun(Scope) ->
+            ?assertMatch({ok, _}, hb_ao:resolve(
+                Base, #{ <<"path">> => <<"format">>, <<"format">> => Scope }, Opts
+            ))
+        end,
+        [<<"base">>, <<"request">>]
+    ),
+    {ok, #{ <<"body">> := Debug }} = hb_ao:resolve(
+        Base, #{ <<"path">> => <<"format">>, <<"format">> => <<"node">> },
+        Opts#{ <<"mode">> => debug, <<"priv-test">> => <<"private-marker">> }
+    ),
+    ?assertNotEqual(nomatch, binary:match(Debug, <<"node-marker">>)),
+    ?assertEqual(nomatch, binary:match(Debug, <<"private-marker">>)).
 
 return_templated_file_test() ->
     {ok, #{ <<"body">> := Body }} =

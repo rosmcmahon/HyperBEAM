@@ -510,18 +510,12 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
             <<"details">> => DetailsStr,
             <<"stacktrace">> => StacktraceStr
         },
-    ErrorBin = hb_format:error(ErrorMsg, NodeMsg),
     ?event(
         http_error,
         {returning_error,
             {method, cowboy_req:method(Req)},
             {path, {string, cowboy_req:path(Req)}},
-            {string,
-                hb_format:indent_lines(
-                    <<"\n", ErrorBin/binary, "\n">>,
-                    1
-                )
-            }
+            {error, ErrorMsg}
         },
         NodeMsg
     ),
