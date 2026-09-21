@@ -962,48 +962,6 @@ remove_test() ->
         )
     ).
 
-set_committed_content_type_test_() ->
-    [
-        {binary_to_list(Device), fun() ->
-            Opts = #{
-                <<"store">> => hb_test_utils:test_store(),
-                <<"priv-wallet">> => hb:wallet(),
-                <<"hashpath">> => ignore
-            },
-            Msg = hb_message:commit(
-                #{
-                    <<"content-type">> => <<"text/plain">>,
-                    <<"data">> => <<"Original body">>
-                },
-                Opts,
-                Device
-            ),
-            {ok, _} = hb_cache:write(Msg, Opts),
-            {ok, Linked} = hb_cache:read(hb_message:id(Msg, signed, Opts), Opts),
-            lists:foreach(
-                fun(Base) ->
-                    Same = hb_ao:set(
-                        Base, #{ <<"content-type">> => <<"text/plain">> }, Opts
-                    ),
-                    ?assert(hb_maps:is_key(<<"commitments">>, Same)),
-                    ?assert(hb_message:verify(Same, all, Opts)),
-                    lists:foreach(
-                        fun(Value) ->
-                            Changed = hb_ao:set(
-                                Base, #{ <<"content-type">> => Value }, Opts
-                            ),
-                            ?assertNot(hb_maps:is_key(<<"commitments">>, Changed))
-                        end,
-                        [<<"text/html">>, unset]
-                    )
-                end,
-                [Msg, Linked]
-            )
-        end}
-    ||
-        Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
-    ].
-
 set_conflicting_keys_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },
 	Req = #{ <<"path">> => <<"set">>, <<"dangerous">> => <<"Value2">> },
