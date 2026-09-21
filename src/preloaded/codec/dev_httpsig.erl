@@ -99,18 +99,21 @@ do_verify(Base, Req, Opts) ->
         }
     ),
     case {KeyRes, maps:get(<<"type">>, Req)} of
-        {{ok, _, Key, _KeyID}, <<"rsa-pss-sha512">>} ->
+        {{ok, publickey, Key, KeyID}, <<"rsa-pss-sha512">>} ->
             ?event(httpsig_verify, {verify, {rsa_pss_sha512, {sig_base, SigBase}}}),
             {
                 ok,
-                ar_wallet:verify(
+                maps:get(<<"committer">>, Req, undefined) =:=
+                    dev_httpsig_keyid:keyid_to_committer(publickey, KeyID)
+                andalso ar_wallet:verify(
                     {{rsa, 65537}, Key},
                     SigBase,
                     RawSignature,
                     sha512
                 )
             };
-        {{ok, _, Key, KeyID}, <<"hmac-sha256">>} ->
+        {{ok, Scheme, Key, KeyID}, <<"hmac-sha256">>}
+                when Scheme =:= constant; Scheme =:= secret ->
             % Generate the HMAC from the key and signature base.
             ActualHMac =
                 hb_util:human_id(
@@ -126,7 +129,11 @@ do_verify(Base, Req, Opts) ->
                         {matches, Signature =:= ActualHMac}
                     }
                 }),
-            {ok, Signature =:= ActualHMac};
+            {ok, Signature =:= ActualHMac andalso
+                maps:get(<<"committer">>, Req, undefined) =:=
+                    dev_httpsig_keyid:keyid_to_committer(Scheme, KeyID)};
+        {{ok, _, _, _}, _Type} ->
+            {ok, false};
         {{error, Reason}, _Type} ->
             ?event(httpsig_verify, {verify, {error, Reason}}),
             {ok, false};
@@ -618,6 +625,60 @@ signature_param(Name, Commitment) ->
 %%%
 
 %%% Integration Tests
+
+%% @doc Signer attribution must agree with the verified key material.
+committer_bound_to_key_test() ->
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Msg = #{ <<"body">> => <<"authenticated">> },
+    Victim = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
+    Signed = hb_message:commit(Msg, Opts),
+    Unsigned = hb_message:commit(Msg, Opts, #{ <<"type">> => <<"unsigned">> }),
+    lists:foreach(
+        fun(Committed) ->
+            ?assert(hb_message:verify(Committed, all, Opts)),
+            Forged = Committed#{ <<"commitments">> => maps:map(
+                fun(_, C) -> C#{ <<"committer">> => Victim } end,
+                maps:get(<<"commitments">>, Committed)
+            ) },
+            ?assertNot(hb_message:verify(Forged, all, Opts))
+        end,
+        [Signed, Unsigned]
+    ),
+    Wire = hb_message:convert(Signed, <<"httpsig@1.0">>, Opts),
+    Roundtrip = hb_message:convert(
+        Wire, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts
+    ),
+    ?assert(hb_message:verify(Roundtrip, all, Opts)).
+
+%% @doc A publicly known RSA key cannot authenticate an HMAC signer.
+public_key_hmac_is_not_authority_test() ->
+    {_, {_, Pub}} = ar_wallet:new(),
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Committed = hb_message:commit(
+        #{ <<"body">> => <<"public-key-hmac">> }, Opts,
+        #{
+            <<"type">> => <<"hmac-sha256">>,
+            <<"keyid">> => <<"publickey:", (base64:encode(Pub))/binary>>
+        }
+    ),
+    ?assertNot(hb_message:verify(Committed, all, Opts)).
+
+%% @doc RSA verification rejects weak moduli, including zero-padded keys.
+rsa_minimum_modulus_test() ->
+    lists:foreach(
+        fun(Bits) ->
+            {[_, Pub], [_, Pub, Priv | _]} = crypto:generate_key(rsa, {Bits, 65537}),
+            Opts = #{ <<"priv-wallet">> =>
+                {{{rsa, 65537}, Priv, Pub}, {{rsa, 65537}, Pub}} },
+            Signed = hb_message:commit(#{ <<"body">> => <<"rsa-size">> }, Opts),
+            ?assertEqual(Bits >= 2048, hb_message:verify(Signed, all, Opts)),
+            Data = <<"modulus-padding">>,
+            Signature = ar_wallet:sign(maps:get(<<"priv-wallet">>, Opts), Data),
+            ?assertEqual(Bits >= 2048,
+                ar_wallet:verify({{rsa, 65537}, <<0:4096, Pub/binary>>}, Data, Signature))
+        end,
+        [1536, 2048]
+    ).
 
 %% @doc Ensure that we can validate a signature on an extremely large and complex
 %% message that is sent over HTTP, signed with the codec.
