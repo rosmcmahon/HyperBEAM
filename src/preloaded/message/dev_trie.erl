@@ -14,7 +14,7 @@
 %%% `{00, 11, 01, 10}`, which is why each node in a radix-4 trie can have at-most
 %%% 4 children!)
 -module(dev_trie).
--export([info/0, keys/2, set/3, get/3, get_key/4]).
+-export([info/0, keys/2, keys/3, set/3, get/3, get_key/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -39,6 +39,8 @@ info() ->
         reserved => ?RESERVED_KEYS
      }.
 
+keys(Trie, _Req, Opts) ->
+    keys(Trie, Opts).
 keys(Trie, Opts) ->
     collect_keys(Trie, <<>>, Opts, []).
 
@@ -215,15 +217,24 @@ insert(TrieNode, Key, Val, Opts, KeyPrefixSizeAcc) ->
             end
     end.
 
-%% @doc Split reserved edge labels so they cannot overwrite node metadata.
+%% @doc Split edge labels before metadata or private prefixes.
 add_edge(TrieNode, Label, Value) ->
-    case lists:member(Label, ?RESERVED_KEYS) of
+    case edge_prefix_size(Label, 8) of
+        Size when Size =:= bit_size(Label) ->
+            TrieNode#{Label => Value};
+        Size ->
+            <<Prefix:Size/bitstring, Suffix/bitstring>> = Label,
+            TrieNode#{Prefix => #{Suffix => Value}}
+    end.
+
+%% @doc Find the longest prefix that can be stored as a public trie edge.
+edge_prefix_size(Label, N) ->
+    case hb_private:is_private(Label) orelse lists:member(Label, ?RESERVED_KEYS) of
         true ->
-            PrefixSize = byte_size(Label) - 1,
-            <<Prefix:PrefixSize/binary, Suffix/binary>> = Label,
-            TrieNode#{Prefix => #{Suffix => Value}};
-        false ->
-            TrieNode#{Label => Value}
+            Size = bit_size(Label) - N,
+            <<Prefix:Size/bitstring, _/bitstring>> = Label,
+            edge_prefix_size(Prefix, N);
+        false -> bit_size(Label)
     end.
 
 retrieve(TrieNode, Key, Opts) ->
@@ -300,12 +311,8 @@ longest_prefix_match(Best, _Key, [], _N) -> Best;
 longest_prefix_match({BestLabel, BestSize}, Key, [EdgeLabel | EdgeLabels], N) ->
     Size = bitwise_lcp(Key, EdgeLabel, N),
     <<Prefix:Size/bitstring, _/bitstring>> = EdgeLabel,
-    % Split before a metadata key, keeping a shared edge for its descendants.
-    MatchSize =
-        case lists:member(Prefix, ?RESERVED_KEYS) of
-            true -> Size - N;
-            false -> Size
-        end,
+    % Keep shared edges outside the metadata and private namespaces.
+    MatchSize = edge_prefix_size(Prefix, N),
     case MatchSize > BestSize of
         true ->
             longest_prefix_match({EdgeLabel, MatchSize}, Key, EdgeLabels, N);
@@ -517,6 +524,60 @@ device_prefix_test() ->
         end,
         [KeyVals, lists:reverse(KeyVals)]
     ).
+
+reserved_edge_labels_test_() ->
+    [
+        {timeout, 60, fun() ->
+            Opts = test_opts(),
+            Entries = lists:zip(Keys, lists:seq(1, length(Keys))),
+            lists:foldl(
+                fun({Key, Value}, {Trie, Expected}) ->
+                    New = hb_ao:set(Trie, #{Key => Value}, Opts),
+                    NextExpected = Expected#{Key => Value},
+                    {ok, ID} = hb_cache:write(New, Opts),
+                    {ok, Loaded} = hb_cache:read(ID, Opts),
+                    lists:foreach(
+                        fun(Check) ->
+                            ?assertEqual(
+                                lists:sort(maps:keys(NextExpected)),
+                                lists:sort(hb_ao:keys(Check, Opts))
+                            ),
+                            maps:foreach(
+                                fun(K, V) ->
+                                    ?assertEqual(V, hb_ao:get(K, Check, Opts))
+                                end,
+                                NextExpected
+                            ),
+                            ?assert(verify_nodes(Check, Opts)),
+                            ?assertEqual(
+                                <<"trie@1.0">>,
+                                hb_maps:get(<<"device">>, Check, Opts)
+                            )
+                        end,
+                        [New, Loaded]
+                    ),
+                    {Loaded, NextExpected}
+                end,
+                {#{<<"device">> => <<"trie@1.0">>}, #{}},
+                Entries ++ [{K, V + 100} || {K, V} <- Entries]
+            )
+        end}
+    ||
+        Label <- ?RESERVED_KEYS ++ [<<"privAAAA">>, <<"Priv">>],
+        Prefix <- [<<"AA">>, <<"AAbb">>],
+        Order <- [[1, 2, 3], [1, 3, 2], [2, 1, 3],
+            [2, 3, 1], [3, 1, 2], [3, 2, 1]],
+        BaseKeys <- [[
+            <<Prefix/binary, "other">>,
+            <<Prefix/binary, Label/binary, "AA">>,
+            <<Prefix/binary, Label/binary, "BB">>
+        ]],
+        Keys <- [[lists:nth(N, BaseKeys) || N <- Order] ++ [
+            <<Prefix/binary, Label/binary>>,
+            <<Prefix/binary, "pri">>,
+            Prefix
+        ]]
+    ].
 
 basic_key_collection_test() ->
     Opts = test_opts(),
