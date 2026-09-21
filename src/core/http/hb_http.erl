@@ -1379,6 +1379,29 @@ relayed_signed_request_test() ->
         hb_message:signers(Request, ClientOpts),
         hb_message:signers(Loaded, StoreOpts)
     ).
+%% @doc Routing must retain signed fields even when the HTTP destination differs.
+signed_routing_fields_test() ->
+    Opts = test_opts(),
+    Node = hb_http_server:start_node(),
+    Signed = hb_message:commit(#{
+        <<"path">> => <<"/value">>,
+        <<"host">> => <<"application.example">>,
+        <<"method">> => <<"POST">>,
+        <<"value">> => <<"preserved">>
+    }, Opts),
+    Route = #{ <<"uri">> => <<Node/binary, "/value">>, <<"opts">> => #{} },
+    lists:foreach(
+        fun(Routing) ->
+            {ok, _, _, _, Prepared, _} =
+                route_to_request(Signed, {ok, Routing}, Opts),
+            ?assert(hb_message:verify(Prepared, all, Opts)),
+            ?assertEqual(<<"/value">>, maps:get(<<"path">>, Prepared)),
+            ?assertEqual(<<"application.example">>, maps:get(<<"host">>, Prepared))
+        end,
+        [Route, #{ <<"nodes">> => [Route] }]
+    ),
+    ?assertEqual({ok, <<"preserved">>},
+        request(<<"POST">>, Route, <<"/ignored">>, Signed, Opts)).
 
 paranoid_http_result_test() ->
     % The `http_result' topic verifies each response at the reply boundary (in
