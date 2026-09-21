@@ -761,7 +761,9 @@ encode_http_flat_msg(Httpsig, Opts) ->
     HeaderList =
         lists:foldl(
             fun ({HeaderName, RawHeaderVal}, Acc) ->
-                HVal = hb_cache:ensure_loaded(RawHeaderVal, Opts),
+                HVal = hb_escape:encode_header(
+                    hb_cache:ensure_loaded(RawHeaderVal, Opts)
+                ),
                 ?event_debug({encoding_http_header, {header, HeaderName}, {value, HVal}}),
                 [<<HeaderName/binary, ": ", HVal/binary>> | Acc]
             end,
@@ -806,6 +808,26 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
             OldBody = hb_maps:get(<<"body">>, Httpsig, #{}, Opts),
             Httpsig#{ <<"body">> => OldBody#{ NormalizedName => Value } }
     end.
+
+%% @doc Multipart headers preserve literal backslashes and line breaks.
+multipart_header_bytes_roundtrip_test() ->
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Value = <<"before\r\ninjected: value\n\\n\\r\\after", 0, 255>>,
+    Signed = hb_message:commit(#{
+        <<"nested">> => #{ <<"value">> => Value, <<"body">> => Value }
+    }, Opts),
+    Wire = hb_message:convert(Signed,
+        #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true }, Opts),
+    Decoded = hb_message:convert(Wire,
+        <<"structured@1.0">>, <<"httpsig@1.0">>, Opts),
+    ?assertEqual(Value, hb_ao:get(<<"nested/value">>, Decoded, Opts)),
+    ?assertEqual(Value, hb_ao:get(<<"nested/body">>, Decoded, Opts)),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    Node = hb_http_server:start_node(#{
+        <<"priv-wallet">> => ar_wallet:new(), <<"store">> => hb_test_utils:test_store()
+    }),
+    ?assertEqual({ok, Value}, hb_http:post(Node,
+        <<"/nested/value">>, Signed, Opts)).
 
 group_maps_test() ->
    Map = #{
