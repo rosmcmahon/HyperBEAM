@@ -786,7 +786,13 @@ set(Base, NewValuesMsg, Opts) ->
             % If not, we must remove the commitments.
             ChangedBaseKeys = hb_maps:with(OverwrittenCommittedKeys, Base, Opts),
             ChangedMergedKeys = hb_maps:with(OverwrittenCommittedKeys, Merged, Opts),
-            Matches = hb_message:match(ChangedMergedKeys, ChangedBaseKeys, strict, Opts),
+            Matches =
+                try
+                    ChangedMergedKeys =:= ChangedBaseKeys orelse
+                        hb_cache:ensure_all_loaded(ChangedMergedKeys, Opts) =:=
+                            hb_cache:ensure_all_loaded(ChangedBaseKeys, Opts)
+                catch _:_ -> false
+                end,
             case Matches of
                 true ->
                     ?event_debug(message_set, {set_keys_matched, {merged, Merged}}),
@@ -1045,6 +1051,64 @@ remove_test() ->
             #{ <<"hashpath">> => ignore }
         )
     ).
+
+set_committed_values_test_() ->
+    [
+        {binary_to_list(Device), fun() ->
+            Opts = #{
+                <<"store">> => hb_test_utils:test_store(),
+                <<"priv-wallet">> => hb:wallet(),
+                <<"hashpath">> => ignore
+            },
+            Msg = hb_message:commit(
+                #{
+                    <<"content-type">> => <<"text/plain">>,
+                    <<"data">> => <<"Original body">>
+                },
+                Opts,
+                Device
+            ),
+            ?assert(hb_message:verify(Msg, all, Opts)),
+            Missing = Msg#{
+                <<"data">> => {link, hb_util:human_id(crypto:strong_rand_bytes(32)), #{}}
+            },
+            {ok, Replaced} = hb_ao:resolve(
+                Missing,
+                #{
+                    <<"path">> => <<"set">>,
+                    <<"data">> => <<"Changed body">>,
+                    <<"set-mode">> => <<"explicit">>
+                },
+                Opts
+            ),
+            ?assertNot(hb_maps:is_key(<<"commitments">>, Replaced)),
+            {ok, _} = hb_cache:write(Msg, Opts),
+            {ok, Linked} = hb_cache:read(hb_message:id(Msg, signed, Opts), Opts),
+            lists:foreach(
+                fun(Base) ->
+                    lists:foreach(
+                        fun({Key, Value}) ->
+                            Same = hb_ao:set(Base, #{ Key => Value }, Opts),
+                            ?assert(hb_maps:is_key(<<"commitments">>, Same)),
+                            ?assert(hb_message:verify(Same, all, Opts)),
+                            lists:foreach(
+                                fun(NewValue) ->
+                                    Changed = hb_ao:set(Base, #{ Key => NewValue }, Opts),
+                                    ?assertNot(hb_maps:is_key(<<"commitments">>, Changed))
+                                end,
+                                [<<"changed">>, '_', unset]
+                            )
+                        end,
+                        [{<<"content-type">>, <<"text/plain">>},
+                         {<<"data">>, <<"Original body">>}]
+                    )
+                end,
+                [Msg, Linked]
+            )
+        end}
+    ||
+        Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
+    ].
 
 set_conflicting_keys_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },
