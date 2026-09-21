@@ -38,11 +38,11 @@ is_operator(Request, NodeMsg) ->
             NodeMsg
         ),
     EncOperator =
-        case Operator of
-            unclaimed -> unclaimed;
+        case hb_util:bin(Operator) of
+            <<"unclaimed">> -> unclaimed;
             NativeAddress -> hb_util:human_id(NativeAddress)
         end,
-    EncOperator == unclaimed orelse lists:member(EncOperator, RequestSigners).
+    EncOperator =/= unclaimed andalso lists:member(EncOperator, RequestSigners).
 
 %% @doc Return whether the request in the body is signed by the node operator.
 is_operator(_Base, Req, NodeMsg) ->
@@ -475,7 +475,7 @@ is(admin, Request, NodeMsg) ->
             {request_signers, RequestSigners}
         }
     }),
-    EncOperator == unclaimed orelse lists:member(EncOperator, RequestSigners);
+    EncOperator =/= unclaimed andalso lists:member(EncOperator, RequestSigners);
 is(operator, Req, NodeMsg) ->
     % Is the caller explicitly set to be the operator?
     % Get the operator from the node message
@@ -607,7 +607,7 @@ permanent_node_message_test() ->
     Owner = ar_wallet:new(),
     Node = hb_http_server:start_node(
         Opts =#{
-            <<"operator">> => <<"unclaimed">>,
+            <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
             <<"initialized">> => false,
             <<"test-config-item">> => <<"test">>,
 			<<"store">> => StoreOpts
@@ -648,51 +648,29 @@ permanent_node_message_test() ->
     ?assertEqual(<<"test2">>, hb_ao:get(<<"test-config-item">>, Res2, Opts)),
     ?assertEqual(1, length(hb_ao:get(<<"node-history">>, Res2, [], Opts))).
 
-%% @doc Test that we can claim the node correctly and set the node message after.
-claim_node_test() ->
-	StoreOpts = hb_test_utils:test_store(),
+%% @doc An unclaimed node cannot be remotely claimed or reconfigured.
+unclaimed_node_rejects_mutation_test() ->
     Owner = ar_wallet:new(),
-    Address = ar_wallet:to_address(Owner),
     Node = hb_http_server:start_node(
         Opts = #{
             <<"operator">> => unclaimed,
             <<"test-config-item">> => <<"test">>,
-			<<"store">> => StoreOpts
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"store">> => hb_test_utils:test_store()
         }
     ),
-    {ok, SetRes} =
-        hb_http:post(
-            Node,
-            hb_message:commit(
-                #{
-                    <<"path">> => <<"/~meta@1.0/info">>,
-                    <<"operator">> => hb_util:human_id(Address)
-                },
-                Opts#{ <<"priv-wallet">> => Owner}
-            ),
-            Opts
-        ),
-    ?event({res, SetRes}),
+    Req = #{
+        <<"path">> => <<"/~meta@1.0/info">>,
+        <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
+        <<"test-config-item">> => <<"changed">>
+    },
+    lists:foreach(
+        fun(Request) -> ?assertMatch({error, _}, hb_http:post(Node, Request, Opts)) end,
+        [Req, hb_message:commit(Req, #{ <<"priv-wallet">> => Owner })]
+    ),
     {ok, Res} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
-    ?event({res, Res}),
-    ?assertEqual(hb_util:human_id(Address), hb_ao:get(<<"operator">>, Res, Opts)),
-    {ok, SetRes2} =
-        hb_http:post(
-            Node,
-            hb_message:commit(
-                #{
-                    <<"path">> => <<"/~meta@1.0/info">>,
-                    <<"test-config-item">> => <<"test2">>
-                },
-                Opts#{ <<"priv-wallet">> => Owner }
-            ),
-            Opts
-        ),
-    ?event({res, SetRes2}),
-    {ok, Res2} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
-    ?event({res, Res2}),
-    ?assertEqual(<<"test2">>, hb_ao:get(<<"test-config-item">>, Res2, Opts)),
-    ?assertEqual(2, length(hb_ao:get(<<"node-history">>, Res2, [], Opts))).
+    ?assertEqual(<<"test">>, hb_ao:get(<<"test-config-item">>, Res, Opts)),
+    ?assertEqual(0, length(hb_ao:get(<<"node-history">>, Res, [], Opts))).
 
 %% Test that we can use a hook upon a request.
 request_response_hooks_test() ->
