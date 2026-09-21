@@ -779,6 +779,16 @@ subresolve(RawBase, DevID, ReqPath, Opts) when is_binary(ReqPath) ->
 subresolve(RawBase, DevID, Req, Opts) ->
     % First, ensure that the message is loaded from the cache.
     Base = ensure_message_loaded(RawBase, Opts),
+    subresolve_loaded(Base, DevID, Req, Opts).
+
+%% @doc Device selection requires a message with fields, not a scalar.
+subresolve_loaded(Base, DevID, _Req, _Opts)
+        when DevID =/= undefined, not is_map(Base), not is_list(Base) ->
+    {error, #{
+        <<"status">> => 400,
+        <<"body">> => <<"Cannot select a device on a scalar value.">>
+    }};
+subresolve_loaded(Base, DevID, Req, Opts) ->
     ?event(subresolution,
         {subresolving, {base, Base}, {dev, DevID}, {req, Req}}
     ),

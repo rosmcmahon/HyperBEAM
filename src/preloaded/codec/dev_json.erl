@@ -214,6 +214,39 @@ serialize(Base, Msg, Opts) ->
 
 %%% Tests
 
+%% @doc JSON reads preserve scalar values; unsupported chaining is a 400.
+scalar_http_read_test() ->
+    Node = hb_http_server:start_node(#{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"test-integer">> => 42,
+        <<"test-name">> => <<"ASSET">>,
+        <<"test-large">> => 9007199254740993
+    }),
+    lists:foreach(
+        fun({Key, Expected}) ->
+            Req = #{
+                peer => Node,
+                path => <<"/~meta@1.0/info/", Key/binary>>,
+                method => <<"GET">>,
+                headers => #{ <<"accept">> => <<"application/json">> },
+                body => <<>>
+            },
+            {ok, 200, _, JSON} = hb_http_client:request(Req, #{}),
+            ?assertEqual(Expected, maps:get(<<"body">>, json:decode(JSON))),
+            lists:foreach(
+                fun(Suffix) ->
+                    ?assertMatch({ok, 400, _, _}, hb_http_client:request(
+                        Req#{ path => <<"/~meta@1.0/info/", Key/binary,
+                            Suffix/binary>> }, #{}
+                    ))
+                end,
+                [<<"/~json@1.0/serialize">>, <<"/serialize~json@1.0">>]
+            )
+        end,
+        [{<<"test-integer">>, 42}, {<<"test-name">>, <<"ASSET">>},
+            {<<"test-large">>, <<"9007199254740993">>}]
+    ).
+
 large_integer_roundtrip_test() ->
     Big = ?MAX_SAFE_INTEGER + 2,
     Opts = #{
