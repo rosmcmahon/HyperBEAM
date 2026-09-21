@@ -80,10 +80,12 @@ request(Method, #{ <<"opts">> := ReqOpts, <<"uri">> := URI }, _Path, Message, Op
         ),
     % We also recalculate the request. The order of precidence here is subtle:
     % We favor the args given to the function, but the URI rules take precidence
-    % over that.
+    % over that. The URI is the route itself, so the message is not routed
+    % again: its own `path' stays as it is, in case it is a committed key.
     {ok, NewMethod, Node, NewPath, NewMsg, NewOpts} =
-        message_to_request(
-            Message#{ <<"path">> => URI, <<"method">> => Method },
+        route_to_request(
+            Message#{ <<"method">> => Method },
+            {ok, URI},
             MergedOpts
         ),
     request(NewMethod, Node, NewPath, NewMsg, NewOpts);
@@ -366,8 +368,10 @@ route_to_request(M, {ok, #{ <<"uri">> := XPath, <<"opts">> := ReqOpts}}, Opts) -
     Method = hb_ao:get(<<"method">>, M, <<"GET">>, Opts),
     % We must remove the path and host from the message, because they are not
     % valid for outbound requests. The path is retrieved from the route, and
-    % the host should already be known to the caller.
-    MsgWithoutMeta = hb_maps:without([<<"path">>, <<"host">>], M, Opts),
+    % the host should already be known to the caller. A committed path or host
+    % stays in the message: the peer verifies the request as it was signed.
+    MsgWithoutMeta =
+        hb_message:without_unless_signed([<<"path">>, <<"host">>], M, Opts),
     Port =
         case maps:get(port, URI, undefined) of
             undefined ->
@@ -397,8 +401,10 @@ route_to_request(M, {ok, Routes}, Opts) ->
     Method = hb_ao:get(<<"method">>, M, <<"GET">>, Opts),
     % We must remove the path and host from the message, because they are not
     % valid for outbound requests. The path is retrieved from the route, and
-    % the host should already be known to the caller.
-    MsgWithoutMeta = hb_maps:without([<<"path">>, <<"host">>], M, Opts),
+    % the host should already be known to the caller. A committed path or host
+    % stays in the message: the peer verifies the request as it was signed.
+    MsgWithoutMeta =
+        hb_message:without_unless_signed([<<"path">>, <<"host">>], M, Opts),
     {ok, Method, Routes, Path, MsgWithoutMeta, Opts};
 route_to_request(M, {error, Reason}, _Opts) ->
     {error, {no_viable_route, {reason, Reason}, {message, M}}}.
@@ -1316,6 +1322,63 @@ forged_commitment_rejected_test() ->
     ?assertMatch({ok, _}, post(Node, Genuine, Opts)),
     {ok, Changed} = get(Node, <<"/~meta@1.0/info">>, Opts),
     ?assertEqual(7, hb_ao:get(<<"short-trace-len">>, Changed, Opts)).
+%% @doc A request signed by the client and relayed through a router node
+%% reaches the peer with its commitment intact. The peer stores every signed
+%% request it receives, so the stored copy must read back and verify with its
+%% committed `path' in place.
+relayed_signed_request_test() ->
+    Peer =
+        hb_http_server:start_node(
+            (isolated_test_opts())#{ <<"store-all-signed">> => true }
+        ),
+    Router =
+        hb_http_server:start_node(
+            (isolated_test_opts())#{
+                <<"routes">> => [
+                    #{
+                        <<"template">> => <<"/key1">>,
+                        <<"nodes">> => [#{ <<"prefix">> => Peer }]
+                    }
+                ],
+                <<"on">> => #{
+                    <<"request">> => #{ <<"device">> => <<"relay@1.0">> }
+                }
+            }
+        ),
+    ClientOpts = isolated_test_opts(),
+    Request =
+        hb_message:commit(
+            #{ <<"path">> => <<"/key1">>, <<"key1">> => <<"Value1">> },
+            ClientOpts
+        ),
+    ?assertEqual({ok, <<"Value1">>}, post(Router, Request, ClientOpts)),
+    % Read the request back from the store that the peer writes signed
+    % requests to, by the ID of the client's signature.
+    {ok, SignedID, _} =
+        hb_message:commitment(
+            #{ <<"type">> => <<"rsa-pss-sha512">> },
+            Request,
+            ClientOpts
+        ),
+    StoreOpts =
+        #{
+            <<"store">> =>
+                #{
+                    <<"store-module">> => hb_store_fs,
+                    <<"name">> => <<"cache-http">>
+                }
+        },
+    {ok, Stored} = hb_cache:read(SignedID, StoreOpts),
+    Loaded = hb_cache:ensure_all_loaded(Stored, StoreOpts),
+    ?assertEqual(
+        <<"/key1">>,
+        hb_maps:get(<<"path">>, Loaded, not_found, StoreOpts)
+    ),
+    ?assert(hb_message:verify(Loaded, all, StoreOpts)),
+    ?assertEqual(
+        hb_message:signers(Request, ClientOpts),
+        hb_message:signers(Loaded, StoreOpts)
+    ).
 
 paranoid_http_result_test() ->
     % The `http_result' topic verifies each response at the reply boundary (in
@@ -1402,20 +1465,20 @@ run_wasm_unsigned_test() ->
 
 run_wasm_signed_test() ->
     Opts = test_opts(),
-    URL = hb_http_server:start_node(),
+    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
     Msg = wasm_compute_request(<<"test/test-64.wasm">>, <<"fac">>, [3.0], <<"">>, Opts),
     {ok, Res} = post(URL, hb_message:commit(Msg, Opts), Opts),
     ?assertEqual(6.0, hb_ao:get(<<"output/1">>, Res, Opts)).
 
 get_deep_unsigned_wasm_state_test() ->
-    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
+    URL = hb_http_server:start_node(#{ <<"force-signed">> => false }),
     LocalOpts = test_opts(),
     Msg = wasm_compute_request(<<"test/test-64.wasm">>, <<"fac">>, [3.0], <<"">>, LocalOpts),
     {ok, Res} = post(URL, Msg, LocalOpts),
     ?assertEqual(6.0, hb_ao:get(<<"/output/1">>, Res, LocalOpts)).
 
 get_deep_signed_wasm_state_test() ->
-    URL = hb_http_server:start_node(#{ <<"force-signed">> => false }),
+    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
     LocalOpts = test_opts(),
     Msg =
         wasm_compute_request(
@@ -1429,7 +1492,7 @@ get_deep_signed_wasm_state_test() ->
     ?assertEqual(6.0, hb_ao:get(<<"1">>, Res, LocalOpts)).
 
 cors_get_test() ->
-    URL = hb_http_server:start_node(#{ <<"force-signed">> => true }),
+    URL = hb_http_server:start_node(),
     LocalOpts = test_opts(),
     {ok, Res} = get(URL, <<"/~meta@1.0/info">>, LocalOpts),
     ?assertEqual(
@@ -1441,6 +1504,7 @@ ans104_wasm_test() ->
     ServerStore = [hb_test_utils:test_store()],
     ServerOpts =
         #{
+            <<"force-signed">> => true,
             <<"store">> => ServerStore,
             <<"priv-wallet">> => ar_wallet:new()
         },
@@ -1507,7 +1571,6 @@ nested_signed_bundle_over_http_test() ->
             ClientOpts,
             #{
                 <<"commitment-device">> => <<"httpsig@1.0">>,
-            <<"force-signed">> => true,
                 <<"bundle">> => true
             }
         ),
