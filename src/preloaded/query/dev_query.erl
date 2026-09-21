@@ -43,9 +43,18 @@ info(_Opts) ->
         default => fun default/4
     }.
 
-%% @doc Execute the query via GraphQL.
-graphql(Req, Base, Opts) ->
-    dev_query_graphql:handle(Req, Base, Opts).
+%% @doc Serve the node's query UI for GET, or execute a GraphQL query.
+graphql(_Base, #{ <<"method">> := <<"GET">> }, Opts) ->
+    hb_cache:read(
+        hb_opts:get(
+            query_ui,
+            <<"llR5T7zrMLPSXmhlDNN0b2-PCJmkPhWMz5cveMsWUcg">>,
+            Opts
+        ),
+        Opts
+    );
+graphql(Base, Req, Opts) ->
+    dev_query_graphql:handle(Base, Req, Opts).
 
 %% @doc Return whether a GraphQL esponse in a message has transaction results.
 %% This key is used in HB's gateway client multirequest configuration to
@@ -211,6 +220,28 @@ query_match_key(Path, Opts) ->
     end.
 
 %%% Tests
+
+%% @doc GET serves the operator's UI, regardless of request-level overrides.
+graphql_ui_test() ->
+    Store = hb_test_utils:test_store(),
+    Opts = #{ <<"store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    UI = #{ <<"content-type">> => <<"text/html">>, <<"body">> => <<"Query UI">> },
+    {ok, ID} = hb_cache:write(UI, Opts),
+    NodeOpts = Opts#{ <<"query-ui">> => ID },
+    {ok, Resolved} = hb_ao:resolve(
+        #{ <<"device">> => <<"query@1.0">> },
+        #{
+            <<"path">> => <<"graphql">>,
+            <<"method">> => <<"GET">>,
+            <<"query-ui">> => <<"not-the-operator-ui">>
+        },
+        NodeOpts
+    ),
+    ?assertEqual(<<"Query UI">>, hb_maps:get(<<"body">>, Resolved, NodeOpts)),
+    Node = hb_http_server:start_node(NodeOpts),
+    {ok, Response} = hb_http:get(Node, <<"/~query@1.0/graphql">>, NodeOpts),
+    ?assertEqual(<<"text/html">>, hb_maps:get(<<"content-type">>, Response, NodeOpts)),
+    ?assertEqual(<<"Query UI">>, hb_maps:get(<<"body">>, Response, NodeOpts)).
 
 %% @doc Return test options with a test store.
 test_setup() ->
