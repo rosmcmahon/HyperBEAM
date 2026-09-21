@@ -315,7 +315,7 @@ do_normalize_commitments(Msg, Opts, verify) ->
     {MaybeUnsignedID, MaybeCommittedSpec} =
         case UnsignedCommitment of
             {ok, ID, #{ <<"committed">> := Committed }} ->
-                {ID, #{ <<"committed">> => Committed }};
+                {ID, committed_spec(Committed, Msg, Opts)};
             _ -> {undefined, #{}}
         end,
     {ok, #{ <<"commitments">> := NormCommitments }} =
@@ -374,6 +374,22 @@ do_normalize_commitments(Msg, Opts, fast) when is_map(Msg) ->
             MsgWithHash = attach_phash2(Msg, ExpectedHash, Opts),
             do_normalize_commitments(MsgWithHash, Opts, verify)
     end.
+
+%% @doc The spec to regenerate the unsigned commitment of a message with. A
+%% commitment that lists a key the message lacks is not a commitment over the
+%% message: the unsigned commitment is regenerated over the keys the message
+%% carries, so its ID differs and every commitment is dropped.
+committed_spec(Committed, Msg, Opts) ->
+    Keys = hb_util:message_to_ordered_list(Committed, Opts),
+    case lists:all(fun(Key) -> is_key_present(Key, Msg) end, Keys) of
+        true -> #{ <<"committed">> => Committed };
+        false -> #{}
+    end.
+
+%% @doc Whether a message carries a key, directly or as a link.
+is_key_present(Key, Msg) ->
+    Base = hb_link:remove_link_specifier(Key),
+    maps:is_key(Base, Msg) orelse maps:is_key(<<Base/binary, "+link">>, Msg).
 
 %% @doc Annotate a message with its phash2 value in the `priv' sub-map,
 %% calculating it if necessary.

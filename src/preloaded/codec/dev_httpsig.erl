@@ -93,9 +93,19 @@ serialize(Msg, _Req, Opts) ->
     #{ _ => _ }
 ) -> {ok, boolean()} | {failure, _}.
 verify(Base, Req, RawOpts) ->
-    % A rsa-pss-sha512 commitment is verified by regenerating the signature
-    % base and validating against the signature.
     Opts = opts(RawOpts),
+    % A commitment over a key that the base lacks does not verify.
+    case missing_keys(Base, Req, Opts) of
+        [] -> do_verify(Base, Req, Opts);
+        Missing ->
+            ?event(httpsig_verify, {verify, {committed_key_missing, Missing}}),
+            {ok, false}
+    end.
+
+%% @doc Verify a commitment whose committed keys the base carries. A
+%% rsa-pss-sha512 commitment is verified by regenerating the signature base
+%% and validating against the signature.
+do_verify(Base, Req, Opts) ->
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
     SigBase = signature_base(EncMsg, EncComm, Opts),
     KeyRes = dev_httpsig_keyid:req_to_key_material(Req, Opts),
@@ -392,28 +402,24 @@ add_content_digest(Msg, _Opts) ->
 ) -> {ok, #{ _ => _ }, #{ committed := [_], _ => _ }, [_]}.
 normalize_for_encoding(Msg, Commitment, Opts) ->
     % Extract the requested keys to include in the signature base.
-    RawInputs =
-        hb_util:message_to_ordered_list(
-            maps:get(<<"committed">>, Commitment, []),
-            Opts
-        ),
-    % Normalize the keys to their maybe-linked form, adding `+link` if necessary.
-    Inputs =
-        lists:map(
-            fun(Key) ->
-                NormalizedKey = hb_ao:normalize_key(Key),
-                case maps:is_key(NormalizedKey, Msg) of
-                    true -> NormalizedKey;
-                    false ->
-                        case maps:is_key(<<NormalizedKey/binary, "+link">>, Msg) of
-                            true -> <<NormalizedKey/binary, "+link">>;
-                            false -> NormalizedKey
-                        end
-                end
-            end,
-            RawInputs
-        ),
+    RawInputs = committed_keys(Commitment, Opts),
+    Inputs = input_keys(Msg, RawInputs),
     ?event_debug({inputs, {list, Inputs}}),
+    % A commitment is over every key it lists. A committed key that the
+    % message lacks cannot be left out of the signature base silently: the
+    % commitment would then be encoded over a message that its signature does
+    % not verify.
+    case missing_keys(Msg, Commitment, Opts) of
+        [] -> ok;
+        Missing ->
+            throw(
+                {committed_key_missing,
+                    {keys, Missing},
+                    {commitment, Commitment},
+                    {msg, Msg}
+                }
+            )
+    end,
     % Filter the message down to only the requested keys, then encode it.
     MsgWithOnlyInputs =
         maps:with(
@@ -482,6 +488,40 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
         Commitment#{ <<"committed">> => KeysForEncoding },
         KeysForCommitment
     }.
+
+%% @doc The keys a commitment lists as committed, in order.
+committed_keys(Commitment, Opts) ->
+    hb_util:message_to_ordered_list(
+        maps:get(<<"committed">>, Commitment, []),
+        Opts
+    ).
+
+%% @doc The keys a commitment lists, in the form the message carries them: a
+%% key held as a link carries its `+link' specifier.
+input_keys(Msg, RawInputs) ->
+    lists:map(
+        fun(Key) ->
+            NormalizedKey = hb_ao:normalize_key(Key),
+            case maps:is_key(NormalizedKey, Msg) of
+                true -> NormalizedKey;
+                false ->
+                    case maps:is_key(<<NormalizedKey/binary, "+link">>, Msg) of
+                        true -> <<NormalizedKey/binary, "+link">>;
+                        false -> NormalizedKey
+                    end
+            end
+        end,
+        RawInputs
+    ).
+
+%% @doc The keys a commitment lists that the message does not carry.
+missing_keys(Msg, Commitment, Opts) ->
+    [
+        Key
+    ||
+        Key <- input_keys(Msg, committed_keys(Commitment, Opts)),
+        not key_present(Key, Msg)
+    ].
 
 %% @doc Calculate if a key or its `+link' TABM variant is present in a message.
 key_present(Key, Keys) -> key_present(true, Key, Keys).
