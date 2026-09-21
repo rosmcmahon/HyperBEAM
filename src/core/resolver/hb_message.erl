@@ -746,7 +746,7 @@ unsafe_match(RawMap1, RawMap2, Mode, Path, Opts) ->
                         hb_ao:normalize_keys(Map1, Opts),
                         Opts
                     ),
-                    [<<"content-type">>, <<"ao-body-key">>]
+                    [<<"ao-body-key">>]
                 )
         ),
     Keys2 =
@@ -757,7 +757,7 @@ unsafe_match(RawMap1, RawMap2, Mode, Path, Opts) ->
                         hb_ao:normalize_keys(Map2, Opts),
                         Opts
                     ),
-                    [<<"content-type">>, <<"ao-body-key">>]
+                    [<<"ao-body-key">>]
                 )
         ),
     PrimaryKeysPresent =

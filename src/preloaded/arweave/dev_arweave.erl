@@ -1821,7 +1821,7 @@ get_tx_data_tag_exclude_data_test_parallel() ->
     ExpectedMsg = #{
         <<"reward">> => <<"630923958">>,
         <<"anchor">> => <<"CWJKkpdXEQO9sCWLFg8Cqby0d7wY0Gez5H95YG15g8pAYaXVatF9Ms1QBUpvZ-Ll">>,
-        <<"content-type">> => <<"application/json">>
+        <<"content-type">> => <<"image/png">>
     },
     ?assert(hb_message:match(ExpectedMsg, Structured, only_present)),
     {ok, RawData} = hb_ao:resolve(
