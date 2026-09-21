@@ -272,7 +272,7 @@ register_interest(Base, Body, Height, Opts) ->
                 Quantity -> not_found;
                 _ -> hb_maps:get(RemainderID, order_book(Base, Opts), not_found, Opts)
             end,
-        {ok, Paid} ?= amount(<<"reward">>, Body, Opts),
+        {ok, Paid} ?= hb_util:safe_int(tx_field(Body, <<"reward">>, 0, Opts)),
         true ?= Paid >= FillFee,
         true ?= balance(Base, Buyer, Opts) >= FillDeposit,
         Until = Height + Deadline,
@@ -886,6 +886,50 @@ tag_only_target_is_metadata_test() ->
     Result = apply_tx(base(#{ SellerAddr => 100 }), Tagged, 100, Opts),
     ?assertEqual([], orders(Result, Opts)),
     ?assertEqual(100, balance(Result, SellerAddr, Opts)).
+
+%% @doc Only the native transaction fee can satisfy an offer's minimum fee.
+registration_uses_native_reward_test() ->
+    Opts = test_opts(),
+    {Seller, SellerAddr} = party(),
+    {Buyer, _BuyerAddr} = party(),
+    Opened = apply_tx(
+        base(#{ SellerAddr => 1 }),
+        offer(Seller, 1, 10, 0, 100, 20),
+        100,
+        Opts
+    ),
+    OrderID = maps:get(<<"order-id">>, only_order(Opened, Opts)),
+    lists:foreach(
+        fun({Reward, Status}) ->
+            TX = ar_tx:sign(#tx{
+                format = 2,
+                target = hb_util:native_id(?PROCESS),
+                reward = Reward,
+                tags = [
+                    {<<"action">>, <<"register-interest">>},
+                    {<<"order-id">>, OrderID},
+                    {<<"reward">>, <<"100">>}
+                ]
+            }, Buyer),
+            Decoded = hb_message:convert(
+                TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts
+            ),
+            Body = Decoded#{ <<"reward">> => <<"100">> },
+            ?assert(hb_message:verify(Body, all, Opts)),
+            {ok, Result} = hb_ao:resolve(
+                Opened#{ <<"device">> => <<"arweave-swap@1.0">> },
+                #{
+                    <<"path">> => <<"compute">>,
+                    <<"process">> => ?PROCESS,
+                    <<"block-height">> => 101,
+                    <<"body">> => Body
+                },
+                Opts
+            ),
+            ?assertEqual(Status, maps:get(<<"status">>, only_order(Result, Opts)))
+        end,
+        [{1, <<"open">>}, {100, <<"reserved">>}]
+    ).
 
 %% @doc The whole trade: the buyer pays the seller directly on layer one, and
 %% the process -- which is not a party to that payment -- settles it.
