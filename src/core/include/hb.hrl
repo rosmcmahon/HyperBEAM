@@ -1,6 +1,6 @@
 -include("ar.hrl").
 
--define(HYPERBEAM_VERSION, <<"0.10">>).
+-define(HYPERBEAM_VERSION, <<"0.11">>).
 -define(PRELOADED_INDEX_KEY, <<"~meta@1.0/preloaded-devices-index">>).
 
 %% @doc Macro for checking if a message is empty, ignoring its hashpath.
