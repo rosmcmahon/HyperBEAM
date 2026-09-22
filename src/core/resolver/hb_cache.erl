@@ -101,9 +101,7 @@ ensure_loaded(Ref,
                                 <<"store">> =>
                                     lists:flatten([
                                         hb_opts:get(store, [], Opts),
-                                        hb_opts:get(
-                                            store, [], link_opts(#{}, RawOpts)
-                                        )
+                                        hb_opts:get(store, [], RawOpts)
                                     ])
                             }
                         },
