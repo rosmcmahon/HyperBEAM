@@ -164,9 +164,25 @@ perform_cache_write(Base, Req, Res, Opts) ->
 
 %% @doc A request carrying the commitment that covers the keys it holds. Its
 %% hashpath is taken over that commitment, so the hashpath tells apart
-%% requests that differ in the path or in any key given alongside it.
-normalized(Req, Opts) ->
-    hb_message:normalize_commitments(Req, Opts, fast, shallow).
+%% requests that differ in the path or in any key given alongside it. A
+%% commitment that does not cover every key of the request is dropped, so the
+%% request is keyed by all of its keys rather than by the ID of a commitment
+%% over some of them.
+normalized(Req, Opts) when is_map(Req) ->
+    Normalized = hb_message:normalize_commitments(Req, Opts, fast, shallow),
+    Keys = maps:keys(hb_private:reset(hb_message:uncommitted(Normalized, Opts))),
+    case hb_message:with_only_committed(Normalized, Opts) of
+        {ok, Committed} ->
+            CommittedKeys =
+                maps:keys(hb_private:reset(hb_message:uncommitted(Committed, Opts))),
+            case lists:sort(CommittedKeys) =:= lists:sort(Keys) of
+                true -> Normalized;
+                false -> hb_message:uncommitted(Normalized, Opts)
+            end;
+        {error, _} -> hb_message:uncommitted(Normalized, Opts)
+    end;
+normalized(Req, _Opts) ->
+    Req.
 
 %% @doc Generate a message to return when `only_if_cached' was specified, and
 %% we don't have a cached result.
@@ -515,3 +531,33 @@ split_signed_request_does_not_poison_cache_test() ->
         Address
     ),
     ?assertEqual(Path, hb_maps:get(<<"path">>, read_content(ID, Opts), Opts)).
+
+partial_unsigned_request_cache_isolation_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"attested-store">> => hb_test_utils:test_store(),
+        <<"async-cache">> => false,
+        <<"paranoid-verify">> => [cache_write],
+        <<"spawn-worker">> => false
+    },
+    Base = #{ <<"a">> => 0 },
+    CommittedPath =
+        hb_message:commit(
+            #{ <<"path">> => <<"set">> },
+            Opts,
+            #{ <<"type">> => <<"unsigned">> }
+        ),
+    FirstReq = CommittedPath#{
+        <<"x">> => <<"first">>,
+        <<"cache-control">> => [<<"always">>]
+    },
+    SecondReq = CommittedPath#{
+        <<"x">> => <<"second">>,
+        <<"cache-control">> => [<<"always">>]
+    },
+    ?assert(hb_message:verify(FirstReq, all, Opts)),
+    ?assert(hb_message:verify(SecondReq, all, Opts)),
+    {ok, First} = hb_ao:resolve(Base, FirstReq, Opts),
+    {ok, Second} = hb_ao:resolve(Base, SecondReq, Opts),
+    ?assertEqual(<<"first">>, hb_maps:get(<<"x">>, First, Opts)),
+    ?assertEqual(<<"second">>, hb_maps:get(<<"x">>, Second, Opts)).
