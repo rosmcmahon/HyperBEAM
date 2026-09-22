@@ -403,11 +403,16 @@ result_to_message(ExpectedID, Item, Opts) ->
         hb_util:decode(
             hb_maps:get(<<"signature">>, Item, not_found, GQLOpts)
         ),
+	Owner =
+        hb_util:decode(
+            hb_util:deep_get(<<"owner/key">>, Item, GQLOpts)
+        ),
 	SignatureType =
-        case byte_size(Signature) of
-            64 -> {eddsa, ed25519};
-            65 -> ethereum;
-            512 -> {rsa, 65537};
+        case {byte_size(Signature), byte_size(Owner)} of
+            {64, _} -> {eddsa, ed25519};
+            {65, 42} -> typed_ethereum;
+            {65, _} -> ethereum;
+            {512, _} -> {rsa, 65537};
             _ -> unsupported_tx_signature_type
         end,
     TX =
@@ -429,10 +434,7 @@ result_to_message(ExpectedID, Item, Opts) ->
                         GQLOpts
                     )
                 ),
-            owner =
-                hb_util:decode(
-                    hb_util:deep_get(<<"owner/key">>, Item, GQLOpts)
-                ),
+            owner = Owner,
             tags =
                 [
                     {normalize_graphql_tag_name(Name, Value), Value}
