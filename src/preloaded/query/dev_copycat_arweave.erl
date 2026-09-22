@@ -394,12 +394,14 @@ is_block_indexed(Height, Mode, Req, Opts) ->
     HasIndex andalso is_mode_indexed(Height, Mode, Req, Opts).
 
 is_mode_indexed(Height, blocks, Req, Opts) ->
+    % `no-cache' in the opts takes the request past the resolver's own cache
+    % to the device, which answers `only-if-cached' from its block store.
     case hb_ao:resolve(
         #{ <<"device">> => <<"arweave@2.9">> },
         #{ <<"path">> => <<"block">>, <<"block">> => Height,
             <<"include-proofs">> => hb_maps:get(<<"include-proofs">>, Req, true, Opts),
             <<"cache-control">> => [<<"only-if-cached">>] },
-        Opts
+        Opts#{ <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] }
     ) of
         {ok, _} -> true;
         _ -> false
