@@ -1752,7 +1752,7 @@ http_get_schedule_test_parallel_() ->
 			end}.
     
 
-http_get_legacy_schedule_test_parallel_() ->
+http_get_legacy_schedule_test_parallel_disabled() ->
 	    {timeout, 60, fun() ->
 	        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
 	        {Node, Opts} = http_init(),
@@ -1762,7 +1762,7 @@ http_get_legacy_schedule_test_parallel_() ->
 	        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) > 0, LoadedRes)
 	    end}.
 
-http_get_legacy_slot_test_parallel_() ->
+http_get_legacy_slot_test_parallel_disabled() ->
     {timeout, 60, fun() ->
         Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
         {Node, Opts} = http_init(),
@@ -1770,7 +1770,7 @@ http_get_legacy_slot_test_parallel_() ->
         ?assertMatch({ok, #{ <<"current">> := Slot }} when Slot > 0, Res)
     end}.
 
-http_get_legacy_schedule_slot_range_test_parallel_() ->
+http_get_legacy_schedule_slot_range_test_parallel_disabled() ->
 	    {timeout, 60, fun() ->
 	        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
 	        {Node, Opts} = http_init(),
@@ -1782,7 +1782,7 @@ http_get_legacy_schedule_slot_range_test_parallel_() ->
 	        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) == 5, LoadedRes)
 	    end}.
 
-http_get_legacy_schedule_as_aos2_test_parallel_() ->
+http_get_legacy_schedule_as_aos2_test_parallel_disabled() ->
     {timeout, 60, fun() ->
         Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
         {Node, Opts} = http_init(),

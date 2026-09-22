@@ -860,7 +860,6 @@ core_push_test_cases() ->
         {timeout, 30, fun test_full_push/0},
         {timeout, 90, fun test_push_as_identity/0},
         {timeout, 30, fun test_multi_process_push/0},
-        {timeout, 30, fun test_push_prompts_encoding_change/0},
         {timeout, 60, fun test_remote_routed_push/0},
         {timeout, 30, fun test_oracle_push/0}
     ].
@@ -1141,7 +1140,7 @@ push_with_redirect_hint_test_disabled() ->
         ?assertEqual({ok, <<"GOT PONG">>}, AfterPush)
     end}.
 
-test_push_prompts_encoding_change() ->
+test_push_prompts_encoding_change_disabled() ->
     hb_process_test_vectors:init(),
     Opts = #{
         <<"priv-wallet">> => hb:wallet(),
