@@ -252,10 +252,12 @@ normalize_match_spec(MatchSpec, _ReadMode, Opts) ->
 %% @doc Match using the store's reverse index.
 store_match(NormalizedSpec, Opts) ->
     ConvertedMatchSpec =
-        maps:map(
-            fun(Key, Value) -> store_match_value(Key, Value, Opts) end,
-            NormalizedSpec
-        ),
+        maps:from_list([
+            {hb_escape:encode_path_component(Key),
+                store_match_value(Key, Value, Opts)}
+        ||
+            {Key, Value} <- maps:to_list(NormalizedSpec)
+        ]),
     case hb_store:match(
         hb_opts:get(store, no_viable_store, Opts),
         ConvertedMatchSpec,
@@ -443,7 +445,7 @@ write_key_ops(Base, Key, HPAlg, Value, Opts, Acc) ->
     KeyHashPath =
         hb_path:hashpath(
             Base,
-            hb_path:to_binary(Key),
+            hb_escape:encode_path_component(Key),
             HPAlg,
             Opts
         ),
@@ -764,7 +766,7 @@ read_resolved_path(Target, ResolvedFullPath, Store, Opts) ->
                         maps:from_list(
                             [
                                 {
-                                    Subpath,
+                                    hb_escape:decode_path_component(Subpath),
                                     {link,
                                         hb_path:to_binary([ResolvedFullPath, Subpath]),
                                         #{ <<"lazy">> => true, <<"store">> => Store }
@@ -875,14 +877,15 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                         }
                     ),
                     SubkeyPath = hb_path:to_binary([RootPath, Subpath]),
-                    case hb_link:is_link_key(Subpath) of
+                    Key = hb_escape:decode_path_component(Subpath),
+                    case hb_link:is_link_key(Key) of
                         false ->
                             % The key is a literal value, not a nested composite
                             % message. Subsequently, we return a resolvable link
                             % to the subpath, leaving the key as-is.
                             LinkOpts =
                                 (case Types of
-                                    #{ Subpath := Type } ->
+                                    #{ Key := Type } ->
                                         % We have an `ao-types' entry for the
                                         % subpath, so the link carries its type
                                         % and resolves lazily to the final value.
@@ -908,7 +911,7 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                                     _ ->
                                         {link, SubkeyPath, LinkOpts}
                                 end,
-                            {true, {Subpath, PreparedValue}};
+                            {true, {Key, PreparedValue}};
                         true ->
                             % The key is an encoded link, so we create a resolvable
                             % link to the underlying link. This requires that we
@@ -918,7 +921,7 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                             % a large quantity.
                             {true,
                                 {
-                                    binary:part(Subpath, 0, byte_size(Subpath) - 5),
+                                    binary:part(Key, 0, byte_size(Key) - 5),
                                     {link, SubkeyPath, #{
                                         <<"type">> => <<"link">>,
                                         <<"lazy">> => true,
@@ -1016,13 +1019,13 @@ read_resolved({link, ID, LinkOpts}, Req, Opts) ->
     read_resolved(ID, Req, maps:merge(LinkOpts, Opts));
 read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsgID) ->
     Store = hb_opts:get(store, no_viable_store, Opts),
-    _NormKey = hb_ao:normalize_key(Key, Opts),
+    NormKey = hb_ao:normalize_key(Key, Opts),
     case hb_device:is_direct_key_access(BaseMsgID, Req, Opts, Store) of
         unknown -> miss;
         false ->
             ?event_debug(read_cached,
                 {found_non_message_device,
-                    {key, _NormKey}
+                    {key, NormKey}
                 }
             ),
             read_hashpath(BaseMsgID, Req, Opts);
@@ -1035,10 +1038,14 @@ read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsg
             ?event_debug(read_cached,
                 {skipping_execution_store_lookup,
                     {base_msg, BaseMsgID},
-                    {key, _NormKey}
+                    {key, NormKey}
                 }
             ),
-            case hb_store:resolve(Store, [BaseMsgID, Key], Opts) of
+            case hb_store:resolve(
+                Store,
+                [BaseMsgID, hb_escape:encode_path_component(NormKey)],
+                Opts
+            ) of
                 {ok, KeyPath} -> hashpath_read_result(read(KeyPath, Opts));
                 {error, not_found} -> miss;
                 Other -> {hit, Other}
@@ -1420,6 +1427,71 @@ test_raw_match_read(Store) ->
         hb_maps:get(<<"body">>, RawMsg, undefined, RawOpts)
     ).
 
+%% @doc Literal path separators and escapes remain distinct from nested keys.
+test_literal_keys(Store) ->
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store, <<"match-index">> => false },
+    Binaries = #{
+        <<"a/b">> => <<"literal slash">>,
+        <<"a%2fb">> => <<"literal escape">>,
+        <<"a%252fb">> => <<"repeated escape">>,
+        <<"%25/">> => <<"adjacent escapes">>,
+        <<"/leading//trailing/">> => binary:copy(<<"large value">>, 10)
+    },
+    Msg = Binaries#{
+        <<"a">> => #{ <<"b">> => <<"nested">> },
+        <<"typed%2fkey">> => 42,
+        <<"empty%2flist">> => [],
+        <<"nested/map">> => #{ <<"inner/key%25">> => [1, 2, 3] }
+    },
+    {ok, ID} = write(Msg, Opts),
+    {ok, Read} = read(ID, Opts),
+    ?assertEqual(Msg, ensure_all_loaded(Read, Opts)),
+    RawOpts = Opts#{ <<"cache-read-mode">> => raw },
+    {ok, Raw} = read(ID, RawOpts),
+    maps:foreach(
+        fun(Key, Value) ->
+            ?assertEqual(Value, hb_maps:get(Key, Raw, RawOpts)),
+            ?assertEqual({hit, {ok, Value}}, read_resolved(ID, Key, Opts)),
+            case map_get(<<"store-module">>, Store) of
+                hb_store_lmdb ->
+                    ?assertEqual({ok, [ID]}, match(#{ Key => Value }, Opts)),
+                    ?assertEqual({ok, [ID]}, match(#{ Key => Value }, RawOpts));
+                _ ->
+                    ok
+            end
+        end,
+        Binaries
+    ).
+
+%% @doc ANS-104 commitments still verify after caching literal slash tags.
+test_signed_literal_keys(Store) ->
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store },
+    Signed =
+        hb_message:commit(
+            #{
+                <<"@kyvejs/protocol">> => <<"1.4.2">>,
+                <<"@kyvejs/tendermint-bsync">> => <<"1.2.11">>,
+                <<"@kyvejs%2fprotocol">> => <<"distinct tag">>,
+                <<"body">> => <<"Signed data">>
+            },
+            #{ <<"priv-wallet">> => ar_wallet:new(ethereum) },
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"type">> => <<"ethereum">>
+            }
+        ),
+    ?assert(hb_message:verify(Signed, all, Opts)),
+    ID = hb_message:id(Signed, signed, Opts),
+    {ok, _} = write(Signed, Opts),
+    {ok, Read} = read(ID, Opts),
+    Loaded = ensure_all_loaded(Read, Opts),
+    ?assertEqual(Signed, Loaded),
+    ?assert(hb_message:verify(Loaded, all, Opts)),
+    ?assertEqual(ID, hb_message:id(Loaded, signed, Opts)),
+    ?assert(is_map(hb_message:convert(Loaded, <<"httpsig@1.0">>, Opts))).
+
 test_immediate_marker_values(Store) ->
     hb_store:reset(Store),
     Opts = #{ <<"store">> => Store, <<"match-index">> => false },
@@ -1489,6 +1561,8 @@ cache_suite_test_() ->
         {"match linked message", fun test_match_linked_message/1},
         {"match typed message", fun test_match_typed_message/1},
         {"raw match read", fun test_raw_match_read/1},
+        {"literal keys", fun test_literal_keys/1},
+        {"signed literal keys", fun test_signed_literal_keys/1},
         {"immediate marker values", fun test_immediate_marker_values/1},
         {"cache-write hook", fun test_cache_write_hook/1}
     ]).

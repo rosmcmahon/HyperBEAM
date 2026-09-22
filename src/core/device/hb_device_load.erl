@@ -177,7 +177,26 @@ from_preloaded(Ref, Opts) ->
 preloaded_spec(Ref, _Store, _Opts) when ?IS_ID(Ref) ->
     {ok, Ref};
 preloaded_spec(Ref, Store, Opts) ->
-    hb_store:read(Store, <<?PRELOADED_INDEX_KEY/binary, "/", Ref/binary>>, Opts).
+    Key = hb_escape:encode_path_component(Ref),
+    hb_store:read(Store, <<?PRELOADED_INDEX_KEY/binary, "/", Key/binary>>, Opts).
+
+%% @doc Device names are literal members of the preloaded index.
+preloaded_literal_names_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    Opts = #{ <<"store">> => Store, <<"cache-read-mode">> => raw },
+    Index = #{
+        <<"test/device@1.0">> => hb_util:human_id(crypto:strong_rand_bytes(32)),
+        <<"test%2fdevice@1.0">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+    },
+    {ok, ID} = hb_cache:write(Index, Opts),
+    hb_cache:link(ID, ?PRELOADED_INDEX_KEY, Opts),
+    maps:foreach(
+        fun(Name, SpecID) ->
+            ?assertEqual({ok, SpecID}, preloaded_spec(Name, Store, Opts))
+        end,
+        Index
+    ),
+    hb_store:stop(Store).
 
 %% @doc The preloaded store, with request-local cache keys stripped so it is
 %% visible inside a request-scoped resolution.
