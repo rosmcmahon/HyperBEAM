@@ -571,6 +571,8 @@ trace([Item|Rest], Prefixes) ->
     end;
 trace({Func, ArityOrTerm, Extras}, Prefixes) ->
     trace({no_module, Func, ArityOrTerm, Extras}, Prefixes);
+trace({Mod, Func, Args, Extras}, Prefixes) when is_list(Args) ->
+    trace({Mod, Func, length(Args), Extras}, Prefixes);
 trace({Mod, Func, ArityOrTerm, Extras}, _Prefixes) ->
     ExtraMap = hb_maps:from_list(Extras),
     indent(
@@ -768,11 +770,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
             {if_present, #{}} -> [];
             {_, Priv} -> [{<<"!Private!">>, Priv}]
         end,
-    Msg =
-        case FilterPriv of
-            false -> RawMsg;
-            _ -> hb_private:reset(RawMsg)
-        end,
+    Msg = hb_private:reset(RawMsg),
     % Define helper functions for formatting elements of the map.
     ValOrUndef =
         fun(<<"hashpath">>) ->
@@ -1119,6 +1117,42 @@ max_keys(Opts) ->
     end.
 
 %%% Tests
+
+private_message_test() ->
+    Public = #{ <<"body">> => <<"public">> },
+    Private = Public#{
+        <<"priv">> => #{ <<"secret">> => <<"private-marker">> },
+        <<"priv-wallet">> => <<"private-marker">>
+    },
+    lists:foreach(
+        fun(Indent) ->
+            Opts = #{ <<"debug-show-priv">> => false },
+            ?assertEqual(
+                message(Public, Opts, Indent),
+                message(Private, Opts, Indent)
+            ),
+            ?assertEqual(
+                message(#{ <<"nested">> => Public }, Opts, Indent),
+                message(#{ <<"nested">> => Private }, Opts, Indent)
+            )
+        end,
+        [0, 1, 3]
+    ).
+
+private_trace_test() ->
+    Args = [missing, #{ <<"priv-secret">> => <<"private-marker">> }],
+    ?assertEqual(
+        lists:flatten([
+            indent("maps:get/2 [No details]\n", 1),
+            indent("no_module:apply/2 [test.erl:7]\n", 1),
+            indent("hb_ao:resolve/3 [test.erl:9]\n", 1)
+        ]),
+        lists:flatten(trace([
+            {maps, get, Args, []},
+            {apply, Args, [{file, "test.erl"}, {line, 7}]},
+            {hb_ao, resolve, 3, [{file, "test.erl"}, {line, 9}]}
+        ]))
+    ).
 
 short_format_test() ->
     lists:foreach(

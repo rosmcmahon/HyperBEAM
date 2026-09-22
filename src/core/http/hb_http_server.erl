@@ -520,11 +520,11 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
         NodeMsg
     ),
     ErrorDetailsMaxSize = hb_opts:get(error_details_max_size, ?DEFAULT_ERROR_DETAILS_MAX_SIZE, NodeMsg),
-    % Remove leading and trailing noise from the stacktrace and details.
+    % Preserve indentation while removing trailing noise.
     FormattedErrorMsg =
         ErrorMsg#{
-            <<"stacktrace">> => hb_util:bin(hb_format:remove_noise(StacktraceStr)),
-            <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_noise(DetailsStr)), ErrorDetailsMaxSize)
+            <<"stacktrace">> => hb_util:bin(hb_format:remove_trailing_noise(StacktraceStr)),
+            <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_trailing_noise(DetailsStr)), ErrorDetailsMaxSize)
         },
     hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
 
