@@ -949,9 +949,30 @@ ao_data_key_test() ->
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"body">>, <<"tag1">>],
         <<"type">> => ?RSA_SIGN_TYPE,
-        <<"bundle">> => <<"false">>
+        <<"bundle">> => <<"false">>,
+        <<"original-tags">> => #{
+            <<"1">> => #{ <<"name">> => <<"ao-data-key">>, <<"value">> => <<"body">> },
+            <<"2">> => #{ <<"name">> => <<"tag1">>, <<"value">> => <<"value1">> }
+        }
     },
-    do_tabm_roundtrips(UnsignedTX, UnsignedTABM, SignedCommitment).
+    % The `ao-data-key' tag is not a normal tag, so the decoded message carries
+    % it in an unsigned commitment and encodes to the same TX again.
+    Req = #{ <<"bundle">> => false },
+    TX = hb_util:ok(to(UnsignedTABM, Req, #{})),
+    ?assertEqual(
+        UnsignedTX#tx{ unsigned_id = ar_tx:generate_id(UnsignedTX, unsigned) },
+        TX
+    ),
+    TABM = hb_util:ok(from(TX, Req, #{})),
+    ?assertEqual(UnsignedTABM, hb_message:uncommitted(TABM)),
+    ?assertEqual(TX, hb_util:ok(to(TABM, Req, #{}))),
+    do_signed_tabm_roundtrip(
+        UnsignedTX,
+        UnsignedTABM,
+        SignedCommitment,
+        #{ <<"device">> => <<"tx@1.0">>, <<"bundle">> => false },
+        Req
+    ).
 
 unsorted_tags_test() ->
     TX = #tx{

@@ -614,7 +614,7 @@ invalid_optional_signature_cannot_update_node_test() ->
     ),
     Forged = Signed#{ <<"test-config-item">> => <<"forged">> },
     ?assertNot(hb_message:verify(Forged, all, Opts)),
-    ?assertMatch({failure, #{ <<"status">> := 500 }},
+    ?assertMatch({error, #{ <<"status">> := 400 }},
         hb_http:post(Node, Forged, Opts)),
     {ok, Before} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
     ?assertEqual(<<"original">>, hb_ao:get(<<"test-config-item">>, Before, Opts)),

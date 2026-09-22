@@ -153,7 +153,7 @@ ensure_loaded(_Ref, Msg, _Opts) when not ?IS_LINK(Msg) ->
 
 link_opts(LinkOpts, RawOpts) ->
     Opts = hb_util:deep_merge(RawOpts, LinkOpts, RawOpts),
-    case hb_opts:get(store, not_found, LinkOpts) of
+    case hb_opts:get(store, not_found, LinkOpts#{ <<"only">> => local }) of
         not_found ->
             hb_store:scope(
                 Opts,

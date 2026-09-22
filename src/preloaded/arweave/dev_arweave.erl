@@ -1291,7 +1291,7 @@ block_index_reindex_test() ->
     {ok, [Updated]} = hb_ao:resolve(<<"~arweave@2.9/blocks&weave-size=0&limit=10">>, Opts),
     ?assertEqual(NewHash, hb_maps:get(<<"hash">>, Updated)),
     ?assertEqual(101, hb_maps:get(<<"weave-size">>, Updated)),
-    ?assertEqual({error, not_found}, hb_ao:resolve(#{
+    ?assertMatch({error, #{ <<"status">> := 504 }}, hb_ao:resolve(#{
         <<"path">> => <<"~arweave@2.9/block">>, <<"block">> => 4,
         <<"include-proofs">> => false,
         <<"cache-control">> => [<<"only-if-cached">>] }, Opts)),
@@ -1337,14 +1337,20 @@ include_proofs(Height) ->
         Full = Public(RawFull),
         ?assert(hb_maps:is_key(<<"poa">>, Full)),
         ?assertEqual(Height =:= 2003806, hb_maps:is_key(<<"poa2">>, Full)),
-        Expected = hb_maps:without([<<"poa">>, <<"poa2">>], Full),
+        % The unsigned commitment of a header covers the keys it carries, so
+        % a header with its proofs and one without differ in that commitment
+        % alone.
+        Expected =
+            hb_message:uncommitted(
+                hb_maps:without([<<"poa">>, <<"poa2">>], Full), Opts),
+        Lean0 = fun(Msg) -> hb_message:uncommitted(Public(Msg), Opts) end,
         {ok, Lean} = hb_ao:resolve(
             Req#{ <<"include-proofs">> => false }, Opts),
-        ?assertEqual(Expected, Public(Lean)),
+        ?assertEqual(Expected, Lean0(Lean)),
         {ok, Stored} = hb_cache:read(
             CachePath,
             Opts#{ <<"store">> => [Blocks] }),
-        ?assertEqual(Expected, Public(Stored)),
+        ?assertEqual(Expected, Lean0(Stored)),
         ?assertEqual({error, not_found}, hb_cache:read(
             CachePath, Opts)),
         lists:foreach(fun(Reference) ->
@@ -1352,7 +1358,7 @@ include_proofs(Height) ->
             ?assertEqual({error, not_found}, hb_ao:resolve(Read, Offline)),
             {ok, Header} = hb_ao:resolve(
                 Read#{ <<"include-proofs">> => <<"false">> }, Offline),
-            ?assertEqual(Expected, Public(Header))
+            ?assertEqual(Expected, Lean0(Header))
         end, [Height, hb_maps:get(<<"indep_hash">>, Full)]),
         % Explicit cache controls still apply to proof-free reads.
         ?assertEqual({error, not_found}, hb_ao:resolve(
@@ -1365,7 +1371,7 @@ include_proofs(Height) ->
         ?assertEqual(Full, Public(Warm)),
         {ok, WarmLean} = hb_ao:resolve(
             CachedReq#{ <<"include-proofs">> => false }, Offline),
-        ?assertEqual(Expected, Public(WarmLean))
+        ?assertEqual(Expected, Lean0(WarmLean))
     after
         lists:foreach(fun hb_store:stop/1, Stores)
     end.

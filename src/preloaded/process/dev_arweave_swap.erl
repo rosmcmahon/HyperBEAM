@@ -914,7 +914,7 @@ registration_uses_native_reward_test() ->
             Decoded = hb_message:convert(
                 TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts
             ),
-            Body = Decoded#{ <<"reward">> => <<"100">> },
+            Body = Decoded,
             ?assert(hb_message:verify(Body, all, Opts)),
             {ok, Result} = hb_ao:resolve(
                 Opened#{ <<"device">> => <<"arweave-swap@1.0">> },

@@ -336,7 +336,15 @@ verify(Self, Req, Opts) ->
     {ok, RawBase} = hb_message:find_target(Self, Req, Opts),
     CommitmentBase = ensure_commitments_loaded(RawBase, Opts),
     Commitments = maps:get(<<"commitments">>, CommitmentBase, #{}),
-    IDsToVerify = commitment_ids_from_request(CommitmentBase, Req, Opts),
+    % A request with neither `committers' nor `commitment-ids' verifies every
+    % commitment of the message.
+    Selection =
+        case maps:with([<<"committers">>, <<"commitment-ids">>], Req) of
+            None when map_size(None) == 0 ->
+                Req#{ <<"commitment-ids">> => <<"all">> };
+            _ -> Req
+        end,
+    IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),
     % Generate the new commitment request base messsage by removing the keys
     % used by this function (path, committers, commitments) and returning the
     % remaining keys. This message will then be merged with each commitment
@@ -533,20 +541,12 @@ with_relevant_commitments(Base, Req, Opts) ->
 %% the default is `all' for commitments -- also implying `all' for committers.
 commitment_ids_from_request(Base, Req, Opts) ->
     Commitments = maps:get(<<"commitments">>, Base, #{}),
-    % A request with neither `committers' nor `commitment-ids' selects every
-    % commitment of the message.
-    Selection =
-        case maps:with([<<"committers">>, <<"commitment-ids">>], Req) of
-            None when map_size(None) == 0 ->
-                #{ <<"commitment-ids">> => <<"all">> };
-            Given -> Given
-        end,
     ReqCommitters =
-        case maps:get(<<"committers">>, Selection, <<"none">>) of
+        case maps:get(<<"committers">>, Req, <<"none">>) of
             X when is_list(X) -> X;
             CommitterDescriptor -> hb_ao:normalize_key(CommitterDescriptor)
         end,
-    RawReqCommitments = maps:get(<<"commitment-ids">>, Selection, <<"none">>),
+    RawReqCommitments = maps:get(<<"commitment-ids">>, Req, <<"none">>),
     ReqCommitments =
         case RawReqCommitments of
             X2 when is_list(X2) -> X2;

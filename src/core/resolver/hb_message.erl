@@ -948,7 +948,8 @@ without_commitments(Spec, Msg = #{ <<"commitments">> := Commitments }, Opts) ->
                     Opts
                 )
             ),
-            Commitments
+            Commitments,
+            Opts
         ),
     ?event_debug({without_commitments, {filtered_commitments, FilteredCommitments}}),
     Msg#{ <<"commitments">> => FilteredCommitments };

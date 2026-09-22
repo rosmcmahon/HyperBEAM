@@ -761,9 +761,7 @@ encode_http_flat_msg(Httpsig, Opts) ->
     HeaderList =
         lists:foldl(
             fun ({HeaderName, RawHeaderVal}, Acc) ->
-                HVal = hb_escape:encode_header(
-                    hb_cache:ensure_loaded(RawHeaderVal, Opts)
-                ),
+                HVal = hb_cache:ensure_loaded(RawHeaderVal, Opts),
                 ?event_debug({encoding_http_header, {header, HeaderName}, {value, HVal}}),
                 [<<HeaderName/binary, ": ", HVal/binary>> | Acc]
             end,
