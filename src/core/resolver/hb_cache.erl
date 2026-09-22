@@ -321,10 +321,32 @@ write(Bin, Opts) when is_binary(Bin) ->
 %% write links the ID of each signed commitment to the content, so such a
 %% commitment is kept only if it verifies.
 verified_unsigned(Msg, Opts) ->
-    case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Msg, Opts) of
-        not_found -> hb_message:without_commitments_unless_verified(Msg, Opts);
-        _ -> hb_message:normalize_commitments(Msg, Opts, fast, shallow)
+    % The nested messages are held to the same rule first: the write links a
+    % nested message by the IDs it is stored under, so its commitments must be
+    % settled before the message that carries it is.
+    Deep =
+        maps:map(
+            fun(Key, Value) ->
+                case hb_private:is_private(Key) orelse Key == <<"commitments">> of
+                    true -> Value;
+                    false -> verified_unsigned_value(Value, Opts)
+                end
+            end,
+            Msg
+        ),
+    case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Deep, Opts) of
+        not_found -> hb_message:without_commitments_unless_verified(Deep, Opts);
+        _ -> hb_message:normalize_commitments(Deep, Opts, fast, shallow)
     end.
+
+%% @doc Apply the rule of `verified_unsigned/2' to a nested message, and to
+%% every message of a list.
+verified_unsigned_value(Value, Opts) when is_map(Value) ->
+    verified_unsigned(Value, Opts);
+verified_unsigned_value(Values, Opts) when is_list(Values) ->
+    [ verified_unsigned_value(Value, Opts) || Value <- Values ];
+verified_unsigned_value(Value, _Opts) ->
+    Value.
 
 do_write_message(Bin, Store, Opts) when is_binary(Bin) ->
     % Write the binary in the store at its calculated content-hash.

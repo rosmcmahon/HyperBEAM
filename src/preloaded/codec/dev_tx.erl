@@ -64,7 +64,7 @@ verify(Msg, Req, Opts) ->
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, {explicit, TX}}}),
     Res =
-        ar_tx:verify(TX) andalso
+        tx_verifies(TX, Req, OnlyWithCommitment) andalso
             lib_arweave_common:verify_committed(
                 ?BASE_FIELDS,
                 TX,
@@ -73,6 +73,14 @@ verify(Msg, Req, Opts) ->
                 Opts
             ),
     {ok, Res}.
+
+%% @doc An unsigned commitment verifies when the transaction's unsigned ID is
+%% the ID of the commitment; a signed one when its signature verifies.
+tx_verifies(TX, #{ <<"type">> := <<"unsigned-sha256">> }, Msg) ->
+    [ID] = maps:keys(maps:get(<<"commitments">>, Msg, #{})),
+    hb_util:human_id(ar_tx:id(TX, unsigned)) =:= hb_util:human_id(ID);
+tx_verifies(TX, _Req, _Msg) ->
+    ar_tx:verify(TX).
 
 %% @doc Convert a #tx record into a message map recursively.
 -spec from(binary() | #tx{}, #{ _ => _ }, #{ _ => _ }) ->

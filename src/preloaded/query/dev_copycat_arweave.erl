@@ -937,6 +937,11 @@ index_full_bundle_item(ItemID, ItemBinary, ItemStartOffset, IndexMode, Store, Op
                         LocalOpts = hb_store:scope(Opts, local),
                         Msg = hb_message:convert(
                             Parsed, <<"structured@1.0">>, <<"ans104@1.0">>, LocalOpts),
+                        % An item whose signature does not verify is not
+                        % indexed: the cache would write it without its
+                        % commitment.
+                        true = not is_map(Msg) orelse
+                            hb_message:verify(Msg, all, LocalOpts),
                         {ok, _Path} =
                             hb_cache:write(
                                 with_offset(Msg, ItemStartOffset, LocalOpts),
@@ -2067,7 +2072,9 @@ pending_bundle_children(Rejected, StoreModule) ->
         },
         Wallet
     ),
-    Binary = <<"pending-binary-child">>,
+    % A binary child large enough to encode as an item again: a smaller one
+    % decodes to a tag value and the bundle no longer verifies as signed.
+    Binary = binary:copy(<<"pending-binary-child">>, 256),
     BinaryChild = hb_message:convert(Binary, <<"ans104@1.0">>, DefaultOpts),
     {undefined, BundleData} =
         ar_bundles:serialize_bundle(list, [Child] ++ Rejected ++ [BinaryChild], false),
@@ -2158,7 +2165,13 @@ pending_bundle_children(Rejected, StoreModule) ->
     RootMsg =
         hb_message:convert(
             RootTX, <<"structured@1.0">>, <<"tx@1.0">>, DefaultOpts),
-    {ok, _} = hb_cache:write(RootMsg, RemoteOpts),
+    % A node keeps no commitment that does not verify, so a remote holds the
+    % bundle only when every child verifies; the bytes of a bundle with a
+    % rejected child are read from the network, as they are in production.
+    case Rejected of
+        [] -> {ok, _} = hb_cache:write(RootMsg, RemoteOpts);
+        _ -> ok
+    end,
     Remote = #{
         <<"store-module">> => hb_store_remote_node,
         <<"node">> => hb_http_server:start_node(RemoteOpts),
@@ -2174,7 +2187,14 @@ pending_bundle_children(Rejected, StoreModule) ->
             <<"paranoid-verify">> => [cache_write]
         },
     try
-        ?assertMatch({ok, _}, hb_cache:read(TXID, #{ <<"store">> => [Remote] })),
+        case Rejected of
+            [] ->
+                ?assertMatch(
+                    {ok, _},
+                    hb_cache:read(TXID, #{ <<"store">> => [Remote] })
+                );
+            _ -> ok
+        end,
         ShallowCount = 2 + length(Rejected),
         {ok, #{ items_count := ShallowCount, total_txs := 1 }} =
             hb_ao:resolve(
