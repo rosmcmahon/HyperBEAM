@@ -199,6 +199,15 @@ serve(Key, _, _, Opts) ->
 %% @doc Read a file from disk and serve it as a static HTML page.
 return_file(Device, Name) ->
     return_file(Device, Name, #{}).
+return_file(Device, <<"404.html">>, Template) ->
+    return_file(Device, <<"error.html">>, maps:merge(
+        #{
+            <<"status">> => 404,
+            <<"title">> => <<"Page cannot be found.">>,
+            <<"description">> => <<"This hashpath cannot be resolved on this node, yet...">>
+        },
+        Template
+    ));
 return_file(Device, Name, Template) ->
     hb_http_server:static(Device, Name, Template, #{}).
 

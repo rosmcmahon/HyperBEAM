@@ -67,9 +67,7 @@ start_application() ->
         Loaded#{
             <<"priv-wallet">> => PrivWallet,
             <<"store">> => UpdatedStoreOpts,
-            <<"port">> => hb_opts:get(port, 8734, Loaded),
-            <<"cache-writers">> =>
-                [hb_util:human_id(ar_wallet:to_address(PrivWallet))]
+            <<"port">> => hb_opts:get(port, 8734, Loaded)
         }
     ),
     ServerID = hb_util:human_id(ar_wallet:to_address(PrivWallet)),

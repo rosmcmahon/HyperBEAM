@@ -192,6 +192,7 @@ group(Opts = #{ <<"node">> := _Node }, #{ <<"group">> := Path }, _NodeOpts) ->
 remote_write_value(Opts = #{ <<"node">> := Node }, Value) ->
     Msg = #{
         <<"path">> => <<"/~cache@1.0/write">>,
+        <<"type">> => <<"cache-write">>,
         <<"method">> => <<"POST">>,
         <<"body">> => Value
     },
@@ -214,6 +215,7 @@ remote_write_value(Opts = #{ <<"node">> := Node }, Value) ->
 remote_link(Opts = #{ <<"node">> := Node }, Source, Destination) ->
     Msg = #{
         <<"path">> => <<"/~cache@1.0/link">>,
+        <<"type">> => <<"cache-link">>,
         <<"method">> => <<"POST">>,
         <<"source">> => Source,
         <<"destination">> => Destination
@@ -232,6 +234,7 @@ remote_link(Opts = #{ <<"node">> := Node }, Source, Destination) ->
 remote_group(Opts = #{ <<"node">> := Node }, Path) ->
     Msg = #{
         <<"path">> => <<"/~cache@1.0/group">>,
+        <<"type">> => <<"cache-group">>,
         <<"method">> => <<"POST">>,
         <<"group">> => Path
     },
