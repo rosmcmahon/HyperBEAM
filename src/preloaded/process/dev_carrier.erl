@@ -301,9 +301,7 @@ value_of(Body, Opts) ->
 %% supply the token requires, which is all of it unless the token says
 %% otherwise. This is `token-1.0''s `supply-threshold-owner' rule, and it is
 %% evaluated against the balances as they stand -- so the authority moves with
-%% the unit, with no separate owner field to keep in step. An unreadable
-%% threshold falls back to requiring the whole supply, as `supply/2' falls
-%% back to one unit: a malformed spawn tag must never fail a slot.
+%% the unit, with no separate owner field to keep in step.
 owns_supply(Base, Address, Opts) ->
     Supply = supply(Base, Opts),
     Threshold =
