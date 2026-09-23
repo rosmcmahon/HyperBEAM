@@ -1456,6 +1456,26 @@ invalid_bundle_test_parallel() ->
     assert_item_read(<<"cGNURX2IUt98VKVIeXSfYe6eulNwPEqijaQfvatzd_o">>, Opts),
     ok.
 
+%% @doc A format-1 transaction in block 206780 remains readable by its signed
+%% ID after deep indexing.
+format_one_tx_index_read_test_parallel() ->
+    {Local, IndexStore, BaseOpts} = setup_index_opts(),
+    ArweaveStore = #{
+        <<"store-module">> => hb_store_arweave,
+        <<"index-store">> => [Local],
+        <<"local-store">> => [Local]
+    },
+    Opts = BaseOpts#{ <<"store">> => [Local, ArweaveStore] },
+    Height = 206780,
+    TXID = <<"VLJIGuTJewofKx8ad4JYQs93nEuGnkgjrIt_Sd2QPYw">>,
+    {ok, Height} = hb_ao:resolve(
+        <<"~copycat@1.0/arweave&from=206780&to=206780&mode=deep">>,
+        Opts
+    ),
+    ?assertMatch({ok, _}, hb_store_arweave:read_index_offset(IndexStore, TXID)),
+    assert_item_read(TXID, Opts),
+    ok.
+
 block_with_large_integer_test_parallel() ->
     {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
     Block = 633719,
