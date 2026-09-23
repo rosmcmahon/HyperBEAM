@@ -116,7 +116,7 @@ format_request(Req, Opts) ->
 %% @doc Use an explicit request ID when supplied by a parsed receipt.
 format_request_context(#{ <<"request-id">> := ID }, _Opts) -> {ok, ID};
 format_request_context(Ctx = #{ <<"request">> := Req }, Opts) ->
-    case hb_private:reset(Req) of
+    case hb_private:reset(hb_ao:execution_input(Req, Opts)) of
         #{ <<"path">> := Key } = Path when map_size(Path) == 1 ->
             BinKey = hb_ao:normalize_key(Key),
             case binary:match(BinKey, [<<"/">>, <<">">>, <<"+">>,
@@ -823,7 +823,10 @@ result_from_context(Ctx, Opts) ->
 %% Return its hashpath and complete context for challenge, preserving witnesses
 %% under the execution's cache policy. The resolver supplies the overlaid
 %% result.
-generate(Base, Req, Res, VariedBase, VariedReq, VariedRes, Overlay, Opts) ->
+generate(RawBase, RawReq, Res, VariedBase, VariedReq, VariedRes, Overlay, Opts) ->
+    % Original witnesses must also name all unsigned fields selected by Vary.
+    Base = original_witness(RawBase, VariedBase, Opts),
+    Req = original_witness(RawReq, VariedReq, Opts),
     Normalizer =
         case Overlay of
             Type when is_map(VariedRes), (Type == base orelse Type == request) ->
@@ -842,7 +845,10 @@ generate(Base, Req, Res, VariedBase, VariedReq, VariedRes, Overlay, Opts) ->
     % receipts name their witnesses; a patch's ancestry is denoted by them.
     Completed =
         case Normalizer == replace andalso
-                VariedBase =:= Base andalso VariedReq =:= Req of
+                hb_message:id(VariedBase, all, Opts) =:=
+                    hb_message:id(Base, all, Opts) andalso
+                hb_message:id(VariedReq, all, Opts) =:=
+                    hb_message:id(Req, all, Opts) of
             true -> Ctx;
             false ->
                 Witnessed =
@@ -857,6 +863,15 @@ generate(Base, Req, Res, VariedBase, VariedReq, VariedRes, Overlay, Opts) ->
     HP = format(Completed, Opts),
     store(HP, Completed, Opts),
     {HP, Completed}.
+
+%% @doc Reuse the varied identity when Vary only added unsigned commitments.
+%% A distinct original witness must name all its unsigned fields as well.
+original_witness(Original, Varied, Opts) ->
+    case hb_ao:execution_input(Original, Opts) =:=
+            hb_ao:execution_input(Varied, Opts) of
+        true -> Varied;
+        false -> hb_ao:normalize_input(Original, Opts)
+    end.
 
 %% @doc Preserve the witnesses required to port a receipt under the same cache
 %% policy as its reusable execution result.

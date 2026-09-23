@@ -268,7 +268,8 @@ committers(_, _, _) ->
 %% the default device (`httpsig@1.0') is used.
 -spec commit(
     #{ _ => _ },
-    #{ 'commitment-device' => binary(), type => binary(), _ => _ },
+    #{ 'commitment-device' => binary(), type => binary(),
+        committed => [binary()], _ => _ },
     #{ _ => _ }
 ) -> {ok, #{ commitments := #{ _ => _ }, _ => _ }}.
 commit(Self, Req, Opts) ->

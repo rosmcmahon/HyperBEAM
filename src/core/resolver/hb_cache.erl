@@ -9,13 +9,11 @@
 %%%
 %%% 1. The raw binary data, written to the store at the hash of the content.
 %%%    Storing binary paths in this way effectively deduplicates the data.
-%%% 2. The hashpath-graph of all content, stored as a set of links between
-%%%    hashpaths, their keys, and the data that underlies them. This allows
-%%%    all messages to share the same hashpath space, such that all requests
-%%%    from users additively fill-in the hashpath space, minimizing duplicated
-%%%    compute.
-%%% 3. Messages, referrable by their IDs (committed or uncommitted). These are
-%%%    stored as a set of links commitment IDs and the uncommitted message.
+%%% 2. Messages, stored as links from their IDs and keys to underlying data
+%%%    or child messages. Commitment IDs link to the message's content root.
+%%% 3. Computations, stored separately in `attested-store' as links from
+%%%    `VBaseID/VReqID' to `VResID'. Portable hashpath receipts describe the
+%%%    execution and its witnesses independently of these lookup entries.
 %%%
 %%% Before writing a message to the store, we convert it to Type-Annotated
 %%% Binary Messages (TABMs), such that each of the keys in the message is
@@ -40,8 +38,7 @@
 -module(hb_cache).
 -export([read_all_commitments/2]).
 -export([ensure_loaded/1, ensure_loaded/2, ensure_all_loaded/1, ensure_all_loaded/2]).
--export([read/2, read_resolved/3, write/2, write_binary/3, write_hashpath/2, link/3]).
--export([write_hashpath/3]).
+-export([read/2, read_resolved/3, write/2, link/3]).
 -export([match/2, list/2, list_numbered/2]).
 -export([test_unsigned/1, test_signed/1]).
 -include("include/hb.hrl").
@@ -60,6 +57,12 @@ ensure_loaded(Msg, Opts) ->
     ensure_loaded([], Msg, Opts).
 ensure_loaded(Ref, {Status, Msg}, Opts) when Status == ok; Status == error ->
     {Status, ensure_loaded(Ref, Msg, Opts)};
+ensure_loaded(Ref, {link, ID, LinkOpts = #{ <<"execution-input">> := true }}, Opts) ->
+    hb_ao:execution_input(
+        ensure_loaded(Ref,
+            {link, ID, maps:remove(<<"execution-input">>, LinkOpts)}, Opts),
+        Opts
+    );
 ensure_loaded(Ref,
         Lk = {link, ID, LkOpts = #{ <<"type">> := <<"link">>, <<"lazy">> := Lazy }},
         RawOpts) ->
@@ -284,9 +287,8 @@ generate_binary_path(Bin, Opts) ->
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    Verified = verified_unsigned(RawMsg, Opts),
-    hb_message:paranoid_verify(cache_write, Verified, Opts),
-    {ok, Msg} = hb_message:with_only_committed(Verified, Opts),
+    Msg = verified_unsigned(RawMsg, Opts),
+    hb_message:paranoid_verify(cache_write, Msg, Opts),
     TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
     ?event_debug(debug_cache, {writing_full_message, {msg, TABM}}),
     try
@@ -334,9 +336,25 @@ verified_unsigned(Msg, Opts) ->
             end,
             Msg
         ),
-    case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Deep, Opts) of
-        not_found -> hb_message:without_commitments_unless_verified(Deep, Opts);
-        _ -> hb_message:normalize_commitments(Deep, Opts, fast, shallow)
+    Verified =
+        case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Deep, Opts) of
+            not_found -> hb_message:without_commitments_unless_verified(Deep, Opts);
+            _ -> hb_message:normalize_commitments(Deep, Opts, fast, shallow)
+        end,
+    {ok, Committed} = hb_message:with_only_committed(Verified, Opts),
+    % Projecting to the shared committed keys can invalidate a commitment
+    % covering more fields. Settle that identity before naming this child.
+    case lists:all(fun hb_private:is_private/1,
+            maps:keys(Verified) -- maps:keys(Committed)) of
+        true -> Verified;
+        false ->
+            hb_message:normalize_commitments(
+                hb_message:with_commitments(
+                    #{ <<"committer">> => '_' }, Committed, Opts),
+                Opts#{ <<"commitment-device">> => <<"httpsig@1.0">> },
+                verify,
+                shallow
+            )
     end.
 
 %% @doc Apply the rule of `verified_unsigned/2' to a nested message, and to
@@ -623,28 +641,6 @@ calculate_all_ids(Msg, UncommittedID, Opts) ->
                 ),
             {SignedIDs, UnsignedIDs, AllID}
     end.
-
-%% @doc Write a hashpath and its message to the store and link it.
-write_hashpath(Msg = #{ <<"priv">> := #{ <<"hashpath">> := HP } }, Opts) ->
-    write_hashpath(HP, Msg, Opts);
-write_hashpath(MsgWithoutHP, Opts) ->
-    write(MsgWithoutHP, Opts).
-write_hashpath(HP, Msg, Opts) when is_binary(HP) or is_list(HP) ->
-    Store = hb_opts:get(attested_store, [], Opts),
-    ?event_debug({writing_hashpath, {hashpath, HP}, {msg, Msg}, {store, Store}}),
-    {ok, Path} = write(Msg, Opts),
-    hb_store:link(Store, #{ hb_path:to_binary(HP) => Path }, Opts),
-    {ok, Path}.
-
-%% @doc Write a raw binary keys into the store and link it at a given hashpath.
-write_binary(Hashpath, Bin, Opts) ->
-    write_binary(Hashpath, Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
-write_binary(Hashpath, Bin, Store, Opts) ->
-    ?event_debug({writing_binary, {hashpath, Hashpath}, {bin, Bin}, {store, Store}}),
-    {ok, Path} = do_write_message(Bin, Store, Opts),
-    LinkStore = hb_opts:get(attested_store, [], Opts),
-    hb_store:link(LinkStore, #{ hb_path:to_binary(Hashpath) => Path }, Opts),
-    {ok, Path}.
 
 %% @doc Read the message at a path. Returns in `structured@1.0' format: Either
 %% a richly typed map or a direct binary. If `cache-read-mode' is `raw',
@@ -1028,7 +1024,7 @@ read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsg
                     {key, NormKey}
                 }
             ),
-            read_hashpath(BaseMsgID, Req, Opts);
+            read_computation(BaseMsgID, Req, Opts);
         true ->
             % Either the message does not exist in the store, or there is no
             % explicit device in the message. If the message exists this implies
@@ -1056,17 +1052,19 @@ read_resolved(BaseMsg, Req = #{ <<"path">> := Key }, Opts) when is_map(BaseMsg) 
     % and perform a direct lookup if it does not.
     NormKey = hb_ao:normalize_key(Key, Opts),
     case hb_device:is_direct_key_access(BaseMsg, Req, Opts) of
-        false -> read_hashpath(BaseMsg, Req, Opts);
+        false -> read_computation(BaseMsg, Req, Opts);
         true ->
             ?event_debug(read_cached,
                 {skip_execution_memory_lookup,
                     {path, NormKey}
                 }
             ),
-            {hit, read_in_memory_key(BaseMsg, NormKey, Opts)}
+            {hit,
+                read_in_memory_key(
+                    hb_ao:execution_input(BaseMsg, Opts), NormKey, Opts)}
     end;
 read_resolved(Base, Req, Opts) ->
-    read_hashpath(Base, Req, Opts).
+    read_computation(Base, Req, Opts).
 
 %% @doc Return a key from an in-memory message, returning the same form as
 %% a store read (`{Status, Value}').
@@ -1081,20 +1079,19 @@ read_in_memory_key(BaseMsg, NormKey, Opts) ->
     end.
 
 %% @doc Read the output of a prior computation, given BaseMsg and Req.
-read_hashpath(BaseMsgID, ReqID, Opts) when ?IS_ID(BaseMsgID) and ?IS_ID(ReqID) ->
+read_computation(BaseMsgID, ReqID, Opts) when ?IS_ID(BaseMsgID) and ?IS_ID(ReqID) ->
     ?event_debug({cache_lookup, {base, BaseMsgID}, {req, ReqID}, {opts, Opts}}),
-    hashpath_read_result(read(<<BaseMsgID/binary, "/", ReqID/binary>>, Opts));
-read_hashpath(BaseMsgID, Req, Opts) when ?IS_ID(BaseMsgID) and is_map(Req) ->
-    ReqID = hb_message:id(Req, all, Opts),
-    hashpath_read_result(read(<<BaseMsgID/binary, "/", ReqID/binary>>, Opts));
-read_hashpath(BaseMsg, Req, Opts) when is_map(BaseMsg) and is_map(Req) ->
-    HP = hb_path:hashpath(BaseMsg, Req, Opts),
-    case hb_store:resolve(hb_opts:get(attested_store, [], Opts), HP, Opts) of
-        {ok, Path} when Path =/= HP ->
+    Key = <<BaseMsgID/binary, "/", ReqID/binary>>,
+    case hb_store:resolve(hb_opts:get(attested_store, [], Opts), Key, Opts) of
+        {ok, Path} when Path =/= Key ->
             hashpath_read_result(read(Path, Opts));
         _ -> miss
     end;
-read_hashpath(_, _, _) -> miss.
+read_computation(BaseMsgID, Req, Opts) when ?IS_ID(BaseMsgID) and is_map(Req) ->
+    read_computation(BaseMsgID, hb_message:id(Req, all, Opts), Opts);
+read_computation(BaseMsg, Req, Opts) when is_map(BaseMsg) and is_map(Req) ->
+    read_computation(hb_message:id(BaseMsg, all, Opts), Req, Opts);
+read_computation(_, _, _) -> miss.
 
 hashpath_read_result({ok, Msg}) -> {hit, {ok, Msg}};
 hashpath_read_result({error, not_found}) -> miss;
@@ -1618,6 +1615,25 @@ write_changed_normalized_message_test() ->
     ?assertEqual(hb_message:id(#{ <<"a">> => 2 }, all, Opts), ChangedID),
     {ok, Read} = read(ID, Opts),
     ?assertEqual(1, hb_maps:get(<<"a">>, Read, undefined, Opts)).
+
+%% @doc Projecting mixed commitments cannot retain an ID covering a removed
+%% field, either at the root or in a child named by its parent.
+projected_commitments_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new() },
+    Signed = hb_message:commit(#{ <<"a">> => <<"1">> }, Opts),
+    Mixed = hb_message:normalize_commitments(Signed#{ <<"extra">> => <<"2">> }, Opts),
+    FullID = hb_message:id(Mixed, unsigned, Opts),
+    lists:foreach(fun(Msg) ->
+        {ok, ID} = write(Msg, Opts),
+        {ok, Stored} = read(ID, Opts),
+        Loaded = ensure_all_loaded(Stored, Opts),
+        ?assert(hb_message:paranoid_verify(Loaded, Opts#{ <<"paranoid-verify">> => true })),
+        ?assertEqual(ID, hb_message:id(hb_message:uncommitted(Loaded, Opts), all, Opts))
+    end, [Mixed, #{ <<"child">> => Mixed }, #{ <<"children">> => [Mixed] }]),
+    {ok, Kept} = read(hb_message:id(Signed, all, Opts), Opts),
+    ?assertEqual(hb_message:signers(Signed, Opts), hb_message:signers(Kept, Opts)),
+    ?assertEqual({error, not_found}, read(FullID, Opts)).
 
 %% @doc Run a specific test with a given store module.
 run_test() ->

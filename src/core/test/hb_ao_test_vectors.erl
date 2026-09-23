@@ -286,16 +286,19 @@ hashpath_reset_test() ->
     Container = #{ <<"result">> => Result },
     {ok, Ignored} = hb_ao:resolve(Container, <<"result">>,
         Opts#{ <<"hashpath">> => ignore }),
-    ?assertEqual(Result, Ignored),
+    % The invocation removes the loaded child's unsigned commitment.
+    ?assertEqual(hb_message:uncommitted(Result, Opts), Ignored),
     {ok, Reset} = hb_ao:resolve(Container, <<"result">>,
         Opts#{ <<"hashpath">> => reset }),
     Hook = fun(_Base, Req, _Opts) -> {ok, Req#{ <<"status">> => error }} end,
     {error, Failed} = hb_ao:resolve(Container, <<"result">>, Opts#{
         <<"on">> => #{ <<"step">> => #{ <<"device">> => #{ step => Hook } } }
     }),
+    ?assertEqual(hb_private:reset(Result), hb_private:reset(Reset)),
+    ?assertEqual(hb_private:reset(hb_message:uncommitted(Result, Opts)),
+        hb_private:reset(Failed)),
     lists:foreach(
         fun(Msg) ->
-            ?assertEqual(hb_private:reset(Result), hb_private:reset(Msg)),
             ?assertEqual(#{}, maps:with([<<"hashpath">>, <<"hashpath-result">>],
                 hb_private:from_message(Msg)))
         end,
@@ -1262,11 +1265,11 @@ paranoid_message_verification_test(RawOpts) ->
     ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)).
 
 paranoid_input_verification_test(RawOpts) ->
-    Opts = paranoid_opts(RawOpts),
-    % Test that the input and base messages are verified prior to execution.
-    Base = hb_message:normalize_commitments(#{ <<"a">> => 1 }, Opts),
+    Opts = (paranoid_opts(RawOpts))#{ <<"priv-wallet">> => ar_wallet:new() },
+    % Signed inputs are preserved by Vary and verified before execution.
+    Base = hb_message:commit(#{ <<"a">> => 1 }, Opts),
     Request =
-        hb_message:normalize_commitments(
+        hb_message:commit(
             #{ <<"path">> => <<"keys">>, <<"a">> => 1 },
             Opts
         ),
@@ -1275,9 +1278,9 @@ paranoid_input_verification_test(RawOpts) ->
 
 paranoid_result_verification_test(RawOpts) ->
     % Test that the result message is verified after execution.
-    Opts = paranoid_opts(RawOpts),
+    Opts = (paranoid_opts(RawOpts))#{ <<"priv-wallet">> => ar_wallet:new() },
     Base =
-        hb_message:normalize_commitments(
+        hb_message:commit(
             #{ <<"device">> => <<"test-device@1.0">>, <<"a">> => 1 },
             Opts
         ),

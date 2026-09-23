@@ -95,7 +95,7 @@
 -export([resolve/2, resolve/3, resolve_many/2]).
 -export([raw/2, raw/3, raw/4, raw/5]).
 -export([normalize_key/1, normalize_key/2, normalize_keys/1, normalize_keys/2]).
--export([force_message/2]).
+-export([force_message/2, normalize_input/2, execution_input/2]).
 %%% Shortcuts and tools:
 -export([keys/1, keys/2, keys/3]).
 -export([get/2, get/3, get/4, get_first/2, get_first/3]).
@@ -548,16 +548,18 @@ resolve_stage(5, Resolver, Base, Req, Original, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 5, ExecName, execution}, Opts),
 	% Execution.
     ExecOpts = execution_opts(Opts),
+    ExecBase = execution_input(Base, Opts),
+    ExecReq = execution_input(Req, Opts),
     {Func, Args} =
         case Resolver of
-            {Key, F} -> {F, [Key, Base, Req, ExecOpts]};
-            F -> {F, [Base, Req, ExecOpts]}
+            {Key, F} -> {F, [Key, ExecBase, ExecReq, ExecOpts]};
+            F -> {F, [ExecBase, ExecReq, ExecOpts]}
         end,
     % Try to execute the function.
     Res = 
         try
             TruncatedArgs = hb_device:truncate_args(Func, Args),
-            MsgRes = maybe_profiled_apply(Func, TruncatedArgs, Base, Req, Opts),
+            MsgRes = maybe_profiled_apply(Func, TruncatedArgs, ExecBase, ExecReq, Opts),
             ?event(
                 debug_ao_result,
                 {
@@ -675,7 +677,7 @@ resolve_stage(
     ?event_debug(debug_ao_core, {stage, 8, ExecName, result_caching}, Opts),
     % Normalize the commitments of the generic result, then cache it before
     % applying the caller's overlay.
-    Res = maybe_normalize_result(RawRes, [Base, Req], Opts),
+    Res = maybe_normalize_result(RawRes, Opts),
     hb_cache_control:maybe_store(Base, Req, Res, OriginalReq, Opts),
     resolve_stage(9, Base, Req, {ok, Res}, Original, ExecName, Opts);
 resolve_stage(8, Base, Req, Res, Original, ExecName, Opts) ->
@@ -706,13 +708,11 @@ resolve_stage(
             base when is_map(VariedRes) ->
                 maybe_normalize_result(
                     set(Base, VariedRes, internal_opts(Opts)),
-                    [Base],
                     Opts
                 );
             request when is_map(VariedRes) ->
                 maybe_normalize_result(
                     set(Req, VariedRes, internal_opts(Opts)),
-                    [Req],
                     Opts
                 );
             _ -> VariedRes
@@ -932,74 +932,21 @@ ensure_message_loaded(Msg, _Opts) ->
     Msg.
 
 %% @doc Normalize the commitments of a result unless the execution generates
-%% no receipts: such internal resolutions store nothing, and their results
-%% are named only if a later execution returns them.
-maybe_normalize_result(Res, Inputs, Opts) ->
-    case hb_opts:get(hashpath, update, Opts) of
-        ignore -> Res;
-        _ -> normalize_result(Res, Inputs, Opts)
+%% no receipts or context: such internal resolutions store nothing, and their
+%% results are named only if a later execution returns them.
+maybe_normalize_result(Res, Opts) ->
+    case {hb_opts:get(hashpath, update, Opts),
+            hb_opts:get(return_context, false, Opts)} of
+        {ignore, false} -> Res;
+        _ -> normalize_result(Res, Opts)
     end.
 
-%% @doc Normalize the commitments of a result before it is cached, returned,
-%% or named by a receipt. Commitments that the result retains from an input
-%% follow the rule of `dev_message:set/3': they are dropped if the result adds
-%% a key or changes a committed key, such that a key set directly upon an
-%% input cannot carry the input's commitments to the cache. The unsigned
-%% commitment is then verified, or created, unless the result is unchanged
-%% since it was last normalized.
-normalize_result(Res, Inputs, Opts) when is_map(Res) ->
-    Stale =
-        lists:any(
-            fun(Input) -> retains_stale_commitments(Res, Input, Opts) end,
-            Inputs
-        ),
-    hb_message:normalize_commitments(
-        case Stale of
-            true -> hb_message:uncommitted(Res, Opts);
-            false -> Res
-        end,
-        Opts,
-        fast,
-        shallow
-    );
-normalize_result(Res, _Inputs, _Opts) ->
-    Res.
-
-%% @doc Whether a result retains commitments of an input that no longer
-%% describe it. A result that is the input itself retains nothing stale.
-retains_stale_commitments(Res, Res, _Opts) ->
-    false;
-retains_stale_commitments(Res, Input, Opts) when is_map(Input) ->
-    Commitments = hb_maps:get(<<"commitments">>, Res, #{}, Opts),
-    Retained =
-        [
-            ID
-        ||
-            ID <- hb_maps:keys(Commitments, Opts),
-            hb_message:commitment(ID, Input, Opts) =/= not_found
-        ],
-    Retained =/= [] andalso
-        (
-            public_keys(Res, Opts) -- public_keys(Input, Opts) =/= [] orelse
-                changed_committed_keys(Res, Input, Retained, Opts)
-        );
-retains_stale_commitments(_Res, _Input, _Opts) ->
-    false.
-
-%% @doc The keys of a message that its commitments can describe.
-public_keys(Msg, Opts) ->
-    hb_maps:keys(hb_message:uncommitted(hb_private:reset(Msg), Opts), Opts).
-
-%% @doc Whether the keys committed to by the given commitments differ between
-%% a result and the input it retained them from.
-changed_committed_keys(Res, Input, CommitmentIDs, Opts) ->
-    Committed = hb_message:committed(Res, CommitmentIDs, Opts),
-    hb_message:match(
-        hb_maps:with(Committed, Res, Opts),
-        hb_maps:with(Committed, Input, Opts),
-        strict,
-        Opts
-    ) =/= true.
+%% @doc A result gets a complete unsigned identity unless it retains valid
+%% signatures. A device cannot carry invalid input commitments into storage.
+normalize_result(Res, Opts) when is_map(Res) ->
+    normalize_input(
+        hb_message:without_commitments_unless_verified(Res, Opts), Opts);
+normalize_result(Res, _Opts) -> Res.
 
 %% @doc Resolve the device function for a loaded base and vary the inputs
 %% by its schema. Return the function, optionally paired with its handler key,
@@ -1033,14 +980,68 @@ vary_loaded(Base, Req, Opts) ->
             _ -> false
         end,
     Resolver = case AddKey of false -> Func; _ -> {AddKey, Func} end,
-    case hb_types:vary(Key, Func, AddKey, Base, Req, UserOpts) of
-        {ok, VariedBase, VariedReq, none} ->
-            {Resolver, VariedBase, VariedReq, no_overlay};
-        {ok, VariedBase, VariedReq, Overlay} ->
-            {Resolver, VariedBase, VariedReq, Overlay};
-        no_spec ->
-            {Resolver, Base, Req, no_overlay}
-    end.
+    {VariedBase, VariedReq, Overlay} =
+        case hb_types:vary(Key, Func, AddKey, Base, Req, UserOpts) of
+            {ok, VBase, VReq, none} -> {VBase, VReq, no_overlay};
+            {ok, VBase, VReq, Target} -> {VBase, VReq, Target};
+            no_spec -> {Base, Req, no_overlay}
+        end,
+    {Resolver,
+        normalize_input(VariedBase, Opts),
+        normalize_input(VariedReq, Opts),
+        Overlay
+    }.
+
+%% @doc Remove unsigned commitments from loaded invocation inputs recursively.
+%% Lazy children carry the same rule into loading. Signed subtrees are unchanged.
+execution_input({link, ID, LinkOpts}, _Opts) ->
+    {link, ID, LinkOpts#{ <<"execution-input">> => true }};
+execution_input(Msg, Opts) when is_map(Msg) ->
+    case hb_maps:is_key(<<"commitments">>, Msg, Opts) andalso
+            hb_message:signers(Msg, Opts) =/= [] of
+        false -> maps:map(
+            fun(Key, Value) ->
+                case hb_private:is_private(Key) of
+                    true -> Value;
+                    false -> execution_input(Value, Opts)
+                end
+            end,
+            hb_message:uncommitted(Msg, Opts)
+        );
+        true -> Msg
+    end;
+execution_input(Values, Opts) when is_list(Values) ->
+    [ execution_input(Value, Opts) || Value <- Values ];
+execution_input(Value, _Opts) -> Value.
+
+%% @doc Name every field of an unsigned varied input, including loaded children
+%% whose IDs participate in their parent's identity. Preserve signed subtrees
+%% and avoid adding commitments to children that have none.
+normalize_input(Msg, Opts) -> normalize_input(Msg, true, Opts).
+normalize_input(Msg, Commit, Opts) when is_map(Msg) ->
+    case hb_maps:is_key(<<"commitments">>, Msg, Opts) andalso
+            hb_message:signers(Msg, Opts) =/= [] of
+        false ->
+            Unsigned = maps:map(
+                fun(Key, Value) ->
+                    case hb_private:is_private(Key) of
+                        true -> Value;
+                        false -> normalize_input(Value, false, Opts)
+                    end
+                end,
+                hb_message:uncommitted(Msg, Opts)
+            ),
+            case Commit orelse hb_maps:is_key(<<"commitments">>, Msg, Opts) of
+                true -> hb_message:commit(Unsigned, Opts,
+                    #{ <<"type">> => <<"unsigned">>,
+                        <<"commitment-device">> => <<"httpsig@1.0">> });
+                false -> Unsigned
+            end;
+        true -> Msg
+    end;
+normalize_input(Values, _Commit, Opts) when is_list(Values) ->
+    [ normalize_input(Value, false, Opts) || Value <- Values ];
+normalize_input(Value, _Commit, _Opts) -> Value.
 
 %% @doc Catch all return if we are in an infinite loop.
 error_infinite(Base, Req, Opts) ->

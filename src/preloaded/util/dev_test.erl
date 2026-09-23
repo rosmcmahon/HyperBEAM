@@ -4,7 +4,7 @@
 -export([info/1, test_func/1, compute/3, init/3, restore/3, snapshot/3, mul/2]).
 -export([mangle/3, update_state/3, increment_counter/3, delay/3, append/3]).
 -export([index/3, postprocess/3, load/3]).
--export([vary_projection/3, vary_wildcard/3, vary_unspecified/3]).
+-export([vary_projection/3, vary_wildcard/3, vary_unspecified/3, vary_inspect/3]).
 -export([vary_overlay/3, vary_request_overlay/3]).
 -export([vary_alternatives/3, vary_dependent/3]).
 -include_lib("eunit/include/eunit.hrl").
@@ -294,6 +294,14 @@ vary_wildcard(Base, Req, _Opts) ->
 vary_unspecified(Base, Req, _Opts) ->
     {ok, #{ <<"base">> => Base, <<"request">> => Req }}.
 
+%% @doc Capture commitment presence before the resolver normalizes the result.
+vary_inspect(Base, Req, Opts) ->
+    {ok, #{
+        <<"base">> => Base, <<"request">> => Req,
+        <<"base-committed">> => hb_maps:is_key(<<"commitments">>, Base, Opts),
+        <<"request-committed">> => hb_maps:is_key(<<"commitments">>, Req, Opts)
+    }}.
+
 %% @doc Increment a counter in a projection of the base, returning a patch
 %% that the resolver lays over the whole base.
 -spec vary_overlay(#{ counter := integer() }, #{ _ => _ }, #{ _ => _ }) ->
@@ -479,9 +487,11 @@ vary_wildcard_preserves_other_keys_test() ->
             Opts
         ),
     ?assertEqual(1, maps:get(<<"required">>, maps:get(<<"base">>, Res))),
-    ?assertEqual(BaseExtra, maps:get(<<"extra">>, maps:get(<<"base">>, Res))),
+    % Invocation annotates links without loading them or changing their targets.
+    ?assertEqual({link, BaseExtraPath, #{ <<"execution-input">> => true }},
+        maps:get(<<"extra">>, maps:get(<<"base">>, Res))),
     ?assertEqual(
-        RequestExtra,
+        {link, RequestExtraPath, #{ <<"execution-input">> => true }},
         maps:get(<<"extra">>, maps:get(<<"request">>, Res))
     ).
 
@@ -698,7 +708,7 @@ vary_unspecified_function_is_identity_test() ->
     },
     {ok, Res} = hb_ao:resolve(Base, <<"vary-unspecified">>, Opts),
     ?assertEqual(
-        Base,
+        Base#{ <<"noise">> => {link, Path, #{ <<"execution-input">> => true }} },
         hb_private:reset(maps:get(<<"base">>, Res))
     ).
 
