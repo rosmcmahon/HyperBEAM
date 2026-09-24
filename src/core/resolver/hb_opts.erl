@@ -520,7 +520,7 @@ raw_default_message() ->
         % signatures it cannot verify? Gateways serve only an item's data and
         % may leave out its `anchor', so such items are served without commitments
         % when this is enabled, and refused otherwise.
-        <<"ans104-trust-gql">> => true,
+        <<"ans104-trust-gql">> => false,
         % Number of chunks to fetch in parallel when loading a TX or dataitem.
         <<"arweave-chunk-fetch-concurrency">> => 5,
         <<"http-extra-opts">> =>

@@ -288,8 +288,8 @@ avoid_double_read_test() ->
         hb_mock_server:stop(ServerHandle)
     end.
 
-%% @doc An item the node cannot verify is served without commitments and is
-%% not cached under its ID: the next read asks the gateway again.
+%% @doc Unverifiable items are refused by default. Explicit trust serves them
+%% without commitments and does not cache them under the requested ID.
 unverifiable_item_not_cached_test() ->
     hb_http_server:start_node(#{}),
     ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
@@ -311,11 +311,11 @@ unverifiable_item_not_cached_test() ->
             ]
     },
     try
-        {ok, First} = hb_cache:read(ID, Opts),
+        ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+        {ok, First} = hb_cache:read(ID, Opts#{ <<"ans104-trust-gql">> => true }),
         ?assertEqual([], hb_message:signers(First, Opts)),
         ?assertEqual(<<"123">>, hb_ao:get(<<"data">>, First, Opts)),
         ?assertEqual({error, not_found}, hb_cache:read(ID, #{ <<"store">> => [Local] })),
-        {ok, _} = hb_cache:read(ID, Opts),
         TXs = hb_mock_server:get_requests(raw, 2, ServerHandle),
         ?assertEqual(2, length(TXs))
     after
@@ -394,7 +394,8 @@ specific_route_test() ->
                 }
             ]
     },
-    {ok, Response} = hb_cache:read(ID, Opts),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+    {ok, Response} = hb_cache:read(ID, Opts#{ <<"ans104-trust-gql">> => true }),
     %% If the result returns <<"1984">>, it is using the default route, 
     %% not the custom one we defined
     ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)),
@@ -482,6 +483,7 @@ store_opts_test() ->
                 #{
                     <<"store-module">> => hb_store_gateway, 
                     <<"local-store">> => false,
+                    <<"ans104-trust-gql">> => true,
                     <<"subindex">> => [
                         #{
                             <<"name">> => <<"Data-Protocol">>,
