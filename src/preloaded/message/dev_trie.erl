@@ -78,15 +78,19 @@ collect_keys(TrieNode, Prefix, Opts, Acc) ->
 %% @doc Get the value associated with a key from a trie represented in a base
 %% message.
 -spec get_key(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
-    {ok, _} | {error, binary()}.
+    {ok, _} | {error, not_found | binary()}.
 get_key(Key, Trie, Req, Opts) ->
     get(Trie, Req#{<<"key">> => Key}, Opts).
 -spec get(#{ _ => _ }, #{ key := binary(), _ => _ }, #{ _ => _ }) ->
-    {ok, _} | {error, binary()}.
+    {ok, _} | {error, not_found | binary()}.
 get(TrieNode, Req, Opts) ->
     case hb_maps:find(<<"key">>, Req, Opts) of
         error -> {error, <<"'key' parameter is required for trie lookup.">>};
-        {ok, Key} -> retrieve(TrieNode, Key, Opts)
+        {ok, Key} ->
+            case retrieve(TrieNode, Key, Opts) of
+                {error, not_found} -> {error, not_found};
+                Value -> {ok, Value}
+            end
     end.
 
 %% @doc Set keys and their values in the trie.

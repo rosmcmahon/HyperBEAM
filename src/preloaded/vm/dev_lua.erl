@@ -288,13 +288,14 @@ sandbox(State, [Path | Rest], Opts) ->
     {ok, NextState} = luerl:set_table_keys_dec(Path, <<"sandboxed">>, State),
     sandbox(NextState, Rest, Opts).
 
-%% @doc Call the Lua script with the given arguments.
+%% @doc Call the Lua script with the given arguments, returning the status
+%% and result that the Lua function returns.
 -spec compute(
     binary(),
     #{ _ => _ },
     #{ _ => _ },
     #{ _ => _ }
-) -> {ok, _} | {error, #{ status := integer(), _ => _ }}.
+) -> {atom(), _}.
 compute(Key, RawBase, RawReq, Opts) ->
     ?event(debug_lua, compute_called),
     Req = 

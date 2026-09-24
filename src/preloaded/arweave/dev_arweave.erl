@@ -952,7 +952,7 @@ current(Base, Request, Opts) ->
     #{ size => integer(), _ => _ },
     #{ size => integer(), _ => _ },
     #{ _ => _ }
-) -> {ok, binary() | #{ _ => _ }} | {error, _}.
+) -> {ok, integer() | binary() | #{ _ => _ }} | {error, _}.
 price(Base, Request, Opts) ->
     Size =
         hb_ao:get_first(
