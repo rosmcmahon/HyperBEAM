@@ -994,12 +994,33 @@ linked_list_test(Store) ->
     ok = link(Store, link_req(<<"test-link">>, [<<"test-dir1">>]), #{}),
     ?assertEqual({ok, [<<"test-file">>]}, list(Store, <<"test-link">>, #{})).
 
+%% @doc Ensure that keys with non-ASCII characters are listed and read as
+%% written.
+unicode_key_test(Store) ->
+    Keys = [<<"é"/utf8>>, <<"日本語"/utf8>>, <<"🚀"/utf8>>],
+    ok = group(Store, <<"test-dir1">>, #{}),
+    lists:foreach(
+        fun(Key) ->
+            ok = write(Store, write_req([<<"test-dir1">>, Key], Key), #{})
+        end,
+        Keys
+    ),
+    {ok, Listed} = list(Store, <<"test-dir1">>, #{}),
+    ?assertEqual(lists:sort(Keys), lists:sort(Listed)),
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual({ok, Key}, read(Store, [<<"test-dir1">>, Key], #{}))
+        end,
+        Keys
+    ).
+
 store_suite_test_() ->
     generate_test_suite([
         {"simple path resolution", fun simple_path_resolution_test/1},
         {"resursive path resolution", fun resursive_path_resolution_test/1},
         {"hierarchical path resolution", fun hierarchical_path_resolution_test/1},
-        {"linked list", fun linked_list_test/1}
+        {"linked list", fun linked_list_test/1},
+        {"unicode key", fun unicode_key_test/1}
     ]).
 
 benchmark_suite_test_() ->
