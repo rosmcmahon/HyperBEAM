@@ -140,6 +140,10 @@ derived_commitment_id(Sig) when byte_size(Sig) == 32 ->
 derived_commitment_id(Sig) ->
     hb_util:human_id(crypto:hash(sha256, Sig)).
 
+%% @doc HTTPSig derives its committer; other codecs transport theirs explicitly.
+get_additional_params(Commitment = #{
+        <<"commitment-device">> := <<"httpsig@1.0">>, <<"committer">> := _ }) ->
+    get_additional_params(maps:remove(<<"committer">>, Commitment));
 get_additional_params(Commitment) ->
     AdditionalParams =
         sets:to_list(
@@ -157,8 +161,7 @@ get_additional_params(Commitment) ->
                         <<"signature">>,
                         <<"type">>,
                         <<"id">>,
-                        <<"commitment-device">>,
-                        <<"committer">>
+                        <<"commitment-device">>
                     ]
                 )
             )
@@ -281,7 +284,7 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
     % 2. Filter undefined keys.
     % 3. Use the transported `id' parameter when present (content-addressed
     %    devices), otherwise fall back to `derived_commitment_id/1'.
-    % 4. If the `keyid' resolves to a public key, set the `committer'.
+    % 4. Keep a transported committer, or derive it from the HTTPSig keyid.
     Commitment3 =
         Commitment2#{
             <<"signature">> => hb_util:encode(Sig),
@@ -299,7 +302,8 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
                 Commitment4;
             Committer ->
                 Commitment4#{
-                    <<"committer">> => Committer
+                    <<"committer">> =>
+                        maps:get(<<"committer">>, Commitment4, Committer)
                 }
         end,
     % Return the commitment and calculated ID.
