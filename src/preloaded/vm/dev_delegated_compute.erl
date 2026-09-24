@@ -157,6 +157,7 @@ do_relay(Method, Path, Body, Headers, Opts) ->
     hb_ao:resolve(
         #{
             <<"device">> => <<"relay@1.0">>,
+            <<"peer">> => hb_opts:get(delegated_compute_peer, not_found, Opts),
             <<"content-type">> => ContentType
         },
         Headers#{
@@ -241,6 +242,7 @@ snapshot(Msg, Req, Opts) ->
         hb_ao:resolve(
             #{
                 <<"device">> => <<"relay@1.0">>,
+                <<"peer">> => hb_opts:get(delegated_compute_peer, not_found, Opts),
                 <<"content-type">> => <<"application/json">>
             },
             #{

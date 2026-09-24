@@ -33,7 +33,7 @@ normalize(Msg, Req, Opts) ->
                     <<"delegated-compute@1.0">>,
                     Req#{ <<"path">> => <<"normalize">> }
                 },
-                Opts
+                delegated_opts(Opts)
             );
         false ->
             {error, #{
@@ -120,7 +120,7 @@ do_compute(State, Req, Opts) ->
             hb_ao:resolve(
                 State2,
                 {as, <<"delegated-compute@1.0">>, Req},
-                Opts
+                delegated_opts(Opts)
             ),
         {ok, State4} ?=
             hb_ao:resolve(
@@ -183,6 +183,13 @@ do_compute(State, Req, Opts) ->
             ),
             do_compute(ExitState, Req2, Opts)
     end.
+
+%% @doc Bind delegated requests to this node's Genesis server.
+delegated_opts(Opts) ->
+    Port = integer_to_binary(hb_opts:get(genesis_wasm_port, 6363, Opts)),
+    Opts#{
+        <<"delegated-compute-peer">> => <<"http://localhost:", Port/binary>>
+    }.
 
 %% @doc Ensure the local `genesis-wasm@1.0' is live. If it not, start it.
 ensure_started(Opts) ->
@@ -286,6 +293,9 @@ ensure_started(Opts) ->
                                                 )
                                             },
                                             {"DB_URL", DatabaseUrl},
+                                            {"PROCESS_MEMORY_CACHE_FILE_DIR",
+                                                filename:join(DBDir, "memory-cache")
+                                            },
                                             {"NODE_CONFIG_ENV", "production"},
                                             {"DEFAULT_LOG_LEVEL",
                                                 hb_util:list(
@@ -587,6 +597,103 @@ log_server_events([Line | Rest]) ->
     log_server_events(Rest).
 
 %%% Tests
+
+%% @doc Genesis requests stay on their configured server, independently of
+%% the routing table used by standalone delegated computation.
+instance_routing_test_() ->
+    {timeout, 60, fun instance_routing/0}.
+
+instance_routing() ->
+    Nodes = [routing_test_node(self()), routing_test_node(self())],
+    try
+        [{First, _}, {Second, _}] = Nodes,
+        lists:foreach(
+            fun({Device, Peer, RoutedPeer}) ->
+                #{port := Port} = uri_string:parse(Peer),
+                Opts = #{
+                    <<"store">> => [hb_test_utils:test_store()],
+                    <<"priv-wallet">> => ar_wallet:new(),
+                    <<"genesis-wasm-port">> => Port,
+                    <<"cache-control">> => [<<"no-store">>, <<"no-cache">>],
+                    <<"routes">> => [#{
+                        <<"template">> => <<"/.*">>,
+                        <<"node">> => #{ <<"prefix">> => RoutedPeer }
+                    }]
+                },
+                Process = hb_message:commit(#{ <<"type">> => <<"Process">> }, Opts),
+                ProcID = hb_message:id(Process, signed, Opts),
+                Base = #{ <<"device">> => Device, <<"process">> => Process },
+                % Warm the real HTTP endpoint before Genesis's bounded probe.
+                {ok, _} = hb_http:get(Peer, <<"/status">>, Opts),
+                erase(genesis_wasm_pid),
+                lists:foreach(
+                    fun({State, Req, Path}) ->
+                        {ok, _} = hb_ao:resolve(State, Req, Opts),
+                        Received = receive
+                            {routing_request, ActualPeer, #{
+                                <<"method">> := <<"POST">>
+                            } = Incoming} -> {ActualPeer, Incoming}
+                        after 5_000 -> error(genesis_request_timeout)
+                        end,
+                        {Peer, Request} = Received,
+                        ?assertEqual(Path, hb_maps:get(<<"path">>, Request, Opts))
+                    end,
+                    [
+                        {Base, #{ <<"path">> => <<"snapshot">> },
+                            <<"/snapshot/", ProcID/binary>>},
+                        {Base#{ <<"snapshot">> => #{
+                            <<"type">> => <<"Checkpoint">>,
+                            <<"content-type">> => <<"application/octet-stream">>,
+                            <<"data">> => <<"checkpoint">>
+                        }}, #{ <<"path">> => <<"normalize">> }, <<"/state">>},
+                        {Base, #{ <<"path">> => <<"compute">> },
+                            <<"/dry-run?process-id=", ProcID/binary>>},
+                        {Base, #{
+                            <<"path">> => <<"compute">>,
+                            <<"type">> => <<"Assignment">>,
+                            <<"slot">> => 0,
+                            <<"body">> => hb_message:commit(
+                                #{ <<"data">> => <<"test">> }, Opts
+                            )
+                        }, <<"/result/0?process-id=", ProcID/binary>>}
+                    ]
+                )
+            end,
+            [
+                {<<"genesis-wasm@1.0">>, First, Second},
+                {<<"genesis-wasm@1.0">>, Second, First},
+                {<<"delegated-compute@1.0">>, First, First}
+            ]
+        )
+    after
+        erase(genesis_wasm_pid),
+        lists:foreach(fun({_, ID}) -> cowboy:stop_listener(ID) end, Nodes)
+    end.
+
+%% @doc Use isolated HyperBEAM HTTP nodes to observe the outgoing requests.
+routing_test_node(Parent) ->
+    Wallet = ar_wallet:new(),
+    ID = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Node = hb_http_server:start_node(#{
+        <<"port">> => 0,
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => [hb_test_utils:test_store()],
+        <<"force-signed">> => false,
+        <<"on">> => #{ <<"request">> => #{ <<"device">> => #{
+            <<"request">> => fun(_, #{ <<"request">> := Req }, _) ->
+                Port = integer_to_binary(ranch:get_port(ID)),
+                Parent ! {routing_request,
+                    <<"http://localhost:", Port/binary, "/">>, Req},
+                {error, #{
+                    <<"status">> => 200,
+                    <<"content-type">> => <<"application/json">>,
+                    <<"body">> => <<"{\"Output\":{\"data\":\"ok\"},\"Messages\":[]}">>
+                }}
+            end
+        }}}
+    }),
+    {Node, ID}.
+
 -ifdef(ENABLE_GENESIS_WASM).
 
 import_legacy_checkpoint_test_() ->
