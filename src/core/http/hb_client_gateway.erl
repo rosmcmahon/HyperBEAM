@@ -451,11 +451,14 @@ result_to_message(ExpectedID, Item, Opts) ->
     Structured = hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts),
     % Gateways serve only an item's data, and their indexes may leave out the
     % `anchor' or change the tags that its signature covers, so the item built
-    % from the result is verified before its commitment is added. A signature
-    % that does not verify over the item built here is not a commitment of this
-    % message: the node serves the item uncommitted if it trusts the gateway's
-    % index, or refuses it.
-    case try ar_bundles:verify_item(TX) catch _:_ -> false end of
+    % from the result must verify and match the requested ID. Otherwise, the
+    % node serves it uncommitted only if it explicitly trusts the index.
+    IDMatches =
+        ExpectedID =:= undefined orelse
+            hb_util:human_id(TX#tx.id) =:= hb_util:human_id(ExpectedID),
+    case IDMatches andalso
+        (try ar_bundles:verify_item(TX) catch _:_ -> false end)
+    of
         true ->
             ?event({gql_verify_succeeded, Structured}),
             {ok, Structured};
@@ -613,10 +616,13 @@ l1_transaction_test() ->
     ?assertEqual(<<"Hello World">>, Data).
 
 %% @doc Test l2 message from graphql. The gateway index leaves out the item's
-%% anchor, so its signature cannot be verified and it is served uncommitted.
+%% anchor, so explicit trust is needed to serve it uncommitted.
 l2_dataitem_test() ->
     _Node = hb_http_server:start_node(#{}),
-    {ok, Res} = read(<<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>, #{}),
+    {ok, Res} = read(
+        <<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>,
+        #{ <<"ans104-trust-gql">> => true }
+    ),
     ?event(gateway, {l2_dataitem, Res}),
     ?assertEqual([], hb_message:signers(Res, #{})),
     ?assertNot(maps:is_key(<<"commitments">>, Res)),
@@ -624,11 +630,11 @@ l2_dataitem_test() ->
     ?assertEqual(<<"Hello World">>, Data).
 
 %% @doc ed25519 L2 Transaction test. The gateway index leaves out the item's
-%% anchor, so its signature cannot be verified and it is served uncommitted.
+%% anchor, so explicit trust is needed to serve it uncommitted.
 l2_dataitem_ed25519_test() ->
     _Node = hb_http_server:start_node(#{}),
     ID = <<"AwrAs-HaBlc8xeI8sw6Wpbi7A0weQWeXYwW20CpX5oM">>,
-    {ok, Res} = read(ID, #{}),
+    {ok, Res} = read(ID, #{ <<"ans104-trust-gql">> => true }),
     ?event(gateway, {l2_dataitem, Res}),
     ?assertEqual([], hb_message:signers(Res, #{})),
     ?assertNot(maps:is_key(<<"commitments">>, Res)),
@@ -639,7 +645,10 @@ l2_dataitem_ed25519_test() ->
 %% @doc Test optimistic index
 ao_dataitem_test() ->
     _Node = hb_http_server:start_node(#{}),
-    {ok, Res} = read(<<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>, #{}),
+    {ok, Res} = read(
+        <<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>,
+        #{ <<"ans104-trust-gql">> => true }
+    ),
     ?event(gateway, {l2_dataitem, Res}),
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"Hello World">>, Data).
@@ -647,8 +656,7 @@ ao_dataitem_test() ->
 %% @doc An index that serves an item's anchor lets the item verify against its
 %% real signature, so it is served with its commitment. With the anchor left
 %% out, as arweave.net and goldsky serve bundled items, the signature cannot be
-%% verified: the item is served uncommitted, or refused if the node does not
-%% trust the index.
+%% verified: the item is refused unless the node explicitly trusts the index.
 anchor_verification_test() ->
     {ok, Bin} = file:read_file(<<"test/arbundles.js/ans104-item-ed25519.bin">>),
     TX = ar_bundles:deserialize(Bin),
@@ -673,11 +681,14 @@ anchor_verification_test() ->
         hb_message:signers(Verified, #{})
     ),
     Unanchored = Item#{ <<"anchor">> => <<>> },
-    {ok, Uncommitted} = result_to_message(Unanchored, #{}),
+    ?assertEqual({error, unverifiable_item}, result_to_message(Unanchored, #{})),
+    {ok, Uncommitted} = result_to_message(
+        Unanchored, #{ <<"ans104-trust-gql">> => true }
+    ),
     ?assertEqual([], hb_message:signers(Uncommitted, #{})),
     ?assertNot(maps:is_key(<<"commitments">>, Uncommitted)),
     ?assertEqual(TX#tx.data, maps:get(<<"data">>, Uncommitted)),
     ?assertEqual(
         {error, unverifiable_item},
-        result_to_message(Unanchored, #{ <<"ans104-trust-gql">> => false })
+        result_to_message(hb_util:human_id(<<0:256>>), Item, #{})
     ).

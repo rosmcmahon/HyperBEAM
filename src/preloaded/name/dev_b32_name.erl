@@ -186,6 +186,10 @@ test_manifest_subdomain_matches_path_id() ->
 test_manifest_subdomain_does_not_match_path_id() ->
     TestPath = <<"/1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
     Opts = manifest_opts(),
+    {ok, _} = hb_test_utils:preload(
+        Opts,
+        <<"test/arbundles.js/ans104-item-ed25519.bin">>
+    ),
     Subdomain = <<"4nuojs5tw6xtfjbq47dqk6ak7n6tqyr3uxgemkq5z5vmunhxphya">>,
     Node = hb_http_server:start_node(Opts),
     assert_manifest(Node, TestPath, Subdomain, <<"image/png">>, <<137, "PNG">>, Opts).

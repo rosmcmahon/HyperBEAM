@@ -275,7 +275,11 @@ default_query(Parts) ->
 %% @doc Run node for testing
 run_test_node() ->
     Store = hb_test_utils:test_store(),
-    Opts = #{ <<"store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    Opts = #{
+        <<"store">> => Store,
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"ans104-trust-gql">> => true
+    },
     Node = hb_http_server:start_node(Opts),
     {Node ,Opts}. 
 %% @doc Basic test to test copycat device
