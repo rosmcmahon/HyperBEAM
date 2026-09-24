@@ -431,7 +431,11 @@ deep_set([Key], Value, Msg, Opts) ->
             Msg#{ Key => Value }
     end;
 deep_set([Key|Rest], Value, Map, Opts) ->
-    SubMap = hb_maps:get(Key, Map, #{}, Opts),
+    SubMap =
+        case hb_maps:get(Key, Map, #{}, Opts) of
+            Existing when is_map(Existing) -> Existing;
+            _ -> #{}
+        end,
     hb_maps:put(Key, deep_set(Rest, Value, SubMap, Opts), Map, Opts).
 
 %% @doc Get a deep value from a message.
@@ -447,7 +451,7 @@ deep_get([Key|Rest], Msg, Default, Opts) ->
     case hb_maps:find(Key, Msg, Opts) of
         {ok, DeepMsg} when is_map(DeepMsg) ->
             deep_get(Rest, DeepMsg, Default, Opts);
-        error -> Default
+        _ -> Default
     end.
 
 %% @doc Find the target path to route for a request message.
@@ -983,6 +987,19 @@ atom_to_dashed_binary_test_parallel() ->
 all_atoms_test() ->
     Count = erlang:system_info(atom_count),
     ?assert(length(all_atoms()) >= Count).
+
+%% @doc Setting a deep key over a path that contains a literal replaces the
+%% literal with a message. Getting a deep key over that path returns the
+%% default.
+deep_literal_test() ->
+    ?assertEqual(
+        #{ <<"a">> => #{ <<"b">> => 2 } },
+        deep_set([<<"a">>, <<"b">>], 2, #{ <<"a">> => 1 }, #{})
+    ),
+    ?assertEqual(
+        not_found,
+        deep_get([<<"a">>, <<"b">>], #{ <<"a">> => 1 }, #{})
+    ).
 
 message_to_ordered_list_metadata_test() ->
     Msg = #{
