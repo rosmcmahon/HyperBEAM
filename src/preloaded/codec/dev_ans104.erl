@@ -284,6 +284,29 @@ modified_committed_value_test() ->
         Msg#{ <<"target">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
     ?assertNot(hb_message:verify(ModifiedField, all, #{})).
 
+%% @doc Committing a message with 126 keys and a nested message throws
+%% `too_many_keys': its item would have 129 tags, and ANS-104 allows 128.
+bundle_tag_count_test() ->
+    Msg =
+        (maps:from_list(
+            [
+                {<<"key-", (integer_to_binary(N))/binary>>, <<"value">>}
+            ||
+                N <- lists:seq(1, 126)
+            ]
+        ))#{ <<"nested">> => #{ <<"a">> => <<"b">> } },
+    ?assertThrow(
+        {too_many_keys, _},
+        hb_message:commit(
+            Msg,
+            #{ <<"priv-wallet">> => ar_wallet:new() },
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"bundle">> => true
+            }
+        )
+    ).
+
 unsigned_duplicated_tag_name_test() ->
     TX = ar_tx:normalize(#tx {
         tags = [

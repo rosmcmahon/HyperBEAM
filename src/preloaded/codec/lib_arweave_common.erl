@@ -72,7 +72,7 @@ to(Device, TABM, Req, FieldsFun, ExcludedTagsFun, Opts) ->
     ?event({calculated_tags, Tags}),
     TX = TX1#tx{ tags = Tags },
     ?event({tx_before_id_gen, TX}),
-    try ar_tx:normalize(TX)
+    try tag_count(ar_tx:normalize(TX), TABM)
     catch
         Type:Error:Stacktrace ->
             ?event({
@@ -84,6 +84,14 @@ to(Device, TABM, Req, FieldsFun, ExcludedTagsFun, Opts) ->
             }),
             erlang:raise(Type, Error, Stacktrace)
     end.
+
+%% @doc Throw `too_many_keys' if a normalized item has more tags than ANS-104
+%% allows. `ar_tx:normalize/1' adds three tags to an item whose data is a
+%% bundle, so the tags are counted after it.
+tag_count(TX, TABM) when length(TX#tx.tags) > ?MAX_TAG_COUNT ->
+    throw({too_many_keys, TABM});
+tag_count(TX, _TABM) ->
+    TX.
 
 %% @doc Return a TABM message containing the fields of the given decoded
 %% ANS-104 data item that should be included in the base message.
