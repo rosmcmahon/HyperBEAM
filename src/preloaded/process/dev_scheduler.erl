@@ -15,7 +15,7 @@
 %%% </pre>
 
 -module(dev_scheduler).
--device_libraries([lib_process]).
+-device_libraries([lib_process, lib_scheduler_formats]).
 %%% AO-Core API functions:
 -export([info/0]).
 %%% Local scheduling functions:
@@ -802,7 +802,7 @@ remote_slot(<<"ao.TN.1">>, ProcID, Node, Opts) ->
                     % Convert the JSON object for the latest assignment into the
                     % standardized `~scheduler@1.0' format.
                     A =
-                        dev_scheduler_formats:aos2_to_assignment(
+                        lib_scheduler_formats:aos2_to_assignment(
                             JSON,
                             Opts
                         ),
@@ -871,7 +871,7 @@ get_schedule(Base, Req, Opts) ->
                         {ok, Res} ->
                             case uri_string:percent_decode(Format) of
                                 <<"application/aos-2">> ->
-                                    dev_scheduler_formats:assignments_to_aos2(
+                                    lib_scheduler_formats:assignments_to_aos2(
                                         ProcID,
                                         hb_ao:get(
                                             <<"assignments">>, Res, [], Opts),
@@ -922,7 +922,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, _, Opts)
     % as a bundle. We set the 'more' to `undefined' to indicate that there may
     % be more assignments to fetch, but we don't know for sure.
     Res = 
-        dev_scheduler_formats:assignments_to_bundle(
+        lib_scheduler_formats:assignments_to_bundle(
             ProcID,
             LocalAssignments,
             undefined,
@@ -1021,7 +1021,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                                 cache_remote_schedule(Variant, ProcID, JSONRes, Opts),
                                 ?event(debug_aos2, {json_res, {json, JSONRes}}),
                                 Filtered = filter_json_assignments(JSONRes, To, From, Opts),
-                                dev_scheduler_formats:aos2_to_assignments(
+                                lib_scheduler_formats:aos2_to_assignments(
                                     ProcID,
                                     Filtered,
                                     Opts
@@ -1044,7 +1044,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                     % Merge the local assignments with the remote assignments,
                     % and normalize the keys.
                     Merged =
-                        dev_scheduler_formats:assignments_to_bundle(
+                        lib_scheduler_formats:assignments_to_bundle(
                             ProcID,
                             MergedAssignments = LocalAssignments ++ RemoteAssignments,
                             hb_ao:get(<<"continues">>, NormSched, false, Opts),
@@ -1298,7 +1298,7 @@ post_legacy_schedule(ProcID, OnlyCommitted, Node, Opts) ->
                                 ),
                             ?event({assignment_json, AssignmentJSON}),
                             Assignment =
-                                dev_scheduler_formats:aos2_to_assignment(
+                                lib_scheduler_formats:aos2_to_assignment(
                                     AssignmentJSON,
                                     Opts
                                 ),
@@ -1412,9 +1412,9 @@ generate_local_schedule(Format, ProcID, From, To, Opts) ->
     FormatterFun =
         case uri_string:percent_decode(Format) of
             <<"application/aos-2">> ->
-                fun dev_scheduler_formats:assignments_to_aos2/4;
+                fun lib_scheduler_formats:assignments_to_aos2/4;
             _ ->
-                fun dev_scheduler_formats:assignments_to_bundle/4
+                fun lib_scheduler_formats:assignments_to_bundle/4
         end,
     Res = FormatterFun(ProcID, Assignments, More, Opts),
     ?event({assignments_bundle_outbound, {format, Format}, {res, Res}}),

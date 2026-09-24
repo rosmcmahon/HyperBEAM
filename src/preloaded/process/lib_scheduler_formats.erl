@@ -6,7 +6,7 @@
 %%%
 %%% The `application/json' format is a legacy format that is not recommended for
 %%% new integrations of the AO protocol.
--module(dev_scheduler_formats).
+-module(lib_scheduler_formats).
 -export([assignments_to_bundle/4, assignments_to_aos2/4]).
 -export([aos2_to_assignments/3, aos2_to_assignment/2]).
 -export([aos2_normalize_types/1]).
