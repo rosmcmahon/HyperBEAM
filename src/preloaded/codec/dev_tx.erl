@@ -2,13 +2,19 @@
 %%% records to and from TABMs.
 -module(dev_tx).
 -device_libraries([lib_arweave_common]).
--export([from/3, to/3, to_hint/3, commit/3, verify/3]).
+-export([from/3, to/3, to_hint/3, commit/3, verify/3, deserialize/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(BASE_FIELDS, [
     <<"anchor">>, <<"format">>, <<"quantity">>, <<"reward">>, <<"target">>,
     <<"data_root">>, <<"data_size">> ]).
+
+%% @doc Deserialize a JSON-encoded transaction to a TABM.
+deserialize(#{ <<"body">> := Body }, Req, Opts) ->
+    deserialize(Body, Req, Opts);
+deserialize(Body, Req, Opts) when is_binary(Body) ->
+    from(ar_tx:json_struct_to_tx(hb_json:decode(Body)), Req, Opts).
 
 %% @doc Sign a message using the `priv-wallet' key in the options. Supports both
 %% the `hmac-sha256' and `rsa-pss-sha256' algorithms, offering unsigned and
