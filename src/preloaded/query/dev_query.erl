@@ -21,11 +21,14 @@
 %%% - `first-path': Return the first path of the matches.
 %%% - `first-message': Return the first message of the matches.
 %%% - `boolean': Return a boolean indicating whether any matches were found.
+%%%
+%%% `recipient' returns the native recipient preserved in the message's
+%%% commitment, or an empty binary when absent, as used by Arweave GraphQL.
 -module(dev_query).
 %%% Message matching API:
 -export([info/1, only/3, all/3, base/3]).
 %%% GraphQL API:
--export([graphql/3, has_results/3]).
+-export([graphql/3, has_results/3, recipient/3]).
 %%% Test setup:
 -export([test_setup/0]).
 -include_lib("eunit/include/eunit.hrl").
@@ -56,6 +59,10 @@ graphql(_Base, #{ <<"method">> := <<"GET">> }, Opts) ->
     );
 graphql(Base, Req, Opts) ->
     dev_query_graphql:handle(Base, Req, Opts).
+
+%% @doc Read the native recipient independently of ordinary message tags.
+recipient(Base, Req, Opts) ->
+    dev_query_arweave:query(Base, <<"recipient">>, Req, Opts).
 
 %% @doc Return whether a GraphQL esponse in a message has transaction results.
 %% This key is used in HB's gateway client multirequest configuration to
