@@ -1102,7 +1102,7 @@ cache_remote_schedule(<<"ao.N.1">>, ProcID, Schedule, Opts) ->
             Opts#{ <<"hashpath">> => ignore }
         ),
     cache_remote_schedule(common, ProcID, Assignments, Opts);
-cache_remote_schedule(_, _ProcID, Schedule, Opts) ->
+cache_remote_schedule(_, ProcID, Schedule, Opts) ->
     Cacher =
         fun() ->
             ?event(debug_sched, {caching_remote_schedule, {schedule, Schedule}}),
@@ -1115,7 +1115,7 @@ cache_remote_schedule(_, _ProcID, Schedule, Opts) ->
                             {assignment, hb_maps:get(<<"slot">>, Assignment, undefined, Opts)}
                         }
                     ),
-                    dev_scheduler_cache:write(Assignment, Opts)
+                    dev_scheduler_cache:write(ProcID, Assignment, Opts)
                 end,
                 AssignmentList =
                     hb_util:message_to_ordered_list(
