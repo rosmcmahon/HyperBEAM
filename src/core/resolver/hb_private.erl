@@ -136,14 +136,7 @@ reset(Msg) when is_map(Msg) ->
         )
     );
 reset(List) when is_list(List) ->
-    % Check if any of the terms in the list are private specifiers, return an
-    % empty list if so.
-    case lists:any(fun is_private/1, List) of
-        true -> [];
-        false ->
-            % The list itself is safe. Check each of the children.
-            lists:map(fun reset/1, List)
-    end;
+    lists:map(fun reset/1, List);
 reset(Tuple) when is_tuple(Tuple) ->
     list_to_tuple(reset(tuple_to_list(Tuple)));
 reset(NonMapMessage) ->

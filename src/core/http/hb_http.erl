@@ -735,11 +735,23 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                 maps:without([<<"body">>], ErrMsg),
                 maps:get(<<"body">>, ErrMsg, <<>>)
             };
-        {404, <<"httpsig@1.0">>, false} ->
+        {Code, <<"httpsig@1.0">>, false} when Code == 403; Code == 404 ->
+            {Title, Description} =
+                case Code of
+                    403 -> {<<"Access denied.">>,
+                        <<"This request does not have permission to perform this operation.">>};
+                    404 -> {<<"Page cannot be found.">>,
+                        <<"This hashpath cannot be resolved on this node, yet...">>}
+                end,
             {ok, ErrMsg} =
                 hb_http_server:static(
                     <<"hyperbuddy@1.0">>,
-                    <<"404.html">>,
+                    <<"error.html">>,
+                    #{
+                        <<"status">> => Code,
+                        <<"title">> => Title,
+                        <<"description">> => Description
+                    },
                     Opts
                 ),
             {Status,
@@ -1278,6 +1290,29 @@ simple_ao_resolve_signed_test() ->
         ),
     ?assertEqual(<<"Value1">>, Res).
 
+%% @doc Browser requests receive friendly, templated authorization and missing
+%% resource pages, with the corresponding HTTP status.
+client_error_pages_test() ->
+    Node = hb_http_server:start_node(isolated_test_opts()),
+    lists:foreach(
+        fun({Path, Status, Title}) ->
+            {ok, {{_, Status, _}, Headers, Body}} = httpc:request(
+                get,
+                {binary_to_list(<<Node/binary, Path/binary>>), []},
+                [],
+                [{body_format, binary}]
+            ),
+            ?assertEqual("text/html", proplists:get_value("content-type", Headers)),
+            ?assertNotEqual(nomatch, binary:match(Body, Title)),
+            ?assertEqual(nomatch, binary:match(Body, <<"{{">>)),
+            ?assertEqual(nomatch, binary:match(Body, <<"not_authorized">>))
+        end,
+        [
+            {<<"/~cache@1.0/group">>, 403, <<"Access denied.">>},
+            {<<"/~cache@1.0/read?read=missing">>, 404, <<"Page cannot be found.">>}
+        ]
+    ).
+
 %% @doc A request whose commitment carries the operator's address but was not
 %% made with the operator's key is refused, and the node message stays as it
 %% is.
@@ -1288,7 +1323,8 @@ forged_commitment_rejected_test() ->
         #{
             <<"path">> => <<"/~meta@1.0/info">>,
             <<"method">> => <<"POST">>,
-            <<"short-trace-len">> => 7
+            <<"short-trace-len">> => 7,
+            <<"type">> => <<"node-message">>
         },
     Genuine = hb_message:commit(Update, Opts),
     [{_, GenuineComm}] =
