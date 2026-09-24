@@ -982,11 +982,24 @@ hierarchical_path_resolution_test(Store) ->
         read(Store, [<<"test-link">>, <<"test-file">>], #{})
     ).
 
+%% @doc Ensure that we can list a directory through a link to it.
+linked_list_test(Store) ->
+    ok = group(Store, <<"test-dir1">>, #{}),
+    ok =
+        write(
+            Store,
+            write_req([<<"test-dir1">>, <<"test-file">>], <<"test-data">>),
+            #{}
+        ),
+    ok = link(Store, link_req(<<"test-link">>, [<<"test-dir1">>]), #{}),
+    ?assertEqual({ok, [<<"test-file">>]}, list(Store, <<"test-link">>, #{})).
+
 store_suite_test_() ->
     generate_test_suite([
         {"simple path resolution", fun simple_path_resolution_test/1},
         {"resursive path resolution", fun resursive_path_resolution_test/1},
-        {"hierarchical path resolution", fun hierarchical_path_resolution_test/1}
+        {"hierarchical path resolution", fun hierarchical_path_resolution_test/1},
+        {"linked list", fun linked_list_test/1}
     ]).
 
 benchmark_suite_test_() ->

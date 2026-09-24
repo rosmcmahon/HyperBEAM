@@ -93,13 +93,19 @@ write_path(Opts, PathComponents, Value) ->
     ok = file:write_file(Path, Value),
     ok.
 
-%% @doc List contents of a directory in the store.
-list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
-    case file:list_dir(add_prefix(Opts, hb_path:to_binary(Path))) of
-        {ok, Files} ->
-            Children = lists:map(fun hb_util:bin/1, Files),
-            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
-        {error, _} -> {error, not_found}
+%% @doc List contents of a directory in the store, following symlinks as
+%% needed.
+list(Opts, Req = #{ <<"list">> := Path }, NodeOpts) ->
+    case resolve(Opts, #{ <<"resolve">> => Path }, NodeOpts) of
+        {ok, ResolvedPath} ->
+            case file:list_dir(add_prefix(Opts, ResolvedPath)) of
+                {ok, Files} ->
+                    Children = lists:map(fun hb_util:bin/1, Files),
+                    {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
+                {error, _} -> {error, not_found}
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Replace links in a path successively, returning the final path.
