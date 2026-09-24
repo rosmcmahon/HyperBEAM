@@ -32,6 +32,7 @@
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
 -define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
                                                 % every 5,000 write operations.
+-define(MAX_KEY_SIZE, 511).                     % LMDB's key size limit, bytes.
 
 %% @doc Start the LMDB storage system for a given database configuration.
 %%
@@ -153,6 +154,10 @@ write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
     {error, not_found};
 write(Opts, PathParts, Value) when is_list(PathParts) ->
     write(Opts, hb_store_utils:to_path(PathParts), Value);
+write(_Opts, Path, _Value) when byte_size(Path) > ?MAX_KEY_SIZE ->
+    % elmdb accepts a longer key, fails to flush it, and then fails every
+    % later operation on the database.
+    {error, 'key-too-long'};
 write(Opts, Path, Value) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
     ?event_debug({elmdb_write, {db, DBInstance}, {path, Path}, {value, Value}}),
@@ -773,6 +778,19 @@ basic_test() ->
     ?assertEqual(ok, Res),
     {ok, Value} = test_read(StoreOpts, <<"Hello">>),
     ?assertEqual(Value, <<"World2">>),
+    ok = test_stop(StoreOpts).
+
+%% @doc A 511-byte key is written, a 512-byte key returns an error, and the
+%% store still reads the first key afterwards.
+long_key_test() ->
+    StoreOpts = hb_test_utils:test_store(?MODULE),
+    MaxKey = binary:copy(<<"k">>, ?MAX_KEY_SIZE),
+    ?assertEqual(ok, write(StoreOpts, MaxKey, <<"held">>)),
+    ?assertEqual(
+        {error, 'key-too-long'},
+        write(StoreOpts, <<MaxKey/binary, "k">>, <<"refused">>)
+    ),
+    ?assertEqual({ok, <<"held">>}, test_read(StoreOpts, MaxKey)),
     ok = test_stop(StoreOpts).
 
 %% @doc List test - verifies prefix-based key listing functionality.
