@@ -4,7 +4,7 @@
 -export([commitments_to_siginfo/3, siginfo_to_commitments/3]).
 -export([committed_keys_to_siginfo/1, to_siginfo_keys/3, from_siginfo_keys/3]).
 -export([add_derived_specifiers/1, remove_derived_specifiers/1]).
--export([commitment_to_sig_name/1]).
+-export([commitment_to_sig_name/1, derived_commitment_id/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 

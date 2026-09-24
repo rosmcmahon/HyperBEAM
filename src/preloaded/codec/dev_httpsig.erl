@@ -73,11 +73,16 @@ serialize(Msg, _Req, Opts) ->
 ) -> {ok, boolean()} | {failure, _}.
 verify(Base, Req, RawOpts) ->
     Opts = opts(RawOpts),
-    % A commitment over a key that the base lacks does not verify.
-    case missing_keys(Base, Req, Opts) of
-        [] -> do_verify(Base, Req, Opts);
-        Missing ->
-            ?event(httpsig_verify, {verify, {committed_key_missing, Missing}}),
+    % Verify the commitment's ID as well as the presence of its committed keys.
+    maybe
+        [] ?= missing_keys(Base, Req, Opts),
+        ID = dev_httpsig_siginfo:derived_commitment_id(
+            hb_util:decode(maps:get(<<"signature">>, Req))),
+        true ?= maps:is_key(ID, maps:get(<<"commitments">>, Base, #{})),
+        do_verify(Base, Req, Opts)
+    else
+        Failure ->
+            ?event(httpsig_verify, {verify, {invalid_commitment, Failure}}),
             {ok, false}
     end.
 
@@ -626,8 +631,8 @@ signature_param(Name, Commitment) ->
 
 %%% Integration Tests
 
-%% @doc Signer attribution must agree with the verified key material.
-committer_bound_to_key_test() ->
+%% @doc Commitment identities must agree with the verified key and signature.
+commitment_identity_test() ->
     Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
     Msg = #{ <<"body">> => <<"authenticated">> },
     Victim = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
@@ -635,12 +640,18 @@ committer_bound_to_key_test() ->
     Unsigned = hb_message:commit(Msg, Opts, #{ <<"type">> => <<"unsigned">> }),
     lists:foreach(
         fun(Committed) ->
-            ?assert(hb_message:verify(Committed, all, Opts)),
+            ?assert(hb_message:verify(
+                Committed, #{ <<"commitment-ids">> => <<"all">> }, Opts)),
             Forged = Committed#{ <<"commitments">> => maps:map(
                 fun(_, C) -> C#{ <<"committer">> => Victim } end,
                 maps:get(<<"commitments">>, Committed)
             ) },
-            ?assertNot(hb_message:verify(Forged, all, Opts))
+            ?assertNot(hb_message:verify(Forged, all, Opts)),
+            Renamed = Committed#{ <<"commitments">> => #{
+                Victim => hd(maps:values(maps:get(<<"commitments">>, Committed)))
+            } },
+            ?assertNot(hb_message:verify(
+                Renamed, #{ <<"commitment-ids">> => <<"all">> }, Opts))
         end,
         [Signed, Unsigned]
     ),
