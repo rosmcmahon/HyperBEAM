@@ -305,13 +305,16 @@ value_of(Body, Opts) ->
 owns_supply(Base, Address, Opts) ->
     Supply = supply(Base, Opts),
     Threshold =
-        hb_util:int(
-            state(
-                <<"set-authority-threshold-bps">>,
-                Base,
-                ?DEFAULT_THRESHOLD_BPS,
-                Opts
-            )
+        hb_util:ok_or(
+            hb_util:safe_int(
+                state(
+                    <<"set-authority-threshold-bps">>,
+                    Base,
+                    ?DEFAULT_THRESHOLD_BPS,
+                    Opts
+                )
+            ),
+            ?DEFAULT_THRESHOLD_BPS
         ),
     balance(Base, Address, Opts) * 10000 >= Supply * Threshold.
 
@@ -825,6 +828,22 @@ unreadable_supply_is_one_unit_test() ->
     Set = apply_tx(Alive, set_tx(Owner, #{ <<"greeting">> => <<"mine">> }), Opts),
     ?assertEqual(
         <<"mine">>,
+        hb_ao:get(<<"greeting">>, value(Set, Opts), not_found, Opts)
+    ).
+
+%% @doc An unreadable set-authority threshold falls back to requiring the
+%% whole supply: a malformed spawn tag cannot fail the slot, and the holder
+%% of the unit may still speak for the name.
+unreadable_threshold_is_whole_supply_test() ->
+    Opts = test_opts(),
+    {Owner, OwnerAddr} = party(),
+    Base =
+        (name_held_by(OwnerAddr))#{
+            <<"set-authority-threshold-bps">> => <<"all of it">>
+        },
+    Set = apply_tx(Base, set_tx(Owner, #{ <<"greeting">> => <<"still mine">> }), Opts),
+    ?assertEqual(
+        <<"still mine">>,
         hb_ao:get(<<"greeting">>, value(Set, Opts), not_found, Opts)
     ).
 
