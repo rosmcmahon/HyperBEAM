@@ -293,6 +293,7 @@ ensure_started(Opts) ->
                                                 )
                                             },
                                             {"DB_URL", DatabaseUrl},
+                                            {"WASM_BINARY_FILE_DIRECTORY", DBDir},
                                             {"PROCESS_MEMORY_CACHE_FILE_DIR",
                                                 filename:join(DBDir, "memory-cache")
                                             },
