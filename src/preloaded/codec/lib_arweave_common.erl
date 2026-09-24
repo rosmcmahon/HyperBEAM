@@ -1,7 +1,7 @@
 %%% @doc Shared Arweave codec helpers.
 -module(lib_arweave_common).
 -export([from/3]).
--export([fields/3, tags/2, data/5, committed/6, base/5, verify_committed/5]).
+-export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([to/3, to/6, siginfo/4, fields_to_tx/4]).
@@ -287,38 +287,23 @@ find_key(Key, Map, Opts) ->
             end
     end.
 
-%% @doc Check commitment identity and values against the encoded item.
-%% Tags and fields restored from a commitment must also match the message.
-%% Keys in the item's data are encoded from the message itself, so the
-%% signature already covers them.
-verify_committed(FieldKeys, Item, FieldsFun, TABM, Opts) ->
-    Fields = FieldsFun(Item, <<>>, Opts),
-    Tags = tags(Item, Opts),
-    DataKeys =
-        case Item#tx.data of
-            ?DEFAULT_DATA -> [];
-            Data when is_map(Data) -> maps:keys(Data);
-            _ -> [maps:get(<<"ao-data-key">>, Tags, <<"data">>)]
-        end,
-    Keys =
-        hb_util:list_without(
-            DataKeys,
-            committed(FieldKeys, Item, Fields, Tags, #{}, Opts)
-        ),
-    Expected = base(Keys, Fields, Tags, #{}, Opts),
+%% @doc Check that a commitment's ID and committer are those of the item
+%% encoded from the message. The item's values need no check here:
+%% `commitment_to_tx/4' takes the commitment's fields and tags only while the
+%% message holds their values, and gives a changed message its own, which the
+%% item's signature then does not verify.
+verify_identity(Item, TABM) ->
     [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
-    IdentityMatches =
-        case maps:get(<<"type">>, Commitment) of
-            <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
-            _ ->
-                hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
-                    maps:get(<<"committer">>, Commitment, undefined) =:=
-                        hb_util:human_id(
-                            ar_wallet:to_address(
-                                Item#tx.owner, Item#tx.signature_type)
-                        )
-        end,
-    IdentityMatches andalso Expected == maps:with(maps:keys(Expected), TABM).
+    case maps:get(<<"type">>, Commitment) of
+        <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
+        _ ->
+            hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
+                maps:get(<<"committer">>, Commitment, undefined) =:=
+                    hb_util:human_id(
+                        ar_wallet:to_address(
+                            Item#tx.owner, Item#tx.signature_type)
+                    )
+    end.
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
@@ -525,15 +510,18 @@ bundle_hint(Device, Msg, Req, Opts) ->
     end.
 
 %% @doc Calculate the fields for a message, returning an initial TX record.
-siginfo(_Message, {ok, _, Commitment}, FieldsFun, Opts) ->
-    commitment_to_tx(Commitment, FieldsFun, Opts);
+siginfo(Message, {ok, _, Commitment}, FieldsFun, Opts) ->
+    commitment_to_tx(Message, Commitment, FieldsFun, Opts);
 siginfo(Message, not_found, FieldsFun, Opts) ->
     FieldsFun(#tx{}, <<>>, Message, Opts);
 siginfo(Message, multiple_matches, _FieldsFun, _Opts) ->
     throw({multiple_ans104_commitments_unsupported, Message}).
 
-%% @doc Convert a commitment to a base TX record.
-commitment_to_tx(Commitment, FieldsFun, Opts) ->
+%% @doc Convert a commitment to a base TX record. Its fields and tags are the
+%% commitment's while the message holds their values. A message changed after
+%% signing is given its own fields and committed keys' values instead, so the
+%% commitment's signature does not verify the item.
+commitment_to_tx(Message, Commitment, FieldsFun, Opts) ->
     Signature =
         hb_util:decode(
             maps:get(<<"signature">>, Commitment, hb_util:encode(?DEFAULT_SIG))
@@ -562,7 +550,85 @@ commitment_to_tx(Commitment, FieldsFun, Opts) ->
         signature_type = SignatureType,
         tags = Tags
     },
-    FieldsFun(TX, ?FIELD_PREFIX, Commitment, Opts).
+    case holds_signed_values(Commitment, Tags, Message, Opts) of
+        true -> FieldsFun(TX, ?FIELD_PREFIX, Commitment, Opts);
+        false -> FieldsFun(TX#tx{ tags = [] }, <<>>, Message, Opts)
+    end.
+
+%% @doc Check that a message still holds the values of the fields and tags
+%% that its commitment restores, and the types that the tags give to its
+%% committed keys. Keys added after signing are not compared.
+holds_signed_values(Commitment, OriginalTags, TABM, Opts) ->
+    Fields =
+        maps:from_list(
+            [
+                {Key, Value}
+            ||
+                {<<"field-", Key/binary>>, Value}
+                    <- hb_maps:to_list(Commitment, Opts)
+            ]
+        ),
+    holds(Fields, TABM, Opts) andalso
+        holds_tags(OriginalTags, maps:keys(Fields), Commitment, TABM, Opts).
+
+%% @doc Check that a message holds the values of its commitment's tags, and
+%% the types that the `ao-types' tag gives to its committed keys. A tag with
+%% the name of a field is skipped: decoding takes the field's value.
+holds_tags([], _FieldKeys, _Commitment, _TABM, _Opts) ->
+    true;
+holds_tags(OriginalTags, FieldKeys, Commitment, TABM, Opts) ->
+    Tags = deduplicating_from_list(OriginalTags, Opts),
+    Keys =
+        hb_util:list_without(
+            [<<"ao-types">> | FieldKeys],
+            tag_keys(#tx{ tags = OriginalTags }, Opts)
+        ),
+    holds(maps:with(Keys, Tags), TABM, Opts) andalso
+        holds_types(
+            maps:get(<<"ao-types">>, Tags, <<>>),
+            Commitment,
+            TABM,
+            Opts
+        ).
+
+%% @doc Check that a message holds the given values for their keys. Lazy
+%% values, as in a message read from a cache, are loaded before comparing.
+holds(Values, TABM, Opts) ->
+    hb_cache:ensure_all_loaded(Values, Opts) ==
+        hb_cache:ensure_all_loaded(maps:with(maps:keys(Values), TABM), Opts).
+
+%% @doc Check that the message gives its committed keys the types that the
+%% commitment's `ao-types' tag gives them. Equal `ao-types' values need no
+%% decoding.
+holds_types(Types, _Commitment, #{ <<"ao-types">> := Types }, _Opts) ->
+    true;
+holds_types(SignedTypes, Commitment, TABM, Opts) ->
+    Committed =
+        [
+            normalize_key(hb_link:remove_link_specifier(Key))
+        ||
+            Key <-
+                hb_util:message_to_ordered_list(
+                    hb_maps:get(<<"committed">>, Commitment, #{}, Opts)
+                )
+        ],
+    maps:with(Committed, decode_types(SignedTypes, Opts)) ==
+        maps:with(
+            Committed,
+            decode_types(hb_maps:get(<<"ao-types">>, TABM, <<>>, Opts), Opts)
+        ).
+
+%% @doc Decode an `ao-types' value to a map of normalized keys to types.
+decode_types(<<>>, _Opts) ->
+    #{};
+decode_types(Types, Opts) ->
+    {ok, Decoded} =
+        hb_ao:raw(<<"structured@1.0">>, <<"decode-types">>, Types, #{}, Opts),
+    maps:fold(
+        fun(Key, Type, Acc) -> Acc#{ normalize_key(Key) => Type } end,
+        #{},
+        Decoded
+    ).
 
 %% @doc Convert a HyperBEAM-compatible message into an ANS-104 tag list.
 original_tags_to_tags(TagMap) ->

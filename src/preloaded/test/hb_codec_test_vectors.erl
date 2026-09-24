@@ -171,6 +171,8 @@ test_suite() ->
         % Signed messages
         {<<"Signed message to message and back">>,
             fun signed_message_encode_decode_verify_test/2},
+        {<<"Changed signed message">>,
+            fun changed_signed_message_test/2},
         {<<"Specific order signed message">>,
             fun specific_order_signed_message_test/2},
         {<<"Specific order deeply nested signed message">>,
@@ -997,6 +999,31 @@ signed_message_encode_decode_verify_test(Codec, Opts) ->
     MatchRes = hb_message:match(SignedMsg, Decoded, strict, Opts),
     ?event({match_result, MatchRes}),
     ?assert(MatchRes).
+
+%% @doc A signed message whose committed value is changed after signing does
+%% not verify, before or after it is converted, and keeps the new value and
+%% type when it is converted. Signed again, it keeps the new value.
+changed_signed_message_test(Codec, Opts) ->
+    Signed = hb_message:commit(#{ <<"a">> => 1, <<"b">> => 2 }, Opts, Codec),
+    RoundTrip =
+        fun(Msg) ->
+            hb_message:convert(
+                hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+                <<"structured@1.0">>,
+                Codec,
+                Opts
+            )
+        end,
+    Changed = Signed#{ <<"a">> => 3 },
+    ?assertNot(hb_message:verify(Changed, all, Opts)),
+    Converted = RoundTrip(Changed),
+    ?assertMatch(#{ <<"a">> := 3 }, Converted),
+    ?assertNot(hb_message:verify(Converted, all, Opts)),
+    ?assertMatch(#{ <<"a">> := 3 }, hb_message:commit(Changed, Opts, Codec)),
+    ?assertMatch(
+        #{ <<"a">> := <<"1">> },
+        RoundTrip(Signed#{ <<"a">> => <<"1">> })
+    ).
 
 specific_order_signed_message_test(RawCodec, Opts) ->
     Msg = #{
