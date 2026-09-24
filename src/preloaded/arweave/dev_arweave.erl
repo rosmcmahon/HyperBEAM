@@ -1206,6 +1206,8 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
     ),
     {ok, Data} =
         case hb_maps:get(<<"exclude-data">>, Req, false, Opts) of
+            true when TXHeader#tx.format =:= 1 ->
+                {ok, TXHeader#tx.data};
             true -> {ok, ?DEFAULT_DATA};
             false ->
                 DataRes =
