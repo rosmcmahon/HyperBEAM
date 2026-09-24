@@ -1063,14 +1063,23 @@ error_infinite(Base, Req, Opts) ->
         }
     }.
 
-%% @doc Handle an error in a device call.
+%% @doc Handle an error in a device call: raise it, or return it as the
+%% execution's error status under another `error_strategy'.
 error_execution(ExecGroup, Req, Whence, {Class, Exception, Stacktrace}, Opts) ->
-    Error = {error, Whence, {Class, Exception, Stacktrace}},
-    hb_persistent:unregister_notify(ExecGroup, Req, Error, Opts),
-    ?event_debug(debug_ao_core, {handle_error, Error, {opts, Opts}}, Opts),
+    Failure =
+        {failure,
+            #{
+                <<"whence">> => Whence,
+                <<"class">> => Class,
+                <<"exception">> => Exception,
+                <<"trace">> => Stacktrace
+            }
+        },
+    hb_persistent:unregister_notify(ExecGroup, Req, Failure, Opts),
+    ?event_debug(debug_ao_core, {handle_error, Failure}, Opts),
     case hb_opts:get(error_strategy, throw, Opts) of
         throw -> erlang:raise(Class, Exception, Stacktrace);
-        _ -> Error
+        _ -> Failure
     end.
 
 %% @doc Force the result of a device call into a message if the result is not

@@ -60,6 +60,8 @@ test_suite() ->
         {device_with_default_handler_function,
             "device with default handler function",
             fun device_with_default_handler_function_test/1},
+        {error_strategy, "error strategy",
+            fun error_strategy_test/1},
         {basic_get, "basic get",
             fun basic_get_test/1},
         {get_with_denormalized_key, "get with denormalized key",
@@ -184,6 +186,7 @@ test_opts() ->
                 resolve_path_element,
                 device_with_default_handler_function,
                 device_with_handler_function,
+                error_strategy,
                 denormalized_device_name,
                 get_with_device,
                 get_as_with_device,
@@ -210,6 +213,7 @@ test_opts() ->
             skip => [
                 % Skip tests that assert behaviors of the management stages
                 % that raw mode explicitly skips.
+                error_strategy,
                 step_hook,
                 paranoid_input_verification,
                 paranoid_result_verification
@@ -663,6 +667,23 @@ device_with_default_handler_function_test(Opts) ->
     ?assertEqual(
         {ok, <<"DEFAULT">>},
         hb_ao:resolve(Msg, <<"any_random_key">>, Opts)
+    ).
+
+%% @doc A device call that raises is an error status, under an error strategy
+%% other than `throw'.
+error_strategy_test(Opts) ->
+    Msg =
+        #{
+            <<"device">> =>
+                #{ <<"fail">> => fun(_Base, _Req, _Opts) -> error(bad) end }
+        },
+    ?assertMatch(
+        {failure, #{ <<"class">> := bad }},
+        hb_ao:resolve(
+            Msg,
+            <<"fail">>,
+            Opts#{ <<"error-strategy">> => <<"continue">> }
+        )
     ).
 
 basic_get_test(Opts) ->
