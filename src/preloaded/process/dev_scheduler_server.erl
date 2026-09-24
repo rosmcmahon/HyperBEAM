@@ -254,7 +254,7 @@ do_assign(State, Message, ReplyPID) ->
                 State
             ),
             ?event(starting_message_write),
-            ok = dev_scheduler_cache:write(Assignment, Opts),
+            ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
             maybe_inform_recipient(
                 local_confirmation,
                 ReplyPID,
