@@ -529,7 +529,6 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
 %% @doc The status of an error response. A request whose commitments do not
 %% verify is refused as the client's error.
 error_status(throw, {invalid_commitments, _}) -> 400;
-error_status(throw, {invalid_ans104_signature, _}) -> 400;
 error_status(_Type, _Details) -> 500.
 
 %% @doc Return the list of allowed methods for the HTTP server.

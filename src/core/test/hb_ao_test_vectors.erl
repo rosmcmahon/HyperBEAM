@@ -1247,6 +1247,14 @@ paranoid_message_verification_test(RawOpts) ->
     ?assert(hb_message:paranoid_verify(Linked, Opts)),
     ?assert(hb_message:paranoid_verify({ok, Linked}, Opts)),
     ?assert(hb_message:paranoid_verify([Link, Linked], Opts)),
+    ?assertEqual(true, hb_message:deep_verify([Link, Linked], Opts)),
+    ?assertMatch(
+        {false, <<"1/child">>, _},
+        hb_message:deep_verify(
+            [Linked#{ <<"child">> => Base#{ <<"a">> => 2 } }],
+            Opts#{ <<"paranoid-verify">> => false }
+        )
+    ),
     ?assertThrow(
         {paranoid_verification_failure, default, <<"child">>, _, _},
         hb_message:paranoid_verify(

@@ -60,7 +60,8 @@
 -export([convert/3, convert/4, uncommitted/1, uncommitted/2, committed/3]).
 -export([add_bundle_hint/2, add_bundle_hint/3]).
 -export([with_only_committers/2, with_only_committers/3, commitment_devices/2]).
--export([verify/1, verify/2, verify/3, paranoid_verify/2, paranoid_verify/3]).
+-export([verify/1, verify/2, verify/3, deep_verify/2]).
+-export([paranoid_verify/2, paranoid_verify/3]).
 -export([commit/2, commit/3, signers/2, type/1, minimize/1]).
 -export([normalize_commitments/2, normalize_commitments/3]).
 -export([normalize_commitments/4, is_signed_key/3]).
@@ -632,45 +633,53 @@ paranoid_verify(Topic, Msg, Opts) ->
     end.
 
 do_paranoid_verify(Topic, Msg, Opts) ->
-    try
-        do_paranoid_verify(Topic, [], Msg, Opts),
+    maybe
+        true ?= deep_verify(Msg, Opts),
         ?event_debug(debug_paranoia, {paranoid_verify_complete, ok}, Opts),
         true
-    catch
-        throw:{verification_failure, _Topic, RawPath, FailedMsg, Details, Stack} ->
-            Path = hb_path:to_binary(RawPath),
+    else
+        {false, Path, FailedMsg} ->
             ?event(error,
                 {paranoid_verification_failure,
                     {triggered_by, Topic},
                     {at_path, Path},
                     {failed_message, FailedMsg},
-                    {while_verifying, Msg},
-                    {details, Details},
-                    {stack, {trace, Stack}}
+                    {while_verifying, Msg}
                 },
-                Opts#{
-                    <<"paranoid-verify">> => false
-                }
+                Opts#{ <<"paranoid-verify">> => false }
             ),
             throw({paranoid_verification_failure, Topic, Path, Msg, FailedMsg})
     end.
-do_paranoid_verify(Topic, Path, {_Status, Msg}, Opts) ->
-    do_paranoid_verify(Topic, Path, Msg, Opts);
-do_paranoid_verify(Topic, Path, ListMsg, Opts) when is_list(ListMsg) ->
-    do_paranoid_verify(Topic, Path, hb_util:list_to_numbered_message(ListMsg), Opts);
-do_paranoid_verify(Topic, Path, Msg, Opts) when is_map(Msg) ->
-    maps:map(
-        fun(Key, Value) ->
-            do_paranoid_verify(Topic, Path ++ [Key], Value, Opts)
-        end,
-        uncommitted(hb_private:reset(Msg), Opts)
-    ),
-    try true = verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts)
-    catch
-        _:Details:St ->
-            throw({verification_failure, Topic, Path, Msg, Details, St})
+
+%% @doc Verify all commitments of a message and its loaded children, without
+%% traversing links. Return `true' or `{false, Path, MsgAtFault}'.
+deep_verify(Msg, Opts) ->
+    deep_verify([], Msg, Opts).
+deep_verify(Path, {_Status, Msg}, Opts) ->
+    deep_verify(Path, Msg, Opts);
+deep_verify(Path, ListMsg, Opts) when is_list(ListMsg) ->
+    deep_verify(Path, hb_util:list_to_numbered_message(ListMsg), Opts);
+deep_verify(Path, Msg, Opts) when is_map(Msg) ->
+    maybe
+        true ?=
+            maps:fold(
+                fun(Key, Value, true) ->
+                    deep_verify(Path ++ [Key], Value, Opts);
+                   (_, _, Failure) -> Failure
+                end,
+                true,
+                uncommitted(hb_private:reset(Msg), Opts)
+            ),
+        Verified =
+            try verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts)
+            catch _:_ -> false
+            end,
+        case Verified of
+            true -> true;
+            false -> {false, hb_path:to_binary(Path), Msg}
+        end
     end;
-do_paranoid_verify(_Topic, _Path, _Msg, _Opts) ->
+deep_verify(_Path, _Msg, _Opts) ->
     true.
 
 %% @doc Return the unsigned version of a message in AO-Core format.
