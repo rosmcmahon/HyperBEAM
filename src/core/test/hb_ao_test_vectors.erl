@@ -866,6 +866,10 @@ device_exports_test(Opts) ->
 	Msg = #{ <<"device">> => dev_message },
 	?assert(hb_device:is_exported(Msg, dev_message, info, Opts)),
 	?assert(hb_device:is_exported(Msg, dev_message, set, Opts)),
+	?assertEqual(
+        not_found,
+        hb_ao:get(<<"module_info">>, #{ <<"a">> => 1 }, Opts)
+    ),
 	?assert(
         hb_device:is_exported(
             Msg,

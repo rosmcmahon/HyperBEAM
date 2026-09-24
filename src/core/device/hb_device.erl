@@ -189,6 +189,10 @@ find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev)
 	end;
 find_exported_function(_Msg, _Mod, _Key, Arity, MinArity, _Opts) when Arity < MinArity ->
     not_found;
+find_exported_function(_Msg, _Mod, module_info, _Arity, _MinArity, _Opts) ->
+    % The Erlang compiler exports `module_info' from every module: it is
+    % never a key of a device.
+    not_found;
 find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) ->
 	case erlang:function_exported(Mod, Key, Arity) of
 		true ->
