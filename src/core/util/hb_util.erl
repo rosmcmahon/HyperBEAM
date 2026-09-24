@@ -920,19 +920,16 @@ ok_or_throw(_TX, false, Error) ->
     throw(Error).
 
 %% @doc List the loaded atoms in the Erlang VM.
-all_atoms() -> all_atoms(0).
-all_atoms(N) ->
-    case atom_from_int(N) of
-        not_found -> [];
-        A -> [A | all_atoms(N+1)]
-    end.
+all_atoms() ->
+    [
+        atom_from_int(N)
+    ||
+        N <- lists:seq(0, erlang:system_info(atom_count) - 1)
+    ].
 
 %% @doc Find the atom with the given integer reference.
 atom_from_int(Int) ->
-    case catch binary_to_term(<<131,75,Int:24>>) of
-        A -> A;
-        _ -> not_found
-    end.
+    binary_to_term(<<131,75,Int:24>>).
 
 %% @doc Check if a given binary is already an atom.
 binary_is_atom(X) ->
@@ -981,6 +978,11 @@ atom_to_dashed_binary(Key) when is_atom(Key) ->
 
 atom_to_dashed_binary_test_parallel() ->
     ?assertEqual(atom_to_dashed_binary(atom_1), <<"atom-1">>).
+
+%% @doc Every atom of the VM is listed.
+all_atoms_test() ->
+    Count = erlang:system_info(atom_count),
+    ?assert(length(all_atoms()) >= Count).
 
 message_to_ordered_list_metadata_test() ->
     Msg = #{
