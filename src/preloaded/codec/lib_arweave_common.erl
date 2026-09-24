@@ -279,12 +279,10 @@ find_key(Key, Map, Opts) ->
             end
     end.
 
-%% @doc Check that a message holds the values for its committed keys that
-%% decoding the given item yields. The tags and fields of an item encoded from
-%% a commitment are restored from the commitment rather than the message, so
-%% a valid signature does not bind them to the message on its own. Keys found
-%% in the item's data are encoded from the message itself, so the signature
-%% already covers them.
+%% @doc Check commitment identity and values against the encoded item.
+%% Tags and fields restored from a commitment must also match the message.
+%% Keys in the item's data are encoded from the message itself, so the
+%% signature already covers them.
 verify_committed(FieldKeys, Item, FieldsFun, TABM, Opts) ->
     Fields = FieldsFun(Item, <<>>, Opts),
     Tags = tags(Item, Opts),
@@ -300,7 +298,19 @@ verify_committed(FieldKeys, Item, FieldsFun, TABM, Opts) ->
             committed(FieldKeys, Item, Fields, Tags, #{}, Opts)
         ),
     Expected = base(Keys, Fields, Tags, #{}, Opts),
-    Expected == maps:with(maps:keys(Expected), TABM).
+    [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
+    IdentityMatches =
+        case maps:get(<<"type">>, Commitment) of
+            <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
+            _ ->
+                hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
+                    maps:get(<<"committer">>, Commitment, undefined) =:=
+                        hb_util:human_id(
+                            ar_wallet:to_address(
+                                Item#tx.owner, Item#tx.signature_type)
+                        )
+        end,
+    IdentityMatches andalso Expected == maps:with(maps:keys(Expected), TABM).
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
