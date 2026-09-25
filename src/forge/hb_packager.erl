@@ -751,7 +751,7 @@ include_source_files(Entries) ->
 %% @doc Add test-only compile flags when packaging for `device test'.
 test_compile_opts(Opts) ->
     case hb_maps:get(<<"test">>, Opts, false, Opts) of
-        true -> [{d, 'TEST'}];
+        true -> [{d, 'TEST'} | hb_maps:get(<<"erl-defines">>, Opts, [], Opts)];
         _ -> []
     end.
 
