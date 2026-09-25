@@ -79,6 +79,39 @@ These options control identity and security settings.
 | `scheduler_location_ttl` | Integer | 604800000 | TTL for scheduler registration (7 days in ms) |
 <!-- Complex options like trusted_device_signers, trusted are omitted -->
 
+#### TLS termination
+
+TLS is opt-in and uses ACME HTTP-01 to obtain and renew a certificate whose
+leaf key is the node's RSA `priv-wallet`:
+
+```text
+ao-types: protocol=atom
+port: 443
+protocol: http2
+
+tls/domains/ao-types: .=list
+tls/domains/1: node.example.com
+
+tls/acme/ao-types: terms-of-service-agreed=atom, http-port=integer
+tls/acme/directory-url: https://acme.example/directory
+tls/acme/terms-of-service-agreed: true
+tls/acme/http-port: 80
+```
+
+`tls/acme/http-port` defaults to `80` and must be reachable for HTTP-01
+validation. This cleartext listener serves only the exact ACME challenge path.
+The ACME directory uses the operating-system trust store unless
+`tls/acme/ca-certificate` supplies a PEM CA certificate. The TLS listener
+negotiates HTTP/2 (`h2`) or HTTP/1.1 using ALPN. HTTP/3 is not supported by
+the wallet-key TLS adapter.
+
+The certificate leaf contains the exact `priv-wallet` public key. Certificate
+viewers expose a fingerprint of that TLS key; the node address instead hashes
+the wallet's raw RSA modulus.
+
+The `tls` node-message field cannot be changed while the listener is running;
+restart the node to adopt a different TLS policy.
+
 ### Caching & Storage
 
 These options control caching behavior. **Note:** Detailed storage configuration (`store` option) involves complex data structures and cannot be set via `config.flat`.

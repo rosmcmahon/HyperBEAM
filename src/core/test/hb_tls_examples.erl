@@ -1,0 +1,171 @@
+%%% @doc End-to-end examples for node-wallet TLS against a real ACME server.
+-module(hb_tls_examples).
+-include_lib("eunit/include/eunit.hrl").
+
+%% @doc The documented flat configuration preserves the required option types.
+configuration_test() ->
+    {ok, Docs} = file:read_file("docs/run/configuring-your-machine.md"),
+    [_, Section] = binary:split(Docs, <<"#### TLS termination">>),
+    [_, Example] = binary:split(Section, <<"```text\n">>),
+    [Flat, _] = binary:split(Example, <<"```">>),
+    ?assertMatch({ok, #{
+        <<"port">> := 443,
+        <<"protocol">> := http2,
+        <<"tls">> := #{
+            <<"domains">> := [<<"node.example.com">>],
+            <<"acme">> := #{
+                <<"http-port">> := 80,
+                <<"terms-of-service-agreed">> := true
+            }
+        }
+    }}, hb_opts:load_bin(Flat, #{})).
+
+%% @doc Run the Pebble example when its environment has been configured.
+pebble_test_() ->
+    case os:getenv("HB_PEBBLE_DIRECTORY_URL") of
+        false -> [];
+        _ -> {timeout, 300, fun pebble/0}
+    end.
+
+%% @doc Issue, serve, renew, and verify a node-wallet certificate with Pebble.
+pebble() ->
+    DirectoryURL = os:getenv("HB_PEBBLE_DIRECTORY_URL"),
+    {ok, ACMECACertificate} =
+        file:read_file(os:getenv("HB_PEBBLE_CA")),
+    {ok, IssuerCACertificate} =
+        file:read_file(os:getenv("HB_PEBBLE_ISSUER_CA")),
+    IssuerCAs = [DER || {'Certificate', DER, not_encrypted} <-
+        public_key:pem_decode(IssuerCACertificate)],
+    Wallet = ar_wallet:load_keyfile("test/key-1.json"),
+    Domain = <<"host.docker.internal">>,
+    URL = hb_http_server:start_node(#{
+        <<"priv-wallet">> => Wallet,
+        <<"port">> => 0,
+        <<"protocol">> => http2,
+        <<"tls">> => #{
+            <<"domains">> => [Domain],
+            <<"acme">> => #{
+                <<"directory-url">> => hb_util:bin(DirectoryURL),
+                <<"http-port">> => 5002,
+                <<"ca-certificate">> => ACMECACertificate,
+                <<"terms-of-service-agreed">> => true
+            }
+        }
+    }),
+    #{port := Port} = uri_string:parse(URL),
+    ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    RuntimeName = {<<"tls@1.0">>, ServerID},
+    PublicURL = <<"https://", Domain/binary, ":",
+        (integer_to_binary(Port))/binary, "/">>,
+    ResolverOrder = inet_db:res_option(lookup),
+    ok = inet_db:set_lookup([file | lists:delete(file, ResolverOrder)]),
+    ok = inet_db:add_host({127, 0, 0, 1}, [hb_util:list(Domain)]),
+    ClientOpts = #{
+        <<"http-client">> => gun,
+        <<"http-client-tls-ca">> => IssuerCAs,
+        <<"protocol">> => http2
+    },
+    try
+        FirstCertificate = peer_certificate(Domain, Port),
+        ?assertMatch({ok, _},
+            hb_tls:socket_options(Wallet, [FirstCertificate])),
+        ?assertEqual({error, 'certificate-key-mismatch'},
+            hb_tls:socket_options(ar_wallet:load_keyfile("test/key-2.json"),
+                [FirstCertificate])),
+        {ok, Info} = hb_http:get(PublicURL, <<"/~meta@1.0/info">>, ClientOpts),
+        ?assertEqual([ServerID], hb_message:signers(Info, ClientOpts)),
+        ?assert(hb_message:verify(Info, all, ClientOpts)),
+        HTTP2 = http2_connection(Domain, Port, IssuerCAs),
+        http2_address(HTTP2, ServerID),
+        ?assertMatch({error, #{ <<"status">> := 404 }}, hb_http:get(
+            <<"http://localhost:5002/">>, <<"/~meta@1.0/info">>,
+            #{ <<"protocol">> => http1 }
+        )),
+        {ok, EstablishedSocket} = ssl:connect(
+            hb_util:list(Domain),
+            Port,
+            [
+                {verify, verify_peer},
+                {cacerts, IssuerCAs},
+                {active, false},
+                {mode, binary},
+                {alpn_advertised_protocols, [<<"http/1.1">>]}
+            ],
+            5000
+        ),
+        ?assertEqual({ok, <<"http/1.1">>},
+            ssl:negotiated_protocol(EstablishedSocket)),
+        RuntimePID = hb_name:lookup(RuntimeName),
+        RuntimePID ! renew,
+        ?assert(hb_util:wait_until(fun() ->
+            try peer_certificate(Domain, Port) =/= FirstCertificate
+            catch _:_ -> false
+            end
+        end, 180000)),
+        ?assertMatch({ok, _}, hb_tls:socket_options(Wallet,
+            [peer_certificate(Domain, Port)])),
+        http2_address(HTTP2, ServerID),
+        gun:close(HTTP2),
+        RenewedHTTP2 = http2_connection(Domain, Port, IssuerCAs),
+        http2_address(RenewedHTTP2, ServerID),
+        gun:close(RenewedHTTP2),
+        ok = ssl:send(EstablishedSocket, <<
+            "GET /~meta@1.0/info/address HTTP/1.1\r\n",
+            "Host: host.docker.internal\r\n",
+            "Connection: close\r\n\r\n"
+        >>),
+        ?assertNotEqual(nomatch, binary:match(
+            recv_ssl_response(EstablishedSocket, <<>>), <<" 200 ">>
+        ))
+    after
+        stop_runtime(RuntimeName),
+        inet_db:del_host({127, 0, 0, 1}),
+        inet_db:set_lookup(ResolverOrder),
+        catch cowboy:stop_listener(ServerID),
+        catch cowboy:stop_listener({tls_http_01, ServerID})
+    end.
+
+%% @doc Negotiate HTTP/2 over a CA-verified TLS connection.
+http2_connection(Domain, Port, CAs) ->
+    {ok, PID} = gun:open(hb_util:list(Domain), Port, #{
+        transport => tls,
+        protocols => [http2],
+        retry => 0,
+        tls_opts => [{verify, verify_peer}, {cacerts, CAs}]
+    }),
+    ?assertEqual({ok, http2}, gun:await_up(PID, 5000)),
+    PID.
+
+%% @doc Resolve the node address through an established HTTP/2 connection.
+http2_address(PID, Address) ->
+    Ref = gun:get(PID, <<"/~meta@1.0/info/address">>),
+    ?assertMatch({response, nofin, 200, _}, gun:await(PID, Ref, 5000)),
+    ?assertEqual({ok, Address}, gun:await_body(PID, Ref, 5000)).
+
+%% @doc Stop the singleton runtime if the example started it.
+stop_runtime(Name) ->
+    case hb_name:lookup(Name) of
+        PID when is_pid(PID) ->
+            PID ! {stop, self()},
+            receive {stopped, PID} -> ok end;
+        undefined -> ok
+    end.
+
+%% @doc Read an HTTP response until the server closes its TLS connection.
+recv_ssl_response(Socket, Acc) ->
+    case ssl:recv(Socket, 0, 5000) of
+        {ok, Data} -> recv_ssl_response(Socket, <<Acc/binary, Data/binary>>);
+        {error, closed} -> Acc
+    end.
+
+%% @doc Return the leaf certificate currently served by the node.
+peer_certificate(Domain, Port) ->
+    {ok, Socket} = ssl:connect(
+        hb_util:list(Domain),
+        Port,
+        [{verify, verify_none}, {active, false}],
+        5000
+    ),
+    {ok, Certificate} = ssl:peercert(Socket),
+    ok = ssl:close(Socket),
+    Certificate.
