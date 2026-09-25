@@ -2,7 +2,7 @@
 %%% @doc A wrapper around the hb_cache module that provides a more
 %%% convenient interface for reading the result of a process at a given slot or
 %%% message ID.
--module(dev_process_cache).
+-module(lib_process_cache).
 -export([fresh/3, fresh/4]).
 -export([latest/2, latest/3, latest/4]).
 -export([read/2, read/3, refresh/3, write/4]).

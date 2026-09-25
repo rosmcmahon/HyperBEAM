@@ -14,24 +14,24 @@
 init(Base, _Req, _Opts) ->
     {ok, Base}.
 
-%% @doc We assume that the compute engine stores its own internal state,
-%% with snapshots triggered only when HyperBEAM requests them. Subsequently,
-%% to load a snapshot, we just need to return the original message.
+%% @doc Restore checkpoint memory in the delegated engine before removing the
+%% snapshot from the process state. Failed restores leave normalization failed.
 -spec normalize(
     #{ snapshot => #{ type => binary(), data => _, _ => _ }, _ => _ },
     #{ _ => _ },
     #{ _ => _ }
-) -> {ok, #{ _ => _ }} | #{ _ => _ }.
+) -> {ok, #{ _ => _ }} | {error, _} | #{ _ => _ }.
 normalize(Base, _Req, Opts) ->
     case hb_maps:find(<<"snapshot">>, Base, Opts) of
         error -> {ok, Base};
         {ok, Snapshot} ->
-            Unset = hb_ao:set(Base, #{ <<"snapshot">> => unset }, Opts),
             case hb_maps:get(<<"type">>, Snapshot, Opts) == <<"Checkpoint">> of
-                false -> Unset;
+                false -> hb_ao:set(Base, #{ <<"snapshot">> => unset }, Opts);
                 true ->
-                    load_state(Snapshot, Opts),
-                    Unset
+                    maybe
+                        {ok, _} ?= load_state(Snapshot, Opts),
+                        hb_ao:set(Base, #{ <<"snapshot">> => unset }, Opts)
+                    end
             end
     end.
 
@@ -39,7 +39,10 @@ normalize(Base, _Req, Opts) ->
 load_state(Snapshot, Opts) ->
     ?event(debug_load_snapshot, {loading_snapshot, {snapshot, Snapshot}}),
     Body = hb_maps:get(<<"data">>, Snapshot, Opts),
-    Headers = hb_maps:without([<<"data">>], Snapshot, Opts),
+    % Checkpoint commitments cover data, not the HTTP request body.
+    Headers = hb_maps:without(
+        [<<"data">>], hb_message:uncommitted(Snapshot, Opts), Opts
+    ),
     Res = do_relay(
         <<"POST">>,
         <<"/state">>,
@@ -51,7 +54,10 @@ load_state(Snapshot, Opts) ->
         }
     ),
     ?event(debug_load_snapshot, {load_result, Res}),
-    Res.
+    case Res of
+        {failure, Error} -> {error, Error};
+        _ -> Res
+    end.
 
 %% @doc Call the delegated server to compute the result. The endpoint is
 %% `POST /compute' and the body is the JSON-encoded message that we want to

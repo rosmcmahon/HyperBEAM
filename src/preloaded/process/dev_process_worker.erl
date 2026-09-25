@@ -43,12 +43,12 @@ compute_group(Base, Req, Opts) ->
 
 %% @doc Return `true' if the requested compute result is already cached.
 compute_cached(ProcID, not_found, Opts) ->
-    case dev_process_cache:latest(ProcID, Opts) of
+    case lib_process_cache:latest(ProcID, Opts) of
         {ok, _Slot, _Msg} -> true;
         _ -> false
     end;
 compute_cached(ProcID, RawSlot, Opts) ->
-    case dev_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
+    case lib_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
         {ok, _Msg} -> true;
         _ -> false
     end.
@@ -237,7 +237,7 @@ grouper_skips_when_slot_cached_test() ->
     % Write slot 5 into the cache. The same request now has a result
     % available and the grouper should step out of the queue.
     {ok, _} =
-        dev_process_cache:write(
+        lib_process_cache:write(
             ProcessGroup,
             5,
             #{ <<"hello">> => <<"cached">> },

@@ -11,7 +11,7 @@
 %%% computation step the device caches the result at a path relative to the
 %%% process definition itself, such that the process message's ID can act as an
 %%% immutable reference to the process's growing list of interactions. See 
-%%% `dev_process_cache' for details.
+%%% `lib_process_cache' for details.
 %%% 
 %%% The external API of the device is as follows:
 %%% <pre>
@@ -40,7 +40,7 @@
 %%%     Cache-Keys:      A list of the keys that should be cached for all 
 %%%                      assignments, in addition to `/Results'.
 -module(dev_process).
--device_libraries([lib_process]).
+-device_libraries([lib_process, lib_process_cache]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
 -export([target_slot/2]).
@@ -236,7 +236,7 @@ compute(Base, Req, Opts) ->
             end;
         RawSlot ->
             Slot = hb_util:int(RawSlot),
-            case dev_process_cache:read(ProcID, Slot, Opts) of
+            case lib_process_cache:read(ProcID, Slot, Opts) of
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
                     ?event(
@@ -603,7 +603,7 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
                 WithLastSnapshot
     end,
     ?event(compute, {caching_result, {proc_id, ProcID}, {slot, Slot}}, Opts),
-    dev_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
+    lib_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
     ?event(compute, {caching_completed, {proc_id, ProcID}, {slot, Slot}}, Opts),
     hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts).
 
@@ -672,7 +672,7 @@ now(RawBase, Req, Opts) ->
                     Opts
                 ),
             ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
-            dev_process_cache:refresh(
+            lib_process_cache:refresh(
                 ProcessID,
                 hb_util:int(CurrentSlot),
                 Opts
@@ -688,10 +688,10 @@ now(RawBase, Req, Opts) ->
         CacheParam ->
             % We are serving the latest known state from the cache, rather
             % than computing it.
-            LatestKnown = dev_process_cache:latest(ProcessID, [], Opts),
+            LatestKnown = lib_process_cache:latest(ProcessID, [], Opts),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
-                    case dev_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
+                    case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
                         true ->
                             LatestMsg = without_snapshot(RawLatestMsg, Opts),
                             ?event(compute_cache,
@@ -768,7 +768,7 @@ ensure_loaded(Base, Req, Opts) ->
             ?event(not_initialized),
             % Try to load the latest complete state from disk.
             LoadRes =
-                dev_process_cache:latest(
+                lib_process_cache:latest(
                     ProcID,
                     [<<"snapshot+link">>],
                     TargetSlot,
