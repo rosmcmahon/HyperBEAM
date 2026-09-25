@@ -20380,7 +20380,57 @@ These options control identity and security settings.
 #### TLS termination
 
 TLS is opt-in and uses ACME HTTP-01 to obtain and renew a certificate whose
-leaf key is the node's RSA `priv-wallet`:
+leaf key is the node's RSA `priv-wallet`. TLS terminates inside the BEAM.
+
+Save this as `config.json`, replacing `node.example.com` with your domain:
+
+```json
+{
+  "ao-types": "protocol=atom",
+  "port": 443,
+  "protocol": "http2",
+  "tls": {
+    "domains": ["node.example.com"],
+    "acme": {
+      "directory-url": "https://acme-v02.api.letsencrypt.org/directory",
+      "terms-of-service-agreed": true,
+      "http-port": 80
+    }
+  }
+}
+```
+
+Before starting:
+
+- Point the domain's DNS records (`A`, and `AAAA` if present) to this node.
+  Do not put a TLS-terminating proxy in front of it if the browser must see
+  the node's wallet key.
+- Make TCP ports 80 and 443 reachable from the internet and available to
+  HyperBEAM. Port 80 must remain reachable for
+  [HTTP-01 validation and renewal](https://letsencrypt.org/docs/challenge-types/#http-01-challenge);
+  it serves ACME challenges only, not application requests or HTTPS redirects.
+- Give the BEAM process permission to bind ports 80 and 443. Set
+  `terms-of-service-agreed` to `true` only if you accept the CA's terms.
+
+Start from the directory containing the config and node wallet:
+
+```sh
+HB_CONFIG=config.json rebar3 shell
+```
+
+The node uses `hyperbeam-key.json` by default; set `HB_KEY` to use a different
+node wallet. It must be an RSA wallet. No separate TLS private key, certificate
+files, or request hooks need to be configured.
+
+Each startup obtains a certificate before opening the HTTPS listener. If initial
+issuance fails, startup fails; there is no self-signed fallback. For repeated
+setup tests, use the
+[Let's Encrypt staging directory](https://letsencrypt.org/docs/staging-environment/):
+`https://acme-staging-v02.api.letsencrypt.org/directory`. Staging certificates are
+not browser-trusted. Use the production URL above for normal service.
+
+For `config.flat`, use the equivalent configuration below and start with
+`HB_CONFIG=config.flat rebar3 shell`:
 
 ```text
 ao-types: protocol=atom
@@ -20391,7 +20441,7 @@ tls/domains/ao-types: .=list
 tls/domains/1: node.example.com
 
 tls/acme/ao-types: terms-of-service-agreed=atom, http-port=integer
-tls/acme/directory-url: https://acme.example/directory
+tls/acme/directory-url: https://acme-v02.api.letsencrypt.org/directory
 tls/acme/terms-of-service-agreed: true
 tls/acme/http-port: 80
 ```
@@ -20400,8 +20450,10 @@ tls/acme/http-port: 80
 validation. This cleartext listener serves only the exact ACME challenge path.
 The ACME directory uses the operating-system trust store unless
 `tls/acme/ca-certificate` supplies a PEM CA certificate. The TLS listener
-negotiates HTTP/2 (`h2`) or HTTP/1.1 using ALPN. HTTP/3 is not supported by
-the wallet-key TLS adapter.
+prefers HTTP/2 (`h2`) through ALPN, with HTTP/1.1 fallback. The `ao-types`
+annotation makes `protocol` an atom; explicitly choosing `http2` also avoids
+selecting HTTP/3 in an HTTP/3-enabled build. HTTP/3 is not supported by the
+wallet-key TLS adapter.
 
 The certificate leaf contains the exact `priv-wallet` public key. Certificate
 viewers expose a fingerprint of that TLS key; the node address instead hashes

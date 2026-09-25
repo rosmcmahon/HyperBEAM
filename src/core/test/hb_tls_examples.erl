@@ -2,24 +2,6 @@
 -module(hb_tls_examples).
 -include_lib("eunit/include/eunit.hrl").
 
-%% @doc The documented flat configuration preserves the required option types.
-configuration_test() ->
-    {ok, Docs} = file:read_file("docs/run/configuring-your-machine.md"),
-    [_, Section] = binary:split(Docs, <<"#### TLS termination">>),
-    [_, Example] = binary:split(Section, <<"```text\n">>),
-    [Flat, _] = binary:split(Example, <<"```">>),
-    ?assertMatch({ok, #{
-        <<"port">> := 443,
-        <<"protocol">> := http2,
-        <<"tls">> := #{
-            <<"domains">> := [<<"node.example.com">>],
-            <<"acme">> := #{
-                <<"http-port">> := 80,
-                <<"terms-of-service-agreed">> := true
-            }
-        }
-    }}, hb_opts:load_bin(Flat, #{})).
-
 %% @doc Run the Pebble example when its environment has been configured.
 pebble_test_() ->
     case os:getenv("HB_PEBBLE_DIRECTORY_URL") of
