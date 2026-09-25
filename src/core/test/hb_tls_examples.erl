@@ -2,23 +2,38 @@
 -module(hb_tls_examples).
 -include_lib("eunit/include/eunit.hrl").
 
-%% @doc The documented flat configuration preserves the required option types.
+%% @doc Both documented configuration formats preserve the required option types.
 configuration_test() ->
     {ok, Docs} = file:read_file("docs/run/configuring-your-machine.md"),
     [_, Section] = binary:split(Docs, <<"#### TLS termination">>),
-    [_, Example] = binary:split(Section, <<"```text\n">>),
-    [Flat, _] = binary:split(Example, <<"```">>),
-    ?assertMatch({ok, #{
-        <<"port">> := 443,
-        <<"protocol">> := http2,
-        <<"tls">> := #{
-            <<"domains">> := [<<"node.example.com">>],
-            <<"acme">> := #{
-                <<"http-port">> := 80,
-                <<"terms-of-service-agreed">> := true
-            }
-        }
-    }}, hb_opts:load_bin(Flat, #{})).
+    lists:foreach(
+        fun({Language, Extension}) ->
+            [_, Example] = binary:split(Section,
+                <<"```", Language/binary, "\n">>),
+            [Config, _] = binary:split(Example, <<"```">>),
+            Path = "test/tls-config-" ++
+                integer_to_list(erlang:unique_integer([positive])) ++ Extension,
+            ok = file:write_file(Path, Config),
+            try
+                ?assertMatch({ok, #{
+                    <<"port">> := 443,
+                    <<"protocol">> := http2,
+                    <<"tls">> := #{
+                        <<"domains">> := [<<"node.example.com">>],
+                        <<"acme">> := #{
+                            <<"directory-url">> :=
+                                <<"https://acme-v02.api.letsencrypt.org/directory">>,
+                            <<"http-port">> := 80,
+                            <<"terms-of-service-agreed">> := true
+                        }
+                    }
+                }}, hb_opts:load(Path, #{}))
+            after
+                file:delete(Path)
+            end
+        end,
+        [{<<"json">>, ".json"}, {<<"text">>, ".flat"}]
+    ).
 
 %% @doc Run the Pebble example when its environment has been configured.
 pebble_test_() ->
