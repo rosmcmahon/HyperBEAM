@@ -180,26 +180,17 @@ transaction_cursor(Res, Opts) ->
     [#{ <<"cursor">> := Cursor }] = transaction_edges(Res, Opts),
     Cursor.
 
-%% Helper function to write test message with Recipient
+%% @doc Write an ANS-104 item with a native recipient.
 write_test_message_with_recipient(Recipient, Opts) ->
-    hb_cache:write(
-        Msg = hb_message:commit(
-            #{
-                <<"data-protocol">> => <<"ao">>,
-                <<"variant">> => <<"ao.N.1">>,
-                <<"type">> => <<"Message">>,
-                <<"action">> => <<"Eval">>,
-                <<"content-type">> => <<"text/plain">>,
-                <<"data">> => <<"test data">>,
-                <<"target">> => Recipient
-            },
-            Opts,
-            #{
-                <<"commitment-device">> => <<"ans104@1.0">>
-            }
-        ),
-        Opts
+    TX = ar_bundles:sign_item(
+        #tx{ target = hb_util:decode(Recipient), data = <<"test data">>,
+            tags = [{<<"Data-Protocol">>, <<"ao">>}, {<<"Variant">>, <<"ao.N.1">>},
+                {<<"Type">>, <<"Message">>}, {<<"Action">>, <<"Eval">>},
+                {<<"Content-Type">>, <<"text/plain">>}] },
+        hb_maps:get(<<"priv-wallet">>, Opts)
     ),
+    Msg = hb_message:convert(TX, <<"structured@1.0">>, <<"ans104@1.0">>, Opts),
+    hb_cache:write(Msg, Opts),
     {ok, Msg}.
 
 %%% Tests
@@ -604,19 +595,26 @@ transactions_query_recipients_test_parallel() ->
     ?event({alice, Alice, {explicit, hb_util:human_id(Alice)}}),
     AliceAddress = hb_util:human_id(Alice),
     {ok, WrittenMsg} = write_test_message_with_recipient(AliceAddress, Opts),
+    TagOnly = ar_bundles:sign_item(#tx{ tags = [
+        {<<"Target">>, AliceAddress}, {<<"field-target">>, AliceAddress}
+    ] }, ar_wallet:new()),
+    hb_cache:write(hb_message:convert(
+        TagOnly, <<"structured@1.0">>, <<"ans104@1.0">>, Opts
+    ), Opts),
     ?assertMatch(
         {ok, [_]},
         hb_cache:match(#{<<"type">> => <<"Message">>}, Opts)
     ),
     Query =
         <<"""
-            query($recipients: [String!]) {
+            query($recipients: [String!], $ids: [ID!], $sort: SortOrder) {
                 transactions(
-                    recipients: $recipients
+                    recipients: $recipients, ids: $ids, sort: $sort
                 ) {
                     edges {
                         node {
                             id
+                            recipient
                             tags {
                                 name
                                 value
@@ -647,6 +645,7 @@ transactions_query_recipients_test_parallel() ->
                             <<"node">> :=
                                 #{
                                     <<"id">> := ExpectedID,
+                                    <<"recipient">> := AliceAddress,
                                     <<"tags">> :=
                                         [#{ <<"name">> := _, <<"value">> := _ }|_]
                                 }
@@ -655,6 +654,37 @@ transactions_query_recipients_test_parallel() ->
             }
         } when ?IS_ID(ExpectedID),
         Res
+    ),
+    % Native recipient and Target tags must stay distinct on both read paths.
+    lists:foreach(
+        fun(Codec) ->
+            Wallet = ar_wallet:new(),
+            Native = hb:address(ar_wallet:new()),
+            Unsigned = #tx{ format = 1, target = hb_util:decode(Native),
+                tags = [{<<"Target">>, AliceAddress},
+                    {<<"field-target">>, AliceAddress}] },
+            TX = case Codec of
+                <<"tx@1.0">> -> ar_tx:sign(Unsigned, Wallet);
+                <<"ans104@1.0">> -> ar_bundles:sign_item(Unsigned, Wallet)
+            end,
+            Msg = hb_message:convert(TX, <<"structured@1.0">>, Codec, Opts),
+            hb_cache:write(Msg, Opts),
+            ID = hb_util:encode(TX#tx.id),
+            lists:foreach(
+                fun({Recipient, IDs, Expected, Direction}) ->
+                    Actual = dev_query_graphql:test_query(Node, Query,
+                        #{ <<"recipients">> => [Recipient], <<"ids">> => IDs,
+                            <<"sort">> => Direction }, Opts),
+                    ?assertEqual(Expected, transaction_ids(Actual, Opts))
+                end,
+                [{Recipient, IDs, Expected, Direction}
+                    || {Recipient, IDs, Expected} <-
+                        [{Native, null, [ID]}, {Native, [ID], [ID]},
+                         {AliceAddress, null, [ExpectedID]}, {AliceAddress, [ID], []}],
+                    Direction <- [<<"HEIGHT_ASC">>, <<"HEIGHT_DESC">>]]
+            )
+        end,
+        [<<"tx@1.0">>, <<"ans104@1.0">>]
     ).
 
 %% @doc Test transactions query with ids filter

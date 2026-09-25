@@ -7,7 +7,8 @@
 %%% optional string `count'. Supported filters are `ids', `tags', `owners',
 %%% `recipients' and `block'. Tag names address message keys. Values within a
 %%% tag are ORed; separate tags and other filters are ANDed. Owners are
-%%% committers and recipients are targets. Without these selecting filters,
+%%% committers; indexed recipients use the commitment's `field-target'.
+%%% Without these selecting filters,
 %%% queries enumerate confirmed base-layer TXs from block headers, optionally
 %%% within inclusive `block.min/max' heights. This excludes bundled data items
 %%% and pending messages. Heights start at zero and end at the compact index's
@@ -1030,7 +1031,7 @@ index_connection(Predicates, Args, Opts) ->
     end.
 
 %% @doc The query's AND predicates, each with alternative values. Owners and
-%% recipients use `committer' and `target'. Explicit IDs, a height or bundle
+%% recipients use `committer' and `field-target'. Explicit IDs, a height or bundle
 %% filter are `unservable'. An empty predicate list selects block enumeration.
 index_predicates(Args, Opts) ->
     Get = fun(Filter) -> hb_maps:get(Filter, Args, null, Opts) end,
@@ -1041,7 +1042,7 @@ index_predicates(Args, Opts) ->
             {Pair, Filter} <-
                 [
                     {<<"committer">>, <<"owners">>},
-                    {<<"target">>, <<"recipients">>}
+                    {<<"field-target">>, <<"recipients">>}
                 ]
         ],
     maybe

@@ -538,7 +538,10 @@ raw_default_message() ->
         },
         <<"on">> => #{
             <<"cache-write">> =>
-                #{ <<"device">> => <<"match@1.0">>, <<"path">> => <<"index">> },
+                #{ <<"device">> => <<"match@1.0">>, <<"path">> => <<"index">>,
+                    <<"match-paths">> => #{
+                        <<"field-target">> => <<"recipient~query@1.0">>
+                    } },
             <<"request">> =>
                 [
                     #{
