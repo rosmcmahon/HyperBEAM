@@ -156,12 +156,15 @@ do_from(RawTX, Req, Opts) ->
     {ok, WithCommitments}.
 
 %% @doc Inspect a message's signed ans104 commitment and, if it carries an
-%% explicit `bundle' field, mirror that value onto the request `Req'.
+%% explicit `bundle' field, mirror that value onto the request `Req'. Bundling
+%% is turned off for a message with a nested message signed by another device.
 to_hint(Msg, Req, Opts) ->
-    case lib_arweave_common:bundle_hint(<<"ans104@1.0">>, Msg, Req, Opts) of
-        not_found -> {ok, Req};
-        Hint -> Hint
-    end.
+    Hint =
+        case lib_arweave_common:bundle_hint(<<"ans104@1.0">>, Msg, Req, Opts) of
+            not_found -> {ok, Req};
+            Found -> Found
+        end,
+    lib_arweave_common:signed_children_hint(Msg, Hint, Opts).
 
 %% @doc Internal helper to translate a message to its #tx record representation,
 %% which can then be used by ar_bundles to serialize the message. We call the 

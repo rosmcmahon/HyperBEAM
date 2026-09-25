@@ -5,6 +5,7 @@
 -export([verify_committed_keys/5]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
+-export([signed_children_hint/3]).
 -export([to/3, to/6, siginfo/4, fields_to_tx/4]).
 -export([bundle_header/2, bundle_header/3]).
 -include("include/hb.hrl").
@@ -537,6 +538,37 @@ bundle_hint(Device, Msg, Req, Opts) ->
             end;
         _ -> not_found
     end.
+
+%% @doc Turn off bundling for a message with a nested message signed by a
+%% device other than `ans104@1.0': its nested messages are then linked. An item
+%% in a bundle can hold only its own ANS-104 signature, so bundling would drop
+%% the nested message's other commitments.
+signed_children_hint(Msg, {ok, Req = #{ <<"bundle">> := true }}, Opts) ->
+    Children =
+        hb_maps:values(
+            hb_maps:without([<<"commitments">>, <<"priv">>], Msg, Opts),
+            Opts
+        ),
+    case lists:any(fun(Child) -> signed_by_other(Child, Opts) end, Children) of
+        true -> {ok, Req#{ <<"bundle">> => false }};
+        false -> {ok, Req}
+    end;
+signed_children_hint(_Msg, Hint, _Opts) ->
+    Hint.
+
+%% @doc Check whether a value is a message with a signed commitment of a device
+%% other than `ans104@1.0'.
+signed_by_other(Value, Opts) ->
+    lists:any(
+        fun(Commitment) ->
+            hb_maps:get(<<"commitment-device">>, Commitment, undefined, Opts)
+                =/= <<"ans104@1.0">>
+        end,
+        hb_maps:values(
+            hb_message:commitments(#{ <<"committer">> => '_' }, Value, Opts),
+            Opts
+        )
+    ).
 
 %% @doc Calculate the fields for a message, returning an initial TX record.
 siginfo(Message, {ok, _, Commitment}, FieldsFun, Opts) ->

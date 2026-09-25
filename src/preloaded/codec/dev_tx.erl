@@ -129,7 +129,7 @@ do_from(RawTX, Req, Opts) ->
 to_hint(Msg, Req, Opts) ->
     case lib_arweave_common:bundle_hint(<<"tx@1.0">>, Msg, Req, Opts) of
         not_found -> hb_ao:raw(<<"ans104@1.0">>, <<"to-hint">>, Msg, Req, Opts);
-        Hint -> Hint
+        Hint -> lib_arweave_common:signed_children_hint(Msg, Hint, Opts)
     end.
 %% @doc Internal helper to translate a message to its #tx record representation,
 %% which can then be used by ar_tx to serialize the message. We call the 
