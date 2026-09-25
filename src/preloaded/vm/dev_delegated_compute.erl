@@ -3,7 +3,7 @@
 %%% bring trusted results into the local node, or as the `Execution-Device' of
 %%% an AO process.
 -module(dev_delegated_compute).
--device_libraries([lib_process]).
+-device_libraries([lib_process, lib_scheduler_formats]).
 -export([init/3, compute/3, normalize/3, snapshot/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -94,7 +94,7 @@ do_compute(ProcID, Req, Opts) ->
     ?event({do_compute_msg, {req, Req}}),
     Slot = hb_ao:get(<<"slot">>, Req, Opts),
     {ok, AOS2 = #{ <<"body">> := Body }} =
-        dev_scheduler_formats:assignments_to_aos2(
+        lib_scheduler_formats:assignments_to_aos2(
             ProcID,
             #{
                 Slot => Req
@@ -157,6 +157,7 @@ do_relay(Method, Path, Body, Headers, Opts) ->
     hb_ao:resolve(
         #{
             <<"device">> => <<"relay@1.0">>,
+            <<"peer">> => hb_opts:get(delegated_compute_peer, not_found, Opts),
             <<"content-type">> => ContentType
         },
         Headers#{
@@ -241,6 +242,7 @@ snapshot(Msg, Req, Opts) ->
         hb_ao:resolve(
             #{
                 <<"device">> => <<"relay@1.0">>,
+                <<"peer">> => hb_opts:get(delegated_compute_peer, not_found, Opts),
                 <<"content-type">> => <<"application/json">>
             },
             #{
