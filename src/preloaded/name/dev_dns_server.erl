@@ -135,9 +135,12 @@ dispatch(Handle, Packet, Peer) ->
             ignore
     end.
 
-peer(Transport, IP, Port) -> #{
-    <<"transport">> => atom_to_binary(Transport),
-    <<"peer">> => #{
-        <<"address">> => list_to_binary(inet:ntoa(IP)), <<"port">> => Port
-    }
-}.
+peer(Transport, IP, Port) ->
+    #{
+        <<"transport">> => atom_to_binary(Transport),
+        <<"peer">> =>
+            #{
+                <<"address">> => list_to_binary(inet:ntoa(IP)),
+                <<"port">> => Port
+            }
+    }.
