@@ -337,7 +337,8 @@ compute(Key, RawBase, RawReq, Opts) ->
     ?event(debug_lua, parameters_found),
     % Resolve all hyperstate links
     ResolvedParams = hb_cache:ensure_all_loaded(Params, Opts),
-    % Call the VM function with the given arguments.
+    % Call the VM function with the given arguments. The AO-Core library
+    % functions read the node message from the private data of the Lua state.
     ?event(lua,
         {calling_lua_func,
             {function, Function},
@@ -349,7 +350,7 @@ compute(Key, RawBase, RawReq, Opts) ->
         try luerl:call_function_dec(
             [Function],
             encode(ResolvedParams, Opts),
-            State
+            luerl:put_private(<<"node-message">>, Opts, State)
         )
         catch
             _:Reason:Stacktrace -> {error, Reason, Stacktrace}
@@ -399,15 +400,16 @@ process_response({error, Reason, Trace}, _Priv, _Opts) ->
         <<"trace">> => TraceBin
     }}.
 
-%% @doc Snapshot the Lua state from a live computation. Normalizes its `priv'
-%% state element, then serializes the state to a binary.
+%% @doc Snapshot the Lua state from a live computation. Removes the node message
+%% from the private data of the state, then serializes the state to a binary.
 -spec snapshot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ body := binary(), _ => _ }} | {error, binary()}.
 snapshot(Base, _Req, Opts) ->
     case hb_private:get(<<"state">>, Base, Opts) of
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
-        State ->
+        RawState ->
+            State = luerl:delete_private(<<"node-message">>, RawState),
             {ok, #{ <<"body">> => term_to_binary(luerl:externalize(State)) }}
     end.
 
@@ -959,6 +961,50 @@ pure_lua_restore_test() ->
     ),
     {ok, Count2} = hb_ao:resolve(Process, <<"now/count">>, Opts),
     ?assertEqual(2, Count2).
+
+%% @doc Snapshots of a Lua state do not contain the wallet of the node, and
+%% restore to a state whose AO-Core library functions still resolve.
+snapshot_excludes_node_wallet_test() ->
+    Wallet = {{_, PrivKey, _}, _} = ar_wallet:new(),
+    Opts = #{
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => [hb_test_utils:test_store()]
+    },
+    {ok, Script} = file:read_file("test/test.lua"),
+    {ok, ModuleID} =
+        hb_cache:write(
+            #{
+                <<"content-type">> => <<"application/lua">>,
+                <<"body">> => Script
+            },
+            Opts
+        ),
+    Node = hb_http_server:start_node(Opts),
+    % Snapshot the state over HTTP after an invocation.
+    {ok, Snapshot} =
+        hb_http:get(
+            Node,
+            <<
+                "/init~lua@5.3a&module=", ModuleID/binary,
+                "/hello~lua@5.3a/snapshot~lua@5.3a/body"
+            >>,
+            #{}
+        ),
+    ?assertEqual(nomatch, binary:match(Snapshot, PrivKey)),
+    % Restore the state and call a function that uses the AO-Core library.
+    {ok, Restored} =
+        hb_ao:resolve(
+            #{
+                <<"device">> => <<"lua@5.3a">>,
+                <<"snapshot">> => #{ <<"body">> => Snapshot }
+            },
+            <<"normalize">>,
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"Hello, AO world!">>},
+        hb_ao:resolve(Restored, <<"ao_resolve">>, Opts)
+    ).
 
 pure_lua_process_benchmark_test_() ->
     {timeout,

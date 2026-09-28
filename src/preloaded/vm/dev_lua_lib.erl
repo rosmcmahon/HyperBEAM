@@ -52,7 +52,7 @@ install(Base, State, Opts) ->
         end,
     ?event({adding_ao_core_resolver, {device_sandbox, AdmissibleNames}}),
     ExecOpts =
-        Opts#{
+        #{
             <<"admissible-devices">> => AdmissibleNames,
             <<"hashpath">> => ignore
         },
@@ -82,22 +82,30 @@ install(Base, State, Opts) ->
                         [ao, FuncName],
                         fun(RawArgs, ImportState) ->
                             ?event(lua_import, {calling_import, {func, FuncName}}),
+                            % Get the node message of the invocation from the
+                            % private data of the Lua state.
+                            ImportOpts =
+                                luerl:get_private(<<"node-message">>, ImportState),
                             % Decode the arguments from the Lua environment.
                             Args =
                                 lists:map(
                                     fun(Arg) ->
                                         dev_lua:decode(
                                             luerl:decode(Arg, ImportState),
-                                            Opts
+                                            ImportOpts
                                         )
                                     end,
                                     RawArgs
                                 ),
                             % Call the function with the decoded arguments.
                             {Res, ResState} =
-                                Func(Args, ImportState, ExecOpts),
+                                Func(
+                                    Args,
+                                    ImportState,
+                                    maps:merge(ImportOpts, ExecOpts)
+                                ),
                             % Encode the response for return to Lua
-                            return(Res, ResState, Opts)
+                            return(Res, ResState, ImportOpts)
                         end,
                         StateIn
                     ),
