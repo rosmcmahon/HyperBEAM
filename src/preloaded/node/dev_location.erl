@@ -59,18 +59,20 @@ all(_Base, _Req, Opts) ->
 -spec read(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ _ => _ }}
     | {error, #{ status := integer(), body := binary(), _ => _ }}.
-read(Address, _Base, _Req, Opts) ->
-    read(Address, Opts).
+read(Address, _Base, Req, Opts) ->
+    read(Address, hb_maps:get(<<"variant">>, Req, undefined, Opts), Opts).
 read(Address, Opts) ->
+    read(Address, undefined, Opts).
+read(Address, Variant, Opts) ->
     % Search for the location of the scheduler in the scheduler-location cache.
     maybe
         {ok, Cached} ?= dev_location_cache:read(Address, Opts),
-        Variant = hb_maps:get(<<"variant">>, Cached, <<"ao.N.1">>, Opts),
-        Variant ?= hb_opts:get(location_variant, Variant, Opts),
+        true ?= Variant =:= undefined orelse
+            Variant =:= hb_maps:get(<<"variant">>, Cached, <<"ao.N.1">>, Opts),
         {ok, Cached}
     else
         _ ->
-            case hb_client_gateway:location(Address, Opts) of
+            case hb_client_gateway:location(Address, Variant, Opts) of
                 {ok, Location} ->
                     dev_location_cache:write(Location, Opts),
                     {ok, Location};
@@ -428,21 +430,21 @@ legacy_location_variant() ->
     },
     hb_http_server:start_node(Opts#{ <<"port">> => 0 }),
     Address = <<"_GQ33BkPtZrqxA84vM8Zk-N2aO0toNNu_C-l-rawrBA">>,
-    LegacyOpts = Opts#{ <<"location-variant">> => <<"ao.TN.1">> },
-    {ok, Legacy} = hb_client_gateway:location(Address, LegacyOpts),
+    LegacyReq = #{ <<"path">> => Address, <<"variant">> => <<"ao.TN.1">> },
+    {ok, Legacy} = hb_client_gateway:location(Address, <<"ao.TN.1">>, Opts),
     ?assertEqual(<<"ao.TN.1">>, hb_maps:get(<<"variant">>, Legacy, Opts)),
     ?assert(hb_message:verify(Legacy, signers, Opts)),
     Base = #{ <<"device">> => <<"location@1.0">> },
     {ok, Modern} = hb_ao:resolve(Base, Address, Opts),
     ?assertEqual(<<"ao.N.1">>, hb_maps:get(<<"variant">>, Modern, Opts)),
-    {ok, CachedLegacy} = hb_ao:resolve(Base, Address, LegacyOpts),
+    {ok, CachedLegacy} = hb_ao:resolve(Base, LegacyReq, Opts),
     ?assertEqual(Legacy, hb_private:reset(hb_cache:ensure_all_loaded(CachedLegacy, Opts))),
     ?assert(hb_message:verify(CachedLegacy, signers, Opts)),
-    {ok, Again} = hb_ao:resolve(Base, Address, LegacyOpts),
+    {ok, Again} = hb_ao:resolve(Base, LegacyReq, Opts),
     ?assertEqual(hb_message:id(Legacy, none, Opts),
         hb_message:id(Again, none, Opts)),
-    {ok, ModernAgain} = hb_ao:resolve(Base, Address,
-        Opts#{ <<"location-variant">> => <<"ao.N.1">> }),
+    {ok, ModernAgain} = hb_ao:resolve(Base,
+        LegacyReq#{ <<"variant">> => <<"ao.N.1">> }, Opts),
     ?assertEqual(hb_message:id(Modern, none, Opts),
         hb_message:id(ModernAgain, none, Opts)),
     {ok, Proc} = hb_client_gateway:read(
