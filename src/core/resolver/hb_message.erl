@@ -185,8 +185,11 @@ from_tabm(Msg, TargetFormat, OldPriv, Opts) ->
     end.
 
 %% @doc Add the existing `priv' sub-map back to a converted message, honoring
-%% any existing `priv' sub-map that may already be present.
-restore_priv(Msg, EmptyPriv, _Opts) when map_size(EmptyPriv) == 0 -> Msg;
+%% any existing `priv' sub-map that may already be present. A `priv' key that
+%% holds a literal is not a sub-map, and is not restored.
+restore_priv(Msg, OldPriv, _Opts)
+        when not is_map(OldPriv); map_size(OldPriv) == 0 ->
+    Msg;
 restore_priv(Msg, OldPriv, Opts) ->
     MsgPriv = hb_maps:get(<<"priv">>, Msg, #{}, Opts),
     ?event_debug({restoring_priv, {priv_msg, MsgPriv}, {priv_old, OldPriv}}),
