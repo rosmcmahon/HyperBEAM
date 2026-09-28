@@ -169,7 +169,7 @@ aos2_to_assignment(A, RawOpts) ->
     ?event({assignment_data, AssignmentData}),
     {ok, Assignment} =
         hb_client_gateway:result_to_message(
-            aos2_normalize_data(aos2_anchor(AssignmentData, Opts)),
+            aos2_normalize_data(AssignmentData),
             Opts
         ),
     ?event({result_assignment, Assignment}),
@@ -195,25 +195,12 @@ aos2_to_assignment(A, RawOpts) ->
                 end;
             Body ->
                 hb_client_gateway:result_to_message(
-                    aos2_normalize_data(aos2_anchor(Body, Opts)),
+                    aos2_normalize_data(Body),
                     Opts
                 )
         end,
     ?event({message, Message}),
     NormalizedAssignment#{ <<"body">> => Message }.
-
-%% @doc Recover anchors omitted or emitted as raw text by the legacy SU.
-aos2_anchor(JSON = #{ <<"id">> := ID }, Opts) ->
-    case hb_maps:get(<<"anchor">>, JSON, null, Opts) of
-        <<Anchor:32/binary>> -> JSON#{ <<"anchor">> => hb_util:encode(Anchor) };
-        null ->
-            case hb_cache:read(ID, Opts) of
-                {ok, Msg} ->
-                    JSON#{ <<"anchor">> => hb_maps:get(<<"anchor">>, Msg, <<>>, Opts) };
-                _ -> JSON
-            end;
-        _ -> JSON
-    end.
 
 %% @doc The `hb_client_gateway' module expects all JSON structures to at least
 %% have a `data' field. This function ensures that.
