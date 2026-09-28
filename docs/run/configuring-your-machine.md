@@ -6,6 +6,8 @@ This guide details the various ways to configure your HyperBEAM node's behavior,
 
 The primary way to configure your HyperBEAM node is through a `config.json` file located in the node's working directory or specified by the `HB_CONFIG` environment variable.
 
+Configuration is an AO-Core message whose values may include linked data.
+
 ### Flat config file
 
 Another possibility is to use `config.flat` that uses a simple `Key: Value` format.
@@ -19,12 +21,12 @@ port: 8080
 % Specify the Arweave key file
 priv_key_location: /path/to/your/wallet.json
 
-% Maps can be used with forward dash (/)
+% Nested messages use forward slashes (/)
 default_store/lmdb/ao-types: store-module=atom
 default_store/lmdb/store-module: hb_store_lmdb
 default_store/lmdb/name: /tmp/store
 
-% Lists can be used with dot (.) and sequential integer key map
+% Lists use numbered message keys and an ao-types annotation
 store/ao-types: .=list
 store/1/ao-types: store-module=atom
 store/1/store-module: hb_store_lmdb
@@ -40,7 +42,8 @@ store/2/force_path_style: true
 store/2/region: us-east-1
 ```
 
-Below is a reference of commonly used configuration keys. Remember that `config.flat` only supports the following value types (Atoms, Strings, Integers, Booleans, Maps and List).
+Below is a reference of commonly used configuration keys. `config.flat` supports
+atoms, strings, integers, booleans, nested messages and lists.
 
 ### Core Configuration
 
@@ -68,7 +71,6 @@ These options control networking behavior and HTTP settings.
 | `http_keepalive` | Integer | 120000 | HTTP keepalive time in milliseconds |
 | `http_request_send_timeout` | Integer | 60000 | HTTP request send timeout in milliseconds |
 | `relay_http_client` | Atom | httpc | HTTP client for the relay device |
-<!-- Complex options like http_extra_opts are omitted as they are not suitable for config.flat -->
 
 ### Security & Identity
 
@@ -77,7 +79,6 @@ These options control identity and security settings.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `scheduler_location_ttl` | Integer | 604800000 | TTL for scheduler registration (7 days in ms) |
-<!-- Complex options like trusted_device_signers, trusted are omitted -->
 
 #### TLS termination
 
@@ -199,10 +200,11 @@ Merge these settings into your node configuration, replacing the example names:
 ```
 
 The `on` entries above are additions, not a replacement for your existing hook
-map. Preserve the node's other handlers, and append DNS startup to any existing
-`on/start` list. An explicit `on` map replaces the defaults; if your configuration
-does not already include it, retain the handlers from `hb_opts:default_message/0`
-for normal request routing, authentication, rate limiting and cache indexing.
+message. Preserve the node's other handlers, and append DNS startup to any
+existing `on/start` list. An explicit `on` message replaces the defaults; if your
+configuration does not already include it, retain the handlers from
+`hb_opts:default_message/0` for normal request routing, authentication, rate
+limiting and cache indexing.
 
 At your existing DNS provider, add:
 
@@ -243,7 +245,8 @@ both UDP and TCP. The normal example without that variable exercises HTTP-01.
 
 ### Caching & Storage
 
-These options control caching behavior. **Note:** Detailed storage configuration (`store` option) involves complex data structures and cannot be set via `config.flat`.
+These options control caching behavior. The `store` option accepts nested messages
+and lists in `config.flat`.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -251,7 +254,6 @@ These options control caching behavior. **Note:** Detailed storage configuration
 | `access_remote_cache_for_client` | Boolean | false | Whether to access data from remote caches for client requests |
 | `store_all_signed` | Boolean | true | Whether the node should store all signed messages |
 | `await_inprogress` | Atom/Boolean | named | Whether to await in-progress executions (false, named, true) |
-<!-- Complex options like cache_control are omitted -->
 
 ### Execution & Processing
 
@@ -271,7 +273,6 @@ These options control how HyperBEAM manages devices.
 
 Remote device loading is enabled by configuring `trusted_device_signers`;
 omit it or set it to `[]` to disable remote signer lookup.
-<!-- Complex options like preloaded-store, devices are omitted -->
 
 ### Debug & Development
 
@@ -280,7 +281,7 @@ These options control debugging and development features.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `debug_stack_depth` | Integer | 40 | Maximum stack depth for debug printing |
-| `debug_print_map_line_threshold` | Integer | 30 | Maximum lines for map printing |
+| `debug_print_map_line_threshold` | Integer | 30 | Maximum lines for message printing |
 | `debug_print_binary_max` | Integer | 60 | Maximum binary size for debug printing |
 | `debug_print_indent` | Integer | 2 | Indentation for debug printing |
 | `debug_print_trace` | Atom | short | Trace mode (short, false) |
@@ -288,9 +289,9 @@ These options control debugging and development features.
 | `debug_hide_metadata` | Boolean | true | Whether to hide metadata in debug output |
 | `debug_ids` | Boolean | false | Whether to print IDs in debug output |
 | `debug_hide_priv` | Boolean | true | Whether to hide private data in debug output |
-<!-- Complex options like debug_print, stack_print_prefixes are omitted -->
 
-**Note:** For the *absolute complete* and most up-to-date list, including complex options not suitable for `config.flat`, refer to the `default_message/0` function in the `hb_opts` module source code.
+**Note:** For the complete and most up-to-date list, refer to the
+`default_message/0` function in the `hb_opts` module source code.
 
 ## Overrides (Environment Variables & Args)
 

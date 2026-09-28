@@ -633,7 +633,7 @@ allowed_methods(Req, State) ->
 %% @doc Merges the provided `Opts' with uncommitted values from `Request',
 %% preserves the http-server value, and updates node-history by prepending
 %% the `Request'. If a server reference exists, updates the Cowboy environment
-%% variable 'node_msg' with the resulting options map.
+%% variable 'node_msg' with the resulting node message.
 set_opts(Opts) ->
     case hb_opts:get(http_server, no_server_ref, Opts) of
         no_server_ref ->
@@ -672,9 +672,9 @@ get_opts(NodeMsg) ->
 set_proc_server_id(ServerID) ->
     put(server_id, ServerID).
 
-%% @doc Apply the default node message to the given opts map.
+%% @doc Apply the default node message to the given options message.
 set_default_opts(Opts) ->
-    % Create a temporary opts map that does not include the defaults.
+    % Create a temporary options message that does not include the defaults.
     TempOpts = Opts#{ <<"only">> => local },
     % Get the port to use for the server. If no port is provided, we use port 0
     % will the operating system assign a free port.
