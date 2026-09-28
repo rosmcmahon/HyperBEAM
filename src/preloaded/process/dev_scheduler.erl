@@ -585,7 +585,19 @@ find_server(ProcID, Base, ToSched, Opts) ->
                                 false ->
                                     % We are not the scheduler. Find it and
                                     % return a redirect.
-                                    find_remote_scheduler(ProcID, ParsedLoc, Opts)
+                                    find_remote_scheduler(
+                                        ProcID,
+                                        ParsedLoc,
+                                        Opts#{
+                                            <<"location-variant">> =>
+                                                hb_ao:get(
+                                                    <<"variant">>,
+                                                    Proc,
+                                                    <<"ao.N.1">>,
+                                                    Opts
+                                                )
+                                        }
+                                    )
                             end
                     end
             end
