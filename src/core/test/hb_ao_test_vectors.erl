@@ -678,7 +678,7 @@ error_strategy_test(Opts) ->
                 #{ <<"fail">> => fun(_Base, _Req, _Opts) -> error(bad) end }
         },
     ?assertMatch(
-        {failure, #{ <<"class">> := bad }},
+        {failure, #{ <<"class">> := error, <<"exception">> := bad }},
         hb_ao:resolve(
             Msg,
             <<"fail">>,
