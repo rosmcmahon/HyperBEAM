@@ -1,7 +1,9 @@
 %%% @doc TLS policy and node-wallet key adapter.
 -module(hb_tls).
 -export([config/1, certificate_expiry/1, install/3, socket_options/2]).
+-export([csr/2, certificate_chain/1]).
 -include_lib("public_key/include/public_key.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -define(UNIX_EPOCH, 62167219200).
 
@@ -14,6 +16,78 @@ config(NodeMsg) ->
                 Invalid -> error({'invalid-tls-config', Invalid})
             end
     end.
+
+%% @doc Decode a PEM certificate chain, with the leaf certificate first.
+certificate_chain(PEM) ->
+    try
+        case [DER || {'Certificate', DER, not_encrypted} <-
+                public_key:pem_decode(PEM)] of
+            [] -> {error, 'invalid-certificate-chain'};
+            Chain -> {ok, Chain}
+        end
+    catch
+        _:_ -> {error, 'invalid-certificate-chain'}
+    end.
+
+%% @doc Create a SAN PKCS#10 request using the node wallet's exact key.
+csr({{{rsa, E}, D, N}, _} = Wallet, Domains) ->
+    Names = [binary_to_list(Domain) || Domain <- Domains],
+    Extensions = [{asn1_OPENTYPE, public_key:der_encode(
+        'Extensions', [#'Extension'{
+            extnID = ?'id-ce-subjectAltName',
+            critical = false,
+            extnValue = public_key:der_encode('GeneralNames',
+                [{dNSName, Name} || Name <- Names])
+        }]
+    )}],
+    {Info, EncodedInfo} = csr_info(Wallet, Names, Extensions,
+        'CertificationRequestInfo_attributes_SETOF'),
+    {ok, Encoded} = 'PKCS-10':encode(
+        'CertificationRequest',
+        #'CertificationRequest'{
+            certificationRequestInfo = Info,
+            signatureAlgorithm = #'CertificationRequest_signatureAlgorithm'{
+                algorithm = ?'sha256WithRSAEncryption',
+                parameters = {asn1_OPENTYPE, <<5, 0>>}
+            },
+            signature = crypto:sign(rsa, sha256, EncodedInfo,
+                [E, binary:decode_unsigned(N), binary:decode_unsigned(D)],
+                [{rsa_padding, rsa_pkcs1_padding}])
+        }
+    ),
+    Encoded.
+
+%% @doc Encode the request attributes using the running OTP's ASN.1 schema.
+csr_info(Wallet, Names, Extensions, AttributeRecord) ->
+    Info = #'CertificationRequestInfo'{
+        version = 0,
+        subject = {rdnSequence, [[#'AttributeTypeAndValue'{
+            type = ?'id-at-commonName',
+            value = {utf8String, hd(Names)}
+        }]]},
+        subjectPKInfo = csr_public_key_info(Wallet),
+        attributes = [{AttributeRecord,
+            {1, 2, 840, 113549, 1, 9, 14}, Extensions}]
+    },
+    try
+        {ok, Encoded} = 'PKCS-10':encode('CertificationRequestInfo', Info),
+        {Info, Encoded}
+    catch error:_ when AttributeRecord =/=
+            'AttributePKCS-10' ->
+        csr_info(Wallet, Names, Extensions, 'AttributePKCS-10')
+    end.
+
+%% @doc Represent the wallet's RSA key in a certificate request.
+csr_public_key_info({{{rsa, E}, _D, N}, _}) ->
+    #'CertificationRequestInfo_subjectPKInfo'{
+        algorithm = #'CertificationRequestInfo_subjectPKInfo_algorithm'{
+            algorithm = ?'rsaEncryption',
+            parameters = {asn1_OPENTYPE, <<5, 0>>}
+        },
+        subjectPublicKey = public_key:der_encode(
+            'RSAPublicKey', rsa_public_key(E, N)
+        )
+    }.
 
 %% @doc Replace a listener's leaf without dropping established connections.
 install(ServerID, Wallet, Chain) ->
@@ -92,3 +166,23 @@ rsa_public_key(E, N) ->
         publicExponent = E,
         modulus = binary:decode_unsigned(N)
     }.
+
+%%% Tests
+
+csr_key_test() ->
+    {{{rsa, E}, _D, N}, _} = Wallet = ar_wallet:load_keyfile("test/key-1.json"),
+    Encoded = csr(Wallet, [<<"localhost">>, <<"node.example">>]),
+    CSR = public_key:der_decode('CertificationRequest', Encoded),
+    Info = CSR#'CertificationRequest'.certificationRequestInfo,
+    {ok, EncodedInfo} = 'PKCS-10':encode('CertificationRequestInfo', Info),
+    ?assert(public_key:verify(
+        EncodedInfo,
+        sha256,
+        CSR#'CertificationRequest'.signature,
+        rsa_public_key(E, N)
+    )),
+    CSRKey = Info#'CertificationRequestInfo'.subjectPKInfo,
+    ?assertEqual(rsa_public_key(E, N), public_key:der_decode(
+        'RSAPublicKey',
+        CSRKey#'CertificationRequestInfo_subjectPKInfo'.subjectPublicKey
+    )).

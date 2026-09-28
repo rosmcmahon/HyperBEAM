@@ -313,18 +313,26 @@ prepare_tls(false, _Wallet, ServerID, _NodeMsg) ->
     stop_tls(ServerID),
     [];
 prepare_tls(TLS, Wallet, ServerID, NodeMsg) ->
-    ACME = hb_maps:get(<<"acme">>, TLS, not_found, NodeMsg),
-    true = is_map(ACME),
-    ChallengeRef = {tls_http_01, ServerID},
+    ACME = hb_maps:get(<<"acme">>, TLS, #{}, NodeMsg),
     stop_tls(ServerID),
     try
-        ChallengeNode = challenge_node(ACME, ServerID, NodeMsg),
-        {ok, _, _} = start_http2(
-            ChallengeRef,
-            listener_protocol_options(ChallengeRef, ChallengeNode),
-            ChallengeNode,
-            []
-        ),
+        case {
+            hb_maps:is_key(<<"certificate-path">>, TLS, NodeMsg),
+            hb_maps:get(<<"challenge-type">>, ACME, <<"http-01">>, NodeMsg)
+        } of
+            {true, _} -> ok;
+            {false, <<"http-01">>} ->
+                ChallengeRef = {tls_http_01, ServerID},
+                ChallengeNode = challenge_node(ACME, ServerID, NodeMsg),
+                {ok, _, _} = start_http2(
+                    ChallengeRef,
+                    listener_protocol_options(ChallengeRef, ChallengeNode),
+                    ChallengeNode,
+                    []
+                );
+            {false, <<"dns-01">>} -> ok;
+            _ -> error('invalid-acme-challenge-type')
+        end,
         PrivateTLS = #{
             <<"server-id">> => ServerID,
             <<"lifecycle-capability">> => make_ref()
@@ -628,7 +636,7 @@ allowed_methods(Req, State) ->
 %% @doc Merges the provided `Opts' with uncommitted values from `Request',
 %% preserves the http-server value, and updates node-history by prepending
 %% the `Request'. If a server reference exists, updates the Cowboy environment
-%% variable 'node_msg' with the resulting options map.
+%% variable 'node_msg' with the resulting node message.
 set_opts(Opts) ->
     case hb_opts:get(http_server, no_server_ref, Opts) of
         no_server_ref ->
@@ -667,9 +675,9 @@ get_opts(NodeMsg) ->
 set_proc_server_id(ServerID) ->
     put(server_id, ServerID).
 
-%% @doc Apply the default node message to the given opts map.
+%% @doc Apply the default node message to the given options message.
 set_default_opts(Opts) ->
-    % Create a temporary opts map that does not include the defaults.
+    % Create a temporary options message that does not include the defaults.
     TempOpts = Opts#{ <<"only">> => local },
     % Get the port to use for the server. If no port is provided, we use port 0
     % will the operating system assign a free port.

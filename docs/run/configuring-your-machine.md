@@ -6,6 +6,8 @@ This guide details the various ways to configure your HyperBEAM node's behavior,
 
 The primary way to configure your HyperBEAM node is through a `config.json` file located in the node's working directory or specified by the `HB_CONFIG` environment variable.
 
+Configuration is an AO-Core message whose values may include linked data.
+
 ### Flat config file
 
 Another possibility is to use `config.flat` that uses a simple `Key: Value` format.
@@ -19,12 +21,12 @@ port: 8080
 % Specify the Arweave key file
 priv_key_location: /path/to/your/wallet.json
 
-% Maps can be used with forward dash (/)
+% Nested messages use forward slashes (/)
 default_store/lmdb/ao-types: store-module=atom
 default_store/lmdb/store-module: hb_store_lmdb
 default_store/lmdb/name: /tmp/store
 
-% Lists can be used with dot (.) and sequential integer key map
+% Lists use numbered message keys and an ao-types annotation
 store/ao-types: .=list
 store/1/ao-types: store-module=atom
 store/1/store-module: hb_store_lmdb
@@ -40,7 +42,8 @@ store/2/force_path_style: true
 store/2/region: us-east-1
 ```
 
-Below is a reference of commonly used configuration keys. Remember that `config.flat` only supports the following value types (Atoms, Strings, Integers, Booleans, Maps and List).
+Below is a reference of commonly used configuration keys. `config.flat` supports
+atoms, strings, integers, booleans, nested messages and lists.
 
 ### Core Configuration
 
@@ -68,7 +71,6 @@ These options control networking behavior and HTTP settings.
 | `http_keepalive` | Integer | 120000 | HTTP keepalive time in milliseconds |
 | `http_request_send_timeout` | Integer | 60000 | HTTP request send timeout in milliseconds |
 | `relay_http_client` | Atom | httpc | HTTP client for the relay device |
-<!-- Complex options like http_extra_opts are omitted as they are not suitable for config.flat -->
 
 ### Security & Identity
 
@@ -77,12 +79,65 @@ These options control identity and security settings.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `scheduler_location_ttl` | Integer | 604800000 | TTL for scheduler registration (7 days in ms) |
-<!-- Complex options like trusted_device_signers, trusted are omitted -->
 
 #### TLS termination
 
-TLS is opt-in and uses ACME HTTP-01 to obtain and renew a certificate whose
-leaf key is the node's RSA `priv-wallet`. TLS terminates inside the BEAM.
+TLS is opt-in and terminates inside the BEAM using the node's RSA `priv-wallet`.
+Supply a certificate issued for that key, or use ACME to obtain and renew one
+automatically. ACME is an issuance protocol, not a certificate authority;
+Let's Encrypt is the issuer used in the examples below.
+
+##### Supplied certificates and signing requests
+
+`GET /~tls@1.0/csr` returns a PEM-encoded PKCS#10 certificate signing request
+for the node wallet. It uses `tls/domains` by default, or a `domains` list in
+the request. The private key never leaves the node.
+
+To obtain the first certificate, start an ordinary HTTP node without `tls`
+configured, then fetch its CSR locally, supplying the required names:
+
+```sh
+curl --fail --get \
+  --data-urlencode 'domains+list=\"node.example.com\", \"*.node.example.com\"' \
+  http://127.0.0.1:8734/~tls@1.0/csr \
+  --output node.csr.pem
+```
+
+The escaped quotes preserve string values in the AO-Core list.
+
+Submit this CSR to your chosen issuer and complete its domain validation.
+Save the issued certificate and intermediate certificates in one PEM file,
+leaf first. Keep the same node wallet, then restart with:
+
+```json
+{
+  "ao-types": "protocol=atom",
+  "port": 443,
+  "protocol": "http2",
+  "tls": {
+    "domains": ["node.example.com", "*.node.example.com"],
+    "certificate-path": "node.fullchain.pem"
+  }
+}
+```
+
+`certificate-path` is relative to the node's working directory, or an absolute
+path. It takes precedence over `tls/acme`. This mode starts no ACME runtime,
+challenge listener or automatic renewal; replace the PEM file and restart to
+adopt a renewed certificate. `domains` is optional when loading a file, but
+provides the defaults for subsequent CSR requests.
+
+The certificate must carry the exact public key of `priv-wallet`; a different
+key or an unreadable/malformed PEM file fails startup. There is no separate
+TLS private-key file and no fallback to plaintext. If the node generates a new
+wallet on every boot, it needs a certificate issued for each new key.
+
+##### Automatic issuance with ACME
+
+`tls/acme/directory-url` selects the issuer's ACME endpoint. The client supports
+HTTP-01 (the default) and [DNS-01](#dns-01-and-wildcard-certificates), including
+wildcard names with DNS-01. Issuers requiring External Account Binding are not
+yet supported.
 
 Save this as `config.json`, replacing `node.example.com` with your domain:
 
@@ -164,9 +219,87 @@ the wallet's raw RSA modulus.
 The `tls` node-message field cannot be changed while the listener is running;
 restart the node to adopt a different TLS policy.
 
+##### DNS-01 and wildcard certificates
+
+DNS-01 serves temporary TXT records through `dns@1.0`, with `tls@1.0` as its
+resolver. No DNS-provider API credentials or separate certificate files are
+needed. The certificate still uses the node's wallet key.
+
+Merge these settings into your node configuration, replacing the example names:
+
+```json
+{
+  "ao-types": "protocol=atom",
+  "port": 443,
+  "protocol": "http2",
+  "dns": {
+    "port": 53,
+    "address": "0.0.0.0"
+  },
+  "tls": {
+    "domains": ["example.com", "*.example.com"],
+    "acme": {
+      "directory-url": "https://acme-v02.api.letsencrypt.org/directory",
+      "terms-of-service-agreed": true,
+      "challenge-type": "dns-01",
+      "dns-nameserver": "ns-acme.example.com"
+    }
+  },
+  "on": {
+    "start": { "device": "dns@1.0" },
+    "dns-resolve": { "device": "tls@1.0" }
+  }
+}
+```
+
+The `on` entries above are additions, not a replacement for your existing hook
+message. Preserve the node's other handlers, and append DNS startup to any
+existing `on/start` list. An explicit `on` message replaces the defaults; if your
+configuration does not already include it, retain the handlers from
+`hb_opts:default_message/0` for normal request routing, authentication, rate
+limiting and cache indexing.
+
+At your existing DNS provider, add:
+
+| Name | Type | Value |
+| --- | --- | --- |
+| `ns-acme.example.com` | `A` | The DNS listener's public IPv4 address |
+| `_acme-challenge.example.com` | `NS` | `ns-acme.example.com.` |
+
+This delegates only the challenge zone. Keep the normal domain's nameservers
+and application records unchanged. Do not put a CNAME at the delegated name.
+For additional domain names, delegate their corresponding `_acme-challenge`
+names too. The apex and its wildcard share one challenge zone. The certificate
+needs both names to cover both `example.com` and `anything.example.com`.
+
+Make **UDP and TCP port 53** on the nameserver address reachable from the internet.
+You can forward both to a different local `dns/port`; an NS record cannot specify
+a port. Give the BEAM permission to bind privileged ports if using them directly.
+Before requesting a certificate, allow the NS/address changes and any old negative
+DNS answers to expire. Add an AAAA record only if the listener is also reachable
+over that IPv6 address.
+
+Start with `HB_CONFIG=config.json rebar3 shell`. The startup hook brings DNS up
+before ACME validation. The TLS resolver answers TXT, NS and SOA queries for its
+configured challenge zones, refuses unrelated names, and removes challenge
+values after validation. Challenge answers and negative answers have zero TTL.
+Keep DNS reachable for automatic renewal. Use the staging ACME directory during
+setup, as with HTTP-01.
+
+DNS-01 does not open the HTTP challenge listener and does not require port 80.
+HTTPS clients still need a route to the node's TLS listener. If several nodes
+share public port 443, use TLS passthrough (for example, SNI-based routing) rather
+than TLS termination at the router, so the browser sees the node's own key.
+
+The local ACME example in `src/core/test/hb_tls_examples.erl` supports DNS-01 by
+setting `HB_PEBBLE_DNS_PORT` to the port used by Pebble's `-dnsserver` resolver.
+It exercises apex and wildcard issuance, renewal, HTTP/2 and DNS cleanup over
+both UDP and TCP. The normal example without that variable exercises HTTP-01.
+
 ### Caching & Storage
 
-These options control caching behavior. **Note:** Detailed storage configuration (`store` option) involves complex data structures and cannot be set via `config.flat`.
+These options control caching behavior. The `store` option accepts nested messages
+and lists in `config.flat`.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -174,7 +307,6 @@ These options control caching behavior. **Note:** Detailed storage configuration
 | `access_remote_cache_for_client` | Boolean | false | Whether to access data from remote caches for client requests |
 | `store_all_signed` | Boolean | true | Whether the node should store all signed messages |
 | `await_inprogress` | Atom/Boolean | named | Whether to await in-progress executions (false, named, true) |
-<!-- Complex options like cache_control are omitted -->
 
 ### Execution & Processing
 
@@ -194,7 +326,6 @@ These options control how HyperBEAM manages devices.
 
 Remote device loading is enabled by configuring `trusted_device_signers`;
 omit it or set it to `[]` to disable remote signer lookup.
-<!-- Complex options like preloaded-store, devices are omitted -->
 
 ### Debug & Development
 
@@ -203,7 +334,7 @@ These options control debugging and development features.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `debug_stack_depth` | Integer | 40 | Maximum stack depth for debug printing |
-| `debug_print_map_line_threshold` | Integer | 30 | Maximum lines for map printing |
+| `debug_print_map_line_threshold` | Integer | 30 | Maximum lines for message printing |
 | `debug_print_binary_max` | Integer | 60 | Maximum binary size for debug printing |
 | `debug_print_indent` | Integer | 2 | Indentation for debug printing |
 | `debug_print_trace` | Atom | short | Trace mode (short, false) |
@@ -211,9 +342,9 @@ These options control debugging and development features.
 | `debug_hide_metadata` | Boolean | true | Whether to hide metadata in debug output |
 | `debug_ids` | Boolean | false | Whether to print IDs in debug output |
 | `debug_hide_priv` | Boolean | true | Whether to hide private data in debug output |
-<!-- Complex options like debug_print, stack_print_prefixes are omitted -->
 
-**Note:** For the *absolute complete* and most up-to-date list, including complex options not suitable for `config.flat`, refer to the `default_message/0` function in the `hb_opts` module source code.
+**Note:** For the complete and most up-to-date list, refer to the
+`default_message/0` function in the `hb_opts` module source code.
 
 ## Overrides (Environment Variables & Args)
 
