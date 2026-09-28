@@ -1,4 +1,19 @@
-%%% @doc Bounded RFC 8555 client for a node-wallet certificate.
+%%% @doc RFC 8555 ACME client for certificates carrying the node wallet's key.
+%%% `obtain/5' performs one synchronous issuance against the configured ACME
+%%% directory: create an account and order, validate domains, submit the node's
+%%% CSR, then download the leaf-first certificate chain. The node wallet signs
+%%% the CSR; a separate account wallet signs the ACME requests.
+%%%
+%%% HTTP-01 and DNS-01 records are published through a caller-supplied callback.
+%%% This module does not start listeners, store challenge records or schedule
+%%% renewal. Those responsibilities belong to `dev_tls'. Wildcard domains
+%%% require DNS-01; validation never falls back to another challenge type.
+%%%
+%%% ACME requests require HTTPS and use the system CA certificates unless
+%%% `acme/ca-certificate' supplies a PEM trust chain in the TLS message. Responses
+%%% are size-limited, individual requests have timeouts, and a shared issuance
+%%% deadline is checked before requests and polling waits. Protocol and transport
+%%% errors are returned to the caller rather than retried indefinitely.
 -module(dev_tls_acme).
 -export([obtain/5, dns_name/1]).
 -include_lib("eunit/include/eunit.hrl").
@@ -8,6 +23,11 @@
 -define(REQUEST_TIMEOUT, 30000).
 -define(RESPONSE_LIMIT, 2 * 1024 * 1024).
 
+%% @doc Obtain a certificate chain for `Wallet' using the TLS configuration message.
+%% Return `{ok, Chain}' with leaf-first DER certificates, or `{error, Reason}'.
+%% The challenge callback must return `ok' for `{put, Key, Value}' and receives
+%% `{delete, Key}' when validation finishes or fails. HTTP keys are tokens with
+%% key-authorization values; DNS keys are `{Name, Token}' with TXT digest values.
 obtain(TLS, Wallet, AccountWallet, Challenge, Opts) ->
     try
         {ACME, DirectoryURL, Domains, ChallengeType} = config(TLS, Opts),
@@ -38,6 +58,8 @@ obtain(TLS, Wallet, AccountWallet, Challenge, Opts) ->
         _:Reason -> {error, Reason}
     end.
 
+%% @doc Read ACME settings and require terms agreement, HTTPS and a supported
+%% challenge type before making requests. Return normalized domain identifiers.
 config(TLS, Opts) ->
     ACME = case hb_maps:get(<<"acme">>, TLS, undefined, Opts) of
         Value when is_map(Value) -> Value;
@@ -66,9 +88,12 @@ config(TLS, Opts) ->
         ChallengeType),
     {ACME, DirectoryURL, Domains, ChallengeType}.
 
+%% @doc Raise a tagged ACME error when a protocol or configuration check fails.
 require(true, _Reason) -> ok;
 require(false, Reason) -> throw({acme, Reason}).
 
+%% @doc Require nonempty domain identifiers and normalize their case.
+%% Wildcards must be compatible with the selected challenge type.
 domains(Domains, ChallengeType) when is_list(Domains), Domains =/= [] ->
     require(lists:all(fun(Domain) -> valid_domain(Domain, ChallengeType) end,
         Domains), 'invalid-tls-domains'),
@@ -83,6 +108,8 @@ valid_domain(Domain, _) when is_binary(Domain), byte_size(Domain) > 0 ->
     binary:match(Domain, <<"*">>) =:= nomatch;
 valid_domain(_, _) -> false.
 
+%% @doc Hash the canonical public JWK for the RFC 7638 account thumbprint.
+%% Its lexicographic field order and absence of whitespace are significant.
 account_thumbprint(Wallet) ->
     #{<<"e">> := E, <<"n">> := N} = jwk(Wallet),
     Canonical = <<
@@ -91,6 +118,7 @@ account_thumbprint(Wallet) ->
     >>,
     hb_util:encode(crypto:hash(sha256, Canonical)).
 
+%% @doc Create or retrieve the account, retaining its URL for later JWS requests.
 create_account(State) ->
     {Headers, _Body, State1} = expect(jws_post(
         directory_url(<<"newAccount">>, State),
@@ -105,6 +133,7 @@ create_account(State) ->
         KID -> State1#{kid => KID}
     end.
 
+%% @doc Create an order for the DNS identifiers and retain its URL.
 create_order(Domains, State) ->
     Payload = #{<<"identifiers">> => [
         #{<<"type">> => <<"dns">>, <<"value">> => Domain}
@@ -117,6 +146,9 @@ create_order(Domains, State) ->
         URL -> {json(Body), URL, State1}
     end.
 
+%% @doc Validate each pending authorization through the challenge callback.
+%% Published records remain available during validation and are removed on exit,
+%% including when polling or a later authorization fails.
 authorize([], _Challenge, State) -> State;
 authorize([URL | Rest], Challenge, State) ->
     {_Headers, Body, State1} = expect(jws_post(URL, post_as_get, State), [200]),
@@ -152,7 +184,9 @@ challenge(Authorization, Type) ->
         [] -> throw({acme, {'acme-challenge-not-offered', Type}})
     end.
 
-%% @doc DNS-01 publishes the base64url SHA-256 digest of the key authorization.
+%% @doc Build the callback key and value for an HTTP or DNS challenge.
+%% HTTP-01 serves the key authorization; DNS-01 serves its base64url SHA-256
+%% digest. DNS keys retain the token so concurrent authorizations can coexist.
 challenge_record(<<"http-01">>, _Authorization, Token, KeyAuthorization) ->
     {Token, KeyAuthorization};
 challenge_record(<<"dns-01">>, Authorization, Token, KeyAuthorization) ->
@@ -161,10 +195,11 @@ challenge_record(<<"dns-01">>, Authorization, Token, KeyAuthorization) ->
     {{dns_name(Domain), Token},
         hb_util:encode(crypto:hash(sha256, KeyAuthorization))}.
 
-%% @doc An apex and its wildcard use the same DNS challenge name.
+%% @doc Return the lowercase DNS challenge name, shared by an apex and wildcard.
 dns_name(<<"*.", Domain/binary>>) -> dns_name(Domain);
 dns_name(Domain) -> <<"_acme-challenge.", (hb_util:to_lower(Domain))/binary>>.
 
+%% @doc Finalize the order with a base64url CSR signed by the node wallet.
 finalize(URL, Domains, State) ->
     {_Headers, _Body, State1} = expect(jws_post(
         URL,
@@ -173,6 +208,8 @@ finalize(URL, Domains, State) ->
     ), [200, 202]),
     State1.
 
+%% @doc Poll an order or authorization until its expected state or an error.
+%% Respect numeric Retry-After delays within the shared issuance deadline.
 poll(URL, Expected, State) ->
     deadline(State),
     {Headers, Body, State1} = expect(jws_post(URL, post_as_get, State), [200]),
@@ -185,10 +222,16 @@ poll(URL, Expected, State) ->
             poll(URL, Expected, State1)
     end.
 
+%% @doc Sign a request using the registered account URL as its key identifier.
 jws_post(URL, Payload, State) -> jws_post(URL, Payload, kid, State).
+
+%% @doc Allow one bad-nonce retry, authenticating with a JWK or account URL.
 jws_post(URL, Payload, Auth, State) ->
     jws_post(URL, Payload, Auth, State, 2).
 
+%% @doc Send an RS256 JWS and retain its response nonce for the next request.
+%% POST-as-GET uses an empty payload, distinct from a JSON object. A bad nonce
+%% retries with the response nonce or a fresh one, within the attempt budget.
 jws_post(_URL, _Payload, _Auth, _State, 0) ->
     {error, 'acme-bad-nonce'};
 jws_post(URL, Payload, Auth, State0, Retries) ->
@@ -232,6 +275,7 @@ jws_post(URL, Payload, Auth, State0, Retries) ->
         {error, _} = Error -> Error
     end.
 
+%% @doc Reuse a response nonce or fetch one from the directory's newNonce endpoint.
 ensure_nonce(#{nonce := Nonce} = State)
         when is_binary(Nonce), byte_size(Nonce) > 0 -> State;
 ensure_nonce(State) ->
@@ -247,6 +291,7 @@ ensure_nonce(State) ->
         Nonce -> State#{nonce => Nonce}
     end.
 
+%% @doc Make a size-limited HTTPS request after checking the issuance deadline.
 request(URL, Method, Headers, Body, State) ->
     deadline(State),
     {Peer, Path} = request_parts(URL),
@@ -259,6 +304,7 @@ request(URL, Method, Headers, Body, State) ->
         limit => ?RESPONSE_LIMIT
     }, maps:get(http_opts, State)).
 
+%% @doc Fetch an unsigned JSON resource, such as the ACME directory.
 get_json(URL, State) ->
     {_Headers, Body} = expect(request(
         URL,
@@ -269,6 +315,7 @@ get_json(URL, State) ->
     ), [200]),
     json(Body).
 
+%% @doc Unwrap accepted HTTP responses or raise an ACME error with issuer details.
 expect({ok, Status, Headers, Body}, Statuses) ->
     case lists:member(Status, Statuses) of
         true -> {Headers, Body};
@@ -281,6 +328,8 @@ expect({ok, Status, Headers, Body, State}, Statuses) ->
 expect({error, Reason}, _Statuses) ->
     throw({acme, Reason}).
 
+%% @doc Split an HTTPS URL into peer and request path, preserving its query.
+%% Reject other schemes and embedded user credentials.
 request_parts(URL) ->
     URI = uri_string:parse(URL),
     Scheme = hb_util:to_lower(hb_util:bin(maps:get(scheme, URI, <<>>))),
@@ -295,21 +344,25 @@ request_parts(URL) ->
         error -> {Peer, Path}
     end.
 
+%% @doc Decode a required JSON response or raise an ACME protocol error.
 json(Body) ->
     case decode_json(Body) of
         {ok, Value} -> Value;
         error -> throw({acme, 'invalid-acme-json'})
     end.
 
+%% @doc Return decoded JSON or `error' without throwing on malformed input.
 decode_json(Body) ->
     try {ok, hb_json:decode(Body)} catch _:_ -> error end.
 
+%% @doc Read a required endpoint URL from the issuer's directory.
 directory_url(Key, State) ->
     case maps:get(Key, maps:get(directory, State), undefined) of
         URL when is_binary(URL) -> URL;
         _ -> throw({acme, {'acme-directory-key-missing', Key}})
     end.
 
+%% @doc Encode only the RSA public modulus and exponent as a JWK.
 jwk({{{rsa, E}, _D, N}, {{rsa, E}, N}}) ->
     #{
         <<"e">> => hb_util:encode(binary:encode_unsigned(E)),
@@ -317,14 +370,17 @@ jwk({{{rsa, E}, _D, N}, {{rsa, E}, N}}) ->
         <<"n">> => hb_util:encode(N)
     }.
 
+%% @doc Sign the ACME JWS input using RS256 and the account wallet.
 rsa_sign({{{rsa, E}, D, N}, {{rsa, E}, N}}, Data) ->
     crypto:sign(rsa, sha256, Data,
         [E, binary:decode_unsigned(N), binary:decode_unsigned(D)],
         [{rsa_padding, rsa_pkcs1_padding}]).
 
+%% @doc Read a lowercase response header, returning `not_found' when absent.
 header(Name, Headers) ->
     proplists:get_value(Name, Headers, not_found).
 
+%% @doc Recognize an ACME badNonce response eligible for the bounded JWS retry.
 is_bad_nonce(400, Body) ->
     case decode_json(Body) of
         {ok, #{<<"type">> := Type}} ->
@@ -333,20 +389,24 @@ is_bad_nonce(400, Body) ->
     end;
 is_bad_nonce(_, _) -> false.
 
+%% @doc Preserve issuer error details as decoded JSON or the original body.
 problem(Body) ->
     case decode_json(Body) of {ok, Problem} -> Problem; error -> Body end.
 
+%% @doc Convert a numeric Retry-After value to milliseconds, or use the default.
 retry_after(Headers, Default) ->
     try binary_to_integer(header(<<"retry-after">>, Headers)) * 1000
     catch _:_ -> Default
     end.
 
+%% @doc Wait only when the requested polling delay fits before the deadline.
 wait(Delay, State) ->
     case deadline(State) > Delay of
         true -> timer:sleep(Delay);
         false -> throw({acme, 'acme-timeout'})
     end.
 
+%% @doc Return the remaining issuance time in milliseconds, or raise a timeout.
 deadline(State) ->
     Remaining = maps:get(deadline, State)
         - erlang:monotonic_time(millisecond),
@@ -355,6 +415,8 @@ deadline(State) ->
         false -> throw({acme, 'acme-timeout'})
     end.
 
+%% @doc Configure outbound ACME timeouts and CA trust independently of the listener.
+%% HTTP/1 here applies only to issuer requests, not inbound TLS connections.
 http_options(ACME, Opts) ->
     CA = case hb_maps:get(<<"ca-certificate">>, ACME, not_found, Opts) of
         not_found -> public_key:cacerts_get();
@@ -371,6 +433,7 @@ http_options(ACME, Opts) ->
         <<"http-client-tls-ca">> => CA
     }.
 
+%% @doc Require a nonempty challenge token containing only base64url characters.
 validate_token(Token) when is_binary(Token), byte_size(Token) > 0 ->
     require(re:run(Token, <<"^[A-Za-z0-9_-]+$">>, [{capture, none}]) =:= match,
         'invalid-acme-token');
@@ -378,6 +441,7 @@ validate_token(_) -> throw({acme, 'invalid-acme-token'}).
 
 %%% Tests
 
+%% @doc Reject plaintext issuer URLs and recognize nonce-rejection responses.
 protocol_validation_test() ->
     ?assertThrow({acme, {'invalid-acme-url', _}},
         request_parts(<<"http://acme.example/directory">>)),

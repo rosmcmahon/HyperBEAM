@@ -1,4 +1,37 @@
-%%% @doc Node-wallet TLS and ACME renewal device.
+%%% @doc TLS certificates and domain validation for the node's RSA wallet.
+%%% This device supplies certificates to `hb_http_server', which terminates TLS
+%%% using the node's `priv-wallet'. The listener accepts a certificate only when
+%%% its public key matches that wallet.
+%%%
+%%% The interface is as follows:
+%%%
+%%% - `csr': Return a PEM certificate signing request for the request's `domains',
+%%%   falling back to `tls/domains' in the node message. The CSR can be submitted
+%%%   to any issuer without disclosing the private key.
+%%% - `request': An `on/request' handler that routes HTTP-01 challenge paths to
+%%%   `well-known', preserving the rest of the hook message.
+%%% - `well-known': Serve the active HTTP-01 authorization for a `token'.
+%%% - `dns-resolve': An `on/dns-resolve' handler serving authoritative TXT, NS and
+%%%   SOA records for the configured DNS-01 challenge names. Other names and
+%%%   classes are refused.
+%%% - `obtain': Supply a leaf-first DER certificate chain during listener startup.
+%%%   This key requires the listener's private lifecycle capability; it is not a
+%%%   public certificate-issuance endpoint.
+%%%
+%%% Certificate configuration is read from the node's `tls' message. Setting
+%%% `tls/certificate-path' loads a leaf-first PEM chain from disk and bypasses
+%%% ACME and automatic renewal. The file is read at listener startup.
+%%%
+%%% Without a certificate file, `tls/domains' and the `tls/acme' message configure
+%%% automated issuance. ACME requires a `directory-url' and explicit agreement
+%%% through `terms-of-service-agreed'. The `challenge-type' defaults to `http-01';
+%%% `dns-01' also requires `dns-nameserver' and a running DNS listener whose
+%%% resolution hook calls this device.
+%%%
+%%% ACME challenges and renewal timers belong to an `hb_name' singleton for the
+%%% listener. Issuance runs in a linked worker so validation requests can be
+%%% answered while the client waits for the issuer. Renewal replaces the live
+%%% certificate without closing established connections.
 -module(dev_tls).
 -export([info/1, request/3, well_known/3, dns_resolve/3, csr/3, obtain/3]).
 -include("include/hb.hrl").
@@ -9,6 +42,7 @@
 -define(RENEW_BEFORE_MS, 30 * 24 * 60 * 60 * 1000).
 -define(RENEW_RETRY_MS, 60 * 60 * 1000).
 
+%% @doc Expose the device keys while keeping certificate lifecycle helpers private.
 info(_) ->
     #{ exports => [
         <<"request">>, <<"well-known">>, <<"dns-resolve">>, <<"csr">>, <<"obtain">>
@@ -44,7 +78,9 @@ csr(_Base, Request, Opts) ->
         }}
     end.
 
-%% @doc Route the exact HTTP-01 path through the normal AO-Core hook.
+%% @doc Rewrite an exact HTTP-01 challenge path to a `well-known' resolution.
+%% The inbound HTTP request is nested under `request' in the hook message;
+%% its replacement resolution is returned under `body'. Other paths return 404.
 request(_Base, HookRequest, Opts) ->
     Request = hb_maps:get(<<"request">>, HookRequest, #{}, Opts),
     Path = hb_maps:get(<<"path">>, Request, <<>>, Opts),
@@ -64,7 +100,9 @@ request(_Base, HookRequest, Opts) ->
         _ -> not_found()
     end.
 
-%% @doc Serve an active key authorization from the singleton.
+%% @doc Serve an active HTTP-01 authorization for the request's `token'.
+%% Only GET is accepted. Missing tokens return 404 and other methods return 405;
+%% all responses prohibit caching.
 well_known(_Base, Request, Opts) ->
     case hb_maps:get(<<"method">>, Request, <<"GET">>, Opts) of
         <<"GET">> ->
@@ -88,6 +126,7 @@ well_known(_Base, Request, Opts) ->
             }}
     end.
 
+%% @doc Return a non-cacheable response for an unavailable path or challenge.
 not_found() ->
     {error, #{
         <<"status">> => 404,
@@ -95,7 +134,9 @@ not_found() ->
         <<"body">> => <<"Not found.">>
     }}.
 
-%% @doc Answer DNS challenges through the node's normal DNS resolution hook.
+%% @doc Resolve an IN-class DNS question using the node wallet's TLS singleton.
+%% Return an authoritative reply message, `not_authorized' outside the challenge
+%% zones, or `failure' if the singleton cannot be reached.
 dns_resolve(_Base, Request, Opts) ->
     case hb_maps:get(<<"class">>, Request, <<"in">>, Opts) of
         <<"in">> ->
@@ -111,7 +152,9 @@ dns_resolve(_Base, Request, Opts) ->
         _ -> {error, not_authorized}
     end.
 
-%% @doc Serve only the configured challenge zones, including their NS and SOA.
+%% @doc Serve only the configured DNS-01 names, including their NS and SOA.
+%% Multiple active tokens share a TXT answer set. Empty answers include an SOA
+%% with zero negative-cache lifetime, allowing subsequent challenges to appear.
 dns_reply(Name, Type, #{tls := TLS, challenges := Challenges}) ->
     ACME = maps:get(<<"acme">>, TLS),
     Names = [dev_tls_acme:dns_name(Domain) || Domain <- maps:get(<<"domains">>, TLS)],
@@ -146,7 +189,7 @@ dns_reply(Name, Type, #{tls := TLS, challenges := Challenges}) ->
             }}
     end.
 
-%% @doc Challenge records must not outlive validation in a recursive DNS cache.
+%% @doc Build an IN-class record with zero TTL to avoid caching challenge data.
 dns_record(Name, Type, Data) ->
     #{
         <<"name">> => Name,
@@ -156,7 +199,9 @@ dns_record(Name, Type, Data) ->
         <<"data">> => Data
     }.
 
-%% @doc Obtain the boot certificate behind an unforgeable private capability.
+%% @doc Return a certificate chain only to the listener holding its capability.
+%% Both request and node message must carry the same private reference. A valid
+%% call returns `certificate-chain', or a 500 response if acquisition fails.
 obtain(_Base, Request, Opts) ->
     RequestCapability = hb_private:get(
         <<"tls/lifecycle-capability">>, Request, undefined, Opts
@@ -180,7 +225,8 @@ obtain(_Base, Request, Opts) ->
             end
     end.
 
-%% @doc A configured PEM file takes precedence over automated issuance.
+%% @doc Load a configured PEM chain, or obtain one through the ACME singleton.
+%% An unreadable or invalid file is an error, not a fallback to ACME.
 certificate(Opts) ->
     case hb_ao:get(<<"tls/certificate-path">>, Opts, not_found, Opts) of
         not_found -> call(ensure_started(Opts), obtain, infinity);
@@ -191,6 +237,8 @@ certificate(Opts) ->
             end
     end.
 
+%% @doc Find or start the listener's singleton with its own ACME account wallet.
+%% Fully load the TLS configuration before passing it to the runtime process.
 ensure_started(Opts) ->
     TLS = hb_tls:config(Opts),
     true = is_map(TLS),
@@ -204,6 +252,9 @@ ensure_started(Opts) ->
         operation => idle
     }) end).
 
+%% @doc Serialize issuance and renewal while serving active challenge records.
+%% Only one issuance operation runs at a time. Stopping the singleton also
+%% terminates its linked issuance worker.
 loop(State) ->
     receive
         {obtain, From, Ref} when map_get(operation, State) =:= idle ->
@@ -239,6 +290,7 @@ loop(State) ->
         _ -> loop(State)
     end.
 
+%% @doc Run ACME in a linked worker, leaving the singleton free to answer queries.
 issue(Operation, State) ->
     Parent = self(),
     spawn_link(fun() ->
@@ -253,6 +305,8 @@ issue(Operation, State) ->
     end),
     State#{operation => Operation}.
 
+%% @doc Reply to a startup caller or install a renewed chain on the live listener.
+%% Successful issuance schedules renewal; failed renewal schedules a retry.
 complete(Result, State = #{operation := {obtain, From, Ref}}) ->
     From ! {Ref, Result},
     case Result of
@@ -270,6 +324,7 @@ complete({ok, Chain}, State = #{operation := renew}) ->
 complete({error, Reason}, State = #{operation := renew}) ->
     retry(Reason, State#{operation => idle}).
 
+%% @doc Renew 30 days before expiry, or halfway through a shorter remaining life.
 schedule_certificate(Chain, State) ->
     Remaining = hb_tls:certificate_expiry(Chain)
         - erlang:system_time(millisecond),
@@ -280,6 +335,7 @@ schedule_certificate(Chain, State) ->
     end,
     schedule(Delay, State).
 
+%% @doc Schedule renewal, splitting delays that exceed the timer's maximum range.
 schedule(Delay, State) when Delay > ?MAX_TIMER_MS ->
     erlang:send_after(?MAX_TIMER_MS, self(),
         {renew_after, Delay - ?MAX_TIMER_MS}),
@@ -288,10 +344,13 @@ schedule(Delay, State) ->
     erlang:send_after(Delay, self(), renew),
     State.
 
+%% @doc Report a renewal failure and retry in one hour.
 retry(Reason, State) ->
     ?event(tls, {acme_renewal_failed, {reason, Reason}}),
     schedule(?RENEW_RETRY_MS, State).
 
+%% @doc Call the singleton with a reply reference and the caller's timeout.
+%% A missing process or unanswered request returns a TLS runtime error.
 call(undefined, _Request, _Timeout) ->
     {error, 'tls-runtime-not-found'};
 call(PID, Request, Timeout) ->
@@ -301,13 +360,16 @@ call(PID, Request, Timeout) ->
     after Timeout -> {error, 'tls-runtime-timeout'}
     end.
 
+%% @doc Scope the singleton's registered name to its HTTP listener.
 runtime_name(ServerID) -> {<<"tls@1.0">>, ServerID}.
 
+%% @doc Read the listener identity supplied privately by `hb_http_server'.
 server_id(Opts) ->
     hb_private:get(<<"tls/server-id">>, Opts, undefined, Opts).
 
 %%% Tests
 
+%% @doc Route challenge requests without claiming unrelated HTTP paths.
 request_hook_test() ->
     Hook = #{ <<"request">> => #{
         <<"path">> => <<"/.well-known/acme-challenge/AbC_123-xy">>,
@@ -319,6 +381,7 @@ request_hook_test() ->
     ?assertMatch({error, #{ <<"status">> := 404 }},
         request(#{}, #{ <<"request">> => #{ <<"path">> => <<"/other">> } }, #{})).
 
+%% @doc Reject certificate acquisition without the listener's private capability.
 lifecycle_requires_private_capability_test() ->
     ?assertMatch({error, #{ <<"status">> := 404 }}, obtain(#{}, #{}, #{})).
 
