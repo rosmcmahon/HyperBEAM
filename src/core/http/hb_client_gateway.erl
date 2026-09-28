@@ -11,7 +11,7 @@
 -export([query/2, query/3, query/4, query/5]).
 -export([read/2, data/2, result_to_message/2, item_spec/0]).
 %% Application-specific data access functions:
--export([device/3, location/2]).
+-export([device/3, location/2, location/3]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -133,27 +133,40 @@ data(ID, Opts) ->
 %% Current AO location records use lowercase tags. Nodes may disable the
 %% fallback to legacy capitalized tags with `scheduler-legacy-locations'.
 location(Address, Opts) ->
+    location(Address, undefined, Opts).
+location(Address, Variant, Opts) ->
     maybe
         % Fallback to legacy capitalized tags if a lower-case result is not
         % available and `scheduler-legacy-locations' is enabled.
         Error = {error, _} ?=
-            do_location(Address, <<"type">>, <<"[\"location\"]">>, Opts),
+            do_location(Address, Variant, <<"type">>, [<<"location">>], Opts),
         true ?= hb_opts:get(scheduler_legacy_locations, true, Opts)
             orelse Error,
         do_location(
             Address,
+            Variant,
             <<"Type">>,
-            <<"[\"Location\", \"Scheduler-Location\"]">>,
+            [<<"Location">>, <<"Scheduler-Location">>],
             Opts
         )
     end.
-do_location(Address, TagName, TagValues, Opts) ->
+do_location(Address, Variant, TagName, TagValues, Opts) ->
+    VariantTags =
+        case Variant of
+            undefined -> [];
+            _ ->
+                VariantTag =
+                    case TagName of
+                        <<"type">> -> <<"variant">>;
+                        <<"Type">> -> <<"Variant">>
+                    end,
+                [#{ <<"name">> => VariantTag, <<"values">> => [Variant] }]
+        end,
     Query =
-        <<"query($Addresses: [String!]!) { ",
+        <<"query($Addresses: [String!]!, $Tags: [TagFilter!]!) { ",
                 "transactions(",
                 "owners: $Addresses, ",
-                "tags: { name: \"", TagName/binary, "\" values: ",
-                    TagValues/binary, " }, ",
+                "tags: $Tags, ",
                 "first: 1",
             "){ ",
                 "edges { ",
@@ -161,7 +174,11 @@ do_location(Address, TagName, TagValues, Opts) ->
                 " } ",
             "} ",
         "}">>,
-    Variables = #{ <<"Addresses">> => [Address] },
+    Variables = #{
+        <<"Addresses">> => [Address],
+        <<"Tags">> =>
+            [#{ <<"name">> => TagName, <<"values">> => TagValues } | VariantTags]
+    },
     case query(Query, Variables, Opts) of
         {error, Reason} ->
             ?event({scheduler_location, {query, Query}, {error, Reason}}),

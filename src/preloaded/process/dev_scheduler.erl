@@ -585,7 +585,14 @@ find_server(ProcID, Base, ToSched, Opts) ->
                                 false ->
                                     % We are not the scheduler. Find it and
                                     % return a redirect.
-                                    find_remote_scheduler(ProcID, ParsedLoc, Opts)
+                                    find_remote_scheduler(
+                                        ProcID,
+                                        ParsedLoc,
+                                        hb_maps:get(
+                                            <<"variant">>, Proc, <<"ao.N.1">>, Opts
+                                        ),
+                                        Opts
+                                    )
                             end
                     end
             end
@@ -707,15 +714,15 @@ without_hint(Target) ->
 %% @doc Use the SchedulerLocation to find the remote path and return a redirect.
 %% If there are multiple locations, try each one in turn until we find the first
 %% that matches.
-find_remote_scheduler(_ProcID, [], _Opts) -> {error, not_found};
-find_remote_scheduler(ProcID, [Scheduler | Rest], Opts) ->
-    case find_remote_scheduler(ProcID, Rest, Opts) of
+find_remote_scheduler(_ProcID, [], _Variant, _Opts) -> {error, not_found};
+find_remote_scheduler(ProcID, [Scheduler | Rest], Variant, Opts) ->
+    case find_remote_scheduler(ProcID, Rest, Variant, Opts) of
         {error, not_found} ->
-            find_remote_scheduler(ProcID, Scheduler, Opts);
+            find_remote_scheduler(ProcID, Scheduler, Variant, Opts);
         {redirect, Redirect} ->
             {redirect, Redirect}
     end;
-find_remote_scheduler(ProcID, Scheduler, Opts) ->
+find_remote_scheduler(ProcID, Scheduler, Variant, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,
     % we will use it to construct a redirect message.
     case get_hint(Scheduler, Opts) of
@@ -725,7 +732,7 @@ find_remote_scheduler(ProcID, Scheduler, Opts) ->
         not_found ->
             case hb_ao:resolve(
                 #{ <<"device">> => <<"location@1.0">> },
-                #{ <<"path">> => Scheduler },
+                #{ <<"path">> => Scheduler, <<"variant">> => Variant },
                 Opts
             ) of
                 {ok, SchedMsg} ->
