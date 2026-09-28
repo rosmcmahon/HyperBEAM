@@ -167,11 +167,7 @@ aos2_to_assignment(A, RawOpts) ->
     ?event({node, Node}),
     AssignmentData = hb_maps:get(<<"assignment">>, Node, undefined, Opts),
     ?event({assignment_data, AssignmentData}),
-    {ok, Assignment} =
-        hb_client_gateway:result_to_message(
-            aos2_normalize_data(aos2_anchor(AssignmentData, Opts)),
-            Opts
-        ),
+    {ok, Assignment} = aos2_to_message(AssignmentData, Opts),
     ?event({result_assignment, Assignment}),
     NormalizedAssignment = aos2_normalize_types(Assignment),
     {ok, Message} =
@@ -194,25 +190,28 @@ aos2_to_assignment(A, RawOpts) ->
                         )
                 end;
             Body ->
-                hb_client_gateway:result_to_message(
-                    aos2_normalize_data(aos2_anchor(Body, Opts)),
-                    Opts
-                )
+                aos2_to_message(Body, Opts)
         end,
     ?event({message, Message}),
     NormalizedAssignment#{ <<"body">> => Message }.
 
-%% @doc Recover anchors omitted or emitted as raw text by the legacy SU.
-aos2_anchor(JSON = #{ <<"id">> := ID }, Opts) ->
-    case hb_maps:get(<<"anchor">>, JSON, null, Opts) of
-        <<Anchor:32/binary>> -> JSON#{ <<"anchor">> => hb_util:encode(Anchor) };
-        null ->
-            case hb_cache:read(ID, Opts) of
-                {ok, Msg} ->
-                    JSON#{ <<"anchor">> => hb_maps:get(<<"anchor">>, Msg, <<>>, Opts) };
-                _ -> JSON
-            end;
-        _ -> JSON
+%% @doc Read the original by ID when the legacy SU's JSON cannot verify.
+aos2_to_message(JSON, Opts) ->
+    Result =
+        try hb_client_gateway:result_to_message(aos2_normalize_data(JSON), Opts)
+        catch throw:{invalid_field, anchor, _} -> {error, unverifiable_item}
+        end,
+    case Result of
+        {error, unverifiable_item} ->
+            ID = hb_maps:get(<<"id">>, JSON, Opts),
+            {ok, Cached} = hb_cache:read(ID, Opts),
+            Msg = hb_message:with_commitments(ID, Cached, Opts),
+            true = hb_message:signers(Msg, Opts) =/= [],
+            true = hb_message:verify(
+                Msg, #{ <<"commitment-ids">> => [ID] }, Opts
+            ),
+            hb_message:with_only_committed(Msg, Opts);
+        _ -> Result
     end.
 
 %% @doc The `hb_client_gateway' module expects all JSON structures to at least
