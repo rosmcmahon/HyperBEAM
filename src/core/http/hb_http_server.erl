@@ -315,16 +315,21 @@ prepare_tls(false, _Wallet, ServerID, _NodeMsg) ->
 prepare_tls(TLS, Wallet, ServerID, NodeMsg) ->
     ACME = hb_maps:get(<<"acme">>, TLS, not_found, NodeMsg),
     true = is_map(ACME),
-    ChallengeRef = {tls_http_01, ServerID},
     stop_tls(ServerID),
     try
-        ChallengeNode = challenge_node(ACME, ServerID, NodeMsg),
-        {ok, _, _} = start_http2(
-            ChallengeRef,
-            listener_protocol_options(ChallengeRef, ChallengeNode),
-            ChallengeNode,
-            []
-        ),
+        case hb_maps:get(<<"challenge-type">>, ACME, <<"http-01">>, NodeMsg) of
+            <<"http-01">> ->
+                ChallengeRef = {tls_http_01, ServerID},
+                ChallengeNode = challenge_node(ACME, ServerID, NodeMsg),
+                {ok, _, _} = start_http2(
+                    ChallengeRef,
+                    listener_protocol_options(ChallengeRef, ChallengeNode),
+                    ChallengeNode,
+                    []
+                );
+            <<"dns-01">> -> ok;
+            _ -> error('invalid-acme-challenge-type')
+        end,
         PrivateTLS = #{
             <<"server-id">> => ServerID,
             <<"lifecycle-capability">> => make_ref()

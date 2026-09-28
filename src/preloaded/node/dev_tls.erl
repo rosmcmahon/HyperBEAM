@@ -1,6 +1,6 @@
 %%% @doc Node-wallet TLS and ACME renewal device.
 -module(dev_tls).
--export([info/1, request/3, well_known/3, obtain/3]).
+-export([info/1, request/3, well_known/3, dns_resolve/3, obtain/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -10,7 +10,7 @@
 -define(RENEW_RETRY_MS, 60 * 60 * 1000).
 
 info(_) ->
-    #{ exports => [<<"request">>, <<"well-known">>, <<"obtain">>] }.
+    #{ exports => [<<"request">>, <<"well-known">>, <<"dns-resolve">>, <<"obtain">>] }.
 
 %% @doc Route the exact HTTP-01 path through the normal AO-Core hook.
 request(_Base, HookRequest, Opts) ->
@@ -62,6 +62,67 @@ not_found() ->
         <<"cache-control">> => [<<"no-store">>],
         <<"body">> => <<"Not found.">>
     }}.
+
+%% @doc Answer DNS challenges through the node's normal DNS resolution hook.
+dns_resolve(_Base, Request, Opts) ->
+    case hb_maps:get(<<"class">>, Request, <<"in">>, Opts) of
+        <<"in">> ->
+            Name = hb_util:to_lower(hb_maps:get(<<"name">>, Request, <<>>, Opts)),
+            Type = hb_maps:get(<<"type">>, Request, <<"txt">>, Opts),
+            ServerID = hb:address(hb_opts:get(priv_wallet, no_viable_wallet, Opts)),
+            case call(hb_name:lookup(runtime_name(ServerID)),
+                    {dns, Name, Type}, ?CALL_TIMEOUT) of
+                {error, not_authorized} -> {error, not_authorized};
+                {error, Reason} -> {failure, hb_util:bin(Reason)};
+                Reply -> Reply
+            end;
+        _ -> {error, not_authorized}
+    end.
+
+%% @doc Serve only the configured challenge zones, including their NS and SOA.
+dns_reply(Name, Type, #{tls := TLS, challenges := Challenges}) ->
+    ACME = maps:get(<<"acme">>, TLS),
+    Names = [dev_tls_acme:dns_name(Domain) || Domain <- maps:get(<<"domains">>, TLS)],
+    case maps:get(<<"challenge-type">>, ACME, <<"http-01">>) =:= <<"dns-01">>
+            andalso lists:member(Name, Names) of
+        false -> {error, not_authorized};
+        true ->
+            Nameserver = maps:get(<<"dns-nameserver">>, ACME),
+            SOA = dns_record(Name, <<"soa">>, #{
+                <<"mname">> => Nameserver,
+                <<"rname">> => <<"hostmaster.", Nameserver/binary>>,
+                <<"serial">> => 1,
+                <<"refresh">> => 3600,
+                <<"retry">> => 600,
+                <<"expire">> => 86400,
+                <<"minimum">> => 0
+            }),
+            Answers = case Type of
+                <<"txt">> ->
+                    [dns_record(Name, <<"txt">>, [Value])
+                        || {{Zone, _Token}, Value} <- maps:to_list(Challenges),
+                            Zone =:= Name];
+                <<"ns">> -> [dns_record(Name, <<"ns">>, Nameserver)];
+                <<"soa">> -> [SOA];
+                _ -> []
+            end,
+            {ok, #{
+                <<"authoritative">> => true,
+                <<"answers">> => Answers,
+                <<"authority">> => case Answers of [] -> [SOA]; _ -> [] end,
+                <<"cache-control">> => [<<"no-store">>]
+            }}
+    end.
+
+%% @doc Challenge records must not outlive validation in a recursive DNS cache.
+dns_record(Name, Type, Data) ->
+    #{
+        <<"name">> => Name,
+        <<"type">> => Type,
+        <<"class">> => <<"in">>,
+        <<"ttl">> => 0,
+        <<"data">> => Data
+    }.
 
 %% @doc Obtain the boot certificate behind an unforgeable private capability.
 obtain(_Base, Request, Opts) ->
@@ -118,6 +179,9 @@ loop(State) ->
             )});
         {{get, Token}, From, Ref} ->
             From ! {Ref, maps:find(Token, maps:get(challenges, State))},
+            loop(State);
+        {{dns, Name, Type}, From, Ref} ->
+            From ! {Ref, dns_reply(Name, Type, State)},
             loop(State);
         {acme_result, Result} when map_get(operation, State) =/= idle ->
             loop(complete(Result, State));
@@ -214,3 +278,75 @@ request_hook_test() ->
 
 lifecycle_requires_private_capability_test() ->
     ?assertMatch({error, #{ <<"status">> := 404 }}, obtain(#{}, #{}, #{})).
+
+%% @doc DNS hooks preserve linked questions, concurrent tokens and zone scope.
+dns_challenges_test() ->
+    Wallet = ar_wallet:new(),
+    Store = [hb_test_utils:test_store()],
+    hb_store:start(Store),
+    Opts0 = #{
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => Store,
+        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
+        <<"on">> => #{ <<"dns-resolve">> => #{ <<"device">> => <<"tls@1.0">> } }
+    },
+    {ok, TLSID} = hb_cache:write(#{
+        <<"domains">> => [<<"example.test">>, <<"*.example.test">>],
+        <<"acme">> => #{
+            <<"challenge-type">> => <<"dns-01">>,
+            <<"dns-nameserver">> => <<"ns.example.test">>
+        }
+    }, Opts0),
+    Opts = hb_private:set(
+        Opts0#{ <<"tls">> => {link, TLSID, #{}} },
+        #{ <<"tls">> => #{ <<"server-id">> => hb:address(Wallet) } },
+        Opts0
+    ),
+    PID = ensure_started(Opts),
+    Name = <<"_acme-challenge.example.test">>,
+    {ok, NameID} = hb_cache:write(<<"_ACME-CHALLENGE.Example.Test">>, Opts),
+    Question = #{
+        <<"path">> => <<"resolve">>,
+        <<"name">> => {link, NameID, #{}},
+        <<"type">> => <<"txt">>,
+        <<"class">> => <<"in">>
+    },
+    Resolve = fun(Req) ->
+        hb_ao:resolve(#{ <<"device">> => <<"dns@1.0">> }, Req, Opts)
+    end,
+    try
+        ok = call(PID, {put, {Name, <<"first">>}, <<"first-digest">>}, 1000),
+        ok = call(PID, {put, {Name, <<"second">>}, <<"second-digest">>}, 1000),
+        {ok, Reply} = Resolve(Question),
+        ?assert(hb_maps:get(<<"authoritative">>, Reply)),
+        Answers = hb_maps:get(<<"answers">>, Reply),
+        ?assertEqual([[<<"first-digest">>], [<<"second-digest">>]],
+            lists:sort([hb_maps:get(<<"data">>, RR) || RR <- Answers])),
+        ?assert(lists:all(fun(RR) -> hb_maps:get(<<"ttl">>, RR) =:= 0 end,
+            Answers)),
+        ok = call(PID, {delete, {Name, <<"first">>}}, 1000),
+        {ok, Remaining} = Resolve(Question),
+        ?assertMatch([#{ <<"data">> := [<<"second-digest">>] }],
+            hb_maps:get(<<"answers">>, Remaining)),
+        ok = call(PID, {delete, {Name, <<"second">>}}, 1000),
+        {ok, Empty} = Resolve(Question),
+        ?assertEqual([], hb_maps:get(<<"answers">>, Empty)),
+        ?assertMatch([#{ <<"type">> := <<"soa">>, <<"ttl">> := 0 }],
+            hb_maps:get(<<"authority">>, Empty)),
+        {ok, NS} = Resolve(Question#{ <<"type">> => <<"ns">> }),
+        ?assertMatch([#{ <<"data">> := <<"ns.example.test">> }],
+            hb_maps:get(<<"answers">>, NS)),
+        {ok, SOA} = Resolve(Question#{ <<"type">> => <<"soa">> }),
+        ?assertMatch([#{ <<"data">> := #{ <<"minimum">> := 0 } }],
+            hb_maps:get(<<"answers">>, SOA)),
+        ?assertEqual({error, not_authorized}, Resolve(Question#{
+            <<"name">> => <<"_acme-challenge.other.test">>
+        })),
+        ?assertEqual({error, not_authorized}, Resolve(Question#{
+            <<"class">> => <<"ch">>
+        }))
+    after
+        PID ! {stop, self()},
+        receive {stopped, PID} -> ok end,
+        hb_store:reset(Store)
+    end.

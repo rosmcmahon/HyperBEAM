@@ -1,6 +1,6 @@
 %%% @doc Bounded RFC 8555 client for a node-wallet certificate.
 -module(dev_tls_acme).
--export([obtain/5]).
+-export([obtain/5, dns_name/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("public_key/include/public_key.hrl").
 
@@ -11,13 +11,14 @@
 
 obtain(TLS, Wallet, AccountWallet, Challenge, Opts) ->
     try
-        {ACME, DirectoryURL, Domains} = config(TLS, Opts),
+        {ACME, DirectoryURL, Domains, ChallengeType} = config(TLS, Opts),
         State0 = #{
             wallet => Wallet,
             account_wallet => AccountWallet,
             nonce => undefined,
             kid => undefined,
             thumbprint => account_thumbprint(AccountWallet),
+            challenge_type => ChallengeType,
             http_opts => http_options(ACME, Opts),
             deadline => erlang:monotonic_time(millisecond) + ?ISSUANCE_TIMEOUT
         },
@@ -51,20 +52,37 @@ config(TLS, Opts) ->
     require(is_binary(DirectoryURL) andalso byte_size(DirectoryURL) > 0,
         'invalid-acme-directory-url'),
     request_parts(DirectoryURL),
-    Domains = domains(hb_maps:get(<<"domains">>, TLS, undefined, Opts)),
-    {ACME, DirectoryURL, Domains}.
+    ChallengeType = hb_maps:get(<<"challenge-type">>, ACME, <<"http-01">>, Opts),
+    require(lists:member(ChallengeType, [<<"http-01">>, <<"dns-01">>]),
+        'invalid-acme-challenge-type'),
+    case ChallengeType of
+        <<"dns-01">> ->
+            require(valid_domain(
+                hb_maps:get(<<"dns-nameserver">>, ACME, undefined, Opts),
+                <<"http-01">>
+            ), 'invalid-acme-dns-nameserver');
+        <<"http-01">> -> ok
+    end,
+    Domains = domains(hb_maps:get(<<"domains">>, TLS, undefined, Opts),
+        ChallengeType),
+    {ACME, DirectoryURL, Domains, ChallengeType}.
 
 require(true, _Reason) -> ok;
 require(false, Reason) -> throw({acme, Reason}).
 
-domains(Domains) when is_list(Domains), Domains =/= [] ->
-    require(lists:all(fun(Domain) ->
-        is_binary(Domain) andalso byte_size(Domain) > 0
-            andalso binary:match(Domain, <<"*">>) =:= nomatch
-    end, Domains), 'invalid-tls-domains'),
+domains(Domains, ChallengeType) when is_list(Domains), Domains =/= [] ->
+    require(lists:all(fun(Domain) -> valid_domain(Domain, ChallengeType) end,
+        Domains), 'invalid-tls-domains'),
     [hb_util:to_lower(Domain) || Domain <- Domains];
-domains(_) ->
+domains(_, _) ->
     throw({acme, 'invalid-tls-domains'}).
+
+%% @doc Wildcards are a single leading label and require DNS validation.
+valid_domain(<<"*.", Domain/binary>>, <<"dns-01">>) ->
+    valid_domain(Domain, <<"http-01">>);
+valid_domain(Domain, _) when is_binary(Domain), byte_size(Domain) > 0 ->
+    binary:match(Domain, <<"*">>) =:= nomatch;
+valid_domain(_, _) -> false.
 
 account_thumbprint(Wallet) ->
     #{<<"e">> := E, <<"n">> := N} = jwk(Wallet),
@@ -107,29 +125,46 @@ authorize([URL | Rest], Challenge, State) ->
     case maps:get(<<"status">>, Authorization) of
         <<"valid">> -> authorize(Rest, Challenge, State1);
         _ ->
-            HTTPChallenge = http_challenge(Authorization),
-            Token = maps:get(<<"token">>, HTTPChallenge),
+            Type = maps:get(challenge_type, State1),
+            Selected = challenge(Authorization, Type),
+            Token = maps:get(<<"token">>, Selected),
             validate_token(Token),
             KeyAuthorization = <<Token/binary, ".",
                 (maps:get(thumbprint, State1))/binary>>,
-            ok = Challenge({put, Token, KeyAuthorization}),
+            {Key, Value} = challenge_record(Type, Authorization, Token,
+                KeyAuthorization),
+            ok = Challenge({put, Key, Value}),
             try
                 {_H, _B, State2} = expect(jws_post(
-                    maps:get(<<"url">>, HTTPChallenge), #{}, State1
+                    maps:get(<<"url">>, Selected), #{}, State1
                 ), [200, 202]),
                 {_Valid, State3} = poll(URL, <<"valid">>, State2),
                 authorize(Rest, Challenge, State3)
             after
-                Challenge({delete, Token})
+                Challenge({delete, Key})
             end
     end.
 
-http_challenge(Authorization) ->
+%% @doc Select the configured validation method without falling back to another.
+challenge(Authorization, Type) ->
     case [Challenge || Challenge <- maps:get(<<"challenges">>, Authorization, []),
-            maps:get(<<"type">>, Challenge, undefined) =:= <<"http-01">>] of
+            maps:get(<<"type">>, Challenge, undefined) =:= Type] of
         [Challenge | _] -> Challenge;
-        [] -> throw({acme, 'acme-http-01-not-offered'})
+        [] -> throw({acme, {'acme-challenge-not-offered', Type}})
     end.
+
+%% @doc DNS-01 publishes the base64url SHA-256 digest of the key authorization.
+challenge_record(<<"http-01">>, _Authorization, Token, KeyAuthorization) ->
+    {Token, KeyAuthorization};
+challenge_record(<<"dns-01">>, Authorization, Token, KeyAuthorization) ->
+    #{<<"type">> := <<"dns">>, <<"value">> := Domain} =
+        maps:get(<<"identifier">>, Authorization),
+    {{dns_name(Domain), Token},
+        hb_util:encode(crypto:hash(sha256, KeyAuthorization))}.
+
+%% @doc An apex and its wildcard use the same DNS challenge name.
+dns_name(<<"*.", Domain/binary>>) -> dns_name(Domain);
+dns_name(Domain) -> <<"_acme-challenge.", (hb_util:to_lower(Domain))/binary>>.
 
 finalize(URL, Domains, State) ->
     {_Headers, _Body, State1} = expect(jws_post(
@@ -438,3 +473,28 @@ protocol_validation_test() ->
     ?assert(is_bad_nonce(400, hb_json:encode(#{
         <<"type">> => <<"urn:ietf:params:acme:error:badNonce">>
     }))).
+
+%% @doc DNS-01 hashes the authorization, keeps token identity, and scopes '*.'.
+dns_challenge_test() ->
+    ?assertEqual(
+        {{<<"_acme-challenge.example.test">>, <<"token">>},
+            <<"61rBZ_4knHblO0MNoxFsXZ_eTFUHum0B6IVRbhvUn5I">>},
+        challenge_record(
+            <<"dns-01">>,
+            #{
+                <<"identifier">> =>
+                    #{ <<"type">> => <<"dns">>, <<"value">> => <<"Example.Test">> }
+            },
+            <<"token">>,
+            <<"token.thumbprint">>
+        )
+    ),
+    ?assertEqual(<<"_acme-challenge.example.test">>, dns_name(<<"*.Example.Test">>)),
+    ?assertEqual([<<"*.example.test">>], domains([<<"*.Example.Test">>], <<"dns-01">>)),
+    ?assertThrow({acme, 'invalid-tls-domains'},
+        domains([<<"*.example.test">>], <<"http-01">>)),
+    ?assertThrow({acme, 'invalid-tls-domains'},
+        domains([<<"*.*.example.test">>], <<"dns-01">>)),
+    ?assertThrow({acme, {'acme-challenge-not-offered', <<"dns-01">>}},
+        challenge(#{ <<"challenges">> => [#{ <<"type">> => <<"http-01">> }] },
+            <<"dns-01">>)).

@@ -81,8 +81,9 @@ These options control identity and security settings.
 
 #### TLS termination
 
-TLS is opt-in and uses ACME HTTP-01 to obtain and renew a certificate whose
-leaf key is the node's RSA `priv-wallet`. TLS terminates inside the BEAM.
+TLS is opt-in and uses ACME to obtain and renew a certificate whose leaf key
+is the node's RSA `priv-wallet`. TLS terminates inside the BEAM. HTTP-01 is the
+default; [DNS-01](#dns-01-and-wildcard-certificates) also supports wildcard names.
 
 Save this as `config.json`, replacing `node.example.com` with your domain:
 
@@ -163,6 +164,82 @@ the wallet's raw RSA modulus.
 
 The `tls` node-message field cannot be changed while the listener is running;
 restart the node to adopt a different TLS policy.
+
+##### DNS-01 and wildcard certificates
+
+DNS-01 serves temporary TXT records through `dns@1.0`, with `tls@1.0` as its
+resolver. No DNS-provider API credentials or separate certificate files are
+needed. The certificate still uses the node's wallet key.
+
+Merge these settings into your node configuration, replacing the example names:
+
+```json
+{
+  "ao-types": "protocol=atom",
+  "port": 443,
+  "protocol": "http2",
+  "dns": {
+    "port": 53,
+    "address": "0.0.0.0"
+  },
+  "tls": {
+    "domains": ["example.com", "*.example.com"],
+    "acme": {
+      "directory-url": "https://acme-v02.api.letsencrypt.org/directory",
+      "terms-of-service-agreed": true,
+      "challenge-type": "dns-01",
+      "dns-nameserver": "ns-acme.example.com"
+    }
+  },
+  "on": {
+    "start": { "device": "dns@1.0" },
+    "dns-resolve": { "device": "tls@1.0" }
+  }
+}
+```
+
+The `on` entries above are additions, not a replacement for your existing hook
+map. Preserve the node's other handlers, and append DNS startup to any existing
+`on/start` list. An explicit `on` map replaces the defaults; if your configuration
+does not already include it, retain the handlers from `hb_opts:default_message/0`
+for normal request routing, authentication, rate limiting and cache indexing.
+
+At your existing DNS provider, add:
+
+| Name | Type | Value |
+| --- | --- | --- |
+| `ns-acme.example.com` | `A` | The DNS listener's public IPv4 address |
+| `_acme-challenge.example.com` | `NS` | `ns-acme.example.com.` |
+
+This delegates only the challenge zone. Keep the normal domain's nameservers
+and application records unchanged. Do not put a CNAME at the delegated name.
+For additional domain names, delegate their corresponding `_acme-challenge`
+names too. The apex and its wildcard share one challenge zone. The certificate
+needs both names to cover both `example.com` and `anything.example.com`.
+
+Make **UDP and TCP port 53** on the nameserver address reachable from the internet.
+You can forward both to a different local `dns/port`; an NS record cannot specify
+a port. Give the BEAM permission to bind privileged ports if using them directly.
+Before requesting a certificate, allow the NS/address changes and any old negative
+DNS answers to expire. Add an AAAA record only if the listener is also reachable
+over that IPv6 address.
+
+Start with `HB_CONFIG=config.json rebar3 shell`. The startup hook brings DNS up
+before ACME validation. The TLS resolver answers TXT, NS and SOA queries for its
+configured challenge zones, refuses unrelated names, and removes challenge
+values after validation. Challenge answers and negative answers have zero TTL.
+Keep DNS reachable for automatic renewal. Use the staging ACME directory during
+setup, as with HTTP-01.
+
+DNS-01 does not open the HTTP challenge listener and does not require port 80.
+HTTPS clients still need a route to the node's TLS listener. If several nodes
+share public port 443, use TLS passthrough (for example, SNI-based routing) rather
+than TLS termination at the router, so the browser sees the node's own key.
+
+The local ACME example in `src/core/test/hb_tls_examples.erl` supports DNS-01 by
+setting `HB_PEBBLE_DNS_PORT` to the port used by Pebble's `-dnsserver` resolver.
+It exercises apex and wildcard issuance, renewal, HTTP/2 and DNS cleanup over
+both UDP and TCP. The normal example without that variable exercises HTTP-01.
 
 ### Caching & Storage
 

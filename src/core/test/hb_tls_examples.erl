@@ -1,6 +1,7 @@
 %%% @doc End-to-end examples for node-wallet TLS against a real ACME server.
 -module(hb_tls_examples).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 %% @doc Run the Pebble example when its environment has been configured.
 pebble_test_() ->
@@ -20,34 +21,64 @@ pebble() ->
         public_key:pem_decode(IssuerCACertificate)],
     Wallet = ar_wallet:load_keyfile("test/key-1.json"),
     Domain = <<"host.docker.internal">>,
-    URL = hb_http_server:start_node(#{
+    DNSPort = case os:getenv("HB_PEBBLE_DNS_PORT") of
+        false -> false;
+        Value -> list_to_integer(Value)
+    end,
+    ACME = #{
+        <<"directory-url">> => hb_util:bin(DirectoryURL),
+        <<"http-port">> => 5002,
+        <<"ca-certificate">> => ACMECACertificate,
+        <<"terms-of-service-agreed">> => true
+    },
+    NodeOpts = #{
         <<"priv-wallet">> => Wallet,
         <<"port">> => 0,
         <<"protocol">> => http2,
         <<"tls">> => #{
             <<"domains">> => [Domain],
-            <<"acme">> => #{
-                <<"directory-url">> => hb_util:bin(DirectoryURL),
-                <<"http-port">> => 5002,
-                <<"ca-certificate">> => ACMECACertificate,
-                <<"terms-of-service-agreed">> => true
-            }
+            <<"acme">> => ACME
         }
-    }),
-    #{port := Port} = uri_string:parse(URL),
+    },
+    {Opts, HTTPGuard} = case DNSPort of
+        false -> {NodeOpts, undefined};
+        _ ->
+            {ok, Guard} = gen_tcp:listen(5002, [{ip, {127, 0, 0, 1}}]),
+            On = hb_opts:get(on),
+            {NodeOpts#{
+                <<"dns">> => #{
+                    <<"port">> => DNSPort,
+                    <<"address">> => <<"127.0.0.1">>
+                },
+                <<"on">> => On#{
+                    <<"start">> => #{ <<"device">> => <<"dns@1.0">> },
+                    <<"dns-resolve">> => #{ <<"device">> => <<"tls@1.0">> }
+                },
+                <<"tls">> => #{
+                    <<"domains">> => [Domain, <<"*.", Domain/binary>>],
+                    <<"acme">> => ACME#{
+                        <<"challenge-type">> => <<"dns-01">>,
+                        <<"dns-nameserver">> => <<"ns.", Domain/binary>>
+                    }
+                }
+            }, Guard}
+    end,
     ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
     RuntimeName = {<<"tls@1.0">>, ServerID},
-    PublicURL = <<"https://", Domain/binary, ":",
-        (integer_to_binary(Port))/binary, "/">>,
     ResolverOrder = inet_db:res_option(lookup),
     ok = inet_db:set_lookup([file | lists:delete(file, ResolverOrder)]),
-    ok = inet_db:add_host({127, 0, 0, 1}, [hb_util:list(Domain)]),
+    ok = inet_db:add_host({127, 0, 0, 1},
+        [hb_util:list(Domain), "child." ++ hb_util:list(Domain)]),
     ClientOpts = #{
         <<"http-client">> => gun,
         <<"http-client-tls-ca">> => IssuerCAs,
         <<"protocol">> => http2
     },
     try
+        URL = hb_http_server:start_node(Opts),
+        #{port := Port} = uri_string:parse(URL),
+        PublicURL = <<"https://", Domain/binary, ":",
+            (integer_to_binary(Port))/binary, "/">>,
         FirstCertificate = peer_certificate(Domain, Port),
         ?assertMatch({ok, _},
             hb_tls:socket_options(Wallet, [FirstCertificate])),
@@ -59,10 +90,20 @@ pebble() ->
         ?assert(hb_message:verify(Info, all, ClientOpts)),
         HTTP2 = http2_connection(Domain, Port, IssuerCAs),
         http2_address(HTTP2, ServerID),
-        ?assertMatch({error, #{ <<"status">> := 404 }}, hb_http:get(
-            <<"http://localhost:5002/">>, <<"/~meta@1.0/info">>,
-            #{ <<"protocol">> => http1 }
-        )),
+        case DNSPort of
+            false ->
+                ?assertMatch({error, #{ <<"status">> := 404 }}, hb_http:get(
+                    <<"http://localhost:5002/">>, <<"/~meta@1.0/info">>,
+                    #{ <<"protocol">> => http1 }
+                ));
+            _ ->
+                wildcard_certificate(FirstCertificate, Domain),
+                WildcardHTTP2 = http2_connection(<<"child.", Domain/binary>>,
+                    Port, IssuerCAs),
+                http2_address(WildcardHTTP2, ServerID),
+                gun:close(WildcardHTTP2),
+                dns_clean(DNSPort, Domain)
+        end,
         {ok, EstablishedSocket} = ssl:connect(
             hb_util:list(Domain),
             Port,
@@ -86,6 +127,12 @@ pebble() ->
         end, 180000)),
         ?assertMatch({ok, _}, hb_tls:socket_options(Wallet,
             [peer_certificate(Domain, Port)])),
+        case DNSPort of
+            false -> ok;
+            _ ->
+                wildcard_certificate(peer_certificate(Domain, Port), Domain),
+                dns_clean(DNSPort, Domain)
+        end,
         http2_address(HTTP2, ServerID),
         gun:close(HTTP2),
         RenewedHTTP2 = http2_connection(Domain, Port, IssuerCAs),
@@ -98,14 +145,91 @@ pebble() ->
         >>),
         ?assertNotEqual(nomatch, binary:match(
             recv_ssl_response(EstablishedSocket, <<>>), <<" 200 ">>
-        ))
+        )),
+        case DNSPort of
+            false -> ok;
+            _ -> dns_failure(DNSPort, Domain, Port, ServerID)
+        end
     after
         stop_runtime(RuntimeName),
+        stop_dns(DNSPort),
+        case HTTPGuard of undefined -> ok; _ -> gen_tcp:close(HTTPGuard) end,
         inet_db:del_host({127, 0, 0, 1}),
         inet_db:set_lookup(ResolverOrder),
         catch cowboy:stop_listener(ServerID),
         catch cowboy:stop_listener({tls_http_01, ServerID})
     end.
+
+%% @doc An apex and wildcard must both survive issuance and renewal.
+wildcard_certificate(DER, Domain) ->
+    Certificate = public_key:pkix_decode_cert(DER, otp),
+    TBS = Certificate#'OTPCertificate'.tbsCertificate,
+    #'Extension'{extnValue = Names} = lists:keyfind(
+        ?'id-ce-subjectAltName', #'Extension'.extnID, TBS#'OTPTBSCertificate'.extensions
+    ),
+    ?assertEqual(lists:sort([hb_util:list(Domain), "*." ++ hb_util:list(Domain)]),
+        lists:sort([Name || {dNSName, Name} <- Names])).
+
+%% @doc Both transports return uncached NODATA after challenge cleanup.
+dns_clean(Port, Domain) ->
+    lists:foreach(fun(TCP) ->
+        {ok, Reply} = inet_res:resolve("_acme-challenge." ++ hb_util:list(Domain),
+            in, txt, [
+                {nameservers, [{{127, 0, 0, 1}, Port}]},
+                {usevc, TCP}, {retry, 1}, {timeout, 1000}
+            ]),
+        ?assert(inet_dns:header(inet_dns:msg(Reply, header), aa)),
+        ?assertEqual([], inet_dns:msg(Reply, anlist)),
+        [SOA] = inet_dns:msg(Reply, nslist),
+        ?assertEqual(soa, inet_dns:rr(SOA, type)),
+        ?assertEqual(0, inet_dns:rr(SOA, ttl))
+    end, [false, true]).
+
+%% @doc Failed validation clears TXT values and leaves the served certificate intact.
+dns_failure(DNSPort, Domain, TLSPort, ServerID) ->
+    Certificate = peer_certificate(Domain, TLSPort),
+    NodeOpts = hb_http_server:get_opts(#{ <<"http-server">> => ServerID }),
+    Priv = #{ <<"tls">> => #{
+        <<"server-id">> => ServerID,
+        <<"lifecycle-capability">> => make_ref()
+    } },
+    Opts = hb_private:set(NodeOpts#{
+        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+    }, Priv, NodeOpts),
+    Request = hb_private:set(#{ <<"path">> => <<"obtain">> }, Priv, Opts),
+    stop_runtime({<<"tls@1.0">>, ServerID}),
+    stop_dns(DNSPort),
+    {ok, _} = hb_ao:resolve(#{ <<"device">> => <<"dns@1.0">> }, <<"start">>,
+        Opts#{ <<"on">> => #{} }),
+    ?assertMatch({error, #{ <<"status">> := 500 }},
+        hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> }, Request, Opts)),
+    {ok, Reply} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> }, #{
+        <<"path">> => <<"dns-resolve">>,
+        <<"name">> => <<"_acme-challenge.", Domain/binary>>,
+        <<"type">> => <<"txt">>
+    }, Opts),
+    ?assertEqual([], hb_maps:get(<<"answers">>, Reply)),
+    ?assertEqual(Certificate, peer_certificate(Domain, TLSPort)),
+    stop_dns(DNSPort),
+    {ok, _} = hb_ao:resolve(#{ <<"device">> => <<"dns@1.0">> }, <<"start">>, Opts),
+    {ok, Recovered} = hb_ao:resolve(
+        #{ <<"device">> => <<"tls@1.0">> }, Request, Opts
+    ),
+    ?assertMatch({ok, _}, hb_tls:socket_options(
+        hb_opts:get(priv_wallet, no_viable_wallet, Opts),
+        hb_maps:get(<<"certificate-chain">>, Recovered)
+    )),
+    dns_clean(DNSPort, Domain).
+
+%% @doc Release only the example's listener at its explicitly configured port.
+stop_dns(false) -> ok;
+stop_dns(Port) ->
+    lists:foreach(fun(PID) ->
+        Ref = monitor(process, PID),
+        PID ! stop,
+        receive {'DOWN', Ref, process, PID, _} -> ok end
+    end, [PID || {{_Module, {127, 0, 0, 1}, BoundPort}, PID} <- hb_name:all(),
+        BoundPort =:= Port]).
 
 %% @doc Negotiate HTTP/2 over a CA-verified TLS connection.
 http2_connection(Domain, Port, CAs) ->
