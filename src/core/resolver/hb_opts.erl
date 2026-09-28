@@ -495,7 +495,7 @@ raw_default_message() ->
                     <<"index-store">> =>
                         [?DEFAULT_PRIMARY_STORE, ?DEFAULT_OFFSET_INDEX],
                     <<"local-store">> => [?DEFAULT_PRIMARY_STORE],
-                    <<"remote-index">> => false
+                    <<"remote-index">> => true
                 }
             ],
         <<"match-index">> => [?DEFAULT_PRIMARY_STORE],
