@@ -127,6 +127,8 @@ test_suite() ->
             fun basic_message_codec_test/2},
         {<<"Priv survives conversion">>,
             fun priv_survives_conversion_test/2},
+        {<<"Literal priv">>,
+            fun literal_priv_test/2},
         {<<"Message with body">>,
             fun set_body_codec_test/2},
         {<<"Message with large keys">>,
@@ -1657,6 +1659,17 @@ priv_survives_conversion_test(Codec, Opts) ->
     ?assertMatch(
         #{ <<"test_key">> := <<"TEST_VALUE">> },
         maps:get(<<"priv">>, Decoded)
+    ).
+
+%% @doc A message whose `priv' key holds a literal converts, and decodes to its
+%% other keys.
+literal_priv_test(Codec, Opts) ->
+    Msg = #{ <<"data">> => <<"TEST_DATA">>, <<"priv">> => <<"literal">> },
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"TEST_DATA">>,
+        hb_maps:get(<<"data">>, Decoded, not_found, Opts)
     ).
 
 encode_balance_table(Size, Codec, Opts) ->

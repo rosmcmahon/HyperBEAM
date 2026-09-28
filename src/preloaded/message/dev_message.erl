@@ -316,10 +316,11 @@ commit(Self, Req, Opts) ->
     Res = Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) },
     {ok, hb_private:merge(Res, Committed, Opts)}.
 
-%% @doc The keys a commitment lists as committed, in their normalized form.
+%% @doc The keys a commitment lists as committed, in their normalized form. A
+%% commitment without a `committed' list commits no keys.
 committed_keys(Commitment, Opts) ->
     hb_util:message_to_ordered_list(
-        maps:get(<<"committed">>, Commitment),
+        maps:get(<<"committed">>, Commitment, []),
         Opts
     ).
 
@@ -474,14 +475,7 @@ committed(Self, Req, Opts) ->
     CommitmentKeys =
         lists:map(
             fun(CommitmentID) ->
-                Commitment = maps:get(CommitmentID, Commitments),
-                % The committed keys will be a TABM encoded numbered map
-                % so we must decode it to its underlying list of normalized keys
-                % for comparison purposes.
-                hb_util:message_to_ordered_list(
-                    maps:get(<<"committed">>, Commitment),
-                    Opts
-                )
+                committed_keys(maps:get(CommitmentID, Commitments), Opts)
             end,
             CommitmentIDs
         ),
@@ -1228,6 +1222,23 @@ test_verify(KeyType) ->
             #{ <<"hashpath">> => ignore }
         )
     ).
+
+%% @doc A commitment of no keys verifies after a round trip through
+%% `flat@1.0', which writes its empty `committed' list as no key.
+verify_without_committed_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Committed = hb_message:commit(#{}, Opts, #{ <<"type">> => <<"unsigned">> }),
+    Flat =
+        hb_message:convert(
+            Committed,
+            <<"flat@1.0">>,
+            <<"structured@1.0">>,
+            Opts
+        ),
+    Decoded =
+        hb_message:convert(Flat, <<"structured@1.0">>, <<"flat@1.0">>, Opts),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assertEqual([], hb_message:committed(Decoded, all, Opts)).
 
 set_nested_link_test() ->
     Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)] },
