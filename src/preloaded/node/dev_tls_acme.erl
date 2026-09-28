@@ -2,7 +2,6 @@
 -module(dev_tls_acme).
 -export([obtain/5, dns_name/1]).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("public_key/include/public_key.hrl").
 
 -define(ISSUANCE_TIMEOUT, 180000).
 -define(POLL_INTERVAL, 1000).
@@ -33,7 +32,7 @@ obtain(TLS, Wallet, AccountWallet, Challenge, Opts) ->
         {_Headers, PEM, _State8} = expect(jws_post(
             maps:get(<<"certificate">>, Valid), post_as_get, State7
         ), [200]),
-        {ok, certificate_chain(PEM)}
+        hb_tls:certificate_chain(PEM)
     catch
         throw:{acme, Reason} -> {error, Reason};
         _:Reason -> {error, Reason}
@@ -169,7 +168,7 @@ dns_name(Domain) -> <<"_acme-challenge.", (hb_util:to_lower(Domain))/binary>>.
 finalize(URL, Domains, State) ->
     {_Headers, _Body, State1} = expect(jws_post(
         URL,
-        #{<<"csr">> => hb_util:encode(csr(maps:get(wallet, State), Domains))},
+        #{<<"csr">> => hb_util:encode(hb_tls:csr(maps:get(wallet, State), Domains))},
         State
     ), [200, 202]),
     State1.
@@ -305,13 +304,6 @@ json(Body) ->
 decode_json(Body) ->
     try {ok, hb_json:decode(Body)} catch _:_ -> error end.
 
-certificate_chain(PEM) ->
-    case [DER || {'Certificate', DER, not_encrypted} <-
-            public_key:pem_decode(PEM)] of
-        [] -> throw({acme, 'invalid-acme-certificate-chain'});
-        Chain -> Chain
-    end.
-
 directory_url(Key, State) ->
     case maps:get(Key, maps:get(directory, State), undefined) of
         URL when is_binary(URL) -> URL;
@@ -366,7 +358,9 @@ deadline(State) ->
 http_options(ACME, Opts) ->
     CA = case hb_maps:get(<<"ca-certificate">>, ACME, not_found, Opts) of
         not_found -> public_key:cacerts_get();
-        PEM -> certificate_chain(PEM)
+        PEM ->
+            {ok, Chain} = hb_tls:certificate_chain(PEM),
+            Chain
     end,
     #{
         <<"http-client">> => gun,
@@ -382,90 +376,7 @@ validate_token(Token) when is_binary(Token), byte_size(Token) > 0 ->
         'invalid-acme-token');
 validate_token(_) -> throw({acme, 'invalid-acme-token'}).
 
-%% @doc Create a SAN PKCS#10 request using the node wallet's exact key.
-csr(Wallet, Domains) ->
-    Names = [binary_to_list(Domain) || Domain <- Domains],
-    Extensions = [{asn1_OPENTYPE, public_key:der_encode(
-        'Extensions', [#'Extension'{
-            extnID = ?'id-ce-subjectAltName',
-            critical = false,
-            extnValue = public_key:der_encode('GeneralNames',
-                [{dNSName, Name} || Name <- Names])
-        }]
-    )}],
-    {Info, EncodedInfo} = csr_info(Wallet, Names, Extensions,
-        'CertificationRequestInfo_attributes_SETOF'),
-    {ok, Encoded} = 'PKCS-10':encode(
-        'CertificationRequest',
-        #'CertificationRequest'{
-            certificationRequestInfo = Info,
-            signatureAlgorithm = #'CertificationRequest_signatureAlgorithm'{
-                algorithm = ?'sha256WithRSAEncryption',
-                parameters = {asn1_OPENTYPE, <<5, 0>>}
-            },
-            signature = rsa_sign(Wallet, EncodedInfo)
-        }
-    ),
-    Encoded.
-
-csr_info(Wallet, Names, Extensions, AttributeRecord) ->
-    Info = #'CertificationRequestInfo'{
-        version = 0,
-        subject = distinguished_name(hd(Names)),
-        subjectPKInfo = csr_public_key_info(Wallet),
-        attributes = [{AttributeRecord,
-            {1, 2, 840, 113549, 1, 9, 14}, Extensions}]
-    },
-    try
-        {ok, Encoded} = 'PKCS-10':encode('CertificationRequestInfo', Info),
-        {Info, Encoded}
-    catch error:_ when AttributeRecord =/=
-            'AttributePKCS-10' ->
-        csr_info(Wallet, Names, Extensions, 'AttributePKCS-10')
-    end.
-
-csr_public_key_info(Wallet) ->
-    #'CertificationRequestInfo_subjectPKInfo'{
-        algorithm = #'CertificationRequestInfo_subjectPKInfo_algorithm'{
-            algorithm = ?'rsaEncryption',
-            parameters = {asn1_OPENTYPE, <<5, 0>>}
-        },
-        subjectPublicKey = public_key:der_encode(
-            'RSAPublicKey', wallet_public_key(Wallet)
-        )
-    }.
-
-wallet_public_key({{{rsa, E}, _D, N}, {{rsa, E}, N}}) ->
-    #'RSAPublicKey'{
-        publicExponent = E,
-        modulus = binary:decode_unsigned(N)
-    }.
-
-distinguished_name(Name) ->
-    {rdnSequence, [[#'AttributeTypeAndValue'{
-        type = ?'id-at-commonName',
-        value = {utf8String, Name}
-    }]]}.
-
 %%% Tests
-
-csr_key_test() ->
-    Wallet = ar_wallet:load_keyfile("test/key-1.json"),
-    Encoded = csr(Wallet, [<<"localhost">>, <<"node.example">>]),
-    CSR = public_key:der_decode('CertificationRequest', Encoded),
-    Info = CSR#'CertificationRequest'.certificationRequestInfo,
-    {ok, EncodedInfo} = 'PKCS-10':encode('CertificationRequestInfo', Info),
-    ?assert(public_key:verify(
-        EncodedInfo,
-        sha256,
-        CSR#'CertificationRequest'.signature,
-        wallet_public_key(Wallet)
-    )),
-    CSRKey = Info#'CertificationRequestInfo'.subjectPKInfo,
-    ?assertEqual(wallet_public_key(Wallet), public_key:der_decode(
-        'RSAPublicKey',
-        CSRKey#'CertificationRequestInfo_subjectPKInfo'.subjectPublicKey
-    )).
 
 protocol_validation_test() ->
     ?assertThrow({acme, {'invalid-acme-url', _}},

@@ -1,6 +1,6 @@
 %%% @doc Node-wallet TLS and ACME renewal device.
 -module(dev_tls).
--export([info/1, request/3, well_known/3, dns_resolve/3, obtain/3]).
+-export([info/1, request/3, well_known/3, dns_resolve/3, csr/3, obtain/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -10,7 +10,39 @@
 -define(RENEW_RETRY_MS, 60 * 60 * 1000).
 
 info(_) ->
-    #{ exports => [<<"request">>, <<"well-known">>, <<"dns-resolve">>, <<"obtain">>] }.
+    #{ exports => [
+        <<"request">>, <<"well-known">>, <<"dns-resolve">>, <<"csr">>, <<"obtain">>
+    ] }.
+
+%% @doc Return a PEM CSR for request domains, defaulting to `tls/domains'.
+%% Only the node wallet signs the request; no private key material is returned.
+csr(_Base, Request, Opts) ->
+    try
+        RawDomains = hb_ao:get_first(
+            [{Request, <<"domains">>}, {Opts, <<"tls/domains">>}], [], Opts
+        ),
+        Domains = hb_util:message_to_ordered_list(
+            hb_cache:ensure_all_loaded(RawDomains, Opts), Opts
+        ),
+        true = Domains =/= [] andalso lists:all(
+            fun(Domain) -> is_binary(Domain) andalso byte_size(Domain) > 0 end,
+            Domains
+        ),
+        DER = hb_tls:csr(hb_opts:get(priv_wallet, no_viable_wallet, Opts), Domains),
+        {ok, #{
+            <<"status">> => 200,
+            <<"content-type">> => <<"text/plain">>,
+            <<"cache-control">> => [<<"no-store">>],
+            <<"body">> => public_key:pem_encode([
+                {'CertificationRequest', DER, not_encrypted}
+            ])
+        }}
+    catch
+        _:_ -> {error, #{
+            <<"status">> => 400,
+            <<"body">> => <<"CSR requires domain names and an RSA node wallet.">>
+        }}
+    end.
 
 %% @doc Route the exact HTTP-01 path through the normal AO-Core hook.
 request(_Base, HookRequest, Opts) ->
@@ -136,7 +168,7 @@ obtain(_Base, Request, Opts) ->
             andalso RequestCapability =:= OptsCapability of
         false -> not_found();
         true ->
-            case call(ensure_started(Opts), obtain, infinity) of
+            case certificate(Opts) of
                 {ok, Chain} -> {ok, #{
                     <<"status">> => 200,
                     <<"certificate-chain">> => Chain
@@ -145,6 +177,17 @@ obtain(_Base, Request, Opts) ->
                     <<"status">> => 500,
                     <<"body">> => hb_util:bin(io_lib:format("~p", [Reason]))
                 }}
+            end
+    end.
+
+%% @doc A configured PEM file takes precedence over automated issuance.
+certificate(Opts) ->
+    case hb_ao:get(<<"tls/certificate-path">>, Opts, not_found, Opts) of
+        not_found -> call(ensure_started(Opts), obtain, infinity);
+        Path ->
+            case file:read_file(Path) of
+                {ok, PEM} -> hb_tls:certificate_chain(PEM);
+                {error, Reason} -> {error, {'certificate-file', Reason}}
             end
     end.
 

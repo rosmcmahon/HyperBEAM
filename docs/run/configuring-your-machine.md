@@ -82,9 +82,62 @@ These options control identity and security settings.
 
 #### TLS termination
 
-TLS is opt-in and uses ACME to obtain and renew a certificate whose leaf key
-is the node's RSA `priv-wallet`. TLS terminates inside the BEAM. HTTP-01 is the
-default; [DNS-01](#dns-01-and-wildcard-certificates) also supports wildcard names.
+TLS is opt-in and terminates inside the BEAM using the node's RSA `priv-wallet`.
+Supply a certificate issued for that key, or use ACME to obtain and renew one
+automatically. ACME is an issuance protocol, not a certificate authority;
+Let's Encrypt is the issuer used in the examples below.
+
+##### Supplied certificates and signing requests
+
+`GET /~tls@1.0/csr` returns a PEM-encoded PKCS#10 certificate signing request
+for the node wallet. It uses `tls/domains` by default, or a `domains` list in
+the request. The private key never leaves the node.
+
+To obtain the first certificate, start an ordinary HTTP node without `tls`
+configured, then fetch its CSR locally, supplying the required names:
+
+```sh
+curl --fail --get \
+  --data-urlencode 'domains+list=\"node.example.com\", \"*.node.example.com\"' \
+  http://127.0.0.1:8734/~tls@1.0/csr \
+  --output node.csr.pem
+```
+
+The escaped quotes preserve string values in the AO-Core list.
+
+Submit this CSR to your chosen issuer and complete its domain validation.
+Save the issued certificate and intermediate certificates in one PEM file,
+leaf first. Keep the same node wallet, then restart with:
+
+```json
+{
+  "ao-types": "protocol=atom",
+  "port": 443,
+  "protocol": "http2",
+  "tls": {
+    "domains": ["node.example.com", "*.node.example.com"],
+    "certificate-path": "node.fullchain.pem"
+  }
+}
+```
+
+`certificate-path` is relative to the node's working directory, or an absolute
+path. It takes precedence over `tls/acme`. This mode starts no ACME runtime,
+challenge listener or automatic renewal; replace the PEM file and restart to
+adopt a renewed certificate. `domains` is optional when loading a file, but
+provides the defaults for subsequent CSR requests.
+
+The certificate must carry the exact public key of `priv-wallet`; a different
+key or an unreadable/malformed PEM file fails startup. There is no separate
+TLS private-key file and no fallback to plaintext. If the node generates a new
+wallet on every boot, it needs a certificate issued for each new key.
+
+##### Automatic issuance with ACME
+
+`tls/acme/directory-url` selects the issuer's ACME endpoint. The client supports
+HTTP-01 (the default) and [DNS-01](#dns-01-and-wildcard-certificates), including
+wildcard names with DNS-01. Issuers requiring External Account Binding are not
+yet supported.
 
 Save this as `config.json`, replacing `node.example.com` with your domain:
 

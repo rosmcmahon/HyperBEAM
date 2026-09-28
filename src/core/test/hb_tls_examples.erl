@@ -1,7 +1,129 @@
-%%% @doc End-to-end examples for node-wallet TLS against a real ACME server.
+%%% @doc End-to-end examples for supplied and ACME-issued node-wallet certificates.
 -module(hb_tls_examples).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("public_key/include/public_key.hrl").
+
+%% @doc Bootstrap a CSR over HTTP, then serve a supplied chain over verified H2.
+certificate_file_test_() ->
+    {timeout, 60, fun certificate_file/0}.
+certificate_file() ->
+    Hostname = atom_to_binary(localhost),
+    Key = public_key:generate_key({rsa, 2048, 65537}),
+    E = Key#'RSAPrivateKey'.publicExponent,
+    N = binary:encode_unsigned(Key#'RSAPrivateKey'.modulus),
+    D = binary:encode_unsigned(Key#'RSAPrivateKey'.privateExponent),
+    Wallet = {{{rsa, E}, D, N}, {{rsa, E}, N}},
+    ServerID = hb:address(Wallet),
+    Store = [hb_test_utils:test_store()],
+    Opts = #{
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => Store,
+        <<"port">> => 0,
+        <<"protocol">> => http2,
+        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+    },
+    Path = "test/tls-certificate-" ++ binary_to_list(ServerID) ++ ".pem",
+    {ok, Guard} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
+    {ok, {_, GuardPort}} = inet:sockname(Guard),
+    try
+        URL = hb_http_server:start_node(Opts),
+        {ok, CSRReply} = hb_http:get(URL, <<
+            "/~tls@1.0/csr?domains%2Blist="
+            "%5C%22localhost%5C%22,%20%5C%22*.localhost%5C%22"
+        >>, #{}),
+        PEM = hb_maps:get(<<"body">>, CSRReply),
+        verify_csr(PEM, Wallet),
+        ?assertMatch({error, #{ <<"status">> := 400 }},
+            hb_http:get(URL, <<"/~tls@1.0/csr">>, #{})),
+        % Request fields and configured defaults retain normal link semantics.
+        {ok, NamesID} = hb_cache:write(
+            #{ <<"1">> => <<"localhost">>, <<"2">> => <<"*.localhost">> }, Opts
+        ),
+        TLS = #{ <<"domains">> => {link, NamesID, #{}} },
+        {ok, TLSID} = hb_cache:write(TLS, Opts),
+        {ok, Linked} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
+            #{ <<"path">> => <<"csr">>, <<"domains">> => {link, NamesID, #{}} },
+            Opts),
+        ?assertEqual(PEM, hb_maps:get(<<"body">>, Linked)),
+        {ok, Default} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
+            <<"csr">>, Opts#{ <<"tls">> => {link, TLSID, #{}} }),
+        ?assertEqual(PEM, hb_maps:get(<<"body">>, Default)),
+        ok = cowboy:stop_listener(ServerID),
+        % A locally issued chain exercises file loading without any ACME service.
+        Certificates = public_key:pkix_test_data(#{
+            root => [{digest, sha256}],
+            peer => [{key, Key}, {digest, sha256}, {extensions, [
+                #'Extension'{
+                    extnID = ?'id-ce-subjectAltName',
+                    critical = false,
+                    extnValue = [{dNSName, "localhost"}, {dNSName, "*.localhost"}]
+                }
+            ]}]
+        }),
+        Leaf = proplists:get_value(cert, Certificates),
+        CAs = proplists:get_value(cacerts, Certificates),
+        ok = file:write_file(Path, public_key:pem_encode([
+            {'Certificate', DER, not_encrypted} || DER <- [Leaf | CAs]
+        ])),
+        {ok, PathID} = hb_cache:write(hb_util:bin(Path), Opts),
+        FileOpts = Opts#{ <<"tls">> => #{
+            <<"certificate-path">> => {link, PathID, #{}},
+            <<"domains">> => [<<"localhost">>, <<"*.localhost">>],
+            <<"acme">> => #{ <<"http-port">> => GuardPort }
+        } },
+        SecureURL = hb_http_server:start_node(FileOpts),
+        #{scheme := <<"https">>, port := Port} = uri_string:parse(SecureURL),
+        ?assertEqual(Leaf, peer_certificate(Hostname, Port)),
+        HTTP2 = http2_connection(Hostname, Port, CAs),
+        try http2_address(HTTP2, ServerID) after gun:close(HTTP2) end,
+        ?assertEqual(undefined, hb_name:lookup({<<"tls@1.0">>, ServerID})),
+        {ok, DefaultHTTP} = hb_http:get(SecureURL, <<"/~tls@1.0/csr">>, #{
+            <<"http-client">> => gun,
+            <<"protocol">> => http2,
+            <<"http-client-tls-ca">> => CAs
+        }),
+        ?assertEqual(PEM, hb_maps:get(<<"body">>, DefaultHTTP)),
+        ok = cowboy:stop_listener(ServerID),
+        ?assertError({badmatch, {error, 'certificate-key-mismatch'}},
+            hb_http_server:start_node(FileOpts#{
+                <<"priv-wallet">> => ar_wallet:new()
+            })),
+        ok = file:write_file(Path, <<"Not a certificate">>),
+        ?assertError({badmatch, {error, #{ <<"status">> := 500 }}},
+            hb_http_server:start_node(FileOpts)),
+        ok = file:delete(Path),
+        ?assertError({badmatch, {error, #{ <<"status">> := 500 }}},
+            hb_http_server:start_node(FileOpts)),
+        ?assertEqual(undefined, hb_name:lookup({<<"tls@1.0">>, ServerID}))
+    after
+        catch cowboy:stop_listener(ServerID),
+        stop_runtime({<<"tls@1.0">>, ServerID}),
+        gen_tcp:close(Guard),
+        file:delete(Path),
+        hb_store:reset(Store)
+    end.
+
+%% @doc Independently check the public key, signature and requested SANs.
+verify_csr(PEM, {{{rsa, E}, _D, N}, _}) ->
+    [{'CertificationRequest', DER, not_encrypted}] = public_key:pem_decode(PEM),
+    CSR = public_key:der_decode('CertificationRequest', DER),
+    Info = CSR#'CertificationRequest'.certificationRequestInfo,
+    PublicKey = #'RSAPublicKey'{
+        publicExponent = E,
+        modulus = binary:decode_unsigned(N)
+    },
+    {ok, EncodedInfo} = 'PKCS-10':encode('CertificationRequestInfo', Info),
+    ?assert(public_key:verify(EncodedInfo, sha256,
+        CSR#'CertificationRequest'.signature, PublicKey)),
+    SPKI = Info#'CertificationRequestInfo'.subjectPKInfo,
+    ?assertEqual(PublicKey, public_key:der_decode('RSAPublicKey',
+        SPKI#'CertificationRequestInfo_subjectPKInfo'.subjectPublicKey)),
+    [{_, {1, 2, 840, 113549, 1, 9, 14}, [{asn1_OPENTYPE, Extensions}]}] =
+        Info#'CertificationRequestInfo'.attributes,
+    [#'Extension'{extnID = ?'id-ce-subjectAltName', extnValue = SANs}] =
+        public_key:der_decode('Extensions', Extensions),
+    ?assertEqual([{dNSName, "localhost"}, {dNSName, "*.localhost"}],
+        public_key:der_decode('GeneralNames', SANs)).
 
 %% @doc Run the Pebble example when its environment has been configured.
 pebble_test_() ->
