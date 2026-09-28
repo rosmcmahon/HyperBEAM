@@ -398,9 +398,17 @@ with_signed_commitment(
         }
     }.
 
-%% @doc Return the bundle key for an item.
+%% @doc Return the bundle key for an item: whether its nested messages are
+%% bundled in its data. An item whose nested messages are not bundled links
+%% each with a `+link' tag, and bundles only its values too large for tags.
 bundle_commitment_key(Tags, Opts) ->
-    hb_util:bin(hb_maps:is_key(<<"bundle-format">>, Tags, Opts)).
+    hb_util:bin(
+        hb_maps:is_key(<<"bundle-format">>, Tags, Opts) andalso
+            not lists:any(
+                fun hb_link:is_link_key/1,
+                hb_maps:keys(Tags, Opts)
+            )
+    ).
 
 %% @doc Check whether tags contain only normalized UTF-8 keys. Other tag names
 %% need `original-tags' to keep their bytes and order.
