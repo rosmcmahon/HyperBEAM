@@ -133,7 +133,8 @@ request(Method, Peer, Path, RawMessage, Opts) ->
     end.
 
 request_response(Method, Peer, Path, Response, Duration, Opts) ->
-    {_ErlStatus, Status, Headers, Body} = Response,
+    {_ErlStatus, Status, RawHeaders, Body} = Response,
+    Headers = [{hb_util:to_lower(Key), Value} || {Key, Value} <- RawHeaders],
     % Convert the set-cookie headers into a cookie message, if they are present.
     % We do this by extracting the set-cookie headers and converting them into a
     % cookie message if they are present.
