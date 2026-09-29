@@ -110,6 +110,7 @@ do_verify(Base, Req, Opts) ->
                 ok,
                 maps:get(<<"committer">>, Req, undefined) =:=
                     dev_httpsig_keyid:keyid_to_committer(publickey, KeyID)
+                andalso binary:decode_unsigned(Key) >= (1 bsl 2047)
                 andalso ar_wallet:verify(
                     {{rsa, 65537}, Key},
                     SigBase,
@@ -674,19 +675,23 @@ public_key_hmac_is_not_authority_test() ->
     ),
     ?assertNot(hb_message:verify(Committed, all, Opts)).
 
-%% @doc RSA verification rejects weak moduli, including zero-padded keys.
+%% @doc HTTPSig rejects weak moduli, including zero-padded keys.
 rsa_minimum_modulus_test() ->
     lists:foreach(
         fun(Bits) ->
             {[_, Pub], [_, Pub, Priv | _]} = crypto:generate_key(rsa, {Bits, 65537}),
-            Opts = #{ <<"priv-wallet">> =>
-                {{{rsa, 65537}, Priv, Pub}, {{rsa, 65537}, Pub}} },
-            Signed = hb_message:commit(#{ <<"body">> => <<"rsa-size">> }, Opts),
-            ?assertEqual(Bits >= 2048, hb_message:verify(Signed, all, Opts)),
-            Data = <<"modulus-padding">>,
-            Signature = ar_wallet:sign(maps:get(<<"priv-wallet">>, Opts), Data),
-            ?assertEqual(Bits >= 2048,
-                ar_wallet:verify({{rsa, 65537}, <<0:4096, Pub/binary>>}, Data, Signature))
+            lists:foreach(
+                fun(Key) ->
+                    Wallet = {{{rsa, 65537}, Priv, Key}, {{rsa, 65537}, Key}},
+                    Opts = #{ <<"priv-wallet">> => Wallet },
+                    Data = <<"rsa-size">>,
+                    Signature = ar_wallet:sign(Wallet, Data),
+                    ?assert(ar_wallet:verify({{rsa, 65537}, Key}, Data, Signature)),
+                    Signed = hb_message:commit(#{ <<"body">> => Data }, Opts),
+                    ?assertEqual(Bits >= 2048, hb_message:verify(Signed, all, Opts))
+                end,
+                [Pub, <<0:4096, Pub/binary>>]
+            )
         end,
         [1536, 2048]
     ).

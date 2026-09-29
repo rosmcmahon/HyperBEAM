@@ -154,14 +154,13 @@ verify(Key, Data, Sig) ->
     verify(Key, Data, Sig, sha256).
 
 verify({{rsa, PublicExpnt}, Pub}, Data, Sig, DigestType) when PublicExpnt =:= 65537 ->
-    Modulus = binary:decode_unsigned(Pub),
-    Modulus >= (1 bsl 2047) andalso rsa_pss:verify(
+    rsa_pss:verify(
         Data,
         DigestType,
         Sig,
         #'RSAPublicKey'{
             publicExponent = PublicExpnt,
-            modulus = Modulus
+            modulus = binary:decode_unsigned(Pub)
         }
     );
 %% NOTE: We will not write pubkey for ECDSA signature. So don't use verify function 
