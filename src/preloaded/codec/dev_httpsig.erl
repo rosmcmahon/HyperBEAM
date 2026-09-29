@@ -457,7 +457,12 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
     % `from_siginfo_keys' call.
     BodyKeys =
         lists:filter(
-            fun(Key) -> not key_present(Key, Encoded) end,
+            fun(Key) ->
+                not key_present(Key, Encoded) orelse
+                    (Key =:= <<"content-type">> andalso
+                        maps:get(Key, MsgWithOnlyInputs, undefined) =/=
+                            maps:get(Key, Encoded, undefined))
+            end,
             RawInputs
         ),
     KeysForCommitment =

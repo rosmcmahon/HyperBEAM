@@ -473,6 +473,10 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                 % Otherwise, we need to encode the body map as the
                 % multipart body of the HTTP message
                 ?event_debug({encoding_multipart, {bodymap, {explicit, GroupedBodyMap}}}),
+                Parts =
+                    maps:merge(
+                        maps:with([<<"content-type">>], Enc0), GroupedBodyMap
+                    ),
                 PartList = hb_util:to_sorted_list(
                     hb_maps:map(
                         fun(Key, M = #{ <<"body">> := _ }) when map_size(M) =:= 1 ->
@@ -490,7 +494,7 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                         (Key, Value) ->
                             encode_body_part(Key, Value, InlineKey, Opts)
                         end,
-                        GroupedBodyMap,
+                        Parts,
                         Opts
                     ),
                     Opts
@@ -866,6 +870,43 @@ multipart_empty_body_test() ->
             #{ <<"value">> => <<"present">>, <<"body">> => <<>> },
             #{ <<"value">> => <<"present">> }
         ]
+    ).
+
+%% @doc A multipart encoding preserves the message's content-type.
+multipart_content_type_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Msg = #{
+        <<"content-type">> => <<"text/plain">>,
+        <<"body">> => <<"Example message.">>,
+        <<"nested">> => #{ <<"value">> => 42 }
+    },
+    Signed = hb_message:commit(Msg, Opts, #{ <<"bundle">> => true }),
+    ?assert(
+        lists:member(<<"content-type">>, hb_message:committed(Signed, all, Opts))
+    ),
+    Encoded =
+        hb_message:convert(
+            Signed,
+            #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true },
+            Opts
+        ),
+    Decoded =
+        hb_message:convert(Encoded, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts),
+    ?assertEqual(true, hb_message:deep_verify(Decoded, Opts)),
+    ?assert(
+        lists:member(<<"content-type">>, hb_message:committed(Decoded, all, Opts))
+    ),
+    ?assertNot(
+        hb_message:verify(
+            Decoded#{ <<"content-type">> => <<"text/html">> }, all, Opts
+        )
+    ),
+    ?assertEqual(
+        Msg,
+        hb_message:uncommitted(hb_cache:ensure_all_loaded(Decoded, Opts), Opts)
     ).
 
 group_maps_test() ->
