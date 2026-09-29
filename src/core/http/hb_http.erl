@@ -329,7 +329,7 @@ outbound_result_to_message(Codec, Status, Headers, Body, Opts) ->
 http_response_to_httpsig(Status, HeaderMap, Body, Opts) ->
     BinStatus = hb_util:bin(Status),
     BodyMap = case byte_size(Body) of
-        0 -> #{};
+        0 when not is_map_key(<<"content-digest">>, HeaderMap) -> #{};
         _ -> #{ <<"body">> => Body }
     end,
     ConvertFrom = 
@@ -1197,6 +1197,18 @@ simple_ao_resolve_unsigned_test() ->
     URL = hb_http_server:start_node(),
     TestMsg = #{ <<"path">> => <<"/key1">>, <<"key1">> => <<"Value1">> },
     ?assertEqual({ok, <<"Value1">>}, post(URL, TestMsg, test_opts())).
+
+%% @doc An empty body is preserved in signed HTTP requests and responses.
+empty_body_http_test() ->
+    Origin = isolated_test_opts(),
+    Client = isolated_test_opts(),
+    Signed = hb_message:commit(#{ <<"body">> => <<>> }, Origin),
+    URL = hb_http_server:start_node(Origin),
+    {ok, ID} = hb_cache:write(Signed, Origin),
+    {ok, Reply} = get(URL, ID, Client#{ <<"http-only-result">> => false }),
+    ?assertEqual(<<>>, hb_maps:get(<<"body">>, Reply, missing, Client)),
+    ?assertEqual(true, hb_message:deep_verify(Reply, Client)),
+    ?assertEqual({ok, <<>>}, post(URL, <<"/body">>, Signed, Client)).
 
 simple_ao_resolve_signed_test() ->
     URL = hb_http_server:start_node(),

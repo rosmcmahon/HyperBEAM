@@ -213,13 +213,13 @@ body_to_parts(ContentType, Body, _Opts) ->
 %% @doc Parse a single part of a multipart body into a TABM.
 from_body_part(InlinedKey, Part, Opts) ->
     % Extract the Headers block and Body. Only split on the FIRST double CRLF
-    {RawHeadersBlock, RawBody} =
+    {RawHeadersBlock, RawBody, HasBody} =
         case binary:split(Part, [?DOUBLE_CRLF], []) of
             [XRawHeadersBlock] ->
                 % The message has no body.
-                {XRawHeadersBlock, <<>>};
+                {XRawHeadersBlock, <<>>, false};
             [XRawHeadersBlock, XRawBody] ->
-                {XRawHeadersBlock, XRawBody}
+                {XRawHeadersBlock, XRawBody, true}
         end,
     % Extract individual headers
     RawHeaders = binary:split(RawHeadersBlock, ?CRLF, [global]),
@@ -291,7 +291,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                                 % The message is empty, so we return an empty
                                 % map.
                                 #{};
-                            {_, _, <<>>} ->
+                            {_, _, <<>>} when not HasBody ->
                                 % There is no body to the message, so we return
                                 % just the headers.
                                 RestHeaders;
@@ -525,15 +525,15 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     % Add the content-digest to the HTTP message. `add_content_digest/1'
     % will return a map with the `content-digest' key set, but the body removed,
     % so we merge the two maps together to maintain the body and the content-digest.
-    Enc2 = case hb_maps:get(<<"body">>, Enc1, <<>>, Opts) of
-        <<>> -> Enc1;
-        _ ->
+    Enc2 = case hb_maps:find(<<"body">>, Enc1, Opts) of
+        {ok, Body} when is_binary(Body) ->
             ?event_debug({adding_content_digest, {msg, Enc1}}),
             hb_maps:merge(
                 Enc1,
                 dev_httpsig:add_content_digest(Enc1, Opts),
                 Opts
-            )
+            );
+        _ -> Enc1
     end,
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
@@ -774,13 +774,13 @@ encode_http_flat_msg(Httpsig, Opts) ->
             hb_maps:to_list(hb_maps:without([<<"body">>, <<"priv">>], Httpsig, Opts), Opts)
         ),
     EncodedHeaders = iolist_to_binary(lists:join(?CRLF, lists:reverse(HeaderList))),
-    case hb_maps:get(<<"body">>, Httpsig, <<>>, Opts) of
-        <<>> -> EncodedHeaders;
+    case hb_maps:find(<<"body">>, Httpsig, Opts) of
+        error -> EncodedHeaders;
         % Some-Headers: some-value
         % content-type: image/png
         % 
         % <body>
-        SubBody -> <<EncodedHeaders/binary, ?DOUBLE_CRLF/binary, SubBody/binary>>
+        {ok, SubBody} -> <<EncodedHeaders/binary, ?DOUBLE_CRLF/binary, SubBody/binary>>
     end.
 
 %% @doc All maps are encoded into the body of the HTTP message
@@ -831,6 +831,42 @@ multipart_header_bytes_roundtrip_test() ->
     }),
     ?assertEqual({ok, Value}, hb_http:post(Node,
         <<"/nested/value">>, Signed, Opts)).
+
+%% @doc Multipart parts distinguish an absent body from an empty binary body,
+%% including when the empty value is covered by a nested commitment.
+multipart_empty_body_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    lists:foreach(
+        fun(Child) ->
+            Signed = hb_message:commit(Child, Opts),
+            Parent = #{ <<"child">> => Signed },
+            Encoded =
+                hb_message:convert(
+                    Parent,
+                    #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true },
+                    Opts
+                ),
+            Decoded =
+                hb_message:convert(
+                    Encoded, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts
+                ),
+            ?assertEqual(true, hb_message:deep_verify(Decoded, Opts)),
+            ?assertEqual(
+                Child,
+                hb_message:uncommitted(
+                    hb_maps:get(<<"child">>, Decoded, undefined, Opts)
+                )
+            )
+        end,
+        [
+            #{ <<"body">> => <<>> },
+            #{ <<"value">> => <<"present">>, <<"body">> => <<>> },
+            #{ <<"value">> => <<"present">> }
+        ]
+    ).
 
 group_maps_test() ->
    Map = #{
