@@ -3,6 +3,7 @@
 %%% If `to' is omitted, it keeps moving downward from `from' until it reaches a
 %%% block that is already indexed at the requested mode. If `to' is provided,
 %%% every block in the range is processed.
+%%% `reindex' defaults to true and bypasses cached block headers.
 %%% `mode=blocks' stores only block headers in `arweave-block-store' (or `store'),
 %%% irrespective of `arweave-index-blocks', and does not process pending TXs.
 %%% `include-proofs=false' omits block proofs from the returned/cached headers.
@@ -235,10 +236,17 @@ list_index_blocks(Request, Current, To, Opts, Acc) ->
 
 fetch_block_header(Height, Request, Opts) ->
     ?event(debug_copycat, {fetching_block, Height}),
+    CacheControl =
+        lists:flatten([hb_maps:get(<<"cache-control">>, Request, [], Opts)]),
     observe_event(<<"block_header">>, fun() ->
         hb_ao:resolve(
             #{ <<"path">> => <<?ARWEAVE_DEVICE/binary, "/block">>,
                 <<"block">> => Height,
+                <<"cache-control">> =>
+                    case reindex(Request, Opts) of
+                        true -> [<<"no-cache">> | CacheControl];
+                        false -> CacheControl
+                    end,
                 <<"include-proofs">> => hb_maps:get(<<"include-proofs">>, Request, true, Opts),
                 <<"include-block-index">> => include_block_index(Request, Opts) },
             Opts
@@ -1185,7 +1193,7 @@ block_index_boundaries(Module) ->
     ),
     ?assertEqual({ok, 1}, hb_ao:resolve(
         <<"~copycat@1.0/arweave&mode=blocks&from=5&to=1",
-            "&include-proofs=false&include-block-index=true">>, Opts)),
+            "&include-proofs=false&include-block-index=true&reindex=false">>, Opts)),
     {ok, Indexed} = hb_ao:resolve(<<"~arweave@2.9/blocks&limit=5">>, Opts),
     ?assertEqual([1, 2, 3, 4, 5], [hb_maps:get(<<"height">>, E) || E <- Indexed]),
     Items = lists:map(fun({Offset, Expected}) ->
@@ -1224,7 +1232,7 @@ block_transaction_pages_test() ->
     lists:foreach(fun({H, TXs}) -> block_index_header(H, 100, 0, TXs, Blocks) end,
         [{0, lists:sublist(IDs, 2)}, {1, []}, {2, lists:nthtail(2, IDs)}]),
     {ok, 0} = hb_ao:resolve(<<"~copycat@1.0/arweave&mode=blocks&from=2&to=0",
-        "&include-proofs=false&include-block-index=true">>, Opts),
+        "&include-proofs=false&include-block-index=true&reindex=false">>, Opts),
     Node = hb_http_server:start_node(Opts),
     Query = <<"query($block:BlockFilter,$sort:SortOrder,$after:String,$first:Int){",
         "transactions(block:$block,sort:$sort,after:$after,first:$first,tags:[]){",
@@ -1679,6 +1687,42 @@ list_index_test_parallel() ->
         ], maps:get(<<"indexed">>, BlockInfo)),
     ?assertEqual([ ], maps:get(<<"not-indexed">>, BlockInfo)),
     ok.
+
+%% @doc Reindexing bypasses cached headers while retaining request directives.
+block_cache_control_test_() ->
+    {timeout, 60, fun() ->
+        Store = hb_test_utils:test_store(),
+        Blocks = hb_test_utils:test_store(),
+        Opts = #{
+            <<"store">> => [Store | hb_opts:get(store, [], #{})],
+            <<"arweave-block-store">> => Blocks,
+            <<"gateway">> => <<"http://chain-3.arweave.xyz:1984">>,
+            <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+        },
+        Request = #{ <<"reindex">> => false,
+            <<"cache-control">> => [<<"only-if-cached">>] },
+        try
+            {ok, _} = fetch_block_header(2003806, #{}, Opts),
+            ?assertMatch({ok, _}, fetch_block_header(2003806, Request, Opts)),
+            lists:foreach(
+                fun(Req) ->
+                    ?assertEqual({error, not_found},
+                        fetch_block_header(2003806, Req, Opts))
+                end,
+                [
+                    Request#{ <<"reindex">> => true },
+                    maps:remove(<<"reindex">>, Request),
+                    Request#{ <<"cache-control">> =>
+                        [<<"no-cache">>, <<"only-if-cached">>] },
+                    Request#{ <<"reindex">> => true,
+                        <<"cache-control">> => <<"only-if-cached">> }
+                ]
+            )
+        after
+            hb_store:stop(Store),
+            hb_store:stop(Blocks)
+        end
+    end}.
 
 %% @doc Copycat forwards the proof setting and GraphQL uses the lean cache.
 proof_free_blocks_test_() ->
