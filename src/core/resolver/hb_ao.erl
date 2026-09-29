@@ -804,10 +804,12 @@ subresolve_loaded(Base, DevID, Req, Opts) ->
                     hb_maps:without(?TEMP_OPTS, Opts, Opts)
                 )
         end,
-    % If there is no path but there are elements to the request, we set these on
-    % the base message. If there is a path, we do not modify the base message 
-    % and instead apply the request message directly.
+    % With no path, set the request keys on the base. If they are the same
+    % message, only the device may have changed above. With a path, apply the
+    % request without changing the base.
     case hb_path:from_message(request, Req, Opts) of
+        undefined when Base =:= Req ->
+            {ok, set(Base2, hb_maps:with([<<"device">>], Req, Opts), Opts)};
         undefined ->
             Base3 =
                 case map_size(hb_maps:without([<<"path">>], Req, Opts)) of
