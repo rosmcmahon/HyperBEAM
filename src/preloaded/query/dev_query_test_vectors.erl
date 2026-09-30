@@ -180,26 +180,17 @@ transaction_cursor(Res, Opts) ->
     [#{ <<"cursor">> := Cursor }] = transaction_edges(Res, Opts),
     Cursor.
 
-%% Helper function to write test message with Recipient
+%% @doc Write an ANS-104 item with a native recipient.
 write_test_message_with_recipient(Recipient, Opts) ->
-    hb_cache:write(
-        Msg = hb_message:commit(
-            #{
-                <<"data-protocol">> => <<"ao">>,
-                <<"variant">> => <<"ao.N.1">>,
-                <<"type">> => <<"Message">>,
-                <<"action">> => <<"Eval">>,
-                <<"content-type">> => <<"text/plain">>,
-                <<"data">> => <<"test data">>,
-                <<"target">> => Recipient
-            },
-            Opts,
-            #{
-                <<"commitment-device">> => <<"ans104@1.0">>
-            }
-        ),
-        Opts
+    TX = ar_bundles:sign_item(
+        #tx{ target = hb_util:decode(Recipient), data = <<"test data">>,
+            tags = [{<<"Data-Protocol">>, <<"ao">>}, {<<"Variant">>, <<"ao.N.1">>},
+                {<<"Type">>, <<"Message">>}, {<<"Action">>, <<"Eval">>},
+                {<<"Content-Type">>, <<"text/plain">>}] },
+        hb_maps:get(<<"priv-wallet">>, Opts)
     ),
+    Msg = hb_message:convert(TX, <<"structured@1.0">>, <<"ans104@1.0">>, Opts),
+    hb_cache:write(Msg, Opts),
     {ok, Msg}.
 
 %%% Tests
@@ -257,10 +248,15 @@ block_by_height_query_test_parallel() ->
         #{
             <<"priv-wallet">> => ar_wallet:new(),
             <<"store">> => [hb_test_utils:test_store()],
-            <<"arweave-index-blocks">> => true
+            <<"arweave-block-store">> => hb_test_utils:test_store(),
+            <<"arweave-index-blocks">> => true,
+            <<"query-arweave-remote-block-ranges">> => false
         },
     Node = hb_http_server:start_node(Opts),
     get_test_blocks(Node, Opts),
+    ?assertEqual([], hb_cache:list_numbered(<<"~arweave@2.9/block/height">>, Opts)),
+    ?assertEqual([1745749, 1745750], lists:sort(hb_util:ok(
+        hb_ao:resolve(<<"~arweave@2.9/block-heights">>, Opts)))),
     Query =
         <<"""
             query {
@@ -599,19 +595,26 @@ transactions_query_recipients_test_parallel() ->
     ?event({alice, Alice, {explicit, hb_util:human_id(Alice)}}),
     AliceAddress = hb_util:human_id(Alice),
     {ok, WrittenMsg} = write_test_message_with_recipient(AliceAddress, Opts),
+    TagOnly = ar_bundles:sign_item(#tx{ tags = [
+        {<<"Target">>, AliceAddress}, {<<"field-target">>, AliceAddress}
+    ] }, ar_wallet:new()),
+    hb_cache:write(hb_message:convert(
+        TagOnly, <<"structured@1.0">>, <<"ans104@1.0">>, Opts
+    ), Opts),
     ?assertMatch(
         {ok, [_]},
         hb_cache:match(#{<<"type">> => <<"Message">>}, Opts)
     ),
     Query =
         <<"""
-            query($recipients: [String!]) {
+            query($recipients: [String!], $ids: [ID!], $sort: SortOrder) {
                 transactions(
-                    recipients: $recipients
+                    recipients: $recipients, ids: $ids, sort: $sort
                 ) {
                     edges {
                         node {
                             id
+                            recipient
                             tags {
                                 name
                                 value
@@ -642,6 +645,7 @@ transactions_query_recipients_test_parallel() ->
                             <<"node">> :=
                                 #{
                                     <<"id">> := ExpectedID,
+                                    <<"recipient">> := AliceAddress,
                                     <<"tags">> :=
                                         [#{ <<"name">> := _, <<"value">> := _ }|_]
                                 }
@@ -650,6 +654,37 @@ transactions_query_recipients_test_parallel() ->
             }
         } when ?IS_ID(ExpectedID),
         Res
+    ),
+    % Native recipient and Target tags must stay distinct on both read paths.
+    lists:foreach(
+        fun(Codec) ->
+            Wallet = ar_wallet:new(),
+            Native = hb:address(ar_wallet:new()),
+            Unsigned = #tx{ format = 1, target = hb_util:decode(Native),
+                tags = [{<<"Target">>, AliceAddress},
+                    {<<"field-target">>, AliceAddress}] },
+            TX = case Codec of
+                <<"tx@1.0">> -> ar_tx:sign(Unsigned, Wallet);
+                <<"ans104@1.0">> -> ar_bundles:sign_item(Unsigned, Wallet)
+            end,
+            Msg = hb_message:convert(TX, <<"structured@1.0">>, Codec, Opts),
+            hb_cache:write(Msg, Opts),
+            ID = hb_util:encode(TX#tx.id),
+            lists:foreach(
+                fun({Recipient, IDs, Expected, Direction}) ->
+                    Actual = dev_query_graphql:test_query(Node, Query,
+                        #{ <<"recipients">> => [Recipient], <<"ids">> => IDs,
+                            <<"sort">> => Direction }, Opts),
+                    ?assertEqual(Expected, transaction_ids(Actual, Opts))
+                end,
+                [{Recipient, IDs, Expected, Direction}
+                    || {Recipient, IDs, Expected} <-
+                        [{Native, null, [ID]}, {Native, [ID], [ID]},
+                         {AliceAddress, null, [ExpectedID]}, {AliceAddress, [ID], []}],
+                    Direction <- [<<"HEIGHT_ASC">>, <<"HEIGHT_DESC">>]]
+            )
+        end,
+        [<<"tx@1.0">>, <<"ans104@1.0">>]
     ).
 
 %% @doc Test transactions query with ids filter
@@ -716,14 +751,17 @@ transactions_query_ids_test_parallel() ->
 
 %% @doc Test transactions query with combined filters
 transactions_query_combined_test_parallel() ->
+    ArweaveStore = #{ <<"index-store">> => hb_test_utils:test_store() },
     Opts =
         #{
             <<"priv-wallet">> => Wallet = ar_wallet:new(),
+            <<"arweave-index-store">> => ArweaveStore,
             <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)]
         },
     Node = hb_http_server:start_node(Opts),
     {ok, WrittenMsg} = write_test_message(Opts),
     ExpectedID = hb_message:id(WrittenMsg, all, Opts),
+    hb_cache:write(hb_private:set(WrittenMsg, <<"offset">>, 10, Opts), Opts),
     ?assertMatch(
         {ok, [_]},
         hb_cache:match(#{<<"type">> => <<"Message">>}, Opts)
@@ -762,6 +800,9 @@ transactions_query_combined_test_parallel() ->
         ),
     ?event({expected_id, ExpectedID}),
     ?event({transactions_query_combined_test, Res}),
+    % Predicates work without an offset, and when the recorded offset changes.
+    ok = hb_store_arweave:write_offset(
+        ArweaveStore, ExpectedID, <<"ans104@1.0">>, 20, 0),
     lists:foreach(
         fun({TestNode, MatchID}) ->
             lists:foreach(
@@ -783,17 +824,18 @@ transactions_query_combined_test_parallel() ->
                 ]
             )
         end,
-        [{Node, ExpectedID},
+        [{Node, ExpectedID}, {Node, hb_message:id(WrittenMsg, none, Opts)},
             {hb_http_server:start_node(Opts#{
                 <<"priv-wallet">> => ar_wallet:new(), <<"match-index">> => false
             }), hb_message:id(WrittenMsg, none, Opts)}]
     ),
     lists:foreach(
-        fun(Filter) ->
-            Empty = dev_query_graphql:test_query(Node, Query, #{ Filter => [] }, Opts),
+        fun({Filter, Values}) ->
+            Empty = dev_query_graphql:test_query(Node, Query, #{ Filter => Values }, Opts),
             ?assertEqual([], hb_util:deep_get(<<"data/transactions/edges">>, Empty, Opts))
         end,
-        [<<"ids">>, <<"owners">>, <<"recipients">>]
+        [{Filter, []} || Filter <- [<<"ids">>, <<"owners">>, <<"recipients">>]] ++
+            [{<<"ids">>, [hb_util:encode(crypto:hash(sha256, <<"missing">>))]}]
     ),
     ?assertMatch(
         #{
@@ -976,10 +1018,9 @@ transactions_query_filter_by_block_can_ignore_ranges_test_parallel() ->
 transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
     {ok, Node, Opts} = test_env_with_blocks(1892487, 1892487),
     ID = <<"mT7pIQx9ORnemXoIzWmKwymiZJxtOSvzxm3P44M9C1A">>,
-    ?assertMatch(
-        {ok, #{ <<"start">> := _ }},
-        hb_store_arweave:read_offset(hb_store_arweave:store_from_opts(Opts), ID, Opts)
-    ),
+    {ok, #{ <<"start">> := _, <<"length">> := Length }} =
+        hb_store_arweave:read_offset(hb_store_arweave:store_from_opts(Opts), ID, Opts),
+    DataSize = hb_util:bin(Length),
     ?assertMatch(
         #{ <<"data">> := #{ <<"transactions">> := #{
             <<"count">> := <<"1">>,
@@ -987,6 +1028,7 @@ transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
                 #{
                     <<"node">> := #{
                         <<"id">> := ID,
+                        <<"data">> := #{ <<"size">> := DataSize },
                         <<"quantity">> := #{
                             <<"winston">> := <<"0">>,
                             <<"ar">> := <<"0.000000000000">>
@@ -1005,14 +1047,83 @@ transactions_query_ids_preserve_arweave_tx_id_test_parallel() ->
                 query($ids: [ID!]) {
                     transactions(ids: $ids, block: {min: 1892487, max: 1892487}) {
                         count
-                        edges { node { id quantity { winston ar } fee { winston ar } } }
+                        edges { node { id data { size }
+                            quantity { winston ar } fee { winston ar } } }
                     }
                 }
             """>>,
             #{ <<"ids">> => [ID] },
             Opts
         )
+    ),
+    % Whole-message reads retain unsigned commitments alongside the L1 one.
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    AmountOpts = Opts#{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+    AmountNode = hb_http_server:start_node(AmountOpts),
+    lists:foreach(
+        fun({Codec, Amount}) ->
+            Unsigned = #tx{
+                format = 2, quantity = Amount, reward = Amount,
+                target = crypto:strong_rand_bytes(32),
+                tags = [{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
+                    {<<"fee">>, <<"3000">>}]
+            },
+            Wallet = hb_maps:get(<<"priv-wallet">>, AmountOpts),
+            TX = case Codec of
+                <<"tx@1.0">> -> ar_tx:sign(Unsigned, Wallet);
+                <<"ans104@1.0">> -> ar_bundles:sign_item(Unsigned, Wallet)
+            end,
+            Msg = hb_message:normalize_commitments(
+                hb_message:convert(TX, <<"structured@1.0">>, Codec, AmountOpts),
+                AmountOpts),
+            TXID = hb_util:encode(TX#tx.id),
+            ok = hb_store:write(Store, #{ TXID => Msg }, AmountOpts),
+            Winston = hb_util:bin(Amount),
+            ?assertMatch(#{ <<"data">> := #{ <<"transaction">> := #{
+                <<"id">> := TXID,
+                <<"quantity">> := #{ <<"winston">> := Winston },
+                <<"fee">> := #{ <<"winston">> := Winston }
+            }}}, dev_query_graphql:test_query(AmountNode,
+                <<"query($id: ID!) { transaction(id: $id) { id",
+                    " quantity { winston } fee { winston } } }">>,
+                #{ <<"id">> => TXID }, AmountOpts))
+        end,
+        [{<<"tx@1.0">>, 0}, {<<"tx@1.0">>, 5}, {<<"ans104@1.0">>, 0}]
     ).
+
+%% @doc L1 metadata does not load or cache its bundle payload.
+transactions_header_only_test_parallel() ->
+    Local = hb_test_utils:test_store(hb_store_volatile),
+    Store = #{ <<"store-module">> => hb_store_arweave,
+        <<"index-store">> => hb_test_utils:test_store(hb_store_volatile),
+        <<"local-store">> => [Local] },
+    Opts = #{ <<"store">> => [Local, Store],
+        <<"arweave-index-store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    ID = <<"VJhGCNOw2zB0c9apKBs_LKXpPx6rctrw2kSlSSyI_SQ">>,
+    ok = hb_store_arweave:write_offset(Store, ID, <<"tx@1.0">>,
+        386086672048374, 2283569),
+    {ok, Header} = hb_ao:resolve(#{ <<"path">> => <<"~arweave@2.9/tx">>,
+        <<"tx">> => ID, <<"exclude-data">> => true }, Opts),
+    TX = hb_message:convert(Header, <<"tx@1.0">>, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Result = dev_query_graphql:test_query(Node,
+        <<"query($id: ID!) { transaction(id: $id) { id anchor recipient",
+            " owner { address } tags { name value } data { size }",
+            " quantity { winston } fee { winston } } }">>,
+        #{ <<"id">> => ID }, Opts),
+    ?assertMatch(#{ <<"data">> := #{ <<"transaction">> := #{
+        <<"id">> := ID, <<"data">> := #{ <<"size">> := <<"2283569">> }
+    }}}, Result),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, hb_store:scope(Opts, local))),
+    #{ <<"data">> := #{ <<"transaction">> := Projected }} = Result,
+    ?assertEqual(hb_util:encode(TX#tx.anchor), maps:get(<<"anchor">>, Projected)),
+    ?assertEqual(hb_util:encode(TX#tx.target), maps:get(<<"recipient">>, Projected)),
+    ?assertEqual(#{ <<"winston">> => hb_util:bin(TX#tx.quantity) },
+        maps:get(<<"quantity">>, Projected)),
+    ?assertEqual(#{ <<"winston">> => hb_util:bin(TX#tx.reward) },
+        maps:get(<<"fee">>, Projected)),
+    ?assertEqual(lists:sort([#{ <<"name">> => K, <<"value">> => V }
+        || {K, V} <- TX#tx.tags]), lists:sort(maps:get(<<"tags">>, Projected))).
 
 transactions_query_cursor_by_offset_test_parallel() ->
     {ok, Node, Opts} = test_env_with_blocks(1892159, 1892158),
@@ -1410,6 +1521,84 @@ transaction_query_full_test_parallel() ->
             }
         } when ?IS_ID(ExpectedID),
         Res
+    ).
+
+%% @doc Preserve original tags, or exclude native fields from normalized keys.
+transaction_tags_exclude_fields_test_parallel() ->
+    Wallet = ar_wallet:new(),
+    Opts = #{
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => [hb_test_utils:test_store()]
+    },
+    Node = hb_http_server:start_node(Opts),
+    lists:foreach(
+        fun({Codec, Amount, Tags, Expected}) ->
+            Unsigned = #tx{
+                format = 1,
+                target = crypto:strong_rand_bytes(32),
+                anchor = crypto:strong_rand_bytes(32),
+                quantity = Amount,
+                reward = Amount,
+                data = <<"payload">>,
+                tags = Tags
+            },
+            TX = case Codec of
+                <<"tx@1.0">> -> ar_tx:sign(Unsigned, Wallet);
+                <<"ans104@1.0">> -> ar_bundles:sign_item(Unsigned, Wallet)
+            end,
+            Msg = hb_message:convert(TX, <<"structured@1.0">>, Codec, Opts),
+            ID = hb_util:encode(TX#tx.id),
+            Commitment = hb_maps:get(ID, hb_maps:get(<<"commitments">>, Msg)),
+            Original = hb_maps:is_key(<<"original-tags">>, Commitment, Opts),
+            case Tags of
+                [] -> ?assertNot(Original);
+                [{<<"app">>, _} | _] -> ?assertNot(Original);
+                [{<<"quantity">>, _} | _] ->
+                    ?assertEqual(Codec =:= <<"tx@1.0">>, Original);
+                _ -> ?assert(Original)
+            end,
+            {ok, _} = hb_cache:write(Msg, Opts),
+            #{ <<"data">> := #{ <<"transaction">> := #{ <<"tags">> := Actual } }} =
+                dev_query_graphql:test_query(Node,
+                    <<"query($id: ID!) { transaction(id: $id) {",
+                        " tags { name value } } }">>,
+                    #{ <<"id">> => ID }, Opts),
+            case Original of
+                true ->
+                    ?assertEqual(
+                        [#{ <<"name">> => Name, <<"value">> => Value }
+                            || {Name, Value} <- Tags],
+                        Actual
+                    );
+                false ->
+                    ?assertEqual(
+                        lists:sort([#{ <<"name">> => Name, <<"value">> => Value }
+                            || {Name, Value} <- Expected]),
+                        lists:sort(Actual)
+                    )
+            end
+        end,
+        [{Codec, Amount, Tags, Expected}
+            || Codec <- [<<"tx@1.0">>, <<"ans104@1.0">>], Amount <- [0, 5],
+            {Tags, Expected} <- [
+                {[], []},
+                {[{<<"app">>, <<"literal">>}, {<<"body">>, <<"a tag">>}],
+                    [{<<"app">>, <<"literal">>}]},
+                {[{<<"App">>, <<"literal">>}, {<<"Body">>, <<"a tag">>}],
+                    [{<<"app">>, <<"literal">>}]},
+                {[{<<"quantity">>, <<"1000">>}, {<<"reward">>, <<"2000">>},
+                    {<<"fee">>, <<"3000">>}, {<<"field-reward">>, <<"a tag">>}],
+                    [{<<"fee">>, <<"3000">>}, {<<"field-reward">>, <<"a tag">>}] ++
+                        case {Codec, Amount} of
+                            {<<"tx@1.0">>, 5} -> [];
+                            _ -> [{<<"quantity">>, <<"1000">>},
+                                {<<"reward">>, <<"2000">>}]
+                        end},
+                {[{<<"Anchor">>, <<"tag anchor">>},
+                    {<<"Target">>, <<"tag target">>},
+                    {<<"App">>, <<"first">>}, {<<"app">>, <<"second">>}],
+                    [{<<"app">>, <<"\"first\", \"second\"">>}]}
+            ]]
     ).
 
 %% @doc Test single transaction query with non-existent ID

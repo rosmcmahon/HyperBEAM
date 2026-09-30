@@ -4,7 +4,7 @@
 -export([commitments_to_siginfo/3, siginfo_to_commitments/3]).
 -export([committed_keys_to_siginfo/1, to_siginfo_keys/3, from_siginfo_keys/3]).
 -export([add_derived_specifiers/1, remove_derived_specifiers/1]).
--export([commitment_to_sig_name/1]).
+-export([commitment_to_sig_name/1, derived_commitment_id/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -140,6 +140,10 @@ derived_commitment_id(Sig) when byte_size(Sig) == 32 ->
 derived_commitment_id(Sig) ->
     hb_util:human_id(crypto:hash(sha256, Sig)).
 
+%% @doc HTTPSig derives its committer; other codecs transport theirs explicitly.
+get_additional_params(Commitment = #{
+        <<"commitment-device">> := <<"httpsig@1.0">>, <<"committer">> := _ }) ->
+    get_additional_params(maps:remove(<<"committer">>, Commitment));
 get_additional_params(Commitment) ->
     AdditionalParams =
         sets:to_list(
@@ -157,8 +161,7 @@ get_additional_params(Commitment) ->
                         <<"signature">>,
                         <<"type">>,
                         <<"id">>,
-                        <<"commitment-device">>,
-                        <<"committer">>
+                        <<"commitment-device">>
                     ]
                 )
             )
@@ -281,7 +284,7 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
     % 2. Filter undefined keys.
     % 3. Use the transported `id' parameter when present (content-addressed
     %    devices), otherwise fall back to `derived_commitment_id/1'.
-    % 4. If the `keyid' resolves to a public key, set the `committer'.
+    % 4. Keep a transported committer, or derive it from the HTTPSig keyid.
     Commitment3 =
         Commitment2#{
             <<"signature">> => hb_util:encode(Sig),
@@ -299,7 +302,8 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
                 Commitment4;
             Committer ->
                 Commitment4#{
-                    <<"committer">> => Committer
+                    <<"committer">> =>
+                        maps:get(<<"committer">>, Commitment4, Committer)
                 }
         end,
     % Return the commitment and calculated ID.
@@ -346,25 +350,26 @@ to_siginfo_keys(Msg, Commitment, Opts) ->
 
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
 %% format. There are three stages:
-%% 1. Remove the @ prefix from the component identifiers, if present.
-%% 2. Replace `content-digest' with the body keys, if present.
-%% 3. Replace the `body' key again with the value of the `ao-body-key' key, if
+%% 1. Replace `content-digest' with the body keys, if present, and remove the
+%%    @ prefix from the other component identifiers.
+%% 2. Replace the `body' key again with the value of the `ao-body-key' key, if
 %%    present. This is possible because the keys derived from the body often
 %%    contain the `body' key itself.
-%% 4. If the `content-type' starts with `multipart/', we remove it.
+%% 3. If the `content-type' starts with `multipart/', we remove it.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
-    % 1. Remove specifiers from the list and decode percent-encoded keys.
-    BaseCommitted =
-        lists:map(
-            fun(<<"@", Key/binary>>) -> hb_escape:decode(Key);
-               (Key) -> hb_escape:decode(Key)
+    % 1. Replace the `content-digest' component with the body keys, then remove
+    %    specifiers from the other keys and decode them. Only the raw component
+    %    is the digest of the body: a key of the message with that name is
+    %    percent-encoded on the wire.
+    WithBody =
+        lists:flatmap(
+            fun(<<"content-digest">>) -> BodyKeys;
+               (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
+               (Key) -> [hb_escape:decode(Key)]
             end,
             SigInfoCommitted
         ),
-    % 2. Replace the `content-digest' key with the `body' key, if present.
-    WithBody =
-        hb_util:list_replace(BaseCommitted, <<"content-digest">>, BodyKeys),
-    % 3. Replace the `body' key again with the value of the `ao-body-key' key,
+    % 2. Replace the `body' key again with the value of the `ao-body-key' key,
     %    if present.
     ?event_debug(
         {from_siginfo_keys,
@@ -387,7 +392,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
             false ->
                 WithBody
         end,
-    % 4. If the `content-type' starts with `multipart/', we remove it.
+    % 3. If the `content-type' starts with `multipart/', we remove it.
     ListWithoutContentType =
         case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
             <<"multipart/", _/binary>> ->

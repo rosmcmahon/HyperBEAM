@@ -14,6 +14,41 @@ run_test() ->
         test_opts(normal)
     ).
 
+%% @doc Commitment identities belong to the signature or unsigned digest.
+arweave_commitment_identity_test_() ->
+    [
+        {binary_to_list(Codec) ++ ": " ++ atom_to_list(Kind), fun() ->
+            Opts = test_opts(normal),
+            Msg = case Kind of
+                signed ->
+                    hb_message:commit(
+                        #{ <<"body">> => <<"original">> }, Opts, Codec);
+                unsigned ->
+                    hb_message:convert(
+                        ar_tx:normalize(#tx{
+                            format = Format,
+                            tags = [{<<"Example-Key">>, <<"value">>}],
+                            data = <<"original">>
+                        }),
+                        <<"structured@1.0">>, Codec, Opts
+                    )
+            end,
+            Verify = fun(M) ->
+                hb_message:verify(M,
+                    #{ <<"commitment-ids">> => <<"all">> }, Opts)
+            end,
+            [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Msg)),
+            FalseID = hb_util:human_id(<<0:256>>),
+            ?assert(Verify(Msg)),
+            ?assertNot(Verify(Msg#{ <<"commitments">> =>
+                #{ FalseID => Commitment } })),
+            ?assertNot(Verify(Msg#{ <<"commitments">> =>
+                #{ ID => Commitment#{ <<"committer">> => FalseID } } }))
+        end}
+    || {Codec, Format} <- [{<<"ans104@1.0">>, ans104}, {<<"tx@1.0">>, 2}],
+        Kind <- [signed, unsigned]
+    ].
+
 %% @doc Return a list of codecs to test. Disable these as necessary if you need
 %% to test the functionality of a single codec, etc.
 test_codecs() ->
@@ -92,6 +127,8 @@ test_suite() ->
             fun basic_message_codec_test/2},
         {<<"Priv survives conversion">>,
             fun priv_survives_conversion_test/2},
+        {<<"Literal priv">>,
+            fun literal_priv_test/2},
         {<<"Message with body">>,
             fun set_body_codec_test/2},
         {<<"Message with large keys">>,
@@ -102,6 +139,10 @@ test_suite() ->
             fun structured_field_decimal_parsing_test/2},
         {<<"Header escaping">>,
             fun header_escaping_test/2},
+        {<<"Signature as a data key">>,
+            fun signature_data_key_test/2},
+        {<<"Content-digest as a data key">>,
+            fun content_digest_data_key_test/2},
         {<<"Unsigned id">>,
             fun unsigned_id_test/2},
         % Nested structures
@@ -132,6 +173,8 @@ test_suite() ->
         % Signed messages
         {<<"Signed message to message and back">>,
             fun signed_message_encode_decode_verify_test/2},
+        {<<"Changed signed message">>,
+            fun changed_signed_message_test/2},
         {<<"Specific order signed message">>,
             fun specific_order_signed_message_test/2},
         {<<"Specific order deeply nested signed message">>,
@@ -288,7 +331,16 @@ is_idempotent(Func, Msg, Opts) ->
 
 %% @doc Ensure that converting a message to/from TABM multiple times repeatedly 
 %% does not alter the message's contents.
-tabm_conversion_is_idempotent_test(_Codec, Opts) ->
+tabm_conversion_is_idempotent_test(Codec, Opts) ->
+    % L1 TXs can not be nested inside each other, so we'll commit the nested
+    % message as an ANS104 message instead.
+    NestedCodec =
+        case Codec of
+            <<"tx@1.0">> -> <<"ans104@1.0">>;
+            #{ <<"device">> := <<"tx@1.0">> } ->
+                Codec#{ <<"device">> => <<"ans104@1.0">> };
+            _ -> Codec
+        end,
     From = fun(M) -> hb_message:convert(M, <<"structured@1.0">>, tabm, Opts) end,
     To = fun(M) -> hb_message:convert(M, tabm, <<"structured@1.0">>, Opts) end,
     SimpleMsg = #{ <<"a">> => <<"x">>, <<"b">> => <<"y">>, <<"c">> => <<"z">> },
@@ -315,7 +367,7 @@ tabm_conversion_is_idempotent_test(_Codec, Opts) ->
                                 >>
                         },
                         Opts,
-                        <<"structured@1.0">>
+                        NestedCodec
                     )
             },
     ?assert(is_idempotent(From, SimpleMsg, Opts)),
@@ -583,6 +635,55 @@ header_escaping_test(Codec, Opts) ->
     Msg = hb_message:commit(#{ <<"description">> => <<"line 1\nline 2">> }, Opts, Codec),
     Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
     Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+
+%% @doc A message's own `signature' key is data, as on an Arweave block. It
+%% is committed, survives the wire beside the signature headers of the same
+%% name, and is not read back as a commitment.
+signature_data_key_test(Codec, Opts) ->
+    Msg =
+        hb_message:commit(
+            #{ <<"signature">> => <<"abc">>, <<"height">> => 1 },
+            Opts,
+            Codec
+        ),
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"abc">>,
+        hb_maps:get(<<"signature">>, Decoded, not_found, Opts)
+    ),
+    ?assertEqual(
+        hb_message:signers(Msg, Opts),
+        hb_message:signers(Decoded, Opts)
+    ),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+
+%% @doc A key of a message named `content-digest' is data, at any depth. It is
+%% distinct from the digest of the body that `httpsig@1.0' derives.
+content_digest_data_key_test(Codec, Opts) ->
+    Msg =
+        hb_message:commit(
+            #{
+                <<"content-digest">> => <<"abc">>,
+                <<"body">> => <<"hello">>,
+                <<"nested">> => #{ <<"content-digest">> => <<"def">> }
+            },
+            Opts,
+            Codec
+        ),
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"abc">>,
+        hb_maps:get(<<"content-digest">>, Decoded, not_found, Opts)
+    ),
+    ?assertEqual(
+        hb_message:signers(Msg, Opts),
+        hb_message:signers(Decoded, Opts)
+    ),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
 
@@ -900,6 +1001,31 @@ signed_message_encode_decode_verify_test(Codec, Opts) ->
     MatchRes = hb_message:match(SignedMsg, Decoded, strict, Opts),
     ?event({match_result, MatchRes}),
     ?assert(MatchRes).
+
+%% @doc A signed message whose committed value is changed after signing does
+%% not verify, before or after it is converted, and keeps the new value and
+%% type when it is converted. Signed again, it keeps the new value.
+changed_signed_message_test(Codec, Opts) ->
+    Signed = hb_message:commit(#{ <<"a">> => 1, <<"b">> => 2 }, Opts, Codec),
+    RoundTrip =
+        fun(Msg) ->
+            hb_message:convert(
+                hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+                <<"structured@1.0">>,
+                Codec,
+                Opts
+            )
+        end,
+    Changed = Signed#{ <<"a">> => 3 },
+    ?assertNot(hb_message:verify(Changed, all, Opts)),
+    Converted = RoundTrip(Changed),
+    ?assertMatch(#{ <<"a">> := 3 }, Converted),
+    ?assertNot(hb_message:verify(Converted, all, Opts)),
+    ?assertMatch(#{ <<"a">> := 3 }, hb_message:commit(Changed, Opts, Codec)),
+    ?assertMatch(
+        #{ <<"a">> := <<"1">> },
+        RoundTrip(Signed#{ <<"a">> => <<"1">> })
+    ).
 
 specific_order_signed_message_test(RawCodec, Opts) ->
     Msg = #{
@@ -1533,6 +1659,17 @@ priv_survives_conversion_test(Codec, Opts) ->
     ?assertMatch(
         #{ <<"test_key">> := <<"TEST_VALUE">> },
         maps:get(<<"priv">>, Decoded)
+    ).
+
+%% @doc A message whose `priv' key holds a literal converts, and decodes to its
+%% other keys.
+literal_priv_test(Codec, Opts) ->
+    Msg = #{ <<"data">> => <<"TEST_DATA">>, <<"priv">> => <<"literal">> },
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"TEST_DATA">>,
+        hb_maps:get(<<"data">>, Decoded, not_found, Opts)
     ).
 
 encode_balance_table(Size, Codec, Opts) ->

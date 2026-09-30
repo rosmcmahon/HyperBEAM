@@ -318,6 +318,48 @@ dynamic_internal_dispatch_supported_test() ->
     ?assertEqual({ok, <<"hello">>}, Mod:call(#{}, #{}, #{})),
     ?assertEqual(false, code:is_loaded(dev_dyn_pkg_helper)).
 
+%% @doc Test packages compile guarded functions with the active profile defines.
+profile_defines_test() ->
+    Dir = test_fixture_dir(),
+    Path = filename:join(Dir, <<"dev_test_pkg_helper.erl">>),
+    ok = file:write_file(Path, <<
+        "-module(dev_test_pkg_helper).\n"
+        "-export([greet/2]).\n"
+        "-ifdef(HB_TEST_PROFILE).\n"
+        "-export([profile/0]).\n"
+        "profile() -> ?HB_TEST_PROFILE.\n"
+        "-endif.\n"
+        "greet(_, _) -> <<\"hello\">>.\n"
+    >>),
+    try
+        [Group] = hb_packager:scan([Dir], #{}),
+        lists:foreach(
+            fun(Defines) ->
+                Pkg = hb_forge_seed:with_forge_bootstrap(
+                    #{
+                        <<"bootstrap-device-src">> => [<<"src/preloaded">>],
+                        <<"test">> => true,
+                        <<"erl-defines">> => Defines
+                    },
+                    fun(Opts) -> hb_packager:package(Group, Opts) end
+                ),
+                {ok, Modules, _} =
+                    hb_device_archive:contents(maps:get(archive, Pkg)),
+                Exports = lists:append([
+                    begin
+                        {ok, {_, [{exports, E}]}} =
+                            beam_lib:chunks(Beam, [exports]),
+                        E
+                    end
+                 || {_, _, Beam} <- Modules
+                ]),
+                ?assertEqual(Defines =/= [], lists:member({profile, 0}, Exports))
+            end,
+            [[], [{d, 'HB_TEST_PROFILE'}], [{d, 'HB_TEST_PROFILE', enabled}]]
+        )
+    after file:del_dir_r(Dir)
+    end.
+
 archive_contains_ebin_and_priv_entries_test() ->
     Dir = priv_fixture_dir(),
     [Group] = hb_packager:scan([Dir], #{}),

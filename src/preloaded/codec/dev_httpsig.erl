@@ -13,15 +13,15 @@
 -export([serialize/2, serialize/3]).
 %%% Commitment API functions
 -export([commit/3, verify/3]).
-%%% HMAC secret proxy API functions
--export([proxy_commit/3, proxy_verify/3]).
 %%% Public API functions
 -export([add_content_digest/2, normalize_for_encoding/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%% Routing functions for the `dev_httpsig_conv' module
+-spec to(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 to(Msg, Req, Opts) -> dev_httpsig_conv:to(Msg, Req, Opts).
+-spec from(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 from(Msg, Req, Opts) -> dev_httpsig_conv:from(Msg, Req, Opts).
 
 %% @doc Generate the `Opts' to use during AO-Core operations in the codec.
@@ -31,25 +31,6 @@ opts(RawOpts) ->
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
         <<"force-message">> => false
     }.
-
-%% @doc Proxy a secret HMAC commitment, overriding the commitment device.
-proxy_commit(_Base, Req, Opts) ->
-    dev_httpsig_proxy:commit(
-        hb_maps:get(<<"commitment-device">>, Req, Opts),
-        hb_maps:get(<<"secret">>, Req, Opts),
-        hb_maps:get(<<"message">>, Req, Opts),
-        Req,
-        Opts
-    ).
-
-%% @doc Proxy secret HMAC verification.
-proxy_verify(_Base, Req, Opts) ->
-    dev_httpsig_proxy:verify(
-        hb_maps:get(<<"secret">>, Req, Opts),
-        hb_maps:get(<<"message">>, Req, Opts),
-        Req,
-        Opts
-    ).
 
 %% @doc A helper utility for creating a direct encoding of a HTTPSig message.
 %% 
@@ -63,6 +44,11 @@ proxy_verify(_Base, Req, Opts) ->
 %% Optionally, the `index` key can be set to override resolution of the default
 %% index page into HTTP responses that do not contain their own `body` field.
 serialize(Msg, Opts) -> serialize(Msg, #{}, Opts).
+-spec serialize(
+    #{ _ => _ },
+    #{ format => binary(), index => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, binary() | #{ headers := #{ _ => _ }, body := _, _ => _ }}.
 serialize(Msg, #{ <<"format">> := <<"components">> }, Opts) ->
     % Convert to HTTPSig via TABM through calling `hb_message:convert` rather
     % than executing `to/3` directly. This ensures that our responses are 
@@ -80,10 +66,30 @@ serialize(Msg, _Req, Opts) ->
     HTTPSig = hb_message:convert(Msg, <<"httpsig@1.0">>, Opts), 
     {ok, dev_httpsig_conv:encode_http_msg(HTTPSig, Opts) }.
 
+-spec verify(
+    #{ _ => _ },
+    #{ signature := binary(), type := binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, boolean()} | {failure, _}.
 verify(Base, Req, RawOpts) ->
-    % A rsa-pss-sha512 commitment is verified by regenerating the signature
-    % base and validating against the signature.
     Opts = opts(RawOpts),
+    % Verify the commitment's ID as well as the presence of its committed keys.
+    maybe
+        [] ?= missing_keys(Base, Req, Opts),
+        ID = dev_httpsig_siginfo:derived_commitment_id(
+            hb_util:decode(maps:get(<<"signature">>, Req))),
+        true ?= maps:is_key(ID, maps:get(<<"commitments">>, Base, #{})),
+        do_verify(Base, Req, Opts)
+    else
+        Failure ->
+            ?event(httpsig_verify, {verify, {invalid_commitment, Failure}}),
+            {ok, false}
+    end.
+
+%% @doc Verify a commitment whose committed keys the base carries. A
+%% rsa-pss-sha512 commitment is verified by regenerating the signature base
+%% and validating against the signature.
+do_verify(Base, Req, Opts) ->
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
     SigBase = signature_base(EncMsg, EncComm, Opts),
     KeyRes = dev_httpsig_keyid:req_to_key_material(Req, Opts),
@@ -98,18 +104,22 @@ verify(Base, Req, RawOpts) ->
         }
     ),
     case {KeyRes, maps:get(<<"type">>, Req)} of
-        {{ok, _, Key, _KeyID}, <<"rsa-pss-sha512">>} ->
+        {{ok, publickey, Key, KeyID}, <<"rsa-pss-sha512">>} ->
             ?event(httpsig_verify, {verify, {rsa_pss_sha512, {sig_base, SigBase}}}),
             {
                 ok,
-                ar_wallet:verify(
+                maps:get(<<"committer">>, Req, undefined) =:=
+                    dev_httpsig_keyid:keyid_to_committer(publickey, KeyID)
+                andalso binary:decode_unsigned(Key) >= (1 bsl 2047)
+                andalso ar_wallet:verify(
                     {{rsa, 65537}, Key},
                     SigBase,
                     RawSignature,
                     sha512
                 )
             };
-        {{ok, _, Key, KeyID}, <<"hmac-sha256">>} ->
+        {{ok, Scheme, Key, KeyID}, <<"hmac-sha256">>}
+                when Scheme =:= constant; Scheme =:= secret ->
             % Generate the HMAC from the key and signature base.
             ActualHMac =
                 hb_util:human_id(
@@ -125,7 +135,11 @@ verify(Base, Req, RawOpts) ->
                         {matches, Signature =:= ActualHMac}
                     }
                 }),
-            {ok, Signature =:= ActualHMac};
+            {ok, Signature =:= ActualHMac andalso
+                maps:get(<<"committer">>, Req, undefined) =:=
+                    dev_httpsig_keyid:keyid_to_committer(Scheme, KeyID)};
+        {{ok, _, _, _}, _Type} ->
+            {ok, false};
         {{error, Reason}, _Type} ->
             ?event(httpsig_verify, {verify, {error, Reason}}),
             {ok, false};
@@ -134,10 +148,26 @@ verify(Base, Req, RawOpts) ->
             {failure, Info}
     end.
 
+%% @doc Whether a wallet holds an RSA key, in either of the forms that
+%% `ar_wallet' signs with.
+rsa_wallet({{rsa, 65537}, _, _}) -> true;
+rsa_wallet({{{rsa, 65537}, _, _}, {{rsa, 65537}, _}}) -> true;
+rsa_wallet(_) -> false.
+
 %% @doc Commit to a message using the HTTP-Signature format. We use the `type'
 %% parameter to determine the type of commitment to use. If the `type' parameter
 %% is `signed', we default to the rsa-pss-sha512 algorithm. If the `type'
 %% parameter is `unsigned', we default to the hmac-sha256 algorithm.
+-spec commit(
+    #{ _ => _ },
+    #{
+        type := binary(),
+        bundle => boolean(),
+        committed => [_] | #{ _ => _ },
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
     commit(Msg, Req#{ <<"type">> => <<"hmac-sha256">> }, Opts);
 commit(Msg, Req = #{ <<"type">> := <<"signed">> }, Opts) ->
@@ -152,6 +182,12 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
         throw({cannot_commit, no_viable_wallet, MsgToSign});
     true ->
         ok
+    end,
+    % The algorithm signs with an RSA key; a wallet of another type cannot
+    % produce a commitment that this device verifies.
+    case rsa_wallet(Wallet) of
+        true -> ok;
+        false -> throw({cannot_commit, 'unsupported-key-type', MsgToSign})
     end,
     % Utilize the hashpath, if present, as the tag for the commitment.
     MaybeTagMap =
@@ -351,30 +387,31 @@ add_content_digest(Msg, _Opts) ->
 
 %% @doc Given a base message and a commitment, derive the message and commitment
 %% normalized for encoding.
+-spec normalize_for_encoding(
+    #{ _ => _ },
+    #{ committed => [_], _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }, #{ committed := [_], _ => _ }, [_]}.
 normalize_for_encoding(Msg, Commitment, Opts) ->
     % Extract the requested keys to include in the signature base.
-    RawInputs =
-        hb_util:message_to_ordered_list(
-            maps:get(<<"committed">>, Commitment, []),
-            Opts
-        ),
-    % Normalize the keys to their maybe-linked form, adding `+link` if necessary.
-    Inputs =
-        lists:map(
-            fun(Key) ->
-                NormalizedKey = hb_ao:normalize_key(Key),
-                case maps:is_key(NormalizedKey, Msg) of
-                    true -> NormalizedKey;
-                    false ->
-                        case maps:is_key(<<NormalizedKey/binary, "+link">>, Msg) of
-                            true -> <<NormalizedKey/binary, "+link">>;
-                            false -> NormalizedKey
-                        end
-                end
-            end,
-            RawInputs
-        ),
+    RawInputs = committed_keys(Commitment, Opts),
+    Inputs = input_keys(Msg, RawInputs),
     ?event_debug({inputs, {list, Inputs}}),
+    % A commitment is over every key it lists. A committed key that the
+    % message lacks cannot be left out of the signature base silently: the
+    % commitment would then be encoded over a message that its signature does
+    % not verify.
+    case missing_keys(Msg, Commitment, Opts) of
+        [] -> ok;
+        Missing ->
+            throw(
+                {committed_key_missing,
+                    {keys, Missing},
+                    {commitment, Commitment},
+                    {msg, Msg}
+                }
+            )
+    end,
     % Filter the message down to only the requested keys, then encode it.
     MsgWithOnlyInputs =
         maps:with(
@@ -443,6 +480,40 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
         Commitment#{ <<"committed">> => KeysForEncoding },
         KeysForCommitment
     }.
+
+%% @doc The keys a commitment lists as committed, in order.
+committed_keys(Commitment, Opts) ->
+    hb_util:message_to_ordered_list(
+        maps:get(<<"committed">>, Commitment, []),
+        Opts
+    ).
+
+%% @doc The keys a commitment lists, in the form the message carries them: a
+%% key held as a link carries its `+link' specifier.
+input_keys(Msg, RawInputs) ->
+    lists:map(
+        fun(Key) ->
+            NormalizedKey = hb_ao:normalize_key(Key),
+            case maps:is_key(NormalizedKey, Msg) of
+                true -> NormalizedKey;
+                false ->
+                    case maps:is_key(<<NormalizedKey/binary, "+link">>, Msg) of
+                        true -> <<NormalizedKey/binary, "+link">>;
+                        false -> NormalizedKey
+                    end
+            end
+        end,
+        RawInputs
+    ).
+
+%% @doc The keys a commitment lists that the message does not carry.
+missing_keys(Msg, Commitment, Opts) ->
+    [
+        Key
+    ||
+        Key <- input_keys(Msg, committed_keys(Commitment, Opts)),
+        not key_present(Key, Msg)
+    ].
 
 %% @doc Calculate if a key or its `+link' TABM variant is present in a message.
 key_present(Key, Keys) -> key_present(true, Key, Keys).
@@ -560,6 +631,70 @@ signature_param(Name, Commitment) ->
 %%%
 
 %%% Integration Tests
+
+%% @doc Commitment identities must agree with the verified key and signature.
+commitment_identity_test() ->
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Msg = #{ <<"body">> => <<"authenticated">> },
+    Victim = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
+    Signed = hb_message:commit(Msg, Opts),
+    Unsigned = hb_message:commit(Msg, Opts, #{ <<"type">> => <<"unsigned">> }),
+    lists:foreach(
+        fun(Committed) ->
+            ?assert(hb_message:verify(
+                Committed, #{ <<"commitment-ids">> => <<"all">> }, Opts)),
+            Forged = Committed#{ <<"commitments">> => maps:map(
+                fun(_, C) -> C#{ <<"committer">> => Victim } end,
+                maps:get(<<"commitments">>, Committed)
+            ) },
+            ?assertNot(hb_message:verify(Forged, all, Opts)),
+            Renamed = Committed#{ <<"commitments">> => #{
+                Victim => hd(maps:values(maps:get(<<"commitments">>, Committed)))
+            } },
+            ?assertNot(hb_message:verify(
+                Renamed, #{ <<"commitment-ids">> => <<"all">> }, Opts))
+        end,
+        [Signed, Unsigned]
+    ),
+    Wire = hb_message:convert(Signed, <<"httpsig@1.0">>, Opts),
+    Roundtrip = hb_message:convert(
+        Wire, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts
+    ),
+    ?assert(hb_message:verify(Roundtrip, all, Opts)).
+
+%% @doc A publicly known RSA key cannot authenticate an HMAC signer.
+public_key_hmac_is_not_authority_test() ->
+    {_, {_, Pub}} = ar_wallet:new(),
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Committed = hb_message:commit(
+        #{ <<"body">> => <<"public-key-hmac">> }, Opts,
+        #{
+            <<"type">> => <<"hmac-sha256">>,
+            <<"keyid">> => <<"publickey:", (base64:encode(Pub))/binary>>
+        }
+    ),
+    ?assertNot(hb_message:verify(Committed, all, Opts)).
+
+%% @doc HTTPSig rejects weak moduli, including zero-padded keys.
+rsa_minimum_modulus_test() ->
+    lists:foreach(
+        fun(Bits) ->
+            {[_, Pub], [_, Pub, Priv | _]} = crypto:generate_key(rsa, {Bits, 65537}),
+            lists:foreach(
+                fun(Key) ->
+                    Wallet = {{{rsa, 65537}, Priv, Key}, {{rsa, 65537}, Key}},
+                    Opts = #{ <<"priv-wallet">> => Wallet },
+                    Data = <<"rsa-size">>,
+                    Signature = ar_wallet:sign(Wallet, Data),
+                    ?assert(ar_wallet:verify({{rsa, 65537}, Key}, Data, Signature)),
+                    Signed = hb_message:commit(#{ <<"body">> => Data }, Opts),
+                    ?assertEqual(Bits >= 2048, hb_message:verify(Signed, all, Opts))
+                end,
+                [Pub, <<0:4096, Pub/binary>>]
+            )
+        end,
+        [1536, 2048]
+    ).
 
 %% @doc Ensure that we can validate a signature on an extremely large and complex
 %% message that is sent over HTTP, signed with the codec.

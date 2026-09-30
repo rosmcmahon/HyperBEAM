@@ -87,6 +87,10 @@
 %%%                         store sees.
 %%%     `[to|from]-value`:  An AO-Core path, resolved in `raw' mode with a
 %%%                         successful result as the `Base/body`.
+%%%     `from-list`:        An AO-Core path receiving all enumerated children
+%%%                         as `Base/body', returning their normalized list.
+%%%                         Replaces per-child `from-key' and `from-value'
+%%%                         for `list' results.
 %%% '''
 -module(hb_store).
 -export([behavior_info/1]).
@@ -143,7 +147,8 @@ behavior_info(callbacks) ->
 
 %% @doc The store message keys that describe a normalization pipeline.
 -define(PIPELINE_KEYS, [
-    <<"prefix">>, <<"to-key">>, <<"from-key">>, <<"to-value">>, <<"from-value">>
+    <<"prefix">>, <<"to-key">>, <<"from-key">>, <<"to-value">>, <<"from-value">>,
+    <<"from-list">>
 ]).
 
 %%% Store named terms registry functions.
@@ -626,6 +631,8 @@ from_store(Store, read, {composite, Children}, Opts) ->
         {ok, Norm} ?= from_children(Store, Children, Opts),
         {composite, Norm}
     end;
+from_store(Store = #{ <<"from-list">> := _ }, list, {ok, Children}, Opts) ->
+    execute_normalizer(<<"from-list">>, Store, Children, Opts);
 from_store(Store, list, {ok, Children}, Opts) ->
     from_children(Store, Children, Opts);
 from_store(Store, resolve, {ok, Path}, Opts) ->
@@ -685,6 +692,7 @@ execute_normalizer(Setting, Store, Term, Opts) ->
             hb_ao:raw(
                 #{ <<"path">> => Path, <<"0.body">> => Term },
                 Opts#{
+                    <<"linkify-mode">> => false,
                     <<"store">> =>
                         [ S || S <- AllOptsStores, not has_processing_pipeline(S) ]
                 }
@@ -758,8 +766,6 @@ admin_call([Store | Rest], Function, Req, Opts) ->
     end.
 
 admin_post_process(stop, Store) ->
-    set(Store, undefined);
-admin_post_process(reset, Store) ->
     set(Store, undefined);
 admin_post_process(_, _Store) ->
     ok.
@@ -976,11 +982,45 @@ hierarchical_path_resolution_test(Store) ->
         read(Store, [<<"test-link">>, <<"test-file">>], #{})
     ).
 
+%% @doc Ensure that we can list a directory through a link to it.
+linked_list_test(Store) ->
+    ok = group(Store, <<"test-dir1">>, #{}),
+    ok =
+        write(
+            Store,
+            write_req([<<"test-dir1">>, <<"test-file">>], <<"test-data">>),
+            #{}
+        ),
+    ok = link(Store, link_req(<<"test-link">>, [<<"test-dir1">>]), #{}),
+    ?assertEqual({ok, [<<"test-file">>]}, list(Store, <<"test-link">>, #{})).
+
+%% @doc Ensure that keys with non-ASCII characters are listed and read as
+%% written.
+unicode_key_test(Store) ->
+    Keys = [<<"é"/utf8>>, <<"日本語"/utf8>>, <<"🚀"/utf8>>],
+    ok = group(Store, <<"test-dir1">>, #{}),
+    lists:foreach(
+        fun(Key) ->
+            ok = write(Store, write_req([<<"test-dir1">>, Key], Key), #{})
+        end,
+        Keys
+    ),
+    {ok, Listed} = list(Store, <<"test-dir1">>, #{}),
+    ?assertEqual(lists:sort(Keys), lists:sort(Listed)),
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual({ok, Key}, read(Store, [<<"test-dir1">>, Key], #{}))
+        end,
+        Keys
+    ).
+
 store_suite_test_() ->
     generate_test_suite([
         {"simple path resolution", fun simple_path_resolution_test/1},
         {"resursive path resolution", fun resursive_path_resolution_test/1},
-        {"hierarchical path resolution", fun hierarchical_path_resolution_test/1}
+        {"hierarchical path resolution", fun hierarchical_path_resolution_test/1},
+        {"linked list", fun linked_list_test/1},
+        {"unicode key", fun unicode_key_test/1}
     ]).
 
 benchmark_suite_test_() ->
@@ -1408,6 +1448,27 @@ prefix_pipeline_test() ->
     ?assertEqual({ok, <<"2">>}, read([Plain], <<"outer">>, #{})),
     ?event(testing, {unprefixed_skip_and_strip_off_passed}).
 
+%% @doc Resetting a store preserves visibility for existing readers.
+reset_shared_instance_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    ok = write(Store, #{ <<"before">> => <<"old">> }, #{}),
+    {PID, Ref} =
+        spawn_monitor(
+            fun() ->
+                ?assertEqual({ok, <<"old">>}, read(Store, <<"before">>, #{})),
+                ok = reset(Store),
+                ok = write(Store, #{ <<"after">> => <<"new">> }, #{})
+            end
+        ),
+    receive
+        {'DOWN', Ref, process, PID, Reason} -> ?assertEqual(normal, Reason)
+    after 1000 ->
+        ?assert(false)
+    end,
+    ?assertEqual({error, not_found}, read(Store, <<"before">>, #{})),
+    ?assertEqual({ok, <<"new">>}, read(Store, <<"after">>, #{})),
+    stop(Store).
+
 %% @doc Test that lifecycle operations bypass path preprocessing for a store
 %% carrying a prefix.
 prefix_pipeline_stop_test() ->
@@ -1424,6 +1485,43 @@ prefix_pipeline_stop_test() ->
     after 1000 ->
         ?assert(false)
     end.
+
+%% @doc Normalization preserves structured fields without a writable body store.
+normalize_without_body_store_test() ->
+    ID = <<"Zw5s5IwC1EPFMj0FqnBkV5GpR2P39AeJk9Oe57h9Tzs">>,
+    ?assertEqual(
+        {ok, <<"00000391500788188382", ID/binary, "ans104@1.0">>},
+        execute_normalizer(
+            <<"to-key">>,
+            #{ <<"to-key">> => <<"~match@1.0/key">> },
+            #{
+                <<"offset">> => 391500788188382,
+                <<"id">> => ID,
+                <<"commitment-device">> => <<"ans104@1.0">>
+            },
+            #{ <<"store">> => [], <<"on">> => #{} }
+        )
+    ).
+
+%% @doc Listed keys and paired values retain scalar singleton semantics.
+normalize_children_test() ->
+    Opts = #{ <<"store">> => [], <<"linkify-mode">> => false },
+    lists:foreach(
+        fun({Path, Terms}) ->
+            Store = #{ <<"from-key">> => Path, <<"from-value">> => Path },
+            Scalar = fun(Term) ->
+                hb_ao:raw(#{ <<"path">> => Path, <<"0.body">> => Term }, Opts)
+            end,
+            Expected = [begin {ok, Value} = Scalar(Term), Value end || Term <- Terms],
+            ?assertEqual({ok, Expected}, from_children(Store, Terms, Opts)),
+            ?assertEqual({ok, lists:zip(Expected, Expected)},
+                from_children(Store, lists:zip(Terms, Terms), Opts))
+        end,
+        [{<<"~message@1.0/body">>, [<<"abc">>, <<0, 255>>, 17, [<<"a">>]]},
+            {<<"~message@1.0&body=fixed/body">>, [<<"abc">>]},
+            {<<"~message@1.0/set&value=constant/body">>, [<<"abc">>]},
+            {<<"~message@1.0&ao-types=body%3D%22integer%22/body">>, [<<"12">>]}]
+    ).
 
 %% @doc Test that `to-key' and `to-value' rewrite a request's paths and
 %% values ahead of the store -- for writes and reads alike -- and that
@@ -1508,9 +1606,14 @@ normalize_pipeline_test() ->
         {ok, [hb_util:encode(<<"a">>)]},
         list([Store], <<"b64/", EncodedGroup/binary>>, #{})
     ),
+    BatchStore = Store#{ <<"from-list">> => <<"~message@1.0/body">> },
+    ?assertEqual(
+        {ok, [<<"a">>]},
+        list([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
+    ),
     ?assertEqual(
         {composite, [hb_util:encode(<<"a">>)]},
-        read([Store], <<"b64/", EncodedGroup/binary>>, #{})
+        read([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
     ),
     ?assertEqual(
         {ok, <<"b64/", EncodedChild/binary>>},

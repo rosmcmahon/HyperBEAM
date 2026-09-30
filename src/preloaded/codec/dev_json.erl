@@ -8,6 +8,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
+-define(MAX_SAFE_INTEGER, 9007199254740991).
+
 %% @doc Return the content type for the codec.
 content_type(_) -> {ok, <<"application/json">>}.
 
@@ -19,8 +21,14 @@ to_hint(Msg, Req, Opts) ->
     end.
 
 %% @doc Encode a message to a JSON string, using JSON-native typing.
-to(Msg, _Req, _Opts) when is_binary(Msg) ->
-    {ok, hb_util:bin(json:encode(Msg))};
+-spec to(
+    binary() | number() | boolean() | null | #{ _ => _ },
+    #{ bundle => boolean(), _ => _ },
+    #{ _ => _ }
+) -> {ok, binary()}.
+to(Msg, _Req, _Opts) when is_binary(Msg); is_number(Msg);
+        Msg =:= true; Msg =:= false; Msg =:= null ->
+    {ok, hb_util:bin(json:encode(safe_numbers(Msg, #{})))};
 to(Msg, Req, Opts) ->
     ConvOpts = Opts#{ <<"hashpath">> => ignore },
     HintedReq = hb_util:ok(to_hint(Msg, Req, Opts)),
@@ -53,9 +61,56 @@ to(Msg, Req, Opts) ->
             },
             ConvOpts
         ),
-    {ok, hb_json:encode(JSONStructured)}.
+    {ok, hb_json:encode(safe_numbers(JSONStructured, ConvOpts))}.
+
+%% @doc Preserve integers outside JSON consumers' exact range as typed strings.
+safe_numbers(Value, _) when is_integer(Value), abs(Value) > ?MAX_SAFE_INTEGER ->
+    integer_to_binary(Value);
+safe_numbers(List, Opts) when is_list(List) ->
+    case lists:any(
+        fun(V) -> is_integer(V) andalso abs(V) > ?MAX_SAFE_INTEGER end, List
+    ) of
+        true ->
+            safe_numbers(
+                (hb_util:list_to_numbered_message(List))#{
+                    <<"ao-types">> => <<".=\"list\"">>
+                },
+                Opts
+            );
+        false -> [safe_numbers(V, Opts) || V <- List]
+    end;
+safe_numbers(Map, Opts) when is_map(Map) ->
+    {ok, Types} = hb_ao:raw(
+        <<"structured@1.0">>, <<"decode-types">>, Map, #{}, Opts
+    ),
+    {Values, NewTypes} = maps:fold(
+        fun(Key, Value, {Acc, AccTypes}) ->
+            NextTypes =
+                case is_integer(Value) andalso abs(Value) > ?MAX_SAFE_INTEGER of
+                    true -> AccTypes#{ Key => <<"integer">> };
+                    false -> AccTypes
+                end,
+            {Acc#{ Key => safe_numbers(Value, Opts) }, NextTypes}
+        end,
+        {#{}, Types},
+        Map
+    ),
+    case NewTypes =:= Types of
+        true -> Values;
+        false ->
+            {ok, EncodedTypes} = hb_ao:raw(
+                <<"structured@1.0">>, <<"encode-types">>, NewTypes, #{}, Opts
+            ),
+            Values#{ <<"ao-types">> => EncodedTypes }
+    end;
+safe_numbers(Value, _) -> Value.
 
 %% @doc Decode a JSON string to a message.
+-spec from(
+    binary() | #{ _ => _ },
+    #{ 'accept-codec' => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 from(Map, _Req, _Opts) when is_map(Map) -> {ok, Map};
 from(JSON, Req, Opts) ->
     ConvOpts = Opts#{ <<"hashpath">> => ignore },
@@ -89,6 +144,7 @@ from(JSON, Req, Opts) ->
     end.
 
 %% @doc Route commitments through `httpsig@1.0'.
+-spec commit(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 commit(Msg, Req, Opts) ->
     {ok,
         hb_message:commit(
@@ -99,6 +155,7 @@ commit(Msg, Req, Opts) ->
     }.
 
 %% @doc Route verification through `httpsig@1.0'.
+-spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 verify(Msg, Req, Opts) ->
     {ok,
         hb_message:verify(
@@ -108,12 +165,16 @@ verify(Msg, Req, Opts) ->
         )
     }.
 
+-spec committed(binary() | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> [binary()].
 committed(Msg, Req, Opts) when is_binary(Msg) ->
     committed(hb_util:ok(from(Msg, Req, Opts)), Req, Opts);
 committed(Msg, _Req, Opts) ->
     hb_message:committed(Msg, all, Opts).
 
 %% @doc Deserialize the JSON string found at the given path.
+-spec deserialize(#{ _ => _ }, #{ target => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}
+    | {error, #{ status := integer(), body := binary(), _ => _ }}.
 deserialize(Base, Req, Opts) ->
     Payload = 
         hb_ao:get(
@@ -141,6 +202,8 @@ deserialize(Base, Req, Opts) ->
     end.
 
 %% @doc Serialize a message to a JSON string.
+-spec serialize(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ 'content-type' := binary(), body := binary(), _ => _ }}.
 serialize(Base, Msg, Opts) ->
     {ok,
         #{
@@ -150,6 +213,79 @@ serialize(Base, Msg, Opts) ->
     }.
 
 %%% Tests
+
+%% @doc JSON reads preserve scalar values; unsupported chaining is a 400.
+scalar_http_read_test() ->
+    Node = hb_http_server:start_node(#{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"test-integer">> => 42,
+        <<"test-name">> => <<"ASSET">>,
+        <<"test-large">> => 9007199254740993
+    }),
+    lists:foreach(
+        fun({Key, Expected}) ->
+            Req = #{
+                peer => Node,
+                path => <<"/~meta@1.0/info/", Key/binary>>,
+                method => <<"GET">>,
+                headers => #{ <<"accept">> => <<"application/json">> },
+                body => <<>>
+            },
+            {ok, 200, _, JSON} = hb_http_client:request(Req, #{}),
+            ?assertEqual(Expected, maps:get(<<"body">>, json:decode(JSON))),
+            lists:foreach(
+                fun(Suffix) ->
+                    ?assertMatch({ok, 400, _, _}, hb_http_client:request(
+                        Req#{ path => <<"/~meta@1.0/info/", Key/binary,
+                            Suffix/binary>> }, #{}
+                    ))
+                end,
+                [<<"/~json@1.0/serialize">>, <<"/serialize~json@1.0">>]
+            )
+        end,
+        [{<<"test-integer">>, 42}, {<<"test-name">>, <<"ASSET">>},
+            {<<"test-large">>, <<"9007199254740993">>}]
+    ).
+
+large_integer_roundtrip_test() ->
+    Big = ?MAX_SAFE_INTEGER + 2,
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => hb_test_utils:test_store()
+    },
+    Msg = #{
+        <<"balance">> => Big,
+        <<"negative">> => -Big,
+        <<"safe">> => ?MAX_SAFE_INTEGER,
+        <<"nested">> => [Big, #{ <<"amount">> => Big, <<"state">> => ok }]
+    },
+    Signed = hb_message:commit(Msg, Opts, #{ <<"bundle">> => true }),
+    JSON = hb_message:convert(Signed, <<"json@1.0">>, Opts),
+    Parsed = json:decode(JSON),
+    ?assertEqual(integer_to_binary(Big), maps:get(<<"balance">>, Parsed)),
+    ?assertEqual(integer_to_binary(-Big), maps:get(<<"negative">>, Parsed)),
+    ?assertEqual(?MAX_SAFE_INTEGER, maps:get(<<"safe">>, Parsed)),
+    Decoded = hb_message:convert(
+        JSON, <<"structured@1.0">>, <<"json@1.0">>, Opts
+    ),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Signed, Decoded, strict, Opts)),
+    {ok, #{ <<"body">> := Scalar }} = hb_ao:raw(
+        <<"json@1.0">>, <<"serialize">>, Big, #{}, Opts
+    ),
+    ?assertEqual(integer_to_binary(Big), json:decode(Scalar)).
+
+scalar_serialization_test() ->
+    lists:foreach(
+        fun(Value) ->
+            {ok, Result} = hb_ao:raw(
+                <<"json@1.0">>, <<"serialize">>, Value, #{}, #{}
+            ),
+            ?assertEqual(<<"application/json">>, maps:get(<<"content-type">>, Result)),
+            ?assertEqual(Value, json:decode(maps:get(<<"body">>, Result)))
+        end,
+        [42, -1, 1.5, true, false, null, <<"ASSET">>]
+    ).
 
 decode_with_atom_test() ->
     JSON =

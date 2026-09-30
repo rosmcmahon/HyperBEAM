@@ -325,6 +325,7 @@ decode(Type, Value) when is_binary(Type) ->
     );
 decode(integer, Value) ->
     {item, Number, _} = hb_structured_fields:parse_item(Value),
+    true = is_integer(Number),
     Number;
 decode(float, Value) ->
     binary_to_float(Value);
@@ -430,7 +431,11 @@ deep_set([Key], Value, Msg, Opts) ->
             Msg#{ Key => Value }
     end;
 deep_set([Key|Rest], Value, Map, Opts) ->
-    SubMap = hb_maps:get(Key, Map, #{}, Opts),
+    SubMap =
+        case hb_maps:get(Key, Map, #{}, Opts) of
+            Existing when is_map(Existing) -> Existing;
+            _ -> #{}
+        end,
     hb_maps:put(Key, deep_set(Rest, Value, SubMap, Opts), Map, Opts).
 
 %% @doc Get a deep value from a message.
@@ -446,7 +451,7 @@ deep_get([Key|Rest], Msg, Default, Opts) ->
     case hb_maps:find(Key, Msg, Opts) of
         {ok, DeepMsg} when is_map(DeepMsg) ->
             deep_get(Rest, DeepMsg, Default, Opts);
-        error -> Default
+        _ -> Default
     end.
 
 %% @doc Find the target path to route for a request message.
@@ -919,19 +924,16 @@ ok_or_throw(_TX, false, Error) ->
     throw(Error).
 
 %% @doc List the loaded atoms in the Erlang VM.
-all_atoms() -> all_atoms(0).
-all_atoms(N) ->
-    case atom_from_int(N) of
-        not_found -> [];
-        A -> [A | all_atoms(N+1)]
-    end.
+all_atoms() ->
+    [
+        atom_from_int(N)
+    ||
+        N <- lists:seq(0, erlang:system_info(atom_count) - 1)
+    ].
 
 %% @doc Find the atom with the given integer reference.
 atom_from_int(Int) ->
-    case catch binary_to_term(<<131,75,Int:24>>) of
-        A -> A;
-        _ -> not_found
-    end.
+    binary_to_term(<<131,75,Int:24>>).
 
 %% @doc Check if a given binary is already an atom.
 binary_is_atom(X) ->
@@ -980,6 +982,24 @@ atom_to_dashed_binary(Key) when is_atom(Key) ->
 
 atom_to_dashed_binary_test_parallel() ->
     ?assertEqual(atom_to_dashed_binary(atom_1), <<"atom-1">>).
+
+%% @doc Every atom of the VM is listed.
+all_atoms_test() ->
+    Count = erlang:system_info(atom_count),
+    ?assert(length(all_atoms()) >= Count).
+
+%% @doc Setting a deep key over a path that contains a literal replaces the
+%% literal with a message. Getting a deep key over that path returns the
+%% default.
+deep_literal_test() ->
+    ?assertEqual(
+        #{ <<"a">> => #{ <<"b">> => 2 } },
+        deep_set([<<"a">>, <<"b">>], 2, #{ <<"a">> => 1 }, #{})
+    ),
+    ?assertEqual(
+        not_found,
+        deep_get([<<"a">>, <<"b">>], #{ <<"a">> => 1 }, #{})
+    ).
 
 message_to_ordered_list_metadata_test() ->
     Msg = #{

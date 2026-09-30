@@ -60,11 +60,14 @@
 -export([convert/3, convert/4, uncommitted/1, uncommitted/2, committed/3]).
 -export([add_bundle_hint/2, add_bundle_hint/3]).
 -export([with_only_committers/2, with_only_committers/3, commitment_devices/2]).
--export([verify/1, verify/2, verify/3, paranoid_verify/2, paranoid_verify/3]).
+-export([verify/1, verify/2, verify/3, deep_verify/2]).
+-export([paranoid_verify/2, paranoid_verify/3]).
 -export([commit/2, commit/3, signers/2, type/1, minimize/1]).
--export([normalize_commitments/2, normalize_commitments/3, is_signed_key/3]).
+-export([normalize_commitments/2, normalize_commitments/3]).
+-export([normalize_commitments/4, is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
--export([with_only_committed/2, without_unless_signed/3]).
+-export([with_only_committed/2, with_links/3, without_unless_signed/3]).
+-export([without_commitments_unless_verified/2]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -182,8 +185,11 @@ from_tabm(Msg, TargetFormat, OldPriv, Opts) ->
     end.
 
 %% @doc Add the existing `priv' sub-map back to a converted message, honoring
-%% any existing `priv' sub-map that may already be present.
-restore_priv(Msg, EmptyPriv, _Opts) when map_size(EmptyPriv) == 0 -> Msg;
+%% any existing `priv' sub-map that may already be present. A `priv' key that
+%% holds a literal is not a sub-map, and is not restored.
+restore_priv(Msg, OldPriv, _Opts)
+        when not is_map(OldPriv); map_size(OldPriv) == 0 ->
+    Msg;
 restore_priv(Msg, OldPriv, Opts) ->
     MsgPriv = hb_maps:get(<<"priv">>, Msg, #{}, Opts),
     ?event_debug({restoring_priv, {priv_msg, MsgPriv}, {priv_old, OldPriv}}),
@@ -247,24 +253,33 @@ id(Msg, RawCommitters, Opts) ->
 %% @doc Normalize the IDs in a message, ensuring that there is at least one
 %% unsigned ID present. By forcing this work to occur in strategically positioned
 %% places, we avoid the need to recalculate the IDs for every `hb_message:id`
-%% call.
+%% call. The mode sets how far the existing commitments are trusted: `passive'
+%% adds an unsigned commitment only where none exists; `verify' recomputes the
+%% unsigned commitment and drops every commitment if the committed keys no
+%% longer match it; `fast' verifies unless `priv/last-phash2' shows that the
+%% message is unchanged since it was last normalized. `deep' normalizes every
+%% nested message as well, `shallow' only the message itself.
 normalize_commitments(Msg, Opts) ->
     normalize_commitments(Msg, Opts, passive).
-normalize_commitments(Msg, Opts, Mode) when is_map(Msg) ->
+normalize_commitments(Msg, Opts, Mode) ->
+    normalize_commitments(Msg, Opts, Mode, deep).
+normalize_commitments(Msg, Opts, Mode, deep) when is_map(Msg) ->
     ?event_debug(debug_normalize_commitments, {normalize_commitments, {msg, Msg}}),
     NormMsg = 
         maps:map(
             fun(Key, Val) when Key == <<"commitments">> orelse Key == <<"priv">> ->
                 Val;
-               (_Key, Val) -> normalize_commitments(Val, Opts, Mode)
+               (_Key, Val) -> normalize_commitments(Val, Opts, Mode, deep)
             end,
             Msg
         ),
     do_normalize_commitments(NormMsg, Opts, Mode);
-normalize_commitments(Msg, Opts, Mode) when is_list(Msg) ->
+normalize_commitments(Msg, Opts, Mode, deep) when is_list(Msg) ->
     ?event_debug(debug_normalize_commitments, {normalize_commitments, {list, Msg}}),
-    lists:map(fun(X) -> normalize_commitments(X, Opts, Mode) end, Msg);
-normalize_commitments(Msg, _Opts, _Mode) ->
+    lists:map(fun(X) -> normalize_commitments(X, Opts, Mode, deep) end, Msg);
+normalize_commitments(Msg, Opts, Mode, shallow) when is_map(Msg) ->
+    do_normalize_commitments(Msg, Opts, Mode);
+normalize_commitments(Msg, _Opts, _Mode, _Depth) ->
     Msg.
 
 do_normalize_commitments(Msg, _Opts, _Mode) when ?IS_EMPTY_MESSAGE(Msg) ->
@@ -283,21 +298,7 @@ do_normalize_commitments(Msg, Opts, passive) ->
         {maybe_signed_commitment, SignedCommitments}
     }),
     case {UnsignedCommitments, SignedCommitments} of
-        {[], _} ->
-            {ok, #{ <<"commitments">> := NewCommitments }} =
-                hb_ao:raw(
-                    <<"message@1.0">>,
-                    <<"commit">>,
-                    uncommitted(Msg),
-                    #{ <<"type">> => <<"unsigned">> },
-                    Opts
-                ),
-            MergedCommitments = hb_maps:merge(
-                NewCommitments,
-                hb_maps:from_list(SignedCommitments),
-                Opts
-            ),
-            Msg#{ <<"commitments">> => MergedCommitments };
+        {[], _} -> with_unsigned_commitment(Msg, Opts);
         _ -> Msg
     end;
 do_normalize_commitments(Msg, Opts, verify) ->
@@ -305,7 +306,7 @@ do_normalize_commitments(Msg, Opts, verify) ->
     {MaybeUnsignedID, MaybeCommittedSpec} =
         case UnsignedCommitment of
             {ok, ID, #{ <<"committed">> := Committed }} ->
-                {ID, #{ <<"committed">> => Committed }};
+                {ID, committed_spec(Committed, Msg, Opts)};
             _ -> {undefined, #{}}
         end,
     {ok, #{ <<"commitments">> := NormCommitments }} =
@@ -320,19 +321,10 @@ do_normalize_commitments(Msg, Opts, verify) ->
     [NormID] = hb_maps:keys(NormCommitments, Opts),
     case {MaybeUnsignedID, NormID} of
         {MatchedID, MatchedID} ->
-            Msg;
+            attach_phash2(Msg, Opts);
         {undefined, _NewID} ->
             % We did not have an unsigned ID to begin with, so we need to add it.
-            attach_phash2(
-                Msg#{
-                    <<"commitments">> =>
-                        hb_maps:merge(
-                            NormCommitments,
-                            hb_maps:get(<<"commitments">>, Msg, #{}, Opts)
-                        )
-                },
-                Opts
-            );
+            attach_phash2(with_unsigned_commitment(Msg, Opts), Opts);
         {_OldID, _NewID} ->
             {ok, #{ <<"commitments">> := NewCommitments }} =
                 hb_ao:raw(
@@ -357,13 +349,66 @@ do_normalize_commitments(Msg, Opts, fast) when is_map(Msg) ->
     ),
     case hb_private:get(<<"last-phash2">>, Msg, not_found, Opts) of
         not_found ->
-            attach_phash2(Msg, ExpectedHash, Opts);
+            do_normalize_commitments(Msg, Opts, verify);
         ExpectedHash ->
             Msg;
         _DifferingHash ->
             MsgWithHash = attach_phash2(Msg, ExpectedHash, Opts),
             do_normalize_commitments(MsgWithHash, Opts, verify)
     end.
+
+%% @doc Add the unsigned commitment to a message that has none. A cache write
+%% trusts the unsigned commitment and links every commitment ID of the message
+%% to the content, so a signed commitment that does not verify is dropped
+%% before the unsigned commitment is added: no ID is linked to content that
+%% its commitment does not cover.
+with_unsigned_commitment(Msg, Opts) ->
+    Held = without_commitments_unless_verified(Msg, Opts),
+    {ok, #{ <<"commitments">> := Unsigned }} =
+        hb_ao:raw(
+            <<"message@1.0">>,
+            <<"commit">>,
+            uncommitted(Held, Opts),
+            #{ <<"type">> => <<"unsigned">> },
+            Opts
+        ),
+    Held#{
+        <<"commitments">> =>
+            hb_maps:merge(
+                Unsigned,
+                hb_maps:get(<<"commitments">>, Held, #{}, Opts),
+                Opts
+            )
+    }.
+
+%% @doc The message with its signed commitments if every one of them
+%% verifies, and without any commitment otherwise: a commitment that does not
+%% verify is not kept.
+without_commitments_unless_verified(Msg, Opts) ->
+    case signers(Msg, Opts) of
+        [] -> Msg;
+        _ ->
+            case verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts) of
+                true -> Msg;
+                false -> uncommitted(Msg, Opts)
+            end
+    end.
+
+%% @doc The spec to regenerate the unsigned commitment of a message with. A
+%% commitment that lists a key the message lacks is not a commitment over the
+%% message: the unsigned commitment is regenerated over the keys the message
+%% carries, so its ID differs and every commitment is dropped.
+committed_spec(Committed, Msg, Opts) ->
+    Keys = hb_util:message_to_ordered_list(Committed, Opts),
+    case lists:all(fun(Key) -> is_key_present(Key, Msg) end, Keys) of
+        true -> #{ <<"committed">> => Committed };
+        false -> #{}
+    end.
+
+%% @doc Whether a message carries a key, directly or as a link.
+is_key_present(Key, Msg) ->
+    Base = hb_link:remove_link_specifier(Key),
+    maps:is_key(Base, Msg) orelse maps:is_key(<<Base/binary, "+link">>, Msg).
 
 %% @doc Annotate a message with its phash2 value in the `priv' sub-map,
 %% calculating it if necessary.
@@ -566,7 +611,7 @@ verify(Msg, Spec, Opts) ->
         hb_ao:raw(<<"message@1.0">>, <<"verify">>, Msg, Spec, Opts),
     Res.
 
-%% @doc Verify a message recursively, including all nested messages.
+%% @doc Verify a message and its loaded children, without traversing links.
 paranoid_verify(Msg, Opts) ->
     paranoid_verify(default, Msg, Opts).
 paranoid_verify(Topic, Msg, Opts) ->
@@ -591,52 +636,53 @@ paranoid_verify(Topic, Msg, Opts) ->
     end.
 
 do_paranoid_verify(Topic, Msg, Opts) ->
-    try
-        do_paranoid_verify(Topic, [], Msg, Opts),
+    maybe
+        true ?= deep_verify(Msg, Opts),
         ?event_debug(debug_paranoia, {paranoid_verify_complete, ok}, Opts),
         true
-    catch
-        throw:{verification_failure, _Topic, RawPath, FailedMsg, Details, Stack} ->
-            Path = hb_path:to_binary(RawPath),
+    else
+        {false, Path, FailedMsg} ->
             ?event(error,
                 {paranoid_verification_failure,
                     {triggered_by, Topic},
                     {at_path, Path},
                     {failed_message, FailedMsg},
-                    {while_verifying, Msg},
-                    {details, Details},
-                    {stack, {trace, Stack}}
+                    {while_verifying, Msg}
                 },
-                Opts#{
-                    <<"paranoid-verify">> => false
-                }
+                Opts#{ <<"paranoid-verify">> => false }
             ),
             throw({paranoid_verification_failure, Topic, Path, Msg, FailedMsg})
     end.
-do_paranoid_verify(Topic, Path, {_Status, Msg}, Opts) ->
-    do_paranoid_verify(Topic, Path, Msg, Opts);
-do_paranoid_verify(Topic, Path, Link, Opts) when ?IS_LINK(Link) ->
-    case hb_opts:get(paranoid_verify_links, true, Opts) of
-        false -> true;
-        true ->
-            do_paranoid_verify(Topic, Path, hb_cache:ensure_loaded(Link, Opts), Opts)
+
+%% @doc Verify all commitments of a message and its loaded children, without
+%% traversing links. Return `true' or `{false, Path, MsgAtFault}'.
+deep_verify(Msg, Opts) ->
+    deep_verify([], Msg, Opts).
+deep_verify(Path, {_Status, Msg}, Opts) ->
+    deep_verify(Path, Msg, Opts);
+deep_verify(Path, ListMsg, Opts) when is_list(ListMsg) ->
+    deep_verify(Path, hb_util:list_to_numbered_message(ListMsg), Opts);
+deep_verify(Path, Msg, Opts) when is_map(Msg) ->
+    maybe
+        true ?=
+            maps:fold(
+                fun(Key, Value, true) ->
+                    deep_verify(Path ++ [Key], Value, Opts);
+                   (_, _, Failure) -> Failure
+                end,
+                true,
+                uncommitted(hb_private:reset(Msg), Opts)
+            ),
+        Verified =
+            try verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts)
+            catch _:_ -> false
+            end,
+        case Verified of
+            true -> true;
+            false -> {false, hb_path:to_binary(Path), Msg}
+        end
     end;
-do_paranoid_verify(Topic, Path, ListMsg, Opts) when is_list(ListMsg) ->
-    do_paranoid_verify(Topic, Path, hb_util:list_to_numbered_message(ListMsg), Opts);
-do_paranoid_verify(Topic, Path, Msg, Opts) when is_map(Msg) ->
-    hb_maps:map(
-        fun(Key, Value) ->
-            do_paranoid_verify(Topic, Path ++ [Key], Value, Opts)
-        end,
-        uncommitted(hb_private:reset(Msg), Opts),
-        Opts
-    ),
-    try true = verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts)
-    catch
-        _:Details:St ->
-            throw({verification_failure, Topic, Path, Msg, Details, St})
-    end;
-do_paranoid_verify(_Topic, _Path, _Msg, _Opts) ->
+deep_verify(_Path, _Msg, _Opts) ->
     true.
 
 %% @doc Return the unsigned version of a message in AO-Core format.
@@ -752,8 +798,7 @@ unsafe_match(RawMap1, RawMap2, Mode, Path, Opts) ->
                     normalize(
                         hb_ao:normalize_keys(Map1, Opts),
                         Opts
-                    ),
-                    [<<"content-type">>, <<"ao-body-key">>]
+                    )
                 )
         ),
     Keys2 =
@@ -763,8 +808,7 @@ unsafe_match(RawMap1, RawMap2, Mode, Path, Opts) ->
                     normalize(
                         hb_ao:normalize_keys(Map2, Opts),
                         Opts
-                    ),
-                    [<<"content-type">>, <<"ao-body-key">>]
+                    )
                 )
         ),
     PrimaryKeysPresent =
@@ -916,7 +960,8 @@ without_commitments(Spec, Msg = #{ <<"commitments">> := Commitments }, Opts) ->
                     Opts
                 )
             ),
-            Commitments
+            Commitments,
+            Opts
         ),
     ?event_debug({without_commitments, {filtered_commitments, FilteredCommitments}}),
     Msg#{ <<"commitments">> => FilteredCommitments };

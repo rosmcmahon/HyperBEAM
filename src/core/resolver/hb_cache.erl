@@ -9,13 +9,11 @@
 %%%
 %%% 1. The raw binary data, written to the store at the hash of the content.
 %%%    Storing binary paths in this way effectively deduplicates the data.
-%%% 2. The hashpath-graph of all content, stored as a set of links between
-%%%    hashpaths, their keys, and the data that underlies them. This allows
-%%%    all messages to share the same hashpath space, such that all requests
-%%%    from users additively fill-in the hashpath space, minimizing duplicated
-%%%    compute.
-%%% 3. Messages, referrable by their IDs (committed or uncommitted). These are
-%%%    stored as a set of links commitment IDs and the uncommitted message.
+%%% 2. Messages, stored as links from their IDs and keys to underlying data
+%%%    or child messages. Commitment IDs link to the message's content root.
+%%% 3. Computations, stored separately in `attested-store' as links from
+%%%    `VBaseID/VReqID' to `VResID'. Portable hashpath receipts describe the
+%%%    execution and its witnesses independently of these lookup entries.
 %%%
 %%% Before writing a message to the store, we convert it to Type-Annotated
 %%% Binary Messages (TABMs), such that each of the keys in the message is
@@ -40,7 +38,7 @@
 -module(hb_cache).
 -export([read_all_commitments/2]).
 -export([ensure_loaded/1, ensure_loaded/2, ensure_all_loaded/1, ensure_all_loaded/2]).
--export([read/2, read_resolved/3, write/2, write_binary/3, write_hashpath/2, link/3]).
+-export([read/2, read_resolved/3, write/2, link/3]).
 -export([match/2, list/2, list_numbered/2]).
 -export([test_unsigned/1, test_signed/1]).
 -include("include/hb.hrl").
@@ -59,13 +57,18 @@ ensure_loaded(Msg, Opts) ->
     ensure_loaded([], Msg, Opts).
 ensure_loaded(Ref, {Status, Msg}, Opts) when Status == ok; Status == error ->
     {Status, ensure_loaded(Ref, Msg, Opts)};
+ensure_loaded(Ref, {link, ID, LinkOpts = #{ <<"execution-input">> := true }}, Opts) ->
+    hb_ao:execution_input(
+        ensure_loaded(Ref,
+            {link, ID, maps:remove(<<"execution-input">>, LinkOpts)}, Opts),
+        Opts
+    );
 ensure_loaded(Ref,
         Lk = {link, ID, LkOpts = #{ <<"type">> := <<"link">>, <<"lazy">> := Lazy }},
         RawOpts) ->
     % The link is to a submessage; either in lazy (unresolved) form, or direct
     % form.
-    UnscopedOpts = hb_util:deep_merge(RawOpts, LkOpts, RawOpts),
-    Opts = hb_store:scope(UnscopedOpts, hb_opts:get(scope, local, LkOpts)),
+    Opts = link_opts(LkOpts, RawOpts),
     _Store = hb_opts:get(store, no_viable_store, Opts),
     ?event_debug(debug_cache,
         {loading_multi_link,
@@ -97,10 +100,15 @@ ensure_loaded(Ref,
                             Next,
                             #{
                                 <<"type">> => <<"link">>,
-                                <<"lazy">> => false
+                                <<"lazy">> => false,
+                                <<"store">> =>
+                                    lists:flatten([
+                                        hb_opts:get(store, [], Opts),
+                                        hb_opts:get(store, [], RawOpts)
+                                    ])
                             }
                         },
-                        Opts
+                        RawOpts
                     );
                 false ->
                     % The already had the ID of the submessage, so now we have
@@ -108,13 +116,13 @@ ensure_loaded(Ref,
                     Next
             end;
         {error, not_found} ->
-            report_ensure_loaded_not_found(Ref, Lk, Opts)
+            report_ensure_loaded_not_found(Ref, Lk, Opts);
+        {error, Reason} -> erlang:error(Reason)
     end;
 ensure_loaded(Ref, Link = {link, ID, LinkOpts = #{ <<"lazy">> := true }}, RawOpts) ->
     % If the user provided their own options, we merge them and _overwrite_
     % the options that are already set in the link.
-    UnscopedOpts = hb_util:deep_merge(RawOpts, LinkOpts, RawOpts),
-    Opts = hb_store:scope(UnscopedOpts, hb_opts:get(scope, local, LinkOpts)),
+    Opts = link_opts(LinkOpts, RawOpts),
     CacheReadResult = 
         case hb_opts:get(commitment, undefined, Opts) of
             true ->
@@ -136,12 +144,24 @@ ensure_loaded(Ref, Link = {link, ID, LinkOpts = #{ <<"lazy">> := true }}, RawOpt
                 Type -> hb_util:decode(Type, LoadedMsg)
             end;
         {error, not_found} ->
-            report_ensure_loaded_not_found(Ref, Link, Opts)
+            report_ensure_loaded_not_found(Ref, Link, Opts);
+        {error, Reason} -> erlang:error(Reason)
     end;
 ensure_loaded(Ref, {link, ID, LinkOpts}, Opts) ->
 	ensure_loaded(Ref, {link, ID, LinkOpts#{ <<"lazy">> => true}}, Opts);
 ensure_loaded(_Ref, Msg, _Opts) when not ?IS_LINK(Msg) ->
     Msg.
+
+link_opts(LinkOpts, RawOpts) ->
+    Opts = hb_util:deep_merge(RawOpts, LinkOpts, RawOpts),
+    case hb_opts:get(store, not_found, LinkOpts#{ <<"only">> => local }) of
+        not_found ->
+            hb_store:scope(
+                Opts,
+                hb_opts:get(scope, hb_opts:get(scope, local, RawOpts), LinkOpts)
+            );
+        _ -> Opts
+    end.
 
 %% @doc Report that a value was not found in the cache. If a key is provided,
 %% we report that the key was not found, otherwise we report that the link was
@@ -235,10 +255,12 @@ normalize_match_spec(MatchSpec, _ReadMode, Opts) ->
 %% @doc Match using the store's reverse index.
 store_match(NormalizedSpec, Opts) ->
     ConvertedMatchSpec =
-        maps:map(
-            fun(Key, Value) -> store_match_value(Key, Value, Opts) end,
-            NormalizedSpec
-        ),
+        maps:from_list([
+            {hb_escape:encode_path_component(Key),
+                store_match_value(Key, Value, Opts)}
+        ||
+            {Key, Value} <- maps:to_list(NormalizedSpec)
+        ]),
     case hb_store:match(
         hb_opts:get(store, no_viable_store, Opts),
         ConvertedMatchSpec,
@@ -265,8 +287,8 @@ generate_binary_path(Bin, Opts) ->
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    hb_message:paranoid_verify(cache_write, RawMsg, Opts),
-    {ok, Msg} = hb_message:with_only_committed(RawMsg, Opts),
+    Msg = verified_unsigned(RawMsg, Opts),
+    hb_message:paranoid_verify(cache_write, Msg, Opts),
     TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
     ?event_debug(debug_cache, {writing_full_message, {msg, TABM}}),
     try
@@ -293,6 +315,56 @@ write(List, Opts) when is_list(List) ->
     write(hb_message:convert(List, tabm, <<"structured@1.0">>, Opts), Opts);
 write(Bin, Opts) when is_binary(Bin) ->
     do_write_message(Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
+
+%% @doc Re-check the unsigned commitment that a write would trust as the
+%% address of a message, unless `priv/last-phash2' shows that the message is
+%% unchanged since it was normalized. A message without an unsigned
+%% commitment is written as it is, its ID calculated from its content. The
+%% write links the ID of each signed commitment to the content, so such a
+%% commitment is kept only if it verifies.
+verified_unsigned(Msg, Opts) ->
+    % The nested messages are held to the same rule first: the write links a
+    % nested message by the IDs it is stored under, so its commitments must be
+    % settled before the message that carries it is.
+    Deep =
+        maps:map(
+            fun(Key, Value) ->
+                case hb_private:is_private(Key) orelse Key == <<"commitments">> of
+                    true -> Value;
+                    false -> verified_unsigned_value(Value, Opts)
+                end
+            end,
+            Msg
+        ),
+    Verified =
+        case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Deep, Opts) of
+            not_found -> hb_message:without_commitments_unless_verified(Deep, Opts);
+            _ -> hb_message:normalize_commitments(Deep, Opts, fast, shallow)
+        end,
+    {ok, Committed} = hb_message:with_only_committed(Verified, Opts),
+    % Projecting to the shared committed keys can invalidate a commitment
+    % covering more fields. Settle that identity before naming this child.
+    case lists:all(fun hb_private:is_private/1,
+            maps:keys(Verified) -- maps:keys(Committed)) of
+        true -> Verified;
+        false ->
+            hb_message:normalize_commitments(
+                hb_message:with_commitments(
+                    #{ <<"committer">> => '_' }, Committed, Opts),
+                Opts#{ <<"commitment-device">> => <<"httpsig@1.0">> },
+                verify,
+                shallow
+            )
+    end.
+
+%% @doc Apply the rule of `verified_unsigned/2' to a nested message, and to
+%% every message of a list.
+verified_unsigned_value(Value, Opts) when is_map(Value) ->
+    verified_unsigned(Value, Opts);
+verified_unsigned_value(Values, Opts) when is_list(Values) ->
+    [ verified_unsigned_value(Value, Opts) || Value <- Values ];
+verified_unsigned_value(Value, _Opts) ->
+    Value.
 
 do_write_message(Bin, Store, Opts) when is_binary(Bin) ->
     % Write the binary in the store at its calculated content-hash.
@@ -391,7 +463,7 @@ write_key_ops(Base, Key, HPAlg, Value, Opts, Acc) ->
     KeyHashPath =
         hb_path:hashpath(
             Base,
-            hb_path:to_binary(Key),
+            hb_escape:encode_path_component(Key),
             HPAlg,
             Opts
         ),
@@ -570,30 +642,11 @@ calculate_all_ids(Msg, UncommittedID, Opts) ->
             {SignedIDs, UnsignedIDs, AllID}
     end.
 
-%% @doc Write a hashpath and its message to the store and link it.
-write_hashpath(Msg = #{ <<"priv">> := #{ <<"hashpath">> := HP } }, Opts) ->
-    write_hashpath(HP, Msg, Opts);
-write_hashpath(MsgWithoutHP, Opts) ->
-    write(MsgWithoutHP, Opts).
-write_hashpath(HP, Msg, Opts) when is_binary(HP) or is_list(HP) ->
-    Store = hb_opts:get(store, no_viable_store, Opts),
-    ?event_debug({writing_hashpath, {hashpath, HP}, {msg, Msg}, {store, Store}}),
-    {ok, Path} = write(Msg, Opts),
-    hb_store:link(Store, #{ hb_path:to_binary(HP) => Path }, Opts),
-    {ok, Path}.
-
-%% @doc Write a raw binary keys into the store and link it at a given hashpath.
-write_binary(Hashpath, Bin, Opts) ->
-    write_binary(Hashpath, Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
-write_binary(Hashpath, Bin, Store, Opts) ->
-    ?event_debug({writing_binary, {hashpath, Hashpath}, {bin, Bin}, {store, Store}}),
-    {ok, Path} = do_write_message(Bin, Store, Opts),
-    hb_store:link(Store, #{ hb_path:to_binary(Hashpath) => Path }, Opts),
-    {ok, Path}.
-
 %% @doc Read the message at a path. Returns in `structured@1.0' format: Either
 %% a richly typed map or a direct binary. If `cache-read-mode' is `raw',
 %% composite reads return lazy links without decoding `ao-types'.
+read(Path, Opts) when ?IS_HASHPATH(Path) ->
+    hb_hashpath:load(Path, Opts);
 read(Path, Opts) ->
     Store = hb_opts:get(store, no_viable_store, Opts),
     case {
@@ -709,7 +762,7 @@ read_resolved_path(Target, ResolvedFullPath, Store, Opts) ->
                         maps:from_list(
                             [
                                 {
-                                    Subpath,
+                                    hb_escape:decode_path_component(Subpath),
                                     {link,
                                         hb_path:to_binary([ResolvedFullPath, Subpath]),
                                         #{ <<"lazy">> => true, <<"store">> => Store }
@@ -820,14 +873,15 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                         }
                     ),
                     SubkeyPath = hb_path:to_binary([RootPath, Subpath]),
-                    case hb_link:is_link_key(Subpath) of
+                    Key = hb_escape:decode_path_component(Subpath),
+                    case hb_link:is_link_key(Key) of
                         false ->
                             % The key is a literal value, not a nested composite
                             % message. Subsequently, we return a resolvable link
                             % to the subpath, leaving the key as-is.
                             LinkOpts =
                                 (case Types of
-                                    #{ Subpath := Type } ->
+                                    #{ Key := Type } ->
                                         % We have an `ao-types' entry for the
                                         % subpath, so the link carries its type
                                         % and resolves lazily to the final value.
@@ -853,7 +907,7 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                                     _ ->
                                         {link, SubkeyPath, LinkOpts}
                                 end,
-                            {true, {Subpath, PreparedValue}};
+                            {true, {Key, PreparedValue}};
                         true ->
                             % The key is an encoded link, so we create a resolvable
                             % link to the underlying link. This requires that we
@@ -863,10 +917,11 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                             % a large quantity.
                             {true,
                                 {
-                                    binary:part(Subpath, 0, byte_size(Subpath) - 5),
+                                    binary:part(Key, 0, byte_size(Key) - 5),
                                     {link, SubkeyPath, #{
                                         <<"type">> => <<"link">>,
-                                        <<"lazy">> => true
+                                        <<"lazy">> => true,
+                                        <<"store">> => Store
                                     }}
                                 }
                             }
@@ -960,16 +1015,16 @@ read_resolved({link, ID, LinkOpts}, Req, Opts) ->
     read_resolved(ID, Req, maps:merge(LinkOpts, Opts));
 read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsgID) ->
     Store = hb_opts:get(store, no_viable_store, Opts),
-    _NormKey = hb_ao:normalize_key(Key, Opts),
+    NormKey = hb_ao:normalize_key(Key, Opts),
     case hb_device:is_direct_key_access(BaseMsgID, Req, Opts, Store) of
         unknown -> miss;
         false ->
             ?event_debug(read_cached,
                 {found_non_message_device,
-                    {key, _NormKey}
+                    {key, NormKey}
                 }
             ),
-            read_hashpath(BaseMsgID, Req, Opts);
+            read_computation(BaseMsgID, Req, Opts);
         true ->
             % Either the message does not exist in the store, or there is no
             % explicit device in the message. If the message exists this implies
@@ -979,10 +1034,14 @@ read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsg
             ?event_debug(read_cached,
                 {skipping_execution_store_lookup,
                     {base_msg, BaseMsgID},
-                    {key, _NormKey}
+                    {key, NormKey}
                 }
             ),
-            case hb_store:resolve(Store, [BaseMsgID, Key], Opts) of
+            case hb_store:resolve(
+                Store,
+                [BaseMsgID, hb_escape:encode_path_component(NormKey)],
+                Opts
+            ) of
                 {ok, KeyPath} -> hashpath_read_result(read(KeyPath, Opts));
                 {error, not_found} -> miss;
                 Other -> {hit, Other}
@@ -993,23 +1052,24 @@ read_resolved(BaseMsg, Req = #{ <<"path">> := Key }, Opts) when is_map(BaseMsg) 
     % and perform a direct lookup if it does not.
     NormKey = hb_ao:normalize_key(Key, Opts),
     case hb_device:is_direct_key_access(BaseMsg, Req, Opts) of
-        false -> read_hashpath(BaseMsg, Req, Opts);
+        false -> read_computation(BaseMsg, Req, Opts);
         true ->
             ?event_debug(read_cached,
                 {skip_execution_memory_lookup,
                     {path, NormKey}
                 }
             ),
-            {hit, read_in_memory_key(BaseMsg, NormKey, Opts)}
+            {hit,
+                read_in_memory_key(
+                    hb_ao:execution_input(BaseMsg, Opts), NormKey, Opts)}
     end;
 read_resolved(Base, Req, Opts) ->
-    read_hashpath(Base, Req, Opts).
+    read_computation(Base, Req, Opts).
 
 %% @doc Return a key from an in-memory message, returning the same form as
 %% a store read (`{Status, Value}').
-read_in_memory_key(BaseMsg, NormKey, _Opts) ->
-    % For now, just wrap maps:find.
-    case maps:find(NormKey, BaseMsg) of
+read_in_memory_key(BaseMsg, NormKey, Opts) ->
+    case hb_maps:find(NormKey, BaseMsg, Opts) of
         error ->
             ?event_debug(read_cached, {key_not_found, {key, NormKey}}),
             {error, not_found};
@@ -1019,15 +1079,19 @@ read_in_memory_key(BaseMsg, NormKey, _Opts) ->
     end.
 
 %% @doc Read the output of a prior computation, given BaseMsg and Req.
-read_hashpath(BaseMsgID, ReqID, Opts) when ?IS_ID(BaseMsgID) and ?IS_ID(ReqID) ->
+read_computation(BaseMsgID, ReqID, Opts) when ?IS_ID(BaseMsgID) and ?IS_ID(ReqID) ->
     ?event_debug({cache_lookup, {base, BaseMsgID}, {req, ReqID}, {opts, Opts}}),
-    hashpath_read_result(read(<<BaseMsgID/binary, "/", ReqID/binary>>, Opts));
-read_hashpath(BaseMsgID, Req, Opts) when ?IS_ID(BaseMsgID) and is_map(Req) ->
-    ReqID = hb_message:id(Req, all, Opts),
-    hashpath_read_result(read(<<BaseMsgID/binary, "/", ReqID/binary>>, Opts));
-read_hashpath(BaseMsg, Req, Opts) when is_map(BaseMsg) and is_map(Req) ->
-    hashpath_read_result(read(hb_path:hashpath(BaseMsg, Req, Opts), Opts));
-read_hashpath(_, _, _) -> miss.
+    Key = <<BaseMsgID/binary, "/", ReqID/binary>>,
+    case hb_store:resolve(hb_opts:get(attested_store, [], Opts), Key, Opts) of
+        {ok, Path} when Path =/= Key ->
+            hashpath_read_result(read(Path, Opts));
+        _ -> miss
+    end;
+read_computation(BaseMsgID, Req, Opts) when ?IS_ID(BaseMsgID) and is_map(Req) ->
+    read_computation(BaseMsgID, hb_message:id(Req, all, Opts), Opts);
+read_computation(BaseMsg, Req, Opts) when is_map(BaseMsg) and is_map(Req) ->
+    read_computation(hb_message:id(BaseMsg, all, Opts), Req, Opts);
+read_computation(_, _, _) -> miss.
 
 hashpath_read_result({ok, Msg}) -> {hit, {ok, Msg}};
 hashpath_read_result({error, not_found}) -> miss;
@@ -1126,6 +1190,27 @@ test_store_ans104_message(Store) ->
     {ok, RetrievedItemU} = read(UncommittedID, Opts),
     ?assert(hb_message:match(Committed, RetrievedItem, strict, Opts)),
     ?assert(hb_message:match(Committed, RetrievedItemU, strict, Opts)),
+    ok.
+
+%% @doc A signed message whose committed key changed after it was signed is
+%% written without its signature: the signed ID is never linked to content
+%% that the signature does not cover, while the message as signed is.
+test_store_modified_signed_message(Store) ->
+    Opts = #{ <<"store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    hb_store:reset(Store),
+    Signed =
+        hb_message:commit(
+            #{ <<"path">> => <<"/~meta@1.0/info">>, <<"x">> => <<"1">> },
+            Opts
+        ),
+    SignedID = hb_message:id(Signed, signed, Opts),
+    {ok, _} = write(Signed#{ <<"x">> => <<"2">> }, Opts),
+    ?assertEqual({error, not_found}, read(SignedID, Opts)),
+    {ok, _} = write(Signed, Opts),
+    {ok, Stored} = read(SignedID, Opts),
+    Loaded = ensure_all_loaded(Stored, Opts),
+    ?assertEqual(<<"1">>, hb_maps:get(<<"x">>, Loaded, not_found, Opts)),
+    ?assert(hb_message:verify(Loaded, all, Opts)),
     ok.
 
 %% @doc Test storing and retrieving a simple unsigned item
@@ -1339,6 +1424,71 @@ test_raw_match_read(Store) ->
         hb_maps:get(<<"body">>, RawMsg, undefined, RawOpts)
     ).
 
+%% @doc Literal path separators and escapes remain distinct from nested keys.
+test_literal_keys(Store) ->
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store, <<"match-index">> => false },
+    Binaries = #{
+        <<"a/b">> => <<"literal slash">>,
+        <<"a%2fb">> => <<"literal escape">>,
+        <<"a%252fb">> => <<"repeated escape">>,
+        <<"%25/">> => <<"adjacent escapes">>,
+        <<"/leading//trailing/">> => binary:copy(<<"large value">>, 10)
+    },
+    Msg = Binaries#{
+        <<"a">> => #{ <<"b">> => <<"nested">> },
+        <<"typed%2fkey">> => 42,
+        <<"empty%2flist">> => [],
+        <<"nested/map">> => #{ <<"inner/key%25">> => [1, 2, 3] }
+    },
+    {ok, ID} = write(Msg, Opts),
+    {ok, Read} = read(ID, Opts),
+    ?assertEqual(Msg, ensure_all_loaded(Read, Opts)),
+    RawOpts = Opts#{ <<"cache-read-mode">> => raw },
+    {ok, Raw} = read(ID, RawOpts),
+    maps:foreach(
+        fun(Key, Value) ->
+            ?assertEqual(Value, hb_maps:get(Key, Raw, RawOpts)),
+            ?assertEqual({hit, {ok, Value}}, read_resolved(ID, Key, Opts)),
+            case map_get(<<"store-module">>, Store) of
+                hb_store_lmdb ->
+                    ?assertEqual({ok, [ID]}, match(#{ Key => Value }, Opts)),
+                    ?assertEqual({ok, [ID]}, match(#{ Key => Value }, RawOpts));
+                _ ->
+                    ok
+            end
+        end,
+        Binaries
+    ).
+
+%% @doc ANS-104 commitments still verify after caching literal slash tags.
+test_signed_literal_keys(Store) ->
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store },
+    Signed =
+        hb_message:commit(
+            #{
+                <<"@kyvejs/protocol">> => <<"1.4.2">>,
+                <<"@kyvejs/tendermint-bsync">> => <<"1.2.11">>,
+                <<"@kyvejs%2fprotocol">> => <<"distinct tag">>,
+                <<"body">> => <<"Signed data">>
+            },
+            #{ <<"priv-wallet">> => ar_wallet:new(ethereum) },
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"type">> => <<"ethereum">>
+            }
+        ),
+    ?assert(hb_message:verify(Signed, all, Opts)),
+    ID = hb_message:id(Signed, signed, Opts),
+    {ok, _} = write(Signed, Opts),
+    {ok, Read} = read(ID, Opts),
+    Loaded = ensure_all_loaded(Read, Opts),
+    ?assertEqual(Signed, Loaded),
+    ?assert(hb_message:verify(Loaded, all, Opts)),
+    ?assertEqual(ID, hb_message:id(Loaded, signed, Opts)),
+    ?assert(is_map(hb_message:convert(Loaded, <<"httpsig@1.0">>, Opts))).
+
 test_immediate_marker_values(Store) ->
     hb_store:reset(Store),
     Opts = #{ <<"store">> => Store, <<"match-index">> => false },
@@ -1400,12 +1550,16 @@ cache_suite_test_() ->
             fun test_store_unsigned_nested_empty_message/1},
         {"store simple unsigned message", fun test_store_simple_unsigned_message/1},
         {"store simple signed message", fun test_store_simple_signed_message/1},
+        {"store modified signed message",
+            fun test_store_modified_signed_message/1},
         {"deeply nested complex message", fun test_deeply_nested_complex_message/1},
         {"message with list", fun test_message_with_list/1},
         {"match message", fun test_match_message/1},
         {"match linked message", fun test_match_linked_message/1},
         {"match typed message", fun test_match_typed_message/1},
         {"raw match read", fun test_raw_match_read/1},
+        {"literal keys", fun test_literal_keys/1},
+        {"signed literal keys", fun test_signed_literal_keys/1},
         {"immediate marker values", fun test_immediate_marker_values/1},
         {"cache-write hook", fun test_cache_write_hook/1}
     ]).
@@ -1439,6 +1593,47 @@ write_with_only_read_only_store_test() ->
     Opts = #{ <<"store">> => [ReadOnlyStore] },
     ?assertMatch({ok, _}, write(<<"some-binary-payload">>, Opts)),
     ?assertMatch({ok, _}, write(#{ <<"hello">> => <<"world">> }, Opts)).
+
+%% @doc Nested links retain their source store outside the caller's store chain.
+isolated_nested_store_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"isolated-nested">>),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store] },
+    Msg = #{ <<"child">> => #{ <<"value">> => <<"nested">> } },
+    {ok, ID} = write(Msg, Opts),
+    {ok, Lazy} = read(ID, Opts),
+    ?assertEqual(Msg, ensure_all_loaded(Lazy, #{ <<"store">> => [] })),
+    ok = hb_store:stop(Store).
+
+%% @doc A message changed after normalization is written under the ID of its
+%% content rather than the ID its stale unsigned commitment names.
+write_changed_normalized_message_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Msg = hb_message:normalize_commitments(#{ <<"a">> => 1 }, Opts),
+    {ok, ID} = write(Msg, Opts),
+    {ok, ChangedID} = write(Msg#{ <<"a">> => 2 }, Opts),
+    ?assertEqual(hb_message:id(#{ <<"a">> => 2 }, all, Opts), ChangedID),
+    {ok, Read} = read(ID, Opts),
+    ?assertEqual(1, hb_maps:get(<<"a">>, Read, undefined, Opts)).
+
+%% @doc Projecting mixed commitments cannot retain an ID covering a removed
+%% field, either at the root or in a child named by its parent.
+projected_commitments_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new() },
+    Signed = hb_message:commit(#{ <<"a">> => <<"1">> }, Opts),
+    Mixed = hb_message:normalize_commitments(Signed#{ <<"extra">> => <<"2">> }, Opts),
+    FullID = hb_message:id(Mixed, unsigned, Opts),
+    lists:foreach(fun(Msg) ->
+        {ok, ID} = write(Msg, Opts),
+        {ok, Stored} = read(ID, Opts),
+        Loaded = ensure_all_loaded(Stored, Opts),
+        ?assert(hb_message:paranoid_verify(Loaded, Opts#{ <<"paranoid-verify">> => true })),
+        ?assertEqual(ID, hb_message:id(hb_message:uncommitted(Loaded, Opts), all, Opts))
+    end, [Mixed, #{ <<"child">> => Mixed }, #{ <<"children">> => [Mixed] }]),
+    {ok, Kept} = read(hb_message:id(Signed, all, Opts), Opts),
+    ?assertEqual(hb_message:signers(Signed, Opts), hb_message:signers(Kept, Opts)),
+    ?assertEqual({error, not_found}, read(FullID, Opts)).
 
 %% @doc Run a specific test with a given store module.
 run_test() ->

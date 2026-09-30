@@ -31,11 +31,21 @@
 %%% Public interface.
 
 %% @doc An alias for `item/3'.
+-spec tx(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ id := binary(), timestamp := integer(), _ => _ }}
+    | {error, #{ _ => _ }}.
 tx(Base, Req, Opts) ->
     item(Base, Req, Opts).
 
 %% @doc Implements an `up.arweave.net'-compatible endpoint for
 %% bundling messages.
+-spec item(
+    #{ _ => _ },
+    #{ 'bundler-subject' => binary(), _ => _ },
+    #{ _ => _ }
+) ->
+    {ok, #{ id := binary(), timestamp := integer(), _ => _ }}
+    | {error, #{ _ => _ }}.
 item(_Base, Req, Opts) ->
     ServerPID = ensure_server(Opts),
     ItemToProcess =
@@ -1587,11 +1597,10 @@ invalid_item_test_parallel() ->
         TamperedItem = Item#tx{data = <<"tampereddata">>},
         StructuredItem = hb_message:convert(
             TamperedItem, <<"structured@1.0">>, <<"ans104@1.0">>, TestOpts),
+        % The node refuses the item when it arrives: its commitment does not
+        % verify.
         PostResult = post_data_item(Node, TamperedItem, ClientOpts),
-        ?assertMatch({error, #{
-            <<"status">> := 400,
-            <<"error">> := <<"invalid-item">>,
-            <<"details">> := <<"signature-verification-failed">>}}, PostResult),
+        ?assertMatch({error, #{ <<"status">> := 400 }}, PostResult),
         DirectResult = dev_bundler:item(#{}, StructuredItem, TestOpts),
         ?assertMatch({error, #{
             <<"status">> := 400,

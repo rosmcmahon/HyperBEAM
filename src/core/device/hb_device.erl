@@ -189,6 +189,10 @@ find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev)
 	end;
 find_exported_function(_Msg, _Mod, _Key, Arity, MinArity, _Opts) when Arity < MinArity ->
     not_found;
+find_exported_function(_Msg, _Mod, module_info, _Arity, _MinArity, _Opts) ->
+    % The Erlang compiler exports `module_info' from every module: it is
+    % never a key of a device.
+    not_found;
 find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) ->
 	case erlang:function_exported(Mod, Key, Arity) of
 		true ->
@@ -285,7 +289,7 @@ do_is_direct_key_access(not_found, Key, Opts) ->
 do_is_direct_key_access(error, Key, Opts) ->
     do_is_direct_key_access(<<"message@1.0">>, Key, Opts);
 do_is_direct_key_access(<<"message@1.0">>, Key, _Opts) ->
-    not lists:member(Key, ?MESSAGE_KEYS);
+    not lists:member(Key, ?MESSAGE_KEYS) andalso not hb_private:is_private(Key);
 do_is_direct_key_access(Dev, NormKey, Opts) ->
     ?event_debug(debug_read_cached, {calculating_info, {device, Dev}}),
     case info(#{ <<"device">> => Dev}, Opts) of
@@ -298,6 +302,8 @@ do_is_direct_key_access(Dev, NormKey, Opts) ->
                     {exports, Exports}
                 }
             ),
-            not lists:member(NormKey, Exports ++ ?MESSAGE_KEYS);
+            not lists:member(NormKey, ?MESSAGE_KEYS)
+                andalso not hb_private:is_private(NormKey)
+                andalso not is_exported(Info, NormKey, Opts);
         _ -> false
     end.

@@ -14,16 +14,17 @@
 %%% this device to generate and store secrets in the cookies of the caller,
 %%% which are then used with the `~proxy-wallet@1.0' device to sign requests.
 %%% 
-%%% The `commit' and `verify' keys utilize the `~httpsig@1.0''s HMAC `secret'
-%%% commitment scheme, which uses a secret key to commit to a message, with the
-%%% `committer' being listed as a hash of the secret.
+%%% The `commit' and `verify' keys implement the access-control interface of
+%%% the `~secret@1.0' device: a secret is bound to a message by recording its
+%%% `committer' (the hash of the secret), and verified by hashing the secret
+%%% presented by the caller.
 %%% 
 %%% This device supports the following paths:
 %%% 
 %%% `/commit': Sets a `secret' key in the cookies of the caller. The name of 
 %%% the cookie is calculated as the hash of the secret. 
-%%% `/verify': Verifies the caller's request by checking the committer in the
-%%% request matches the secret in the cookies of the base message.
+%%% `/verify': Verifies the caller's request by checking the secret in its
+%%% cookies hashes to the committer recorded in the base message.
 %%% `/store': Sets the keys in the request message in the cookies of the caller.
 %%% `/extract': Extracts the cookies from a base message.
 %%% `/reset': Removes all cookie keys from the base message.
@@ -50,17 +51,29 @@
 opts(Opts) -> hb_private:opts(Opts).
 
 %%% ~message@1.0 Commitments API keys.
+-spec commit(#{ _ => _ }, #{ secret => binary(), _ => _ }, map()) -> term().
 commit(Base, Req, RawOpts) -> dev_cookie_auth:commit(Base, Req, RawOpts).
+-spec verify(#{ _ => _ }, #{ secret => binary(), _ => _ }, map()) -> term().
 verify(Base, Req, RawOpts) -> dev_cookie_auth:verify(Base, Req, RawOpts).
 
 %% @doc Preprocessor keys that utilize cookies and the `~secret@1.0' device to
 %% sign inbound HTTP requests from users if they are not already signed. We use
 %% the hook authentication framework to implement this.
+-spec generate(
+    #{ _ => _ },
+    #{ committer => binary(), generator => _, _ => _ },
+    map()
+) -> term().
 generate(Base, Req, Opts) ->
     dev_cookie_auth:generate(Base, Req, Opts).
 
 %% @doc Finalize an `on-request' hook by adding the `set-cookie' header to the
 %% end of the message sequence.
+-spec finalize(
+    #{ _ => _ },
+    #{ request := #{ _ => _ }, body := _, _ => _ },
+    #{ _ => _ }
+) -> {ok, [_]} | {error, no_request}.
 finalize(Base, Request, Opts) ->
     dev_cookie_auth:finalize(Base, Request, Opts).
 
@@ -76,6 +89,11 @@ finalize(Base, Request, Opts) ->
 %% 
 %% The `format' may be specified in the request message as the `req:format' key.
 %% If no `format' is specified, the default is `default'.
+-spec get_cookie(
+    #{ _ => _ },
+    #{ key := binary(), format => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, _} | {error, not_found}.
 get_cookie(Base, Req, RawOpts) ->
     Opts = opts(RawOpts),
     {ok, Cookies} = extract(Base, Req, Opts),
@@ -92,6 +110,7 @@ get_cookie(Base, Req, RawOpts) ->
     end.
 
 %% @doc Return the parsed and normalized cookies from a message.
+-spec extract(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 extract(Msg, Req, Opts) ->
     {ok, MsgWithCookie} = from(Msg, Req, Opts),
     Cookies = hb_private:get(<<"cookie">>, MsgWithCookie, #{}, Opts),
@@ -100,6 +119,7 @@ extract(Msg, Req, Opts) ->
 %% @doc Set the keys in the request message in the cookies of the caller. Removes
 %% a set of base keys from the request message before setting the remainder as
 %% cookies.
+-spec store(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 store(Base, Req, RawOpts) ->
     Opts = opts(RawOpts),
     ?event({store, {priv_base, Base}, {priv_req, Req}}),
@@ -158,6 +178,11 @@ reset(Base, _Req, Opts) ->
 %% 
 %% Note that the `format: cookie' form is information lossy: All provided
 %% attributes and flags are discarded.
+-spec to(
+    #{ _ => _ },
+    #{ format => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ cookie => binary(), 'set-cookie' => [binary()], _ => _ }}.
 to(Msg, Req, Opts) ->
     ?event({to, {priv_msg, Msg}, {priv_req, Req}}),
     CookieOpts = opts(Opts),
@@ -258,6 +283,11 @@ to_cookie_line(Key, Cookie) ->
 
 %% @doc Normalize a message containing a `cookie', `set-cookie', and potentially
 %% a `priv/cookie' key into a message with only the `priv/cookie' key.
+-spec from(
+    #{ _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 from(Msg, Req, Opts) ->
     CookieOpts = opts(Opts),
     LoadedMsg = ensure_cookie_loaded(Msg, CookieOpts),

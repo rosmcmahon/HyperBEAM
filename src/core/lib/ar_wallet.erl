@@ -12,6 +12,8 @@
 
 -define(WALLET_DIR, ".").
 -define(WALLET_POOL_TARGET, 6).
+-define(SECP256K1_PRIME,
+    16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F).
 
 %%% Public interface.
 
@@ -174,6 +176,12 @@ verify({{KeyAlg, Curve}, Pub}, Data, Sig, _DigestType) when
 verify({ethereum, Pub}, Data, Sig, _DigestType) ->
     {Pass, PubExtracted} = secp256k1_nif:ecrecover(Data, Sig, ethereum),
     Pass andalso PubExtracted =:= compress_ecdsa_pubkey(Pub);
+verify({typed_ethereum, Address}, Data, Sig, _DigestType) ->
+    {Pass, PubExtracted} =
+        secp256k1_nif:ecrecover(Data, Sig, {typed_ethereum, Address}),
+    Pass andalso
+        to_address(Address, typed_ethereum) =:=
+            to_ethereum_address(decompress_ecdsa_pubkey(PubExtracted));
 verify({solana, Pub}, Data, Sig, _DigestType) when
       byte_size(Pub) == 32 andalso byte_size(Sig) == 64 ->
     HexData = hb_util:to_hex(Data),
@@ -210,8 +218,8 @@ to_address(PubKey, solana) ->
     to_solana_address(PubKey);
 to_address(PubKey, ethereum) ->
     to_ethereum_address(PubKey);
-to_address(PubKey, typed_ethereum) ->
-    to_ethereum_address(PubKey).
+to_address(Address, typed_ethereum) ->
+    hb_keccak:address_to_checksum_address(Address).
 
 %% @doc Generate a new wallet public and private key, with a corresponding keyfile.
 %% The provided key is used as part of the file name.
@@ -401,3 +409,18 @@ compress_ecdsa_pubkey(<<4:8, PubPoint/binary>>) ->
             1 -> <<3:8>>
         end,
     iolist_to_binary([PubKeyHeader, X]).
+
+%% @doc Restore the uncompressed form of a compressed secp256k1 public key.
+decompress_ecdsa_pubkey(<<Prefix:8, X:256>>)
+        when Prefix =:= 2 orelse Prefix =:= 3 ->
+    P = ?SECP256K1_PRIME,
+    Root =
+        binary:decode_unsigned(
+            crypto:mod_pow((X * X * X + 7) rem P, (P + 1) div 4, P)
+        ),
+    Y =
+        case Root rem 2 =:= Prefix - 2 of
+            true -> Root;
+            false -> P - Root
+        end,
+    <<4:8, X:256, Y:256>>.

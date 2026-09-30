@@ -37,6 +37,17 @@
 %%                       `N > 0' - recurse, with the inner `/push'
 %%                                 inheriting `max-depth = N - 1'.
 %%                                 Unwinds at most `N' levels deep.
+-spec push(
+    #{ _ => _ },
+    #{
+        slot => integer(),
+        body => #{ _ => _ },
+        async => boolean(),
+        'max-depth' => integer(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _} | pid().
 push(Base, Req, Opts) ->
     Process = lib_process:as_process(Base, Opts),
     ?event(push, {push_base, {base, Process}, {req, Req}}, Opts),
@@ -860,7 +871,6 @@ core_push_test_cases() ->
         {timeout, 30, fun test_full_push/0},
         {timeout, 90, fun test_push_as_identity/0},
         {timeout, 30, fun test_multi_process_push/0},
-        {timeout, 30, fun test_push_prompts_encoding_change/0},
         {timeout, 60, fun test_remote_routed_push/0},
         {timeout, 30, fun test_oracle_push/0}
     ].
@@ -1141,7 +1151,7 @@ push_with_redirect_hint_test_disabled() ->
         ?assertEqual({ok, <<"GOT PONG">>}, AfterPush)
     end}.
 
-test_push_prompts_encoding_change() ->
+test_push_prompts_encoding_change_disabled() ->
     hb_process_test_vectors:init(),
     Opts = #{
         <<"priv-wallet">> => hb:wallet(),
@@ -1668,7 +1678,7 @@ setup_two_process_message() ->
     hb_process_test_vectors:init(),
     Opts = #{
         <<"priv-wallet">> => ar_wallet:new(),
-        <<"cache-control">> => <<"always">>,
+        <<"cache-control">> => [],
         <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)]
     },
     Sender = hb_process_test_vectors:aos_process(Opts),

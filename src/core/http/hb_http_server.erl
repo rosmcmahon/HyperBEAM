@@ -67,9 +67,7 @@ start_application() ->
         Loaded#{
             <<"priv-wallet">> => PrivWallet,
             <<"store">> => UpdatedStoreOpts,
-            <<"port">> => hb_opts:get(port, 8734, Loaded),
-            <<"cache-writers">> =>
-                [hb_util:human_id(ar_wallet:to_address(PrivWallet))]
+            <<"port">> => hb_opts:get(port, 8734, Loaded)
         }
     ),
     ServerID = hb_util:human_id(ar_wallet:to_address(PrivWallet)),
@@ -181,8 +179,9 @@ print_greeter(Config, PrivWallet) ->
             string:pad(
                 lists:flatten(
                     io_lib:format(
-                        "http://~s:~p",
+                        "~s://~s:~p",
                         [
+                            scheme(Config),
                             hb_opts:get(node_host, <<"localhost">>, Config),
                             hb_opts:get(port, 8734, Config)
                         ]
@@ -226,26 +225,26 @@ new_server(RawNodeMsg) ->
         end,
     % Put server ID into node message so it's possible to update current server
     hb_http:start(),
-    ServerID =
-        hb_util:human_id(
-            ar_wallet:to_address(
-                hb_opts:get(
-                    priv_wallet,
-                    no_wallet,
-                    NodeMsg
-                )
-            )
-        ),
+    Wallet = hb_opts:get(priv_wallet, no_wallet, NodeMsg),
+    ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    TLS = hb_tls:config(NodeMsg),
+    DefaultProtocol =
+        case hb_features:http3() of
+            true -> http3;
+            false -> http2
+        end,
+    Protocol = hb_opts:get(protocol, DefaultProtocol, NodeMsg),
+    case {Protocol, TLS} of
+        {http3, TLSConfig} when is_map(TLSConfig) ->
+            error('tls-not-supported-for-http3');
+        {Supported, _} when Supported =:= http1; Supported =:= http2;
+                Supported =:= http3 -> ok;
+        _ -> error({'unknown-protocol', Protocol})
+    end,
     % Put server ID into node message so it's possible to update current server
     % params.
     NodeMsgWithID = hb_maps:put(<<"http-server">>, ServerID, NodeMsg),
-    Dispatcher = cowboy_router:compile([{'_', [{'_', ?MODULE, ServerID}]}]),
-    ProtoOpts = #{
-        env => #{ dispatch => Dispatcher, node_msg => NodeMsgWithID },
-        stream_handlers => [cowboy_stream_h],
-        max_connections => infinity,
-        idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg)
-    },
+    ProtoOpts = listener_protocol_options(ServerID, NodeMsgWithID),
     PrometheusOpts =
         case hb_opts:get(prometheus, not hb_features:test(), NodeMsg) of
             true ->
@@ -277,20 +276,23 @@ new_server(RawNodeMsg) ->
                 ),
                 ProtoOpts
         end,
-    DefaultProto =
-        case hb_features:http3() of
-            true -> http3;
-            false -> http2
-        end,
-    {ok, Port, Listener} =
-        case Protocol = hb_opts:get(protocol, DefaultProto, NodeMsg) of
-            http3 ->
-                start_http3(ServerID, PrometheusOpts, NodeMsg);
-            Pro when Pro =:= http2; Pro =:= http1 ->
-                % The HTTP/2 server has fallback mode to 1.1 as necessary.
-                start_http2(ServerID, PrometheusOpts, NodeMsg);
-            _ -> {error, {unknown_protocol, Protocol}}
-        end,
+    TLSOpts = prepare_tls(TLS, Wallet, ServerID, NodeMsg),
+    {Port, Listener} = try
+        case case {Protocol, TLSOpts} of
+                {http3, []} -> start_http3(ServerID, PrometheusOpts, NodeMsg);
+                {Pro, _} when Pro =:= http2; Pro =:= http1 ->
+                    start_http2(ServerID, PrometheusOpts, NodeMsg, TLSOpts)
+            end of
+            {ok, StartedPort, StartedListener} ->
+                {StartedPort, StartedListener};
+            {error, ListenerReason} ->
+                error({'http-server-start-failed', ListenerReason})
+        end
+    catch
+        Class:StartReason:Stack ->
+            case TLS of false -> ok; _ -> stop_tls(ServerID) end,
+            erlang:raise(Class, StartReason, Stack)
+    end,
     % Update the node message with the actual port that was used, in the event
     % that the OS assigned a different port. This happens, for example, when we
     % use port 0.
@@ -304,7 +306,95 @@ new_server(RawNodeMsg) ->
             {store, hb_opts:get(store, no_store, NodeMsg)}
         }
     ),
+    set_proc_server_id(ServerID),
     {ok, Listener, Port}.
+
+prepare_tls(false, _Wallet, ServerID, _NodeMsg) ->
+    stop_tls(ServerID),
+    [];
+prepare_tls(TLS, Wallet, ServerID, NodeMsg) ->
+    ACME = hb_maps:get(<<"acme">>, TLS, #{}, NodeMsg),
+    stop_tls(ServerID),
+    try
+        case {
+            hb_maps:is_key(<<"certificate-path">>, TLS, NodeMsg),
+            hb_maps:get(<<"challenge-type">>, ACME, <<"http-01">>, NodeMsg)
+        } of
+            {true, _} -> ok;
+            {false, <<"http-01">>} ->
+                ChallengeRef = {tls_http_01, ServerID},
+                ChallengeNode = challenge_node(ACME, ServerID, NodeMsg),
+                {ok, _, _} = start_http2(
+                    ChallengeRef,
+                    listener_protocol_options(ChallengeRef, ChallengeNode),
+                    ChallengeNode,
+                    []
+                );
+            {false, <<"dns-01">>} -> ok;
+            _ -> error('invalid-acme-challenge-type')
+        end,
+        PrivateTLS = #{
+            <<"server-id">> => ServerID,
+            <<"lifecycle-capability">> => make_ref()
+        },
+        Private = #{ <<"tls">> => PrivateTLS },
+        Request = hb_private:set(
+            #{ <<"path">> => <<"obtain">> }, Private, NodeMsg
+        ),
+        ResolveOpts = hb_private:set(NodeMsg, Private, NodeMsg),
+        {ok, BootstrapResult} = hb_ao:resolve(
+            #{ <<"device">> => <<"tls@1.0">> },
+            Request,
+            ResolveOpts#{
+                <<"only">> => local,
+                <<"hashpath">> => ignore,
+                <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+            }
+        ),
+        Chain = hb_maps:get(
+            <<"certificate-chain">>, BootstrapResult, not_found, NodeMsg
+        ),
+        {ok, TLSOpts} = hb_tls:socket_options(Wallet, Chain),
+        TLSOpts
+    catch
+        Class:Reason:Stack ->
+            stop_tls(ServerID),
+            erlang:raise(Class, Reason, Stack)
+    end.
+
+challenge_node(ACME, ServerID, NodeMsg) ->
+    ChallengeRef = {tls_http_01, ServerID},
+    hb_private:set(
+        (hb_private:reset(NodeMsg))#{
+            <<"port">> => hb_maps:get(<<"http-port">>, ACME, 80, NodeMsg),
+            <<"force-signed">> => false,
+            <<"http-server">> => ChallengeRef,
+            <<"on">> => #{
+                <<"request">> => #{ <<"device">> => <<"tls@1.0">> }
+            }
+        },
+        #{ <<"tls">> => #{ <<"server-id">> => ServerID } },
+        NodeMsg
+    ).
+
+listener_protocol_options(ServerID, NodeMsg) ->
+    Dispatcher = cowboy_router:compile([{'_', [{'_', ?MODULE, ServerID}]}]),
+    #{
+        env => #{ dispatch => Dispatcher, node_msg => NodeMsg },
+        stream_handlers => [cowboy_stream_h],
+        max_connections => infinity,
+        idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg)
+    }.
+
+stop_tls(ServerID) ->
+    case hb_name:lookup({<<"tls@1.0">>, ServerID}) of
+        PID when is_pid(PID) ->
+            PID ! {stop, self()},
+            receive {stopped, PID} -> ok end;
+        undefined -> ok
+    end,
+    cowboy:stop_listener({tls_http_01, ServerID}),
+    ok.
 
 start_http3(ServerID, ProtoOpts, NodeMsg) ->
     ?event(http, {start_http3, ServerID}),
@@ -312,7 +402,7 @@ start_http3(ServerID, ProtoOpts, NodeMsg) ->
     ServerPID =
         spawn(fun() ->
             application:ensure_all_started(quicer),
-            {ok, Listener} =
+            {ok, _Listener} =
                 cowboy:start_quic(
                     ServerID, 
                     TransOpts = #{
@@ -356,7 +446,7 @@ http3_conn_sup_loop() ->
             http3_conn_sup_loop()
     end.
 
-start_http2(ServerID, ProtoOpts, NodeMsg) ->
+start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts) ->
     ?event(http, {start_http2, ServerID}),
     MaxConnections = maps:get(<<"max-connections">>, NodeMsg, 10000),
     NumAcceptors =
@@ -365,17 +455,14 @@ start_http2(ServerID, ProtoOpts, NodeMsg) ->
             NodeMsg,
             erlang:system_info(schedulers) * 4
         ),
+    RequestedPort = hb_opts:get(port, 0, NodeMsg),
     TransportOpts = #{
-        socket_opts => [{port, RequestedPort = hb_opts:get(port, 0, NodeMsg)}],
+        socket_opts => [{port, RequestedPort} | TLSOpts],
         max_connections => MaxConnections,
         num_acceptors => NumAcceptors
     },
-    StartRes =
-        cowboy:start_clear(
-            ServerID,
-            TransportOpts,
-            ProtoOpts
-        ),
+    StartFun = case TLSOpts of [] -> start_clear; _ -> start_tls end,
+    StartRes = cowboy:StartFun(ServerID, TransportOpts, ProtoOpts),
     case StartRes of
         {ok, Listener} ->
             ActualPort = ranch:get_port(ServerID),
@@ -399,14 +486,19 @@ start_http2(ServerID, ProtoOpts, NodeMsg) ->
             ),
             cowboy:set_env(ServerID, node_msg, #{}),
             cowboy:stop_listener(ServerID),
-            start_http2(ServerID, ProtoOpts, NodeMsg)
+            start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts);
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% @doc Entrypoint for all HTTP requests. Receives the Cowboy request option and
 %% the server ID, which can be used to lookup the node message.
 init(Req, ServerID) ->
-    case cowboy_req:method(Req) of
-        <<"OPTIONS">> -> cors_reply(Req, ServerID);
+    case {cowboy_req:method(Req), ServerID} of
+        {<<"OPTIONS">>, {tls_http_01, _}} ->
+            {ok, Body} = read_body(Req),
+            handle_request(Req, Body, ServerID);
+        {<<"OPTIONS">>, _} -> cors_reply(Req, ServerID);
         _ ->
             {ok, Body} = read_body(Req),
             handle_request(Req, Body, ServerID)
@@ -498,40 +590,40 @@ handle_request(RawReq, Body, ServerID) ->
         )
     end.
 
-%% @doc Return a 500 error response to the client.
+%% @doc Return an error response to the client: a message the node cannot
+%% accept is the client's error, anything else is the server's.
 handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     DetailsStr = hb_util:bin(hb_format:message(Details, NodeMsg, 1)),
     StacktraceStr = hb_util:bin(hb_format:trace(Stacktrace)),
     ErrorMsg =
         #{
-            <<"status">> => 500,
+            <<"status">> => error_status(Type, Details),
             <<"type">> => hb_util:bin(hb_format:message(Type)),
             <<"details">> => DetailsStr,
             <<"stacktrace">> => StacktraceStr
         },
-    ErrorBin = hb_format:error(ErrorMsg, NodeMsg),
     ?event(
         http_error,
-        {returning_500_error,
+        {returning_error,
             {method, cowboy_req:method(Req)},
             {path, {string, cowboy_req:path(Req)}},
-            {string,
-                hb_format:indent_lines(
-                    <<"\n", ErrorBin/binary, "\n">>,
-                    1
-                )
-            }
+            {error, ErrorMsg}
         },
         NodeMsg
     ),
     ErrorDetailsMaxSize = hb_opts:get(error_details_max_size, ?DEFAULT_ERROR_DETAILS_MAX_SIZE, NodeMsg),
-    % Remove leading and trailing noise from the stacktrace and details.
+    % Preserve indentation while removing trailing noise.
     FormattedErrorMsg =
         ErrorMsg#{
-            <<"stacktrace">> => hb_util:bin(hb_format:remove_noise(StacktraceStr)),
-            <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_noise(DetailsStr)), ErrorDetailsMaxSize)
+            <<"stacktrace">> => hb_util:bin(hb_format:remove_trailing_noise(StacktraceStr)),
+            <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_trailing_noise(DetailsStr)), ErrorDetailsMaxSize)
         },
     hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
+
+%% @doc The status of an error response. A request whose commitments do not
+%% verify is refused as the client's error.
+error_status(throw, {invalid_commitments, _}) -> 400;
+error_status(_Type, _Details) -> 500.
 
 %% @doc Return the list of allowed methods for the HTTP server.
 allowed_methods(Req, State) ->
@@ -544,7 +636,7 @@ allowed_methods(Req, State) ->
 %% @doc Merges the provided `Opts' with uncommitted values from `Request',
 %% preserves the http-server value, and updates node-history by prepending
 %% the `Request'. If a server reference exists, updates the Cowboy environment
-%% variable 'node_msg' with the resulting options map.
+%% variable 'node_msg' with the resulting node message.
 set_opts(Opts) ->
     case hb_opts:get(http_server, no_server_ref, Opts) of
         no_server_ref ->
@@ -553,27 +645,24 @@ set_opts(Opts) ->
             ok = cowboy:set_env(ServerRef, node_msg, Opts)
     end.
 set_opts(Request, Opts) ->
-    PreparedOpts = Opts,
     PreparedRequest = hb_message:uncommitted(Request),
-    MergedOpts =
-        maps:merge(
-            PreparedOpts,
-            PreparedRequest
-        ),
-    ?event(set_opts, {merged_opts, {explicit, MergedOpts}}),
-    History =
-        hb_opts:get(node_history, [], Opts)
-            ++
-                [
-                    hb_private:reset(
-                        maps:without([<<"node-history">>], PreparedRequest)
-                    )
-                ],
-    FinalOpts = MergedOpts#{
-        <<"http-server">> => hb_opts:get(http_server, no_server, Opts),
-        <<"node-history">> => History
-    },
-    {set_opts(FinalOpts), FinalOpts}.
+    case hb_maps:is_key(<<"tls">>, PreparedRequest, Opts) of
+        true ->
+            {error, <<"TLS configuration cannot be changed at runtime.">>};
+        false ->
+            MergedOpts = maps:merge(Opts, PreparedRequest),
+            ?event(set_opts, {merged_opts, {explicit, MergedOpts}}),
+            History = hb_opts:get(node_history, [], Opts) ++ [
+                hb_private:reset(
+                    maps:without([<<"node-history">>], PreparedRequest)
+                )
+            ],
+            FinalOpts = MergedOpts#{
+                <<"http-server">> => hb_opts:get(http_server, no_server, Opts),
+                <<"node-history">> => History
+            },
+            {set_opts(FinalOpts), FinalOpts}
+    end.
 
 %% @doc Get the node message for the current process.
 get_opts() ->
@@ -586,9 +675,9 @@ get_opts(NodeMsg) ->
 set_proc_server_id(ServerID) ->
     put(server_id, ServerID).
 
-%% @doc Apply the default node message to the given opts map.
+%% @doc Apply the default node message to the given options message.
 set_default_opts(Opts) ->
-    % Create a temporary opts map that does not include the defaults.
+    % Create a temporary options message that does not include the defaults.
     TempOpts = Opts#{ <<"only">> => local },
     % Get the port to use for the server. If no port is provided, we use port 0
     % will the operating system assign a free port.
@@ -639,7 +728,14 @@ start_node(Opts) ->
     ok = hb_process_sampler:ensure_started(ServerOpts),
     ok = hb_system_monitor:ensure_started(ServerOpts),
     {ok, _Listener, Port} = new_server(ServerOpts),
-    <<"http://localhost:", (hb_util:bin(Port))/binary, "/">>.
+    Scheme = scheme(get_opts()),
+    <<Scheme/binary, "://localhost:", (hb_util:bin(Port))/binary, "/">>.
+
+scheme(NodeMsg) ->
+    case hb_tls:config(NodeMsg) of
+        TLS when is_map(TLS) -> <<"https">>;
+        false -> <<"http">>
+    end.
 
 %%% Tests
 %%% The following only covering the HTTP server initialization process. For tests
@@ -712,6 +808,22 @@ set_opts_test() ->
     ?event(debug_node_history, {node_history_length, length(NodeHistory3)}),
     ?assert(length(NodeHistory3) == 3),
     ?assert(Key3 == <<"world3">>).
+
+set_tls_opts_rejected_test() ->
+    ?assertEqual(
+        {error, <<"TLS configuration cannot be changed at runtime.">>},
+        set_opts(#{ <<"tls">> => false }, #{})
+    ).
+
+tls_http3_rejected_before_start_test() ->
+    ?assertError(
+        'tls-not-supported-for-http3',
+        start_node(#{
+            <<"priv-wallet">> => ar_wallet:load_keyfile("test/key-1.json"),
+            <<"protocol">> => http3,
+            <<"tls">> => #{}
+        })
+    ).
 
 restart_server_test() ->
     % We force HTTP2, overriding the HTTP3 feature, because HTTP3 restarts don't work yet.

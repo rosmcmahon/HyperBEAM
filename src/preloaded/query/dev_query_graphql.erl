@@ -8,6 +8,9 @@
 %%% Submodule helpers:
 -export([keys_to_template/1, test_query/3, test_query/4]).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("graphql/include/graphql.hrl").
+-include_lib("graphql/src/graphql_internal.hrl").
+-include_lib("graphql/src/graphql_schema.hrl").
 -include("include/hb.hrl").
 
 %%% Constants.
@@ -20,7 +23,6 @@
         <<"id">>,
         <<"message">>,
         <<"keys">>,
-        <<"tags">>,
         <<"name">>,
         <<"value">>,
         <<"cursor">>
@@ -147,7 +149,10 @@ handle(_Base, RawReq, Opts) ->
                                 ?DEFAULT_QUERY_TIMEOUT,
                                 Opts
                             ),
-                        opts => Opts,
+                        opts => Opts#{
+                            <<"query-arweave-blocks">> => selects(<<"block">>, AST2),
+                            <<"query-arweave-nodes">> => selects(<<"node">>, AST2)
+                        },
                         req => Req
                     },
                 ?event(graphql_context_created),
@@ -172,6 +177,18 @@ handle(_Base, RawReq, Opts) ->
                     {error, Error}
             end
     end.
+
+%% @doc Recognize selected fields, including aliases and fragments.
+selects(Name, #document{ definitions = Definitions }) -> selects(Name, Definitions);
+selects(_Name, []) -> false;
+selects(Name, [#field{ selection_set = Selection } = Field | Rest]) ->
+    graphql_ast:id(Field) =:= Name orelse
+        selects(Name, Selection) orelse selects(Name, Rest);
+selects(Name, [#op{ selection_set = Selection } | Rest]) ->
+    selects(Name, Selection) orelse selects(Name, Rest);
+selects(Name, [#frag{ selection_set = Selection } | Rest]) ->
+    selects(Name, Selection) orelse selects(Name, Rest);
+selects(Name, [_ | Rest]) -> selects(Name, Rest).
 
 %% @doc The main entrypoint for resolving GraphQL elements, called by the
 %% GraphQL library. We split the resolution flows into two separated functions:
@@ -222,7 +239,7 @@ message_query(Obj, <<"message">>, #{<<"keys">> := Keys}, Opts) ->
             ?event(graphql_cache_match_not_found),
             {ok, #{<<"id">> => <<"not-found">>, <<"keys">> => #{}}}
     end;
-message_query(Msg, Field, _Args, Opts) when Field =:= <<"keys">>; Field =:= <<"tags">> ->
+message_query(Msg, <<"keys">>, _Args, Opts) ->
     OnlyKeys =
         hb_maps:to_list(
             hb_private:reset(

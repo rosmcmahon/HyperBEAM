@@ -7,8 +7,18 @@
 %%% optional string `count'. Supported filters are `ids', `tags', `owners',
 %%% `recipients' and `block'. Tag names address message keys. Values within a
 %%% tag are ORed; separate tags and other filters are ANDed. Owners are
-%%% committers and recipients are targets. A query without a selecting filter
-%%% does not enumerate the store; a block range alone is not a selecting filter.
+%%% committers; indexed recipients use the commitment's `field-target'.
+%%% Without these selecting filters,
+%%% queries enumerate confirmed base-layer TXs from block headers, optionally
+%%% within inclusive `block.min/max' heights. This excludes bundled data items
+%%% and pending messages. Heights start at zero and end at the compact index's
+%%% tip, or the network tip if the index is empty and remote reads are enabled.
+%%% Within a height, TX IDs sort lexically; descending reverses both orders.
+%%% `block=...&tx=...' cursors resume exclusively within that height. Missing
+%%% headers return errors; empty blocks are skipped. `count' has the same cap
+%%% as indexed queries and ignores `after'. Selected nodes read by ID from the
+%%% local stores, then `~arweave@2.9/tx' with `exclude-data=true'.
+%%% Their block fields reuse the containing header.
 %%%
 %%% `first' limits the page, clamped between zero and node option
 %%% `max-page-size' (default 100). The schema defaults `first' to 10; calls
@@ -22,14 +32,14 @@
 %%% Queries with at least one indexed predicate and no explicit IDs or bundle
 %%% filter can use `~match@1.0/locate' with a compatible cursor. Its store
 %%% pipelines supply entries with `offset', `id' and `commitment-device'.
-%%% A nonempty ID is read
-%%% through `hb_cache', using the node's configured stores. An entry without
+%%% A known L1 ID reads locally, then requests its native header; other IDs
+%%% read through `hb_cache', using the node's configured stores. An entry without
 %%% an ID is read at its weave offset and deserialized by its commitment device
 %%% with `exclude-data=true', then converted to a structured message. This
 %%% requires a byte-addressable item and a device supporting header decoding;
 %%% it cannot identify a base-layer transaction by offset alone. Header reads
-%%% may span chunks. The payload is omitted, so `data.size' is zero for these
-%%% header-only results, not the size of the original payload.
+%%% may span chunks. The payload is omitted, so `data.size' is null for these
+%%% header-only results: its original length is unknown.
 %%%
 %%% Indexed pagination orders by offset and ID and returns `member=' cursors.
 %%% One ID at two offsets can produce two edges. Unreadable entries are omitted
@@ -37,12 +47,19 @@
 %%% index matches, not their readability. `count' ignores `after' and counts
 %%% matches across the query's ranges, capped by `query-arweave-max-index-count'
 %%% (default 1000); it is neither an uncapped total nor a count of readable
-%%% edges. Other supported queries use cache matching and ID reads; their
-%%% count is the number of candidate IDs before pagination and read failures.
+%%% edges. Cursor-only indexed and block-TX pages do not read transaction
+%%% messages; their cursors identify candidates regardless of readability.
+%%% Explicit IDs select candidates directly. With predicates, each readable
+%%% candidate is checked by `match@1.0/check', without scanning the index; count
+%%% includes only matching readable candidates. Missing positions do not prevent
+%%% predicate checks. Without predicates, count precedes message read failures;
+%%% cursor-only ID pages with known positions omit message reads. IDs without
+%%% positions must be readable before they can supply an edge.
 %%% Without an Arweave offset store, that path cannot order or filter by weave
 %%% position.
 %%%
-%%% `block' bounds are inclusive heights translated to weave byte ranges.
+%%% With selecting filters, `block' bounds are inclusive heights translated
+%%% to weave byte ranges.
 %%% Indexed matching tests entry offsets; cache matching tests each item's
 %%% start and end. Block metadata is read locally, then remotely unless
 %%% `query-arweave-remote-block-ranges=false'. A missing lower or upper bound's
@@ -51,13 +68,25 @@
 %%% The AO-Core request's `force-next-page=true' forces `hasNextPage=true' and
 %%% appends `&remaining=0' to the last cursor when no further match is found.
 %%%
-%%% `id' and `tags' use the message projection in `dev_query_graphql'. Signature
-%%% and owner fields come from a signed commitment; recipient and anchor come
-%%% from commitment field mappings. `fee' (falling back to `reward') and
-%%% `quantity' default to zero, projected as winston and exact AR strings.
-%%% `data.size' measures `data', falling back to `body',
-%%% then an empty binary; `data.type' reads `content-type'. These projections
+%%% `id' uses the message projection in `dev_query_graphql'. Native transaction
+%%% tags use the requested commitment's original tags when present, otherwise
+%%% normalized base-message keys excluding its native field keys.
+%%% Signature and owner fields come from
+%%% a signed commitment; recipient and anchor use commitment field mappings.
+%%% `fee' and `quantity' use `field-reward'
+%%% and `field-quantity' on the requested commitment, defaulting to zero.
+%%% Amounts project as winston and exact AR strings.
+%%% `data.size' prefers an L1 transaction's declared or indexed payload size,
+%%% then measures binary `data', falling back to `body', then an empty binary.
+%%% Structured bodies and omitted payloads have unknown size (null).
+%%% `data.type' reads `content-type'. These projections
 %%% do not reconstruct an Arweave transaction or its original tag list.
+%%% Transaction `block' seeks the compact block index at the matched weave
+%%% position, then reads the selected header. Index misses fall back to cached
+%%% block ranges, sharing the height catalogue within the page, then remote
+%%% heights when enabled. L1 IDs resolve shared boundaries; pending positions
+%%% return null. Block metadata is prepared only for selected fields or L1
+%%% boundary checks; empty pages do not enumerate cached heights.
 %%%
 %%% `blocks' pages by height, descending by default or `HEIGHT_ASC', within
 %%% inclusive `height.min/max' bounds. Height enumeration defaults to zero and
@@ -139,8 +168,15 @@ query(#{ <<"predicates">> := Predicates, <<"ranges">> := Ranges },
         {ok, Matches} -> {ok, hb_util:bin(length(Matches))};
         Error -> Error
     end;
+query(#{ <<"block-range">> := Range }, <<"count">>, _Args, Opts) ->
+    Cap = hb_opts:get(query_arweave_max_index_count, ?DEFAULT_MAX_INDEX_COUNT, Opts),
+    maybe
+        {ok, Matches} ?= block_transactions(Range, none, Cap, Opts),
+        {ok, hb_util:bin(length(Matches))}
+    end;
 query(Obj, <<"transaction">>, Args, Opts) ->
-    case query(Obj, <<"transactions">>, Args, Opts) of
+    case query(Obj, <<"transactions">>, Args,
+            Opts#{ <<"query-arweave-nodes">> => true }) of
         {ok, #{ <<"edges">> := [] }} -> {ok, null};
         {ok, #{ <<"edges">> := [#{ <<"node">> := Msg } | _] }} -> {ok, Msg}
     end;
@@ -162,9 +198,9 @@ query(Obj, <<"transactions">>, RawArgs, Opts) ->
         unservable -> cached_transactions(Args, Opts);
         Result -> Result
     end;
-query(_Obj, <<"block">>, Args, Opts) ->
+query(Obj, <<"block">>, Args, Opts) ->
     case hb_maps:get(<<"id">>, Args, null, Opts) of
-        null -> {ok, null};
+        null -> transaction_block(Obj, Opts);
         ID -> read_block(ID, Opts)
     end;
 query(_Obj, <<"networkInfo">>, _Args, Opts) ->
@@ -181,6 +217,42 @@ query(Block, <<"height">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"height">>, Block, null, Opts)};
 query(Block, <<"timestamp">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"timestamp">>, Block, null, Opts)};
+query(Msg, <<"tags">>, Args, Opts) ->
+    Selected =
+        case hb_private:get(<<"query-match/id">>, Msg, <<>>, Opts) of
+            <<>> -> Msg;
+            ID -> hb_message:with_commitments(ID, Msg, Opts)
+        end,
+    Native = [Commitment
+        || Commitment <- hb_maps:values(
+            hb_message:commitments(#{}, Selected, Opts), Opts),
+        lists:member(hb_maps:get(<<"commitment-device">>, Commitment, undefined, Opts),
+            [<<"tx@1.0">>, <<"ans104@1.0">>])],
+    maybe
+        [Commitment | _] ?= Native,
+        {ok, Tags} ?= hb_maps:find(<<"original-tags">>, Commitment, Opts),
+        {ok, [{ok, Tag} || Tag <- hb_util:message_to_ordered_list(Tags, Opts)]}
+    else
+        _ ->
+            Fields = case Native of
+                [C | _] ->
+                    [Key || <<"field-", Key/binary>> <- hb_maps:keys(C, Opts)];
+                [] -> []
+            end,
+            BundleTags = case Native of
+                [BundleCommitment | _] ->
+                    hb_maps:with(?BUNDLE_KEYS, BundleCommitment, Opts);
+                [] -> #{}
+            end,
+            dev_query_graphql:execute(
+                #{opts => Opts},
+                hb_maps:merge(
+                    hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
+                    BundleTags, Opts),
+                <<"keys">>,
+                Args
+            )
+    end;
 query(Msg, <<"signature">>, _Args, Opts) ->
     % Return the signature of the transaction.
     % Other TX access methods are defined below.
@@ -217,9 +289,9 @@ query(#{ <<"key">> := Key }, <<"key">>, _Args, _Opts) ->
 query(#{ <<"address">> := Address }, <<"address">>, _Args, _Opts) ->
     {ok, Address};
 query(Msg, <<"fee">>, _Args, Opts) ->
-    {ok, hb_maps:get_first([{Msg, <<"fee">>}, {Msg, <<"reward">>}], 0, Opts)};
+    transaction_amount(Msg, <<"field-reward">>, Opts);
 query(Msg, <<"quantity">>, _Args, Opts) ->
-    {ok, hb_maps:get(<<"quantity">>, Msg, 0, Opts)};
+    transaction_amount(Msg, <<"field-quantity">>, Opts);
 query(Number, <<"winston">>, _Args, _Opts) ->
     {ok, hb_util:bin(Number)};
 query(Number, <<"ar">>, _Args, _Opts) ->
@@ -242,22 +314,39 @@ query(Msg, <<"anchor">>, _Args, Opts) ->
         {ok, null} -> {ok, <<"">>};
         {ok, Anchor} -> encode_anchor(Anchor)
     end;
-query(Msg, <<"data">>, _Args, Opts) ->
-    Data =
-        hb_ao:get_first(
-            [
-                {{as, <<"message@1.0">>, Msg}, <<"data">>},
-                {{as, <<"message@1.0">>, Msg}, <<"body">>}
-            ],
-            <<>>,
-            Opts
-        ),
-    Type = hb_maps:get(<<"content-type">>, Msg, null, Opts),
-    {ok, #{ <<"data">> => Data, <<"type">> => Type }};
-query(#{ <<"data">> := Data }, <<"size">>, _Args, _Opts) ->
-    {ok, byte_size(Data)};
-query(#{ <<"type">> := Type }, <<"type">>, _Args, _Opts) ->
-    {ok, Type};
+query(Msg, <<"data">>, _Args, _Opts) ->
+    {ok, Msg};
+query(Msg, <<"size">>, _Args, Opts) ->
+    Size =
+        case find_field_key(<<"field-data_size">>, Msg, Opts) of
+            {ok, null} -> indexed_data_size(Msg, Opts);
+            {ok, DeclaredSize} -> DeclaredSize
+        end,
+    case Size of
+        null ->
+            Data =
+                case hb_private:get(<<"query-data-omitted">>, Msg, false, Opts) of
+                    true -> null;
+                    false ->
+                        hb_ao:get_first(
+                            [
+                                {{as, <<"message@1.0">>, Msg}, <<"data">>},
+                                {{as, <<"message@1.0">>, Msg}, <<"body">>}
+                            ],
+                            <<>>,
+                            Opts
+                        )
+                end,
+            {ok,
+                case Data of
+                    Bin when is_binary(Bin) -> byte_size(Bin);
+                    _ -> null
+                end
+            };
+        _ -> {ok, Size}
+    end;
+query(Msg, <<"type">>, _Args, Opts) ->
+    {ok, hb_maps:get(<<"content-type">>, Msg, null, Opts)};
 query(_Msg, Field, _Args, _Opts)
         when Field =:= <<"bundledIn">>; Field =:= <<"parent">> ->
     {ok, #{}};
@@ -276,14 +365,10 @@ cached_transactions(Args, Opts) ->
     case valid_after_cursor(Args, Opts) of
         true ->
             Matches = match_args(Args, Opts),
-            WithExplicit =
-                case explicit_ids(Args, Opts) of
-                    [] -> Matches;
-                    ExplicitIDs -> hb_util:list_with(Matches, ExplicitIDs)
-                end,
             Ordered =
-                case annotate_ids(WithExplicit, Opts) of
-                    unavailable -> [#{ <<"id">> => ID } || ID <- Matches];
+                case annotate_ids(Matches, Opts) of
+                    unavailable -> [#{ <<"id">> => ID,
+                        <<"cursor">> => offset_cursor(ID, undefined) } || ID <- Matches];
                     Annotated ->
                         Order = maps:get(<<"sort">>, Args, <<"HEIGHT_DESC">>),
                         sort_offset_annotated(
@@ -297,7 +382,7 @@ cached_transactions(Args, Opts) ->
                         )
                 end,
             ?event({transactions_matches, Matches}),
-            {ok, connection(Ordered, Args, Opts)};
+            {ok, connection(check_explicit_ids(Ordered, Args, Opts), Args, Opts)};
         false ->
             ?event(
                 {invalid_after_cursor,
@@ -321,8 +406,20 @@ encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 43 -> {ok, Bin};
 encode_anchor(Bin) when is_binary(Bin), byte_size(Bin) == 64 -> {ok, Bin};
 encode_anchor(Other) -> {error, <<"invalid_anchor: ", Other/binary>>}.
 
-%% @doc Find and return a value from the fields of a message (from its
-%% commitments).
+%% @doc Native amounts come only from the requested commitment's fields.
+transaction_amount(Msg, Field, Opts) ->
+    Selected =
+        case hb_private:get(<<"query-match/id">>, Msg, <<>>, Opts) of
+            <<>> -> Msg;
+            ID -> hb_message:with_commitments(ID, Msg, Opts)
+        end,
+    Commitments = hb_message:commitments(#{ Field => '_' }, Selected, Opts),
+    case hb_maps:values(Commitments, Opts) of
+        [] -> {ok, 0};
+        [Commitment | _] -> {ok, hb_maps:get(Field, Commitment, 0, Opts)}
+    end.
+
+%% @doc Find a field preserved by a message's commitment.
 find_field_key(Field, Msg, Opts) ->
     case hb_message:commitments(#{ Field => '_' }, Msg, Opts) of
         not_found -> {ok, null};
@@ -338,6 +435,28 @@ find_field_key(Field, Msg, Opts) ->
             end
     end.
 
+%% @doc The offset index length is the payload size for an L1 transaction.
+indexed_data_size(Msg, Opts) ->
+    case hb_private:get(<<"query-match">>, Msg, #{}, Opts) of
+        #{ <<"commitment-device">> := <<"tx@1.0">>,
+            <<"length">> := Length } -> Length;
+        #{ <<"commitment-device">> := Device }
+                when Device =/= <<>>, Device =/= <<"tx@1.0">> -> null;
+        #{ <<"id">> := ID } when ID =/= <<>> -> indexed_l1_size(ID, Opts);
+        _ -> null
+    end.
+
+indexed_l1_size(ID, Opts) ->
+    case hb_store_arweave:store_from_opts(Opts) of
+        no_store -> null;
+        Store ->
+            case hb_store_arweave:read_offset(Store, ID, Opts) of
+                {ok, #{ <<"codec-device">> := <<"tx@1.0">>,
+                    <<"length">> := Length }} -> Length;
+                _ -> null
+            end
+    end.
+
 %% @doc Generate the connection response for a ordered, annotated list of 
 %% results.
 connection(Ordered, Args, Opts) ->
@@ -345,7 +464,7 @@ connection(Ordered, Args, Opts) ->
     Remaining = drop_to_cursor(Args, Ordered, Opts),
     CountToReturn = page_size(Args, Opts),
     ResultsPagePlusOne = read_ids(Remaining, CountToReturn + 1, Opts),
-    ResultsPage = lists:sublist(ResultsPagePlusOne, CountToReturn),
+    ResultsPage = block_edges(lists:sublist(ResultsPagePlusOne, CountToReturn), Opts),
     HasNextPage = length(ResultsPagePlusOne) > CountToReturn,
     ForceNextPage = force_next_page(Args, Opts),
     Edges =
@@ -374,12 +493,30 @@ force_terminal_cursor(Edges) ->
 %% of offset-annotated messages.
 read_ids([], _Count, _Opts) -> [];
 read_ids(_, 0, _Opts) -> [];
-read_ids([AnnotatedID = #{ <<"id">> := ID } | Rest], Count, Opts) ->
-    case hb_cache:read(ID, Opts) of
+read_ids([ID], _Count, Opts) -> read_id(ID, Opts);
+read_ids(IDs, Count, Opts) ->
+    {Page, Rest} = lists:split(min(Count, length(IDs)), IDs),
+    Read = lists:append(hb_pmap:parallel_map(
+        Page,
+        fun(Annotated) -> read_id(Annotated, Opts) end,
+        hb_opts:get(arweave_chunk_fetch_concurrency, 10, Opts)
+    )),
+    Read ++ read_ids(Rest, Count - length(Read), Opts).
+
+%% @doc Known positions supply cursors without reading unselected nodes.
+%% Otherwise omit messages the stores cannot supply.
+read_id(#{ <<"offset">> := _, <<"cursor">> := Cursor },
+        #{ <<"query-arweave-nodes">> := false }) ->
+    [#{ <<"cursor">> => Cursor }];
+read_id(#{ <<"node">> := _ } = Edge, _Opts) ->
+    [Edge];
+read_id(AnnotatedID, Opts) ->
+    case match_message(AnnotatedID, Opts) of
         {ok, Msg} ->
-            [AnnotatedID#{ <<"node">> => Msg } | read_ids(Rest, Count - 1, Opts)];
-        _ ->
-            read_ids(Rest, Count, Opts)
+            [AnnotatedID#{ <<"node">> =>
+                hb_private:set(Msg, <<"query-match">>, AnnotatedID, Opts)
+            }];
+        _ -> []
     end.
 
 %% @doc Drop to the cursor position, returning the list of items after the cursor.
@@ -461,7 +598,8 @@ sort_offset_annotated(AnnotatedIDs, SortOrder, _Opts) ->
     {Pending, Confirmed} =
         lists:partition(fun(#{ <<"offset">> := Offset }) -> pending_offset(Offset) end, WithOffset),
     ByID = fun(#{ <<"id">> := A }, #{ <<"id">> := B }) -> A < B end,
-    ByOffset = fun(#{ <<"offset">> := A }, #{ <<"offset">> := B }) -> A < B end,
+    ByOffset = fun(#{ <<"offset">> := A, <<"id">> := AID },
+        #{ <<"offset">> := B, <<"id">> := BID }) -> {A, AID} =< {B, BID} end,
     UserOrderSorted =
         case SortOrder of
             <<"HEIGHT_ASC">> ->
@@ -483,6 +621,185 @@ sort_offset_annotated(AnnotatedIDs, SortOrder, _Opts) ->
     UserOrderSorted.
 
 %%% Block pages.
+
+%% @doc Find a transaction's block, trying cached headers before remote ones.
+%% Use the matched position, so pending entries cannot inherit a confirmed block.
+transaction_block(Msg, Opts) ->
+    Match = hb_private:get(<<"query-match">>, Msg, #{}, Opts),
+    match_block(Match, Opts).
+
+%% @doc Resolve the containing block from a match's position and signed ID.
+match_block(Match, Opts) ->
+    {Result, _} = resolve_match_block(Match, Opts),
+    Result.
+
+%% @doc Reuse prepared results and lazily share fallback heights within a page.
+resolve_match_block(#{ <<"block-result">> := Result }, Opts) -> {Result, Opts};
+resolve_match_block(Match = #{ <<"offset">> := Offset },
+        Opts = #{ <<"query-block">> := Block }) when is_integer(Offset), Offset >= 0 ->
+    End = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+    Start = End - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+    case Start =< Offset andalso Offset =< End
+            andalso block_contains(Match, Block, End, Opts) of
+        true -> {{ok, Block}, Opts};
+        false -> resolve_match_block(Match, maps:remove(<<"query-block">>, Opts))
+    end;
+resolve_match_block(Match = #{ <<"offset">> := Offset }, Opts)
+        when is_integer(Offset), Offset >= 0 ->
+    From = case hb_maps:get(<<"commitment-device">>, Match, <<>>, Opts) of
+        <<"tx@1.0">> -> Offset;
+        _ -> Offset + 1
+    end,
+    case indexed_block(Match, From, 0, Opts) of
+        {ok, null} ->
+            QueryOpts = case maps:is_key(<<"query-block-heights">>, Opts) of
+                true -> Opts;
+                false -> Opts#{ <<"query-block-heights">> =>
+                    list_to_tuple(lists:sort(cached_block_heights(Opts))) }
+            end,
+            Sorted = maps:get(<<"query-block-heights">>, QueryOpts),
+            Result = case block_at_offset(Match, Sorted, 1, tuple_size(Sorted), QueryOpts) of
+                {ok, null} -> remote_transaction_block(Match, QueryOpts);
+                Found -> Found
+            end,
+            {Result, QueryOpts};
+        Result -> {Result, Opts}
+    end;
+resolve_match_block(_Match, Opts) -> {{ok, null}, Opts}.
+
+%% @doc Prepare only requested block metadata, listing fallback heights at
+%% most once for the batch, reusing the preceding block when it contains the
+%% next match. Results stay with the match in request-private data.
+prepare_blocks(Matches, Needed, Opts) ->
+    lists:mapfoldl(
+        fun(Match, QueryOpts) ->
+            case Needed(Match) of
+                false -> {Match, QueryOpts};
+                true ->
+                    {Result, NextOpts} = resolve_match_block(Match, QueryOpts),
+                    Reuse = case Result of
+                        {ok, Block} when Block =/= null -> NextOpts#{ <<"query-block">> => Block };
+                        _ -> NextOpts
+                    end,
+                    {Match#{ <<"block-result">> => Result }, Reuse}
+            end
+        end,
+        Opts,
+        Matches
+    ).
+
+%% @doc Project selected block fields after reading a nonempty transaction page.
+block_edges(Edges, Opts) ->
+    case hb_opts:get(query_arweave_blocks, false, Opts) of
+        false -> Edges;
+        true ->
+            Matches = [hb_private:get(<<"query-match">>, maps:get(<<"node">>, Edge), #{}, Opts)
+                || Edge <- Edges],
+            {Prepared, _} = prepare_blocks(Matches, fun(_) -> true end, Opts),
+            [Edge#{ <<"node">> := hb_private:set(maps:get(<<"node">>, Edge),
+                <<"query-match">>, Match, Opts) }
+                || {Edge, Match} <- lists:zip(Edges, Prepared)]
+    end.
+
+%% @doc L1s at either byte boundary need membership checks for height filters.
+block_boundary(#{ <<"commitment-device">> := <<"tx@1.0">>, <<"offset">> := Offset },
+        #{ <<"block-start">> := Start, <<"block-end">> := End }) ->
+    is_integer(Offset) andalso (Offset =:= Start orelse Offset =:= End);
+block_boundary(_Match, _Bounds) -> false.
+
+%% @doc Seek the first candidate by end offset, then read only its header.
+%% L1s also inspect every same-end block for zero-data transaction membership.
+indexed_block(Match = #{ <<"offset">> := Offset }, From, Height, Opts) ->
+    maybe
+        {ok, [Entry]} ?= hb_ao:resolve(
+            #{ <<"path">> => <<"~arweave@2.9/blocks">>,
+                <<"weave-size">> => From, <<"height">> => Height }, Opts),
+        End = hb_maps:get(<<"weave-size">>, Entry, 0, Opts),
+        Result = read_block(hb_maps:get(<<"hash">>, Entry, not_found, Opts), Opts),
+        case Result of
+            {ok, Block} ->
+                BlockEnd = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+                Start = BlockEnd - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+                case Start =< Offset andalso BlockEnd =:= End
+                        andalso block_contains(Match, Block, End, Opts) of
+                    true -> {ok, Block};
+                    false when End =:= Offset ->
+                        indexed_block(Match, End,
+                            hb_maps:get(<<"height">>, Entry, 0, Opts) + 1, Opts);
+                    false -> {ok, null}
+                end;
+            {error, not_found} when End =:= Offset ->
+                indexed_block(Match, End,
+                    hb_maps:get(<<"height">>, Entry, 0, Opts) + 1, Opts);
+            {error, not_found} -> {ok, null};
+            ReadError -> ReadError
+        end
+    else
+        {ok, []} -> {ok, null};
+        Error -> Error
+    end.
+
+%% @doc Search all heights only when the node allows remote block reads.
+remote_transaction_block(Match, Opts) ->
+    case hb_opts:get(query_arweave_remote_block_ranges, true, Opts) of
+        true ->
+            maybe
+                {ok, Status} ?= query(undefined, <<"networkInfo">>, #{}, Opts),
+                Height = hb_util:int(hb_maps:get(<<"height">>, Status, 0, Opts)),
+                block_at_offset(Match, remote, 0, Height, Opts)
+            end;
+        _ -> {ok, null}
+    end.
+
+%% @doc Binary-search blocks by their weave ranges. L1 membership
+%% disambiguates zero-data transactions at shared block boundaries.
+block_at_offset(_Match, _Heights, Low, High, _Opts) when Low > High ->
+    {ok, null};
+block_at_offset(Match = #{ <<"offset">> := Offset }, Heights, Low, High, Opts) ->
+    Mid = (Low + High) div 2,
+    maybe
+        {ok, Block} ?=
+            case Heights of
+                remote -> read_block(Mid, Opts);
+                _ -> read_cached_block(element(Mid, Heights), Opts)
+            end,
+        End = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+        Start = End - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+        case {Offset < Start, Offset > End} of
+            {true, _} -> block_at_offset(Match, Heights, Low, Mid - 1, Opts);
+            {_, true} -> block_at_offset(Match, Heights, Mid + 1, High, Opts);
+            _ ->
+                case block_contains(Match, Block, End, Opts) of
+                    true -> {ok, Block};
+                    false ->
+                        maybe
+                            {ok, null} ?=
+                                case Offset =:= Start of
+                                    true -> block_at_offset(
+                                        Match, Heights, Low, Mid - 1, Opts);
+                                    false -> {ok, null}
+                                end,
+                            case Offset =:= End of
+                                true -> block_at_offset(
+                                    Match, Heights, Mid + 1, High, Opts);
+                                false -> {ok, null}
+                            end
+                        end
+                end
+        end
+    else
+        {error, not_found} -> {ok, null};
+        Error -> Error
+    end.
+
+%% @doc L1s must occur in the block's TX list; bundled items occupy bytes
+%% before its end. Zero-data L1s can also sit exactly at the end.
+block_contains(Match = #{ <<"commitment-device">> := <<"tx@1.0">> },
+        Block, _End, Opts) ->
+    lists:member(hb_maps:get(<<"id">>, Match, <<>>, Opts),
+        hb_maps:get(<<"txs">>, Block, [], Opts));
+block_contains(#{ <<"offset">> := Offset }, _Block, End, _Opts) ->
+    Offset < End.
 
 %% @doc Read a bounded page of blocks by height, or from explicit block IDs.
 block_connection(RawArgs, Opts) ->
@@ -624,7 +941,8 @@ read_block(Height, Opts) ->
                     ?event({read_block_remote, {height, Height}}),
                     hb_ao:resolve(
                         #{ <<"device">> => <<"arweave@2.9">> },
-                        #{ <<"path">> => <<"block">>, <<"block">> => Height },
+                        #{ <<"path">> => <<"block">>, <<"block">> => Height,
+                            <<"include-proofs">> => false },
                         Opts
                     );
                 _ -> {error, not_found}
@@ -635,7 +953,8 @@ read_block(Height, Opts) ->
                     ?event({read_block_remote, {height, Height}}),
                     hb_ao:resolve(
                         #{ <<"device">> => <<"arweave@2.9">> },
-                        #{ <<"path">> => <<"block">>, <<"block">> => Height },
+                        #{ <<"path">> => <<"block">>, <<"block">> => Height,
+                            <<"include-proofs">> => false },
                         Opts
                     );
                 _ -> {error, not_found}
@@ -644,11 +963,12 @@ read_block(Height, Opts) ->
 
 %% @doc Read a block from the Arweave pseudo-path cache.
 read_cached_block(Height, Opts) ->
-    hb_ao:resolve(
+    hb_ao:raw(
         #{ <<"device">> => <<"arweave@2.9">> },
         #{
             <<"path">> => <<"block">>,
             <<"block">> => Height,
+            <<"include-proofs">> => false,
             <<"cache-control">> => [<<"only-if-cached">>]
         },
         Opts
@@ -656,29 +976,29 @@ read_cached_block(Height, Opts) ->
 
 %% @doc Return the latest block height indexed in the Arweave pseudo-path cache.
 latest_cached_block(Opts) ->
-    Blocks =
-        hb_cache:list_numbered(
-            hb_path:to_binary([
-                <<"~arweave@2.9">>,
-                <<"block">>,
-                <<"height">>
-            ]),
-            Opts
-        ),
-    case Blocks of
+    case cached_block_heights(Opts) of
         [] -> not_found;
-        _ -> {ok, lists:max(Blocks)}
+        Blocks -> {ok, lists:max(Blocks)}
     end.
+
+%% @doc List block heights already available in the Arweave pseudo-path cache.
+cached_block_heights(Opts) ->
+    hb_util:ok(hb_ao:resolve(<<"~arweave@2.9/block-heights">>, Opts)).
 
 %%% Index-served pages
 
-%% @doc Serve a transactions page from the `~match@1.0' index: the matches
-%% of the query's pairs over its block range from its cursor, in the sort's
-%% direction. Every query the index cannot serve is `unservable':
-%% `cached_transactions' answers it.
+%% @doc Select block enumeration for unfiltered queries, indexed matching for
+%% predicates, or `unservable' for the cache-matching path.
 index_connection(Args, Opts) ->
+    case index_predicates(Args, Opts) of
+        {ok, []} -> block_transaction_connection(Args, Opts);
+        {ok, Predicates} -> index_connection(Predicates, Args, Opts);
+        Result -> Result
+    end.
+
+%% @doc Read a page selected by indexed predicates.
+index_connection(Predicates, Args, Opts) ->
     maybe
-        {ok, Predicates} ?= index_predicates(Args, Opts),
         {ok, After} ?= index_cursor(Args, Opts),
         Direction =
             case hb_maps:get(<<"sort">>, Args, <<"HEIGHT_DESC">>, Opts) of
@@ -691,7 +1011,7 @@ index_connection(Args, Opts) ->
             index_matches(Predicates, Ranges, After, PageSize + 1, Opts),
         More = length(Matches) > PageSize,
         ForceNextPage = force_next_page(Args, Opts),
-        {ok,
+        Page =
             #{
                 <<"matches">> => lists:sublist(Matches, PageSize),
                 <<"terminal">> => ForceNextPage andalso not More,
@@ -699,12 +1019,20 @@ index_connection(Args, Opts) ->
                 <<"ranges">> => Ranges,
                 <<"pageInfo">> =>
                     #{ <<"hasNextPage">> => More orelse ForceNextPage }
-            }}
+            },
+        {ok,
+            case After =:= none andalso not More of
+                true ->
+                    Cap = hb_opts:get(query_arweave_max_index_count,
+                        ?DEFAULT_MAX_INDEX_COUNT, Opts),
+                    Page#{ <<"count">> => hb_util:bin(min(length(Matches), Cap)) };
+                false -> Page
+            end}
     end.
 
 %% @doc The query's AND predicates, each with alternative values. Owners and
-%% recipients use `committer' and `target'. Explicit IDs, a height or bundle
-%% filter, and a query naming no predicate are `unservable'.
+%% recipients use `committer' and `field-target'. Explicit IDs, a height or bundle
+%% filter are `unservable'. An empty predicate list selects block enumeration.
 index_predicates(Args, Opts) ->
     Get = fun(Filter) -> hb_maps:get(Filter, Args, null, Opts) end,
     Fields =
@@ -714,7 +1042,7 @@ index_predicates(Args, Opts) ->
             {Pair, Filter} <-
                 [
                     {<<"committer">>, <<"owners">>},
-                    {<<"target">>, <<"recipients">>}
+                    {<<"field-target">>, <<"recipients">>}
                 ]
         ],
     maybe
@@ -731,8 +1059,103 @@ index_predicates(Args, Opts) ->
         Predicates = Tags ++
             [ #{ <<"name">> => Pair, <<"values">> => Values }
             || {Pair, Values} <- Fields, Values =/= null ],
-        true ?= Predicates =/= [] orelse unservable,
         {ok, Predicates}
+    end.
+
+%% @doc Page base-layer TX IDs directly from their containing block headers.
+block_transaction_connection(RawArgs, Opts) ->
+    Present = fun(_Key, Value) -> Value =/= null end,
+    Args = hb_maps:filter(Present, RawArgs, Opts),
+    Range = case hb_opts:get(query_arweave_ignore_block_ranges, false, Opts) of
+        true -> #{};
+        false -> hb_maps:filter(Present, hb_maps:get(<<"block">>, Args, #{}, Opts), Opts)
+    end,
+    maybe
+        {ok, After} ?= block_transaction_cursor(hb_maps:get(<<"after">>, Args, null, Opts)),
+        {ok, Tip} ?= block_index_tip(Opts),
+        Bounds = #{
+            <<"min">> => max(0, hb_maps:get(<<"min">>, Range, 0, Opts)),
+            <<"max">> => min(Tip, hb_maps:get(<<"max">>, Range, Tip, Opts)),
+            <<"direction">> => case hb_maps:get(<<"sort">>, Args, <<"HEIGHT_DESC">>, Opts) of
+                <<"HEIGHT_ASC">> -> 1;
+                _ -> -1
+            end
+        },
+        Limit = page_size(Args, Opts),
+        {ok, Matches} ?= block_transactions(Bounds, After, Limit + 1, Opts),
+        More = length(Matches) > Limit,
+        Force = force_next_page(Args, Opts),
+        {ok, #{
+            <<"matches">> => lists:sublist(Matches, Limit),
+            <<"block-range">> => Bounds,
+            <<"terminal">> => Force andalso not More,
+            <<"pageInfo">> => #{ <<"hasNextPage">> => More orelse Force }
+        }}
+    end.
+
+%% @doc Find the indexed tip with one ordered seek, without listing headers.
+block_index_tip(Opts) ->
+    case hb_ao:resolve(<<"~arweave@2.9/blocks&direction=desc">>, Opts) of
+        {ok, [Entry]} -> {ok, hb_maps:get(<<"height">>, Entry, Opts)};
+        {ok, []} ->
+            case hb_opts:get(query_arweave_remote_block_ranges, true, Opts) of
+                false -> {ok, -1};
+                true ->
+                    maybe
+                        {ok, Status} ?= query(undefined, <<"networkInfo">>, #{}, Opts),
+                        {ok, hb_util:int(hb_maps:get(<<"height">>, Status, Opts))}
+                    end
+            end;
+        Error -> Error
+    end.
+
+%% @doc Decode a height and TX ID, accepting the forced-page terminal marker.
+block_transaction_cursor(After) when After =:= null; After =:= <<>> -> {ok, none};
+block_transaction_cursor(After) ->
+    try
+        [<<"block=", H/binary>>, <<"tx=", ID:43/binary>> | Tail] =
+            binary:split(After, <<"&">>, [global]),
+        true = Tail =:= [] orelse Tail =:= [<<"remaining=0">>],
+        Height = binary_to_integer(H),
+        true = Height >= 0,
+        <<_:32/binary>> = hb_util:native_id(ID),
+        {ok, #{ <<"height">> => Height, <<"id">> => ID }}
+    catch _:_ -> {error, <<"Invalid cursor.">>}
+    end.
+
+%% @doc Start at the cursor's height, clamped to the near end of the range.
+block_transactions(Range = #{ <<"min">> := Min, <<"max">> := Max,
+        <<"direction">> := Direction }, After, Limit, Opts) ->
+    Height = case {Direction, After} of
+        {1, #{ <<"height">> := H }} -> max(Min, H);
+        {-1, #{ <<"height">> := H }} -> min(Max, H);
+        {1, none} -> Min;
+        {-1, none} -> Max
+    end,
+    block_transactions(Height, Range, After, Limit, Opts).
+
+%% @doc Read enough headers for the page; reuse each header for block fields.
+block_transactions(Height, #{ <<"min">> := Min, <<"max">> := Max }, _After,
+        Limit, _Opts) when Height < Min; Height > Max; Limit =:= 0 -> {ok, []};
+block_transactions(Height, Range = #{ <<"direction">> := Direction }, After, Limit, Opts) ->
+    maybe
+        {ok, Block} ?= read_block(Height, Opts),
+        IDs = lists:sort(hb_maps:get(<<"txs">>, Block, [], Opts)),
+        Ordered = case Direction of 1 -> IDs; -1 -> lists:reverse(IDs) end,
+        Remaining = case After of
+            #{ <<"height">> := Height, <<"id">> := Last } ->
+                [ID || ID <- Ordered, (Direction =:= 1 andalso ID > Last)
+                    orelse (Direction =:= -1 andalso ID < Last)];
+            _ -> Ordered
+        end,
+        Matches = [#{
+            <<"id">> => ID, <<"commitment-device">> => <<"tx@1.0">>,
+            <<"block-result">> => {ok, Block},
+            <<"cursor">> => <<"block=", (hb_util:bin(Height))/binary, "&tx=", ID/binary>>
+        } || ID <- lists:sublist(Remaining, Limit)],
+        {ok, Rest} ?= block_transactions(Height + Direction, Range, none,
+            Limit - length(Matches), Opts),
+        {ok, Matches ++ Rest}
     end.
 
 %% @doc The match the page resumes after, from the cursor of an
@@ -769,15 +1192,22 @@ index_ranges(Direction, Args, Opts) ->
             {asc, {Start, infinity}} ->
                 [#{ <<"from">> => Start }];
             {asc, {Start, End}} ->
-                [#{ <<"from">> => Start, <<"to">> => End }];
+                [#{ <<"from">> => Start, <<"to">> => End + 1 }];
             {desc, open} ->
                 [#{ <<"from">> => infinity }];
             {desc, {Start, infinity}} ->
                 [#{ <<"from">> => infinity, <<"to">> => Start - 1 }];
             {desc, {Start, End}} ->
-                [#{ <<"from">> => End - 1, <<"to">> => Start - 1 }]
+                [#{ <<"from">> => End, <<"to">> => Start - 1 }]
         end,
-    [ Range#{ <<"direction">> => Direction } || Range <- Bounds ].
+    Filter =
+        case Window of
+            open -> #{};
+            {Low, High} -> #{ <<"block">> => Heights,
+                <<"block-start">> => Low, <<"block-end">> => High }
+        end,
+    [ (maps:merge(Range, Filter))#{ <<"direction">> => Direction }
+        || Range <- Bounds ].
 
 %% @doc The matches of a page: the ranges read in order from the cursor,
 %% which lies in the range holding its key.
@@ -797,18 +1227,78 @@ locate_ranges(_Predicates, Ranges, _After, Limit, _Opts)
         when Ranges =:= []; Limit =:= 0 ->
     {ok, []};
 locate_ranges(Predicates, [Range | Rest], After, Limit, Opts) ->
-    Bounds =
-        case After of
-            none -> Range;
-            _ -> (maps:remove(<<"from">>, Range))#{ <<"after">> => After }
-        end,
     maybe
+        {ok, Bounds} ?= range_cursor(Range, After, Opts),
         {ok, Matches} ?=
-            locate(Predicates, Bounds#{ <<"limit">> => Limit }, Opts),
+            locate_range(Predicates, Bounds, Limit, Opts),
         {ok, More} ?=
             locate_ranges(Predicates, Rest, none, Limit - length(Matches), Opts),
         {ok, Matches ++ More}
     end.
+
+%% @doc A cursor cannot start a range before its inclusive near boundary.
+range_cursor(Range, none, _Opts) -> {ok, Range};
+range_cursor(Range = #{ <<"from">> := From, <<"direction">> := Direction },
+        After, Opts) ->
+    try
+        {ok, #{ <<"offset">> := Offset }} = hb_ao:raw(
+            <<"match@1.0">>, <<"entry">>, #{ <<"body">> => After }, #{}, Opts),
+        case (Direction =:= asc andalso Offset < From) orelse
+                (Direction =:= desc andalso Offset > From) of
+            true -> {ok, Range};
+            false ->
+                {ok, (maps:remove(<<"from">>, Range))#{ <<"after">> => After }}
+        end
+    catch error:badarg ->
+        {error, <<"Invalid cursor.">>}
+    end.
+
+%% @doc Filter boundary candidates before counting the page, refilling it
+%% from the last examined member with bounded reads until full or exhausted.
+locate_range(Predicates, Bounds, Limit, Opts) ->
+    maybe
+        {ok, Matches} ?= locate(Predicates, Bounds#{ <<"limit">> => Limit }, Opts),
+        {Prepared, QueryOpts} = prepare_blocks(Matches,
+            fun(Match) -> block_boundary(Match, Bounds) end, Opts),
+        Accepted = [Match || Match <- Prepared, in_block_range(Match, Bounds, QueryOpts)],
+        case length(Matches) =:= Limit andalso length(Accepted) < Limit of
+            false -> {ok, Accepted};
+            true ->
+                Next = (maps:remove(<<"from">>, Bounds))#{
+                    <<"after">> => maps:get(<<"member">>, lists:last(Matches)) },
+                maybe
+                    {ok, More} ?= locate_range(
+                        Predicates, Next, Limit - length(Accepted), QueryOpts),
+                    {ok, Accepted ++ More}
+                end
+        end
+    end.
+
+%% @doc Byte ranges identify bundled items, but L1s at shared boundaries
+%% require block membership to distinguish zero-data transactions.
+in_block_range(Match, #{ <<"block">> := Heights, <<"block-start">> := Start,
+        <<"block-end">> := End }, Opts) ->
+    Offset = maps:get(<<"offset">>, Match, undefined),
+    Min = case maps:get(<<"min">>, Heights, 0) of null -> 0; Low -> Low end,
+    Max = case maps:get(<<"max">>, Heights, infinity) of
+        null -> infinity; High -> High end,
+    case pending_offset(Offset) of
+        true -> End =:= infinity;
+        false when is_integer(Offset), Offset >= Start, Offset =< End ->
+            case maps:get(<<"commitment-device">>, Match, <<>>) of
+                <<"tx@1.0">> when Offset =:= End;
+                        Offset =:= Start, Min > 0 ->
+                    case hb_util:ok(match_block(Match, Opts)) of
+                        null -> false;
+                        Block ->
+                            Height = hb_maps:get(<<"height">>, Block, -1, Opts),
+                            Height >= Min andalso Height =< Max
+                    end;
+                _ -> Offset < End
+            end;
+        false -> false
+    end;
+in_block_range(_Match, _Range, _Opts) -> true.
 
 %% @doc The matches of the predicates through `~match@1.0'. A node without
 %% stores of the index is `unservable'; a failing store is an error, as
@@ -830,19 +1320,22 @@ locate(Predicates, Req, Opts) ->
 %% their keys, read together. A match carrying an ID reads its cached
 %% message; one without reads the item at its offset from the weave. A
 %% match neither can read is dropped and reported.
+match_edges(Matches, #{ <<"query-arweave-nodes">> := false }) ->
+    [#{ <<"cursor">> => match_cursor(Match) } || Match <- Matches];
 match_edges(Matches, Opts) ->
     Read =
         hb_pmap:parallel_map(
-            Matches,
-            fun(Match) -> {Match, match_message(Match, Opts)} end,
+            [maps:remove(<<"block-result">>, Match) || Match <- Matches],
+            fun(Match) -> match_message(Match, Opts) end,
             hb_opts:get(arweave_chunk_fetch_concurrency, 10, Opts)
         ),
-    lists:filtermap(
-        fun({#{ <<"member">> := Member }, {ok, Node}}) ->
+    block_edges(lists:filtermap(
+        fun({Match, {ok, Node}}) ->
                 {true,
                     #{
-                        <<"cursor">> => <<?MEMBER_CURSOR, Member/binary>>,
-                        <<"node">> => Node
+                        <<"cursor">> => match_cursor(Match),
+                        <<"node">> =>
+                            hb_private:set(Node, <<"query-match">>, Match, Opts)
                     }};
             ({Match, Error}) ->
                 ?event(warning,
@@ -850,15 +1343,33 @@ match_edges(Matches, Opts) ->
                 ),
                 false
         end,
-        Read
-    ).
+        lists:zip(Matches, Read)
+    ), Opts).
 
-%% @doc A match's message: through `hb_cache' by its ID, or from the weave
-%% by its offset.
+%% @doc Preserve block-page cursors, or encode a match index member.
+match_cursor(#{ <<"cursor">> := Cursor }) -> Cursor;
+match_cursor(#{ <<"member">> := Member }) -> <<?MEMBER_CURSOR, Member/binary>>.
+
+%% @doc L1 metadata needs only its native header, not an expanded bundle.
+%% Other messages read by ID, or decode their header at a weave offset.
+match_message(#{ <<"id">> := ID, <<"commitment-device">> := <<"tx@1.0">>,
+        <<"offset">> := Offset }, Opts) when is_integer(Offset), Offset >= 0 ->
+    l1_message(ID, Opts);
+match_message(#{ <<"id">> := ID, <<"cursor">> := <<"block=", _/binary>> }, Opts) ->
+    l1_message(ID, Opts);
 match_message(#{ <<"id">> := ID }, Opts) when ID =/= <<>> ->
     hb_cache:read(ID, Opts);
 match_message(#{ <<"offset">> := Offset, <<"commitment-device">> := Device }, Opts) ->
     header(Offset, Device, Opts).
+
+%% @doc Keep header-only L1 reads separate from complete-message cache reads.
+l1_message(ID, Opts) ->
+    case hb_cache:read(ID, hb_store:scope(Opts, local)) of
+        {ok, Msg} -> {ok, Msg};
+        {error, not_found} -> hb_ao:resolve(#{ <<"path">> => <<"~arweave@2.9/tx">>,
+            <<"tx">> => ID, <<"exclude-data">> => true }, Opts);
+        Error -> Error
+    end.
 
 %% @doc The message of the item at a weave offset, from its header alone:
 %% parsed from the bytes between the offset and the end of its chunk -- one
@@ -892,13 +1403,8 @@ header_message({ok, Bytes}, Device, Opts) ->
                 Device, <<"deserialize">>, #{ <<"body">> => Bytes },
                 #{ <<"exclude-data">> => true }, Opts
             ),
-        {ok,
-            hb_message:convert(
-                TABM,
-                <<"structured@1.0">>,
-                tabm,
-                Opts
-            )}
+        Msg = hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts),
+        {ok, hb_private:set(Msg, <<"query-data-omitted">>, true, Opts)}
     catch _:Reason ->
         {error, {'invalid-item', Reason}}
     end;
@@ -910,17 +1416,17 @@ header_message(Error, _Device, _Opts) ->
 %% @doc Progressively generate matches from each argument for a transaction
 %% query.  The `block' range is applied as a post-filter over the candidate
 %% set rather than as a set-producing index lookup.
+match_args(#{ <<"ids">> := [] }, _Opts) -> [];
 match_args(Args, Opts) when is_map(Args) ->
-    match_args(
-        maps:to_list(
-            maps:with(
-                ?SUPPORTED_QUERY_ARGS,
-                Args
+    case explicit_ids(Args, Opts) of
+        [_ | _] = IDs -> IDs;
+        [] ->
+            match_args(
+                maps:to_list(maps:with(?SUPPORTED_QUERY_ARGS, Args)),
+                [],
+                Opts
             )
-        ),
-        [],
-        Opts
-    ).
+    end.
 match_args([], [], _Opts) -> [];
 match_args([], Results, _Opts) ->
     ?event({match_args_results, Results}),
@@ -937,6 +1443,35 @@ match_args([{Field, X} | Rest], Acc, Opts) ->
         {ok, Result} -> match_args(Rest, [Result | Acc], Opts);
         ignore -> match_args(Rest, Acc, Opts);
         {error, _} = Error -> throw(Error)
+    end.
+
+%% @doc Explicit IDs bound the work to candidate reads and predicate checks.
+%% Keep loaded messages for projection; offsets are only ordering metadata.
+check_explicit_ids(Ordered, Args, Opts) ->
+    {ok, Predicates} = index_predicates(
+        maps:with([<<"tags">>, <<"owners">>, <<"recipients">>], Args), Opts),
+    case explicit_ids(Args, Opts) =:= [] orelse Predicates =:= [] of
+        true -> Ordered;
+        false -> lists:append(hb_pmap:parallel_map(
+            Ordered,
+            fun(Annotated = #{ <<"id">> := ID }) ->
+                maybe
+                    [Edge = #{ <<"node">> := Msg }] ?=
+                        read_id(Annotated, Opts#{ <<"query-arweave-nodes">> => true }),
+                    {ok, true} ?= hb_ao:raw(
+                        <<"match@1.0">>, hb_message:with_commitments([ID], Msg, Opts),
+                        #{ <<"path">> => <<"check">>, <<"predicates">> => Predicates },
+                        Opts
+                    ),
+                    [Edge]
+                else
+                    [] -> [];
+                    {ok, false} -> [];
+                    Error -> throw(Error)
+                end
+            end,
+            hb_opts:get(arweave_chunk_fetch_concurrency, 10, Opts)
+        ))
     end.
 
 %% @doc Generate a match upon `tags' in the arguments, if given.
@@ -1013,34 +1548,38 @@ native_tags(Tags, Opts) ->
 annotate_ids(IDs, Opts) ->
     case hb_store_arweave:store_from_opts(Opts) of
         no_store -> unavailable;
-        StoreOpts -> annotate_offsets(IDs, StoreOpts, undefined, 0, Opts)
+        StoreOpts -> annotate_offsets(lists:sort(IDs), StoreOpts, #{}, Opts)
     end.
-annotate_offsets([], _StoreOpts, _LastOffset, _Ordinate, _Opts) -> [];
-annotate_offsets([ID|IDs], StoreOpts, LastOffset, Ordinate, Opts) ->
+annotate_offsets([], _StoreOpts, _Ordinals, _Opts) -> [];
+annotate_offsets([ID|IDs], StoreOpts, Ordinals, Opts) ->
     {Offset, Annotated} =
         case hb_store_arweave:read_offset(StoreOpts, ID, Opts) of
-            {ok, #{ <<"start">> := StartOffset, <<"length">> := Length }} ->
+            {ok, Location = #{ <<"start">> := StartOffset, <<"length">> := Length }} ->
                 {
                     StartOffset,
                     #{
                         <<"id">> => ID,
                         <<"offset">> => StartOffset,
+                        <<"commitment-device">> =>
+                            hb_maps:get(<<"codec-device">>, Location, <<>>, Opts),
                         <<"length">> => Length
                     }
                 };
             _ ->
                 {undefined, #{ <<"id">> => ID }}
         end,
-    {NewOrdinate, Postfix} =
-        case Offset =/= undefined andalso not pending_offset(Offset) andalso Offset =:= LastOffset of
-            true -> {Ordinate + 1, <<"-", (hb_util:bin(Ordinate + 1))/binary>>};
-            false -> {0, <<>>}
+    Ordinate = maps:get(Offset, Ordinals, 0),
+    Postfix =
+        case is_integer(Offset) andalso Ordinate > 0 of
+            true -> <<"-", (hb_util:bin(Ordinate))/binary>>;
+            false -> <<>>
         end,
     WithCursor =
         Annotated#{
             <<"cursor">> => << (offset_cursor(ID, Offset))/binary, Postfix/binary >>
         },
-    [WithCursor | annotate_offsets(IDs, StoreOpts, Offset, NewOrdinate, Opts)].
+    [WithCursor | annotate_offsets(IDs, StoreOpts,
+        Ordinals#{ Offset => Ordinate + 1 }, Opts)].
 
 offset_cursor(ID, undefined) when is_binary(ID) -> <<"ephemeral=", ID/binary>>;
 offset_cursor(ID, Offset) when is_binary(ID) ->
@@ -1049,6 +1588,7 @@ offset_cursor(ID, Offset) when is_binary(ID) ->
         false -> <<"offset=", (hb_util:bin(Offset))/binary>>
     end.
 
+pending_offset(infinity) -> true;
 pending_offset(relative) -> true;
 pending_offset(#{ <<"relative">> := _, <<"offset">> := _ }) -> true;
 pending_offset(_) -> false.
@@ -1069,22 +1609,22 @@ filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
 do_filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
     {StartOffset, EndOffset} =
         block_range_to_offset_range(Heights, Opts),
+    Range = #{ <<"block">> => Heights, <<"block-start">> => StartOffset,
+        <<"block-end">> => EndOffset },
+    {Prepared, QueryOpts} = prepare_blocks(AnnotatedIDs,
+        fun(Match) -> block_boundary(Match, Range) end, Opts),
     Filtered =
         lists:filter(
-            fun(#{ <<"offset">> := Offset }) when Offset =:= relative ->
-                    EndOffset =:= infinity;
-                (#{ <<"offset">> := Offset }) when is_map(Offset) ->
-                    EndOffset =:= infinity;
-                (#{ <<"offset">> := IDOffset, <<"length">> := Length })
-                        when is_integer(IDOffset) ->
-                    ((StartOffset =:= 0) orelse (IDOffset >= StartOffset)) andalso
-                        (
-                            (EndOffset =:= infinity) orelse
-                                (IDOffset + Length =< EndOffset)
-                        );
-                (_) -> false
+            fun(Match) ->
+                in_block_range(Match, Range, QueryOpts) andalso
+                    case Match of
+                        #{ <<"offset">> := Offset, <<"length">> := Length }
+                                when is_integer(Offset), is_integer(EndOffset) ->
+                            Offset + Length =< EndOffset;
+                        _ -> true
+                    end
             end,
-            AnnotatedIDs
+            Prepared
         ),
     ?event({filtered_out_of_range, length(AnnotatedIDs) - length(Filtered)}),
     Filtered.
@@ -1131,6 +1671,29 @@ explicit_ids(Args, Opts) ->
         end
     ).
 
+%% @doc Clamp only cursors before the near bound, preserving exclusive IDs.
+range_cursor_test() ->
+    lists:foreach(
+        fun({Direction, From, Before, Ahead}) ->
+            Range = #{ <<"direction">> => Direction, <<"from">> => From },
+            ?assertEqual({ok, Range}, range_cursor(Range, none, #{})),
+            ?assertEqual({ok, Range}, range_cursor(Range, Before, #{})),
+            lists:foreach(
+                fun(Cursor) ->
+                    ?assertEqual({ok, #{ <<"direction">> => Direction,
+                        <<"after">> => Cursor }}, range_cursor(Range, Cursor, #{}))
+                end,
+                [hb_util:bin(From),
+                    <<"00000000000000000010",
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAans104@1.0">>,
+                    Ahead]
+            ),
+            ?assertEqual({error, <<"Invalid cursor.">>},
+                range_cursor(Range, <<"nonsense">>, #{}))
+        end,
+        [{asc, 10, <<"9">>, <<"infinity">>}, {desc, 10, <<"11">>, <<"-1">>}]
+    ).
+
 pending_offsets_page_by_cursor_test() ->
     Store = hb_test_utils:test_store(),
     ArweaveStore = #{ <<"store-module">> => hb_store_arweave, <<"index-store">> => [Store] },
@@ -1143,9 +1706,12 @@ pending_offsets_page_by_cursor_test() ->
         ArweaveStore, NumericID, <<"tx@1.0">>, 10, 1),
     ok = hb_store_arweave:write_offset(
         ArweaveStore, PendingA, <<"tx@1.0">>, relative, 0),
+    Missing = hb_util:encode(crypto:hash(sha256, <<"missing">>)),
+    ok = hb_store_arweave:write_offset(
+        ArweaveStore, Missing, <<"tx@1.0">>, 11, 0),
     BaseArgs =
         #{
-            <<"ids">> => [PendingA, NumericID],
+            <<"ids">> => [PendingA, Missing, NumericID],
             <<"block">> => #{ <<"min">> => 0 },
             <<"first">> => 1
         },
@@ -1169,14 +1735,63 @@ pending_offsets_page_by_cursor_test() ->
     #{ <<"id">> := NumericID } = Page(BaseArgs#{ <<"sort">> => <<"HEIGHT_ASC">> }),
     #{ <<"id">> := PendingA, <<"cursor">> := FirstCursor } = Page(BaseArgs),
     #{ <<"id">> := NumericID } = Page(BaseArgs#{ <<"after">> => FirstCursor }),
-    ok.
+    % A cursor-only page reports indexed candidates even without their nodes.
+    ?assertMatch(#{ <<"data">> := #{ <<"transactions">> := #{
+        <<"edges">> := [#{ <<"cursor">> := <<"offset=11">> }],
+        <<"pageInfo">> := #{ <<"hasNextPage">> := true }
+    }}}, dev_query_graphql:test_query(hb_http_server:start_node(Opts),
+        <<"query($ids: [ID!], $after: String) { transactions(ids: $ids,",
+            " after: $after, first: 1) { edges { cursor }",
+            " pageInfo { hasNextPage } } }">>,
+        #{ <<"ids">> => [PendingA, Missing, NumericID],
+            <<"after">> => FirstCursor }, Opts)).
+
+%% @doc Block bounds and exclusive member cursors intersect in either order.
+bounded_member_pages_test() ->
+    Store = (hb_test_utils:test_store(hb_store_lmdb))#{
+        <<"capacity">> => 1024 * 1024 * 1024, <<"list-batch-size">> => 2 },
+    Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new(),
+        <<"match-index">> => [Store#{ <<"from-list">> => <<"~match@1.0/entries">> }] },
+    lists:foreach(
+        fun({N, Offset}) ->
+            Msg = hb_message:commit(#{ <<"type">> => <<"Window">>,
+                <<"n">> => N }, Opts),
+            hb_cache:write(hb_private:set(Msg, <<"offset">>, Offset, Opts), Opts)
+        end,
+        lists:enumerate([9, 10, 10, 19, 20])
+    ),
+    {ok, BlockID} = hb_cache:write(#{ <<"height">> => 1,
+        <<"weave_size">> => 20, <<"block_size">> => 10 }, Opts),
+    hb_cache:link(BlockID, <<"~arweave@2.9/block/height/1">>, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Query = <<"query($after:String,$sort:SortOrder){transactions(first:1,",
+        "block:{min:1,max:1},tags:[{name:\"type\",values:[\"Window\"]}],",
+        "after:$after,sort:$sort){edges{cursor}pageInfo{hasNextPage}}}">>,
+    Page = fun(Sort, After) -> hb_util:deep_get(<<"data/transactions">>,
+        dev_query_graphql:test_query(Node, Query,
+            #{ <<"sort">> => Sort, <<"after">> => After }, Opts), #{}, Opts) end,
+    Pages = fun Pages(Sort, After) ->
+        #{ <<"edges">> := Edges, <<"pageInfo">> := #{ <<"hasNextPage">> := More }} =
+            Page(Sort, After),
+        case More of
+            false -> Edges;
+            true -> Edges ++ Pages(Sort, maps:get(<<"cursor">>, lists:last(Edges)))
+        end
+    end,
+    Asc = Pages(<<"HEIGHT_ASC">>, null),
+    ?assertEqual(3, length(lists:usort(Asc))),
+    ?assertEqual(Asc, Pages(<<"HEIGHT_ASC">>, <<"member=9">>)),
+    ?assertEqual(lists:reverse(Asc), Pages(<<"HEIGHT_DESC">>, <<"member=21">>)),
+    ?assertEqual([], Pages(<<"HEIGHT_ASC">>, <<"member=21">>)),
+    ?assertEqual([], Pages(<<"HEIGHT_DESC">>, <<"member=9">>)).
 
 %% @doc Signed messages the weave never held page out last in either order,
 %% by cursor, from a node's own stores.
 unmined_pages_test() ->
     Opts = #{
         <<"store">> => [hb_test_utils:test_store()],
-        <<"priv-wallet">> => ar_wallet:new()
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"query-arweave-max-index-count">> => 2
     },
     Node = hb_http_server:start_node(Opts),
     lists:foreach(
@@ -1194,13 +1809,14 @@ unmined_pages_test() ->
     ),
     Query =
         <<"""
-            query($after: String, $sort: SortOrder) {
+            query($after: String, $sort: SortOrder, $first: Int = 1) {
                 transactions(
                     tags: [{ name: "type", values: ["Unmined"] }],
-                    first: 1,
+                    first: $first,
                     after: $after,
                     sort: $sort
                 ) {
+                    count
                     pageInfo { hasNextPage }
                     edges { cursor node { id } }
                 }
@@ -1209,6 +1825,7 @@ unmined_pages_test() ->
     Pages =
         fun Pages(Sort, After, Acc) ->
             #{
+                <<"count">> := <<"2">>,
                 <<"edges">> := [Edge = #{ <<"cursor">> := Cursor }],
                 <<"pageInfo">> := #{ <<"hasNextPage">> := More }
             } =
@@ -1232,6 +1849,13 @@ unmined_pages_test() ->
     Descending = Pages(<<"HEIGHT_DESC">>, null, []),
     ?assertEqual(3, length(lists:usort(Descending))),
     ?assertEqual(lists:reverse(Descending), Pages(<<"HEIGHT_ASC">>, null, [])),
+    ?assertMatch(
+        #{ <<"data">> := #{ <<"transactions">> := #{
+            <<"count">> := <<"2">>,
+            <<"pageInfo">> := #{ <<"hasNextPage">> := false }
+        }}},
+        dev_query_graphql:test_query(Node, Query, #{ <<"first">> => 10 }, Opts)
+    ),
     #{ <<"errors">> := Errors } =
         dev_query_graphql:test_query(
             Node, Query, #{ <<"after">> => <<"member=nonsense">> }, Opts
@@ -1271,7 +1895,10 @@ published_pages() ->
                         <<"to-key">> => <<"~match@1.0/row", Sizes/binary>>,
                         <<"from-key">> =>
                             <<"~match@1.0/member", Sizes/binary,
-                                "/set&commitment-device=ans104@1.0">>
+                                "/set&commitment-device=ans104@1.0">>,
+                        <<"from-list">> =>
+                            <<"~match@1.0/members", Sizes/binary,
+                                "&commitment-device=ans104@1.0">>
                     }
                 ]
         },
@@ -1287,7 +1914,7 @@ published_pages() ->
                 ) {
                     count
                     pageInfo { hasNextPage }
-                    edges { cursor node { id tags { name value } } }
+                    edges { cursor node { id data { size } tags { name value } } }
                 }
             }
         """>>,
@@ -1327,7 +1954,8 @@ published_pages() ->
     ?assertEqual(24, length(lists:usort(IDs))),
     ?assert(
         lists:all(
-            fun(#{ <<"node">> := #{ <<"tags">> := Tags } }) ->
+            fun(#{ <<"node">> := #{ <<"tags">> := Tags,
+                    <<"data">> := #{ <<"size">> := null } } }) ->
                 lists:member(
                     #{
                         <<"name">> => <<"action">>,

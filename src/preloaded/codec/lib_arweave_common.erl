@@ -1,7 +1,7 @@
 %%% @doc Shared Arweave codec helpers.
 -module(lib_arweave_common).
 -export([from/3]).
--export([fields/3, tags/2, data/5, committed/6, base/5]).
+-export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([to/3, to/6, siginfo/4, fields_to_tx/4]).
@@ -15,8 +15,8 @@ from(Binary, _Req, _Opts) when is_binary(Binary) ->
     {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
     case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        false -> from_item(TX, Req, Opts);
-        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data}
+        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data};
+        _ -> from_item(TX, Req, Opts)
     end.
 
 from_item(RawTX, Req, Opts) ->
@@ -72,7 +72,7 @@ to(Device, TABM, Req, FieldsFun, ExcludedTagsFun, Opts) ->
     ?event({calculated_tags, Tags}),
     TX = TX1#tx{ tags = Tags },
     ?event({tx_before_id_gen, TX}),
-    try ar_tx:normalize(TX)
+    try tag_count(ar_tx:normalize(TX), TABM)
     catch
         Type:Error:Stacktrace ->
             ?event({
@@ -84,6 +84,14 @@ to(Device, TABM, Req, FieldsFun, ExcludedTagsFun, Opts) ->
             }),
             erlang:raise(Type, Error, Stacktrace)
     end.
+
+%% @doc Throw `too_many_keys' if a normalized item has more tags than ANS-104
+%% allows. `ar_tx:normalize/1' adds three tags to an item whose data is a
+%% bundle, so the tags are counted after it.
+tag_count(TX, TABM) when length(TX#tx.tags) > ?MAX_TAG_COUNT ->
+    throw({too_many_keys, TABM});
+tag_count(TX, _TABM) ->
+    TX.
 
 %% @doc Return a TABM message containing the fields of the given decoded
 %% ANS-104 data item that should be included in the base message.
@@ -118,6 +126,13 @@ tags(Item, Opts) ->
     ),
     ao_types(Tags, Opts).
 
+%% @doc Normalize tag keys while preserving IDs and their link forms.
+normalize_key(Key) ->
+    case hb_link:remove_link_specifier(Key) of
+        ID when ?IS_ID(ID) -> Key;
+        _ -> hb_util:to_lower(hb_ao:normalize_key(Key))
+    end.
+
 %% @doc Ensure the encoded keys in the `ao-types' field are lowercased and
 %% normalized like the other keys in the tags field.
 ao_types(#{ <<"ao-types">> := AoTypes } = Tags, Opts) ->
@@ -135,7 +150,7 @@ ao_types(#{ <<"ao-types">> := AoTypes } = Tags, Opts) ->
     NormAOTypes =
         maps:fold(
             fun(Key, Val, Acc) ->
-                NormKey = hb_util:to_lower(hb_ao:normalize_key(Key)),
+                NormKey = normalize_key(Key),
                 Acc#{ NormKey => Val }
             end,
             #{},
@@ -225,7 +240,7 @@ tag_keys(Item, _Opts) ->
     ],
     lists:filtermap(
         fun({Tag, _}) ->
-            NormalizedTag = hb_util:to_lower(hb_ao:normalize_key(Tag)),
+            NormalizedTag = normalize_key(Tag),
             case lists:member(NormalizedTag, MetaTags) of
                 true -> false;
                 false -> {true, NormalizedTag}
@@ -270,6 +285,24 @@ find_key(Key, Map, Opts) ->
                 {ok, Value} -> {KeyLink, Value};
                 error -> error
             end
+    end.
+
+%% @doc Check that a commitment's ID and committer are those of the item
+%% encoded from the message. The item's values need no check here:
+%% `commitment_to_tx/4' takes the commitment's fields and tags only while the
+%% message holds their values, and gives a changed message its own, which the
+%% item's signature then does not verify.
+verify_identity(Item, TABM) ->
+    [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
+    case maps:get(<<"type">>, Commitment) of
+        <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
+        _ ->
+            hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
+                maps:get(<<"committer">>, Commitment, undefined) =:=
+                    hb_util:human_id(
+                        ar_wallet:to_address(
+                            Item#tx.owner, Item#tx.signature_type)
+                    )
     end.
 
 %% @doc Return a message with the appropriate commitments added to it.
@@ -361,7 +394,7 @@ bundle_commitment_key(Tags, Opts) ->
 
 %% @doc Check whether a list of key-value pairs contains only normalized keys.
 normal_tags(BaseFields, Tags) ->
-    ReservedFields = [<<"ao-types">>, <<"data">> | BaseFields],
+    ReservedFields = [<<"ao-data-key">>, <<"ao-types">>, <<"data">> | BaseFields],
     NormalizedKeys =
         [
             hb_util:to_lower(hb_ao:normalize_key(Key))
@@ -419,7 +452,7 @@ deduplicating_from_list(Tags, Opts) ->
     Aggregated =
         lists:foldl(
             fun({Key, Value}, Acc) ->
-                NormKey = hb_util:to_lower(hb_ao:normalize_key(Key)),
+                NormKey = normalize_key(Key),
                 case hb_maps:get(NormKey, Acc, undefined, Opts) of
                     undefined -> hb_maps:put(NormKey, Value, Acc, Opts);
                     Existing when is_list(Existing) ->
@@ -477,15 +510,18 @@ bundle_hint(Device, Msg, Req, Opts) ->
     end.
 
 %% @doc Calculate the fields for a message, returning an initial TX record.
-siginfo(_Message, {ok, _, Commitment}, FieldsFun, Opts) ->
-    commitment_to_tx(Commitment, FieldsFun, Opts);
+siginfo(Message, {ok, _, Commitment}, FieldsFun, Opts) ->
+    commitment_to_tx(Message, Commitment, FieldsFun, Opts);
 siginfo(Message, not_found, FieldsFun, Opts) ->
     FieldsFun(#tx{}, <<>>, Message, Opts);
 siginfo(Message, multiple_matches, _FieldsFun, _Opts) ->
     throw({multiple_ans104_commitments_unsupported, Message}).
 
-%% @doc Convert a commitment to a base TX record.
-commitment_to_tx(Commitment, FieldsFun, Opts) ->
+%% @doc Convert a commitment to a base TX record. Its fields and tags are the
+%% commitment's while the message holds their values. A message changed after
+%% signing is given its own fields and committed keys' values instead, so the
+%% commitment's signature does not verify the item.
+commitment_to_tx(Message, Commitment, FieldsFun, Opts) ->
     Signature =
         hb_util:decode(
             maps:get(<<"signature">>, Commitment, hb_util:encode(?DEFAULT_SIG))
@@ -514,7 +550,85 @@ commitment_to_tx(Commitment, FieldsFun, Opts) ->
         signature_type = SignatureType,
         tags = Tags
     },
-    FieldsFun(TX, ?FIELD_PREFIX, Commitment, Opts).
+    case holds_signed_values(Commitment, Tags, Message, Opts) of
+        true -> FieldsFun(TX, ?FIELD_PREFIX, Commitment, Opts);
+        false -> FieldsFun(TX#tx{ tags = [] }, <<>>, Message, Opts)
+    end.
+
+%% @doc Check that a message still holds the values of the fields and tags
+%% that its commitment restores, and the types that the tags give to its
+%% committed keys. Keys added after signing are not compared.
+holds_signed_values(Commitment, OriginalTags, TABM, Opts) ->
+    Fields =
+        maps:from_list(
+            [
+                {Key, Value}
+            ||
+                {<<"field-", Key/binary>>, Value}
+                    <- hb_maps:to_list(Commitment, Opts)
+            ]
+        ),
+    holds(Fields, TABM, Opts) andalso
+        holds_tags(OriginalTags, maps:keys(Fields), Commitment, TABM, Opts).
+
+%% @doc Check that a message holds the values of its commitment's tags, and
+%% the types that the `ao-types' tag gives to its committed keys. A tag with
+%% the name of a field is skipped: decoding takes the field's value.
+holds_tags([], _FieldKeys, _Commitment, _TABM, _Opts) ->
+    true;
+holds_tags(OriginalTags, FieldKeys, Commitment, TABM, Opts) ->
+    Tags = deduplicating_from_list(OriginalTags, Opts),
+    Keys =
+        hb_util:list_without(
+            [<<"ao-types">> | FieldKeys],
+            tag_keys(#tx{ tags = OriginalTags }, Opts)
+        ),
+    holds(maps:with(Keys, Tags), TABM, Opts) andalso
+        holds_types(
+            maps:get(<<"ao-types">>, Tags, <<>>),
+            Commitment,
+            TABM,
+            Opts
+        ).
+
+%% @doc Check that a message holds the given values for their keys. Lazy
+%% values, as in a message read from a cache, are loaded before comparing.
+holds(Values, TABM, Opts) ->
+    hb_cache:ensure_all_loaded(Values, Opts) ==
+        hb_cache:ensure_all_loaded(maps:with(maps:keys(Values), TABM), Opts).
+
+%% @doc Check that the message gives its committed keys the types that the
+%% commitment's `ao-types' tag gives them. Equal `ao-types' values need no
+%% decoding.
+holds_types(Types, _Commitment, #{ <<"ao-types">> := Types }, _Opts) ->
+    true;
+holds_types(SignedTypes, Commitment, TABM, Opts) ->
+    Committed =
+        [
+            normalize_key(hb_link:remove_link_specifier(Key))
+        ||
+            Key <-
+                hb_util:message_to_ordered_list(
+                    hb_maps:get(<<"committed">>, Commitment, #{}, Opts)
+                )
+        ],
+    maps:with(Committed, decode_types(SignedTypes, Opts)) ==
+        maps:with(
+            Committed,
+            decode_types(hb_maps:get(<<"ao-types">>, TABM, <<>>, Opts), Opts)
+        ).
+
+%% @doc Decode an `ao-types' value to a map of normalized keys to types.
+decode_types(<<>>, _Opts) ->
+    #{};
+decode_types(Types, Opts) ->
+    {ok, Decoded} =
+        hb_ao:raw(<<"structured@1.0">>, <<"decode-types">>, Types, #{}, Opts),
+    maps:fold(
+        fun(Key, Type, Acc) -> Acc#{ normalize_key(Key) => Type } end,
+        #{},
+        Decoded
+    ).
 
 %% @doc Convert a HyperBEAM-compatible message into an ANS-104 tag list.
 original_tags_to_tags(TagMap) ->
@@ -686,7 +800,8 @@ committed_tag_keys_to_tags(TABM, Committed, Opts) ->
                 {ok, Value} -> {Key, Value}
             end
         end,
-        hb_util:list_without([DataKey], Committed)
+        [Key || Key <- Committed,
+            Key =/= DataKey orelse hb_maps:get(Key, TABM, none, Opts) == <<>>]
     ).
 
 bundle_tags_to_tags({ok, _, Commitment}) ->

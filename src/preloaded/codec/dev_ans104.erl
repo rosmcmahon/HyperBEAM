@@ -13,12 +13,19 @@
 content_type(_) -> {ok, <<"application/ans104">>}.
 
 %% @doc Serialize a message or TX to a binary.
+-spec serialize(binary() | #tx{} | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary()}.
 serialize(Msg, Req, Opts) when is_map(Msg) ->
     serialize(to(Msg, Req, Opts), Req, Opts);
 serialize(TX, _Req, _Opts) when is_record(TX, tx) ->
     {ok, ar_bundles:serialize(TX)}.
 
 %% @doc Deserialize a binary ans104 message to a TABM.
+-spec deserialize(
+    binary() | #tx{} | #{ body := binary(), _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, binary() | #{ _ => _ }}.
 deserialize(#{ <<"body">> := Binary }, Req, Opts) ->
     deserialize(Binary, Req, Opts);
 deserialize(Binary, Req = #{ <<"exclude-data">> := true }, Opts)
@@ -33,6 +40,8 @@ deserialize(TX, Req, Opts) when is_record(TX, tx) ->
 %% @doc Sign a message using the `priv-wallet' key in the options. Supports both
 %% the `hmac-sha256' and `rsa-pss-sha256' algorithms, offering unsigned and
 %% signed commitments.
+-spec commit(#{ _ => _ }, #{ type := binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
     commit(Msg, Req#{ <<"type">> => <<"unsigned-sha256">> }, Opts);
 commit(Msg, Req = #{ <<"type">> := <<"signed">> }, Opts) ->
@@ -81,6 +90,7 @@ sign_tx(TX, Wallet, Opts) ->
     {ok, SignedStructured}.
 
 %% @doc Verify an ANS-104 commitment.
+-spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
     OnlyWithCommitment =
@@ -94,17 +104,27 @@ verify(Msg, Req, Opts) ->
     ?event({verify, {only_with_commitment, OnlyWithCommitment}}),
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, TX}}),
-    Res = ar_bundles:verify_item(TX),
+    Res =
+        item_verifies(TX, Req, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment),
     {ok, Res}.
 
+%% @doc An unsigned commitment verifies when the item's unsigned ID is the
+%% ID of the commitment; a signed one when the item's signature verifies.
+item_verifies(TX, #{ <<"type">> := <<"unsigned-sha256">> }, Msg) ->
+    [ID] = maps:keys(maps:get(<<"commitments">>, Msg, #{})),
+    hb_util:human_id(ar_bundles:id(TX, unsigned)) =:= hb_util:human_id(ID);
+item_verifies(TX, _Req, _Msg) ->
+    ar_bundles:verify_item(TX).
+
 %% @doc Convert a #tx record into a message map recursively.
+-spec from(binary() | #tx{}, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary() | #{ _ => _ }}.
 from(Binary, _Req, _Opts) when is_binary(Binary) -> {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
     case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        false ->
-            do_from(TX, Req, Opts);
-        {<<"ao-type">>, <<"binary">>} ->
-            {ok, TX#tx.data}
+        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data};
+        _ -> do_from(TX, Req, Opts)
     end.
 do_from(RawTX, Req, Opts) ->
     % Ensure the TX is fully deserialized.
@@ -145,6 +165,11 @@ to_hint(Msg, Req, Opts) ->
 %% message's device in order to get the keys that we will be checkpointing. We 
 %% do this recursively to handle nested messages. The base case is that we hit
 %% a binary, which we return as is.
+-spec to(
+    binary() | #tx{} | #{ _ => _ },
+    #{ bundle => boolean(), _ => _ },
+    #{ _ => _ }
+) -> {ok, binary() | #tx{}}.
 to(Binary, _Req, _Opts) when is_binary(Binary) ->
     % ar_bundles cannot serialize just a simple binary or get an ID for it, so
     % we turn it into a TX record with a special tag, tx_to_message will
@@ -229,6 +254,52 @@ restore_tag_name_case_from_cache_test() ->
     ?event({restored_tx, ReadTX}),
     ?assert(hb_message:match(ReadMsg, SignedMsg)),
     ?assert(ar_bundles:verify_item(ReadTX)).
+
+%% @doc Ensure that a message does not verify when the values of its committed
+%% keys differ from those of the signed item. The item's tags and fields are
+%% restored from its commitment, so the signature alone does not cover them.
+modified_committed_value_test() ->
+    TX =
+        ar_bundles:sign_item(
+            #tx {
+                target = crypto:strong_rand_bytes(32),
+                tags = [{<<"Content-Type">>, <<"application/json">>}],
+                data = <<"{}">>
+            },
+            ar_wallet:new()
+        ),
+    Msg = hb_message:convert(TX, <<"structured@1.0">>, <<"ans104@1.0">>, #{}),
+    ?event({msg, Msg}),
+    ?assert(hb_message:verify(Msg, all, #{})),
+    ModifiedTag =
+        Msg#{ <<"content-type">> => <<"application/json; charset=utf-8">> },
+    ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
+    ModifiedField =
+        Msg#{ <<"target">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
+    ?assertNot(hb_message:verify(ModifiedField, all, #{})).
+
+%% @doc Committing a message with 126 keys and a nested message throws
+%% `too_many_keys': its item would have 129 tags, and ANS-104 allows 128.
+bundle_tag_count_test() ->
+    Msg =
+        (maps:from_list(
+            [
+                {<<"key-", (integer_to_binary(N))/binary>>, <<"value">>}
+            ||
+                N <- lists:seq(1, 126)
+            ]
+        ))#{ <<"nested">> => #{ <<"a">> => <<"b">> } },
+    ?assertThrow(
+        {too_many_keys, _},
+        hb_message:commit(
+            Msg,
+            #{ <<"priv-wallet">> => ar_wallet:new() },
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"bundle">> => true
+            }
+        )
+    ).
 
 unsigned_duplicated_tag_name_test() ->
     TX = ar_tx:normalize(#tx {

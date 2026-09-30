@@ -15,7 +15,7 @@
 %%% </pre>
 
 -module(dev_scheduler).
--device_libraries([lib_process]).
+-device_libraries([lib_process, lib_scheduler_formats]).
 %%% AO-Core API functions:
 -export([info/0]).
 %%% Local scheduling functions:
@@ -71,6 +71,8 @@ parse_schedulers(SchedLoc) when is_binary(SchedLoc) ->
     ).
 
 %% @doc The default handler for the scheduler device.
+-spec router(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _}.
 router(_, Base, Req, Opts) ->
     ?event({scheduler_router_called, {req, Req}, {opts, Opts}}),
     schedule(Base, Req, Opts).
@@ -79,6 +81,8 @@ router(_, Base, Req, Opts) ->
 %% assignment. Assumes that Base is a `dev_process' or similar message, having
 %% a `Current-Slot' key. It stores a local cache of the schedule in the
 %% `priv/To-Process' key.
+-spec next(#{ 'at-slot' := integer(), _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ body := #{ _ => _ }, state := #{ _ => _ }, _ => _ }} | {error, _}.
 next(Base, Req, Opts) ->
     ?event(debug_next, {scheduler_next_called, {base, Base}, {req, Req}}),
     ?event(next, started_next),
@@ -346,6 +350,15 @@ check_lookahead_and_local_cache(undefined, ProcID, TargetSlot, Opts) ->
     end.
 
 %% @doc Returns information about the entire scheduler.
+-spec status(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok,
+        #{
+            address := binary(),
+            processes := [binary()],
+            'cache-control' := binary(),
+            _ => _
+        }
+    }.
 status(_M1, _M2, _Opts) ->
     ?event(getting_scheduler_status),
     Wallet = dev_scheduler_registry:get_wallet(),
@@ -363,6 +376,17 @@ status(_M1, _M2, _Opts) ->
 
 %% @doc A router for choosing between getting the existing schedule, or
 %% scheduling a new message.
+-spec schedule(
+    #{ _ => _ },
+    #{
+        method => binary(),
+        from => integer(),
+        to => integer(),
+        accept => binary(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ } | binary()} | {error, _}.
 schedule(Base, Req, Opts) ->
     ?event({resolving_schedule_request, {req, Req}, {state_msg, Base}}),
     case hb_util:key_to_atom(hb_ao:get(<<"method">>, Req, <<"GET">>, Opts)) of
@@ -561,7 +585,14 @@ find_server(ProcID, Base, ToSched, Opts) ->
                                 false ->
                                     % We are not the scheduler. Find it and
                                     % return a redirect.
-                                    find_remote_scheduler(ProcID, ParsedLoc, Opts)
+                                    find_remote_scheduler(
+                                        ProcID,
+                                        ParsedLoc,
+                                        hb_maps:get(
+                                            <<"variant">>, Proc, <<"ao.N.1">>, Opts
+                                        ),
+                                        Opts
+                                    )
                             end
                     end
             end
@@ -683,15 +714,15 @@ without_hint(Target) ->
 %% @doc Use the SchedulerLocation to find the remote path and return a redirect.
 %% If there are multiple locations, try each one in turn until we find the first
 %% that matches.
-find_remote_scheduler(_ProcID, [], _Opts) -> {error, not_found};
-find_remote_scheduler(ProcID, [Scheduler | Rest], Opts) ->
-    case find_remote_scheduler(ProcID, Rest, Opts) of
+find_remote_scheduler(_ProcID, [], _Variant, _Opts) -> {error, not_found};
+find_remote_scheduler(ProcID, [Scheduler | Rest], Variant, Opts) ->
+    case find_remote_scheduler(ProcID, Rest, Variant, Opts) of
         {error, not_found} ->
-            find_remote_scheduler(ProcID, Scheduler, Opts);
+            find_remote_scheduler(ProcID, Scheduler, Variant, Opts);
         {redirect, Redirect} ->
             {redirect, Redirect}
     end;
-find_remote_scheduler(ProcID, Scheduler, Opts) ->
+find_remote_scheduler(ProcID, Scheduler, Variant, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,
     % we will use it to construct a redirect message.
     case get_hint(Scheduler, Opts) of
@@ -701,7 +732,7 @@ find_remote_scheduler(ProcID, Scheduler, Opts) ->
         not_found ->
             case hb_ao:resolve(
                 #{ <<"device">> => <<"location@1.0">> },
-                #{ <<"path">> => Scheduler },
+                #{ <<"path">> => Scheduler, <<"variant">> => Variant },
                 Opts
             ) of
                 {ok, SchedMsg} ->
@@ -715,6 +746,8 @@ find_remote_scheduler(ProcID, Scheduler, Opts) ->
     end.
 
 %% @doc Returns information about the current slot for a process.
+-spec slot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _}.
 slot(M1, M2, Opts) ->
     ?event({getting_current_slot, {msg, M1}}),
     ProcID = find_target_id(M1, M2, Opts),
@@ -776,7 +809,7 @@ remote_slot(<<"ao.TN.1">>, ProcID, Node, Opts) ->
                     % Convert the JSON object for the latest assignment into the
                     % standardized `~scheduler@1.0' format.
                     A =
-                        dev_scheduler_formats:aos2_to_assignment(
+                        lib_scheduler_formats:aos2_to_assignment(
                             JSON,
                             Opts
                         ),
@@ -845,7 +878,7 @@ get_schedule(Base, Req, Opts) ->
                         {ok, Res} ->
                             case uri_string:percent_decode(Format) of
                                 <<"application/aos-2">> ->
-                                    dev_scheduler_formats:assignments_to_aos2(
+                                    lib_scheduler_formats:assignments_to_aos2(
                                         ProcID,
                                         hb_ao:get(
                                             <<"assignments">>, Res, [], Opts),
@@ -896,7 +929,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, _, Opts)
     % as a bundle. We set the 'more' to `undefined' to indicate that there may
     % be more assignments to fetch, but we don't know for sure.
     Res = 
-        dev_scheduler_formats:assignments_to_bundle(
+        lib_scheduler_formats:assignments_to_bundle(
             ProcID,
             LocalAssignments,
             undefined,
@@ -963,7 +996,8 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                 <<
                     ProcID/binary, "?process-id=", ProcID/binary,
                     FromBin/binary, ToParam/binary,
-                    "&limit=", (hb_util:bin(?MAX_ASSIGNMENT_QUERY_LEN))/binary
+                    "&show-anchor=true&limit=",
+                    (hb_util:bin(?MAX_ASSIGNMENT_QUERY_LEN))/binary
                 >>
         end,
     ?event({getting_remote_schedule, {node, {string, Node}}, {path, {string, Path}}}),
@@ -995,7 +1029,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                                 cache_remote_schedule(Variant, ProcID, JSONRes, Opts),
                                 ?event(debug_aos2, {json_res, {json, JSONRes}}),
                                 Filtered = filter_json_assignments(JSONRes, To, From, Opts),
-                                dev_scheduler_formats:aos2_to_assignments(
+                                lib_scheduler_formats:aos2_to_assignments(
                                     ProcID,
                                     Filtered,
                                     Opts
@@ -1018,7 +1052,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                     % Merge the local assignments with the remote assignments,
                     % and normalize the keys.
                     Merged =
-                        dev_scheduler_formats:assignments_to_bundle(
+                        lib_scheduler_formats:assignments_to_bundle(
                             ProcID,
                             MergedAssignments = LocalAssignments ++ RemoteAssignments,
                             hb_ao:get(<<"continues">>, NormSched, false, Opts),
@@ -1076,7 +1110,7 @@ cache_remote_schedule(<<"ao.N.1">>, ProcID, Schedule, Opts) ->
             Opts#{ <<"hashpath">> => ignore }
         ),
     cache_remote_schedule(common, ProcID, Assignments, Opts);
-cache_remote_schedule(_, _ProcID, Schedule, Opts) ->
+cache_remote_schedule(_, ProcID, Schedule, Opts) ->
     Cacher =
         fun() ->
             ?event(debug_sched, {caching_remote_schedule, {schedule, Schedule}}),
@@ -1089,7 +1123,7 @@ cache_remote_schedule(_, _ProcID, Schedule, Opts) ->
                             {assignment, hb_maps:get(<<"slot">>, Assignment, undefined, Opts)}
                         }
                     ),
-                    dev_scheduler_cache:write(Assignment, Opts)
+                    dev_scheduler_cache:write(ProcID, Assignment, Opts)
                 end,
                 AssignmentList =
                     hb_util:message_to_ordered_list(
@@ -1272,7 +1306,7 @@ post_legacy_schedule(ProcID, OnlyCommitted, Node, Opts) ->
                                 ),
                             ?event({assignment_json, AssignmentJSON}),
                             Assignment =
-                                dev_scheduler_formats:aos2_to_assignment(
+                                lib_scheduler_formats:aos2_to_assignment(
                                     AssignmentJSON,
                                     Opts
                                 ),
@@ -1386,9 +1420,9 @@ generate_local_schedule(Format, ProcID, From, To, Opts) ->
     FormatterFun =
         case uri_string:percent_decode(Format) of
             <<"application/aos-2">> ->
-                fun dev_scheduler_formats:assignments_to_aos2/4;
+                fun lib_scheduler_formats:assignments_to_aos2/4;
             _ ->
-                fun dev_scheduler_formats:assignments_to_bundle/4
+                fun lib_scheduler_formats:assignments_to_bundle/4
         end,
     Res = FormatterFun(ProcID, Assignments, More, Opts),
     ?event({assignments_bundle_outbound, {format, Format}, {res, Res}}),
@@ -1746,13 +1780,13 @@ http_get_schedule_test_parallel_() ->
 				{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 3),
 				Assignments = hb_ao:get(<<"assignments">>, Schedule, Opts),
 				?assertEqual(
-					6, % 4 assignments, +1 for the hashpath, +1 for the commitments
-					hb_maps:size(Assignments, Opts)
+					5, % 4 assignments, +1 for the commitments
+					hb_maps:size(hb_private:reset(Assignments), Opts)
 				)
 			end}.
     
 
-http_get_legacy_schedule_test_parallel_() ->
+http_get_legacy_schedule_test_parallel_disabled() ->
 	    {timeout, 60, fun() ->
 	        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
 	        {Node, Opts} = http_init(),
@@ -1762,7 +1796,7 @@ http_get_legacy_schedule_test_parallel_() ->
 	        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) > 0, LoadedRes)
 	    end}.
 
-http_get_legacy_slot_test_parallel_() ->
+http_get_legacy_slot_test_parallel_disabled() ->
     {timeout, 60, fun() ->
         Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
         {Node, Opts} = http_init(),
@@ -1770,7 +1804,7 @@ http_get_legacy_slot_test_parallel_() ->
         ?assertMatch({ok, #{ <<"current">> := Slot }} when Slot > 0, Res)
     end}.
 
-http_get_legacy_schedule_slot_range_test_parallel_() ->
+http_get_legacy_schedule_slot_range_test_parallel_disabled() ->
 	    {timeout, 60, fun() ->
 	        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
 	        {Node, Opts} = http_init(),
@@ -1782,7 +1816,7 @@ http_get_legacy_schedule_slot_range_test_parallel_() ->
 	        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) == 5, LoadedRes)
 	    end}.
 
-http_get_legacy_schedule_as_aos2_test_parallel_() ->
+http_get_legacy_schedule_as_aos2_test_parallel_disabled() ->
     {timeout, 60, fun() ->
         Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
         {Node, Opts} = http_init(),

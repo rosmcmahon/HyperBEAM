@@ -38,8 +38,9 @@ normalize(Msg, Mode, Opts) when is_map(Msg) ->
                         UnderlyingID =
                             case maps:get(<<"lazy">>, LinkOpts, false) of
                                 true ->
-                                    case hb_cache:read(ID, Opts) of
-                                        {ok, Underlying} when ?IS_ID(Underlying) ->
+                                    case hb_cache:read(ID, hb_util:deep_merge(Opts, LinkOpts, Opts)) of
+                                        {ok, Underlying} when ?IS_ID(Underlying)
+                                                orelse ?IS_HASHPATH(Underlying) ->
                                             Underlying;
                                         Err ->
                                             throw(
@@ -63,8 +64,10 @@ normalize(Msg, Mode, Opts) when is_map(Msg) ->
                         % We must offload it such that it is cached, and
                         % referenced by a link.
                         % We start by normalizing the child message, generating 
-                        % its IDs by proxy.
-                        NormChild = normalize(V, Mode, Opts),
+                        % its IDs by proxy. The cache writes the child as given
+                        % and offloads its own submessages, so this pass only
+                        % derives the ID.
+                        NormChild = normalize(V, discard, Opts),
                         NormKey = hb_util:bin(Key),
                         % Generate the ID of the normalized child message.
                         ID = hb_message:id(NormChild, all, Opts),
@@ -75,8 +78,10 @@ normalize(Msg, Mode, Opts) when is_map(Msg) ->
                             discard -> do_nothing;
                             offload ->
                                 % Write the child to the store to ensure its
-                                % storage and availability.
-                                hb_cache:write(NormChild, Opts)
+                                % storage and availability. The child is written
+                                % as a structured message: the cache converts it
+                                % and verifies it in that form.
+                                hb_cache:write(V, Opts)
                         end,
                         ?event(debug_linkify, {generated_link, {key, Key}, {id, ID}}),
                         {<<NormKey/binary, "+link">>, ID};

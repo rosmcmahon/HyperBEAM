@@ -21,11 +21,14 @@
 %%% - `first-path': Return the first path of the matches.
 %%% - `first-message': Return the first message of the matches.
 %%% - `boolean': Return a boolean indicating whether any matches were found.
+%%%
+%%% `recipient' returns the native recipient preserved in the message's
+%%% commitment, or an empty binary when absent, as used by Arweave GraphQL.
 -module(dev_query).
 %%% Message matching API:
 -export([info/1, only/3, all/3, base/3]).
 %%% GraphQL API:
--export([graphql/3, has_results/3]).
+-export([graphql/3, has_results/3, recipient/3]).
 %%% Test setup:
 -export([test_setup/0]).
 -include_lib("eunit/include/eunit.hrl").
@@ -43,13 +46,32 @@ info(_Opts) ->
         default => fun default/4
     }.
 
-%% @doc Execute the query via GraphQL.
-graphql(Req, Base, Opts) ->
-    dev_query_graphql:handle(Req, Base, Opts).
+%% @doc Serve the node's query UI for GET, or execute a GraphQL query.
+-spec graphql(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
+graphql(_Base, #{ <<"method">> := <<"GET">> }, Opts) ->
+    hb_cache:read(
+        hb_opts:get(
+            query_ui,
+            <<"llR5T7zrMLPSXmhlDNN0b2-PCJmkPhWMz5cveMsWUcg">>,
+            Opts
+        ),
+        Opts
+    );
+graphql(Base, Req, Opts) ->
+    dev_query_graphql:handle(Base, Req, Opts).
+
+%% @doc Read the native recipient independently of ordinary message tags.
+recipient(Base, Req, Opts) ->
+    dev_query_arweave:query(Base, <<"recipient">>, Req, Opts).
 
 %% @doc Return whether a GraphQL esponse in a message has transaction results.
 %% This key is used in HB's gateway client multirequest configuration to
 %% determine if the response from the node should be considered admissible.
+-spec has_results(
+    #{ body => binary(), _ => _ },
+    #{ body => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, boolean()}.
 has_results(Base, Req, Opts) ->
     JSON =
         hb_ao:get_first(
@@ -70,22 +92,35 @@ has_results(Base, Req, Opts) ->
     end.
 
 %% @doc Search for the keys specified in the request message.
+-spec default(_, #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 default(_, Base, Req, Opts) ->
     all(Base, Req, Opts).
 
 %% @doc Search the node's store for all of the keys and values in the request,
 %% aside from the `commitments' and `path' keys.
+-spec all(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 all(Base, Req, Opts) ->
     match(Req, Base, Req, Opts).
 
 %% @doc Search the node's store for all of the keys and values in the base
 %% message, aside from the `commitments' and `path' keys.
+-spec base(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 base(Base, Req, Opts) ->
     match(Base, Base, Req, Opts).
 
 %% @doc Search only for the (list of) key(s) specified in `only' in the request.
 %% The `only' key can be a binary, a map, or a list of keys. See the moduledoc
 %% for semantics.
+-spec only(
+    #{ _ => _ },
+    #{
+        only => [binary()] | binary() | #{ _ => _ },
+        exclude => [binary()],
+        return => binary(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, _} | {error, _}.
 only(Base, Req, Opts) ->
     case hb_maps:get(<<"only">>, Req, not_found, Opts) of
         KeyBin when is_binary(KeyBin) ->
@@ -211,6 +246,28 @@ query_match_key(Path, Opts) ->
     end.
 
 %%% Tests
+
+%% @doc GET serves the operator's UI, regardless of request-level overrides.
+graphql_ui_test() ->
+    Store = hb_test_utils:test_store(),
+    Opts = #{ <<"store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    UI = #{ <<"content-type">> => <<"text/html">>, <<"body">> => <<"Query UI">> },
+    {ok, ID} = hb_cache:write(UI, Opts),
+    NodeOpts = Opts#{ <<"query-ui">> => ID },
+    {ok, Resolved} = hb_ao:resolve(
+        #{ <<"device">> => <<"query@1.0">> },
+        #{
+            <<"path">> => <<"graphql">>,
+            <<"method">> => <<"GET">>,
+            <<"query-ui">> => <<"not-the-operator-ui">>
+        },
+        NodeOpts
+    ),
+    ?assertEqual(<<"Query UI">>, hb_maps:get(<<"body">>, Resolved, NodeOpts)),
+    Node = hb_http_server:start_node(NodeOpts),
+    {ok, Response} = hb_http:get(Node, <<"/~query@1.0/graphql">>, NodeOpts),
+    ?assertEqual(<<"text/html">>, hb_maps:get(<<"content-type">>, Response, NodeOpts)),
+    ?assertEqual(<<"Query UI">>, hb_maps:get(<<"body">>, Response, NodeOpts)).
 
 %% @doc Return test options with a test store.
 test_setup() ->

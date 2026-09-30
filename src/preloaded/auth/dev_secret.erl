@@ -18,11 +18,12 @@
 %%% During secret generation:
 %%% 1. This device creates the secret and determines its `committer' address.
 %%% 2. The device invokes the caller's `access-control' message with the `commit'
-%%%    path and the `keyid' in the request.
+%%%    path.
 %%% 3. The `access-control' message sets up authentication (e.g., creates cookies,
-%%%    secrets) and returns a response, containing a commitment with a `keyid'
-%%%    field. This `keyid' is used to identify the user's 'access secret' which
-%%%    grants them the ability to use the device's 'hidden' secret in the future.
+%%%    secrets) and returns a response that records the `committer' of the
+%%%    user's 'access secret': the hash of the secret, from which the `keyid'
+%%%    that grants them the ability to use the device's 'hidden' secret in the
+%%%    future is derived.
 %%% 4. This device stores both the secret and the initialized `access-control'
 %%%    message, as well as its other metadata.
 %%% 5. This device returns the initialized `access-control' message with the
@@ -47,12 +48,15 @@
 %%% two paths:
 %%% 
 %%% `/commit': Called during secret generation to bind the `access-control'
-%%%            template message to the given `keyid' (secret reference).
-%%%  - Input:  Request message containing `keyid' field with the secret's `keyid'
-%%%            in the `body' field.
-%%%  - Output: Response message with authentication setup (cookies, tokens, etc.).
-%%%            This message will be used as the `Base' message for the `verify'
-%%%            path.
+%%%            template message to the user's access secret.
+%%%  - Input:  The caller's request message, optionally carrying the `secret'
+%%%            to bind.
+%%%  - Output: Response message with authentication setup (cookies, tokens,
+%%%            etc.) and the `committer' of the access secret recorded as a
+%%%            key. The node stores this message and uses it as the `Base'
+%%%            message for the `verify' path, so it must carry only
+%%%            commitments that the node can verify itself: an HMAC under the
+%%%            user's secret is not one of them.
 %%% 
 %%% `/verify': Called before allowing an operation that requires access to a
 %%%            secret to proceed.
@@ -174,6 +178,8 @@
 %% @doc Generate a new wallet for a user and register it on the node. If the
 %% `committer' field is provided, we first check whether there is a wallet
 %% already registered for it. If there is, we return the wallet details.
+-spec generate(#{ _ => _ }, #{ committer => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ body := binary(), _ => _ }} | {error, _}.
 generate(Base, Request, Opts) ->
     case request_to_wallets(Base, Request, Opts) of
         [] ->
@@ -199,6 +205,11 @@ generate(Base, Request, Opts) ->
 %% @doc Import a wallet for hosting on the node. Expects the keys to be either
 %% provided as a list of keys, or a single key in the `key' field. If neither
 %% are provided, the keys are extracted from the cookie.
+-spec import(
+    #{ _ => _ },
+    #{ key => [binary()] | binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _}.
 import(Base, Request, Opts) ->
     Wallets =
         case hb_maps:find(<<"key">>, Request, Opts) of
@@ -308,10 +319,9 @@ register_wallet(Wallet, Base, Request, Opts) ->
     case hb_ao:resolve(AccessControl, AuthRequest, Opts) of
         {ok, InitializedAuthMsg} ->
             ?event({register_wallet_success, {initialized_auth_msg, InitializedAuthMsg}}),
-            % Find the new signer address.
-            PriorSigners = hb_message:signers(AccessControl, Opts),
-            NewSigners = hb_message:signers(InitializedAuthMsg, Opts),
-            [Committer] = NewSigners -- PriorSigners,
+            % Find the committer of the access secret.
+            {ok, Committer} =
+                hb_maps:find(<<"committer">>, InitializedAuthMsg, Opts),
             % Store wallet details.
             WalletDetails =
                 #{
@@ -338,22 +348,12 @@ persist_registered_wallet(WalletDetails, RespBase, Opts) ->
     % Add the wallet address as the body of the response.
     Address = hb_maps:get(<<"address">>, WalletDetails, undefined, Opts),
     ?event({resp_base, {auth_resp, RespBase}, {priv_wallet_details, WalletDetails}}),
-    AccessControl = hb_maps:get(<<"access-control">>, WalletDetails, #{}, Opts),
-    {ok, _, Commitment} = 
-        hb_message:commitment(
-            #{},
-            hb_message:without_commitments(
-                #{
-                    <<"keyid">> => <<"constant:ao">>,
-                    <<"commitment-device">> => <<"httpsig@1.0">> 
-                },
-                AccessControl,
-                Opts
-            ),
-            Opts
-        ),
-    KeyID = hb_maps:get(<<"keyid">>, Commitment, Opts),
-    Base = RespBase#{ <<"body">> => KeyID },
+    % The wallet is keyed by the `keyid' of its access secret.
+    Committer = hb_maps:get(<<"committer">>, WalletDetails, undefined, Opts),
+    KeyID = <<"secret:", Committer/binary>>,
+    Base = RespBase#{
+        <<"body">> => KeyID, <<"cache-control">> => [<<"no-store">>]
+    },
     % Determine how to persist the wallet.
     case hb_maps:get(<<"persist">>, WalletDetails, <<"in-memory">>, Opts) of
         <<"client">> ->
@@ -388,10 +388,13 @@ persist_registered_wallet(WalletDetails, RespBase, Opts) ->
     end.
 
 %% @doc List all hosted wallets
+-spec list(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, [_]}.
 list(_Base, _Request, Opts) ->
     {ok, list_wallets(Opts)}.
 
 %% @doc Sign a message with a wallet.
+-spec commit(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, binary()}.
 commit(Base, Request, Opts) ->
     ?event({commit_invoked, {priv_base, Base}, {priv_request, Request}}),
     case request_to_wallets(Base, Request, Opts) of
@@ -526,12 +529,7 @@ verify_controllers(WalletDetails, Request, Opts) ->
 %% @doc Verify a wallet for a given request.
 verify_auth(WalletDetails, Req, Opts) ->
     AuthBase = hb_maps:get(<<"access-control">>, WalletDetails, #{}, Opts),
-    AuthRequest =
-        Req#{
-            <<"path">> => <<"verify">>,
-            <<"committer">> =>
-                hb_maps:get(<<"committer">>, WalletDetails, undefined, Opts)
-        },
+    AuthRequest = Req#{ <<"path">> => <<"verify">> },
     ?event({verify_wallet, {auth_base, AuthBase}, {priv_request, AuthRequest}}),
     hb_ao:resolve(AuthBase, AuthRequest, Opts).
 
@@ -577,6 +575,11 @@ commit_message(Message, #{ <<"wallet">> := Key }, Opts) ->
 %% @doc Export wallets from a request. The request should contain a source of
 %% wallets (cookies, keys, or wallet names), or a specific list/name of a
 %% wallet to authenticate and export.
+-spec export(
+    #{ _ => _ },
+    #{ keyids => [binary()] | binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, [_]} | {error, binary()}.
 export(Base, Request, Opts) ->
     PrivOpts = priv_store_opts(Opts),
     ModReq =
@@ -604,6 +607,16 @@ export(Base, Request, Opts) ->
     end.    
 
 %% @doc Sync wallets from a remote node
+-spec sync(
+    #{ _ => _ },
+    #{
+        node => binary(),
+        as => binary(),
+        keyids => [binary()] | binary(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, [_]} | {error, _}.
 sync(_Base, Request, Opts) ->
     case hb_ao:get(<<"node">>, Request, undefined, Opts) of
         undefined ->
@@ -1181,3 +1194,75 @@ sync_non_volatile_wallets_test() ->
     ?event({sync_wallets_test, {wallet_list, WalletList}}),
     % Should return a map of successfully imported wallets or list of names.
     ?assert(lists:member(WalletName, hb_maps:values(WalletList))).
+
+%% @doc A generated wallet's stored access-control message must be verifiable
+%% by the node, and only a caller presenting the cookie secret may use the
+%% wallet.
+stored_access_control_verifies_test() ->
+    Node = hb_http_server:start_node(#{
+        <<"priv-wallet">> => ar_wallet:new()
+    }),
+    {ok, GenResponse} =
+        hb_http:get(
+            Node,
+            <<"/~secret@1.0/generate?persist=non-volatile">>,
+            #{}
+        ),
+    #{ <<"body">> := KeyID, <<"priv">> := Priv } = GenResponse,
+    WalletAddr = maps:get(<<"wallet-address">>, GenResponse),
+    Committer = hb_util:remove_scheme_prefix(KeyID),
+    % The stored access-control message records the committer of the cookie
+    % secret and carries no commitment by it.
+    {ok, ExportResponse} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/~secret@1.0/export/1">>,
+                <<"priv">> => Priv
+            },
+            #{}
+        ),
+    AccessControl = maps:get(<<"access-control">>, ExportResponse),
+    ?assertEqual(Committer, maps:get(<<"committer">>, AccessControl)),
+    ?assertEqual([], hb_message:signers(AccessControl, #{})),
+    ?assert(
+        hb_message:verify(
+            AccessControl,
+            #{ <<"commitment-ids">> => <<"all">> },
+            #{}
+        )
+    ),
+    % A caller presenting a wrong secret under the same cookie name is refused,
+    % while the right secret signs.
+    {ok, WrongCookie} =
+        hb_ao:resolve(
+            #{ <<"device">> => <<"cookie@1.0">>, <<"priv">> => Priv },
+            #{
+                <<"path">> => <<"store">>,
+                <<"secret-", Committer/binary>> =>
+                    hb_util:encode(crypto:strong_rand_bytes(64))
+            },
+            #{}
+        ),
+    SignRequest =
+        #{
+            <<"device">> => <<"secret@1.0">>,
+            <<"path">> => <<"commit">>,
+            <<"keyids">> => [KeyID],
+            <<"body">> => <<"Test message">>
+        },
+    ?assertNotMatch(
+        {ok, _},
+        hb_http:post(
+            Node,
+            SignRequest#{ <<"priv">> => maps:get(<<"priv">>, WrongCookie) },
+            #{}
+        )
+    ),
+    {ok, SignedMessage} =
+        hb_http:post(Node, SignRequest#{ <<"priv">> => Priv }, #{}),
+    hb_test_utils:assert_hashpath_reply(
+        SignedMessage,
+        WalletAddr,
+        <<"Test message">>
+    ).

@@ -47,6 +47,8 @@ info() ->
 %%    was a device name.
 %% 3. Execute the `default_index_path` (base: `index') upon the message,
 %%    giving the rest of the request unchanged.
+-spec index(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 index(Msg, Req, Opts) ->
     case hb_opts:get(default_index, not_found, Opts) of
         not_found ->
@@ -84,6 +86,16 @@ index(Msg, Req, Opts) ->
 %% if/when non-map message structures are created.
 id(Base) -> id(Base, #{}).
 id(Base, Req) -> id(Base, Req, #{}).
+-spec id(
+    binary() | [#{ _ => _ }] | #{ commitments => #{ _ => _ }, _ => _ },
+    #{
+        committers => _,
+        'commitment-ids' => _,
+        'id-device' => binary(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, binary()}.
 id(Base, _, NodeOpts) when is_binary(Base) ->
     % Return the hashpath of the message in native format, to match the native
     % format of the message ID return.
@@ -227,6 +239,11 @@ id_device(_, _) ->
 %% @doc Return the committers of a message that are present in the given request.
 committers(Base) -> committers(Base, #{}).
 committers(Base, Req) -> committers(Base, Req, #{}).
+-spec committers(
+    #{ commitments => #{ _ => _ }, _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, [_]}.
 committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
     {ok,
         hb_maps:values(
@@ -249,6 +266,12 @@ committers(_, _, _) ->
 %% @doc Commit to a message, using the `commitment-device' key to specify the
 %% device that should be used to commit to the message. If the key is not set,
 %% the default device (`httpsig@1.0') is used.
+-spec commit(
+    #{ _ => _ },
+    #{ 'commitment-device' => binary(), type => binary(),
+        committed => [binary()], _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ commitments := #{ _ => _ }, _ => _ }}.
 commit(Self, Req, Opts) ->
     {ok, Base} = hb_message:find_target(Self, Req, Opts),
     AttDev =
@@ -290,18 +313,40 @@ commit(Self, Req, Opts) ->
             Req#{ <<"type">> => maps:get(<<"type">>, Req, <<"signed">>) },
             CommitOpts
         ),
-    {ok, hb_message:convert(Committed, <<"structured@1.0">>, tabm, CommitOpts)}.
+    Res = Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) },
+    {ok, hb_private:merge(Res, Committed, Opts)}.
+
+%% @doc The keys a commitment lists as committed, in their normalized form. A
+%% commitment without a `committed' list commits no keys.
+committed_keys(Commitment, Opts) ->
+    hb_util:message_to_ordered_list(
+        maps:get(<<"committed">>, Commitment, []),
+        Opts
+    ).
 
 %% @doc Verify a message. By default, all commitments are verified. The
 %% `committers' key in the request can be used to specify that only the 
 %% commitments from specific committers should be verified. Similarly, specific
 %% commitments can be specified using the `commitments' key.
+-spec verify(
+    #{ _ => _ },
+    #{ committers => _, 'commitment-ids' => _, commitments => _, _ => _ },
+    #{ _ => _ }
+) -> {ok, boolean()}.
 verify(Self, Req, Opts) ->
     % Get the target message of the verification request.
     {ok, RawBase} = hb_message:find_target(Self, Req, Opts),
     CommitmentBase = ensure_commitments_loaded(RawBase, Opts),
     Commitments = maps:get(<<"commitments">>, CommitmentBase, #{}),
-    IDsToVerify = commitment_ids_from_request(CommitmentBase, Req, Opts),
+    % A request with neither `committers' nor `commitment-ids' verifies every
+    % commitment of the message.
+    Selection =
+        case maps:with([<<"committers">>, <<"commitment-ids">>], Req) of
+            None when map_size(None) == 0 ->
+                Req#{ <<"commitment-ids">> => <<"all">> };
+            _ -> Req
+        end,
+    IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),
     % Generate the new commitment request base messsage by removing the keys
     % used by this function (path, committers, commitments) and returning the
     % remaining keys. This message will then be merged with each commitment
@@ -348,8 +393,26 @@ verify(Self, Req, Opts) ->
                         },
                         Opts
                     ),
-                Base = hb_message:convert(
-                    CommitmentBase, tabm, SourceSpec, Opts),
+                % A commitment is verified over the keys it lists and as the
+                % only commitment of the base: keys given alongside the
+                % committed ones do not enter its signature base, and the
+                % bundle state of another commitment does not set the
+                % encoding of this one.
+                Covered =
+                    hb_message:with_links(
+                        [
+                            <<"commitments">>,
+                            <<"priv">>
+                        |
+                            committed_keys(Commitment, Opts)
+                        ],
+                        CommitmentBase#{
+                            <<"commitments">> =>
+                                maps:with([CommitmentID], Commitments)
+                        },
+                        Opts
+                    ),
+                Base = hb_message:convert(Covered, tabm, SourceSpec, Opts),
                 ?event(verify, {verify, {base_found, Base}}),
                 {ok, Res} =
                     verify_commitment(
@@ -385,6 +448,11 @@ verify_commitment(Base, Commitment, Opts) ->
     hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts).
 
 %% @doc Return the list of committed keys from a message.
+-spec committed(
+    #{ _ => _ },
+    #{ raw => boolean(), committers => _, 'commitment-ids' => _, _ => _ },
+    #{ _ => _ }
+) -> {ok, [binary()]}.
 committed(Self, Req, Opts) ->
     % Get the target message of the verification request and ensure its 
     % commitments are loaded.
@@ -407,14 +475,7 @@ committed(Self, Req, Opts) ->
     CommitmentKeys =
         lists:map(
             fun(CommitmentID) ->
-                Commitment = maps:get(CommitmentID, Commitments),
-                % The committed keys will be a TABM encoded numbered map
-                % so we must decode it to its underlying list of normalized keys
-                % for comparison purposes.
-                hb_util:message_to_ordered_list(
-                    maps:get(<<"committed">>, Commitment),
-                    Opts
-                )
+                committed_keys(maps:get(CommitmentID, Commitments), Opts)
             end,
             CommitmentIDs
         ),
@@ -611,6 +672,8 @@ commitment_ids_from_committers(CommitterAddrs, Commitments, Opts) ->
 
 %% @doc Deep merge keys in a message. Takes a map of key-value pairs and sets
 %% them in the message, overwriting any existing values.
+-spec set(#{ _ => _ }, #{ 'set-mode' => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 set(Base, NewValuesMsg, Opts) ->
     OriginalPriv = hb_private:from_message(Base),
 	% Filter keys that are in the default device (this one).
@@ -663,6 +726,11 @@ set(Base, NewValuesMsg, Opts) ->
             KeysToSet
         )
     ),
+    AddedKeys =
+        lists:filter(
+            fun(Key) -> not hb_maps:is_key(Key, Base, Opts) end,
+            maps:keys(NewValues)
+        ),
     % Calculate if the keys to be set conflict with any committed keys.
     {ok, CommittedKeys} =
         committed(
@@ -702,16 +770,24 @@ set(Base, NewValuesMsg, Opts) ->
             end,
             OriginalPriv
         ),
-    case OverwrittenCommittedKeys of
-        [] ->
+    case {AddedKeys, OverwrittenCommittedKeys} of
+        {[_ | _], _} ->
+            {ok, hb_maps:without([<<"commitments">>], Merged, Opts)};
+        {[], []} ->
             ?event_debug(message_set, {no_overwritten_committed_keys, {merged, Merged}}),
             {ok, Merged};
-        _ ->
+        {[], _} ->
             % We did overwrite some keys, but do their values match the original?
             % If not, we must remove the commitments.
             ChangedBaseKeys = hb_maps:with(OverwrittenCommittedKeys, Base, Opts),
             ChangedMergedKeys = hb_maps:with(OverwrittenCommittedKeys, Merged, Opts),
-            Matches = hb_message:match(ChangedMergedKeys, ChangedBaseKeys, strict, Opts),
+            Matches =
+                try
+                    ChangedMergedKeys =:= ChangedBaseKeys orelse
+                        hb_cache:ensure_all_loaded(ChangedMergedKeys, Opts) =:=
+                            hb_cache:ensure_all_loaded(ChangedBaseKeys, Opts)
+                catch _:_ -> false
+                end,
             case Matches of
                 true ->
                     ?event_debug(message_set, {set_keys_matched, {merged, Merged}}),
@@ -799,6 +875,8 @@ do_deep_merge(BaseValues, NewValues, Opts) ->
 %% transmit the present key that is being executed. Subsequently, to call `path'
 %% we would need to set `path' to `set', removing the ability to specify its 
 %% new value.
+-spec set_path(#{ path => _, _ => _ }, #{ value => _, _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | #{ _ => _ }.
 set_path(Base, #{ <<"value">> := Value }, Opts) ->
     set_path(Base, Value, Opts);
 set_path(Base, Value, Opts) when not is_map(Value) ->
@@ -825,6 +903,8 @@ set_path(Base, Value, Opts) when not is_map(Value) ->
     end.
 
 %% @doc Remove a key or keys from a message.
+-spec remove(#{ _ => _ }, #{ item => _, items => [_], _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 remove(Base, #{ <<"item">> := Key }, Opts) ->
     remove(Base, #{ <<"items">> => [Key] }, Opts);
 remove(Base, #{ <<"items">> := Keys }, Opts) ->
@@ -860,9 +940,9 @@ get(Key, Msg, _Req, Opts) ->
     case hb_private:is_private(Key) of
         true -> {error, not_found};
         false ->
-            case hb_maps:get(Key, Msg, not_found, Opts) of
-                not_found -> case_insensitive_get(Key, Msg, Opts);
-                Value -> {ok, Value}
+            case hb_maps:find(Key, Msg, Opts) of
+                error -> case_insensitive_get(Key, Msg, Opts);
+                {ok, Value} -> {ok, Value}
             end
     end.
 
@@ -872,9 +952,9 @@ get(Key, Msg, _Req, Opts) ->
 case_insensitive_get(Key, Msg, Opts) ->
     NormKey = hb_util:to_lower(hb_util:bin(Key)),
     NormMsg = hb_ao:normalize_keys(Msg, Opts),
-    case hb_maps:get(NormKey, NormMsg, not_found, Opts) of
-        not_found -> {error, not_found};
-        Value -> {ok, Value}
+    case hb_maps:find(NormKey, NormMsg, Opts) of
+        error -> {error, not_found};
+        {ok, Value} -> {ok, Value}
     end.
 
 %%% Tests
@@ -943,6 +1023,11 @@ cannot_get_private_keys_test() ->
     ).
 
 key_from_device_test() ->
+    {ok, ID} = hb_cache:write(#{ <<"a">> => not_found }, #{}),
+    ?assertEqual(
+        {ok, not_found},
+        hb_ao:resolve(ID, <<"a">>, #{})
+    ),
     ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})).
 
 remove_test() ->
@@ -962,11 +1047,85 @@ remove_test() ->
         )
     ).
 
+set_committed_values_test_() ->
+    [
+        {binary_to_list(Device), fun() ->
+            Opts = #{
+                <<"store">> => hb_test_utils:test_store(),
+                <<"priv-wallet">> => hb:wallet(),
+                <<"hashpath">> => ignore
+            },
+            Msg = hb_message:commit(
+                #{
+                    <<"content-type">> => <<"text/plain">>,
+                    <<"data">> => <<"Original body">>
+                },
+                Opts,
+                Device
+            ),
+            ?assert(hb_message:verify(Msg, all, Opts)),
+            Missing = Msg#{
+                <<"data">> => {link, hb_util:human_id(crypto:strong_rand_bytes(32)), #{}}
+            },
+            {ok, Replaced} = hb_ao:resolve(
+                Missing,
+                #{
+                    <<"path">> => <<"set">>,
+                    <<"data">> => <<"Changed body">>,
+                    <<"set-mode">> => <<"explicit">>
+                },
+                Opts
+            ),
+            ?assertNot(hb_maps:is_key(<<"commitments">>, Replaced)),
+            {ok, _} = hb_cache:write(Msg, Opts),
+            {ok, Linked} = hb_cache:read(hb_message:id(Msg, signed, Opts), Opts),
+            lists:foreach(
+                fun(Base) ->
+                    lists:foreach(
+                        fun({Key, Value}) ->
+                            Same = hb_ao:set(Base, #{ Key => Value }, Opts),
+                            ?assert(hb_maps:is_key(<<"commitments">>, Same)),
+                            ?assert(hb_message:verify(Same, all, Opts)),
+                            lists:foreach(
+                                fun(NewValue) ->
+                                    Changed = hb_ao:set(Base, #{ Key => NewValue }, Opts),
+                                    ?assertNot(hb_maps:is_key(<<"commitments">>, Changed))
+                                end,
+                                [<<"changed">>, '_', unset]
+                            )
+                        end,
+                        [{<<"content-type">>, <<"text/plain">>},
+                         {<<"data">>, <<"Original body">>}]
+                    )
+                end,
+                [Msg, Linked]
+            )
+        end}
+    ||
+        Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
+    ].
+
 set_conflicting_keys_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },
 	Req = #{ <<"path">> => <<"set">>, <<"dangerous">> => <<"Value2">> },
 	?assertMatch({ok, #{ <<"dangerous">> := <<"Value2">> }},
 		hb_ao:resolve(Base, Req, #{})).
+
+set_new_key_drops_commitments_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => hb:wallet()
+    },
+    Signed =
+        hb_message:commit(#{ <<"a">> => <<"1">> }, Opts, <<"httpsig@1.0">>),
+    {ok, Updated} = hb_ao:resolve(
+        Signed,
+        #{ <<"path">> => <<"set">>, <<"b">> => <<"2">> },
+        Opts
+    ),
+    ?assertEqual([], hb_message:signers(Updated, Opts)),
+    {ok, Canonical} = hb_message:with_only_committed(Updated, Opts),
+    ?assertEqual(<<"2">>, maps:get(<<"b">>, Canonical)).
 
 unset_with_set_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },
@@ -1010,33 +1169,76 @@ verify_test_() ->
 	{foreach, fun () -> ok end, fun (_) -> ok end, [
 		{"RSA", fun () -> test_verify(?RSA_KEY_TYPE) end},
 		{"EDDSA", fun () -> test_verify(?EDDSA_KEY_TYPE) end},
-        {"Solana", fun () -> test_verify(?SOLANA_KEY_TYPE) end},
+        {"Solana", fun () -> test_unsupported_key(?SOLANA_KEY_TYPE) end},
         {"Ethereum", fun () -> test_verify(?ETHEREUM_KEY_TYPE) end}
 	]}.
+
+%% @doc The commitment spec for a key type: `httpsig@1.0' signs with RSA keys,
+%% `ans104@1.0' with the others it supports.
+commitment_spec(?RSA_KEY_TYPE) -> #{};
+commitment_spec(?EDDSA_KEY_TYPE) ->
+    #{ <<"device">> => <<"ans104@1.0">>, <<"type">> => ?EDDSA_SIGN_TYPE };
+commitment_spec(?ETHEREUM_KEY_TYPE) ->
+    #{ <<"device">> => <<"ans104@1.0">>, <<"type">> => ?ETHEREUM_SIGN_TYPE }.
+
+%% @doc No commitment device signs with the key type, so the commitment is
+%% refused rather than made without a verifiable signature.
+test_unsupported_key(KeyType) ->
+    Wallet = ar_wallet:new(KeyType),
+    ?assertThrow(
+        {cannot_commit, 'unsupported-key-type', _},
+        hb_message:commit(
+            #{ <<"a">> => <<"b">> },
+            #{ <<"priv-wallet">> => Wallet }
+        )
+    ).
 
 test_verify(KeyType) ->
     Unsigned = #{ <<"a">> => <<"b">> },
     Wallet = ar_wallet:new(KeyType),
-    Signed = hb_message:commit(Unsigned, #{ <<"priv-wallet">> => Wallet }),
+    Signed =
+        hb_message:commit(
+            Unsigned,
+            #{ <<"priv-wallet">> => Wallet },
+            commitment_spec(KeyType)
+        ),
     ?event_debug({signed, Signed}),
     BadSigned = Signed#{ <<"a">> => <<"c">> },
     ?event_debug({bad_signed, BadSigned}),
     ?assertEqual(false, hb_message:verify(BadSigned)),
+    % The message is the target of its own `verify' key, so a request without
+    % `committers' verifies every commitment it carries.
     ?assertEqual({ok, true},
         hb_ao:resolve(
-            #{ <<"device">> => <<"message@1.0">> },
-            #{ <<"path">> => <<"verify">>, <<"body">> => Signed },
+            Signed,
+            #{ <<"path">> => <<"verify">> },
             #{ <<"hashpath">> => ignore }
         )
     ),
-    % Test that we can verify a message without specifying the device explicitly.
-    ?assertEqual({ok, true},
+    ?assertEqual({ok, false},
         hb_ao:resolve(
-            #{},
-            #{ <<"path">> => <<"verify">>, <<"body">> => Signed },
+            BadSigned,
+            #{ <<"path">> => <<"verify">> },
             #{ <<"hashpath">> => ignore }
         )
     ).
+
+%% @doc A commitment of no keys verifies after a round trip through
+%% `flat@1.0', which writes its empty `committed' list as no key.
+verify_without_committed_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Committed = hb_message:commit(#{}, Opts, #{ <<"type">> => <<"unsigned">> }),
+    Flat =
+        hb_message:convert(
+            Committed,
+            <<"flat@1.0">>,
+            <<"structured@1.0">>,
+            Opts
+        ),
+    Decoded =
+        hb_message:convert(Flat, <<"structured@1.0">>, <<"flat@1.0">>, Opts),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assertEqual([], hb_message:committed(Decoded, all, Opts)).
 
 set_nested_link_test() ->
     Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)] },

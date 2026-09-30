@@ -6,7 +6,7 @@
 -module(hb_store_remote_node).
 -export([scope/1, type/3, read/3, write/3, link/3, group/3, resolve/3]).
 %%% Public utilities.
--export([maybe_cache/2, maybe_cache/3, read_local_cache/3]).
+-export([maybe_cache/2, read_local_cache/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -73,7 +73,7 @@ read_request(Opts = #{ <<"node">> := Node }, Key) ->
                     Opts
                 ),
             ?event(store_remote_node, {read_found, {result, Msg, response, Res}}),
-            maybe_cache(Opts, Msg, [Key]),
+            maybe_cache(Opts, Msg),
             {ok, Msg};
         {error, _Err} ->
             ?event(store_remote_node, {read_not_found, {key, Key}}),
@@ -96,11 +96,11 @@ without_transport_commitment(Res, _Opts) ->
     Res.
 
 %% @doc Cache the data if the cache is enabled. The `local-store' option may
-%% either be `false' or a store definition to use as the local cache. Additional
-%% paths may be provided that should be linked to the data.
+%% either be `false' or a store definition to use as the local cache. The
+%% cache links the data to its own IDs alone: its content hash, and the ID of
+%% each commitment that verifies. The key the data was requested by is not
+%% linked to it, as the data need not be the message with that ID.
 maybe_cache(StoreOpts, Data) ->
-    maybe_cache(StoreOpts, Data, []).
-maybe_cache(StoreOpts, Data, Links) ->
     ?event({maybe_cache, StoreOpts, Data}),
     try
         % Check if the local store is in our store options.
@@ -109,35 +109,9 @@ maybe_cache(StoreOpts, Data, Links) ->
                 skipped;
             Store ->
                 case hb_cache:write(Data, #{ <<"store">> => Store }) of
-                    {ok, RootPath} ->
-                        % Remove the base path from the links.
-                        LinksWithoutRootPath =
-                            lists:filter(
-                                fun(Link) -> Link /= RootPath end,
-                                Links
-                            ),
+                    {ok, _RootPath} ->
                         ?event(store_remote_node, cached_received),
-                        LinkResults =
-                            lists:filtermap(
-                                fun(Link) ->
-                                    case hb_store:link(Store, #{ Link => RootPath }, #{}) of
-                                        ok ->
-                                            false;
-                                        Result ->
-                                            {true, {Link, Result}}
-                                    end
-                                end,
-                                LinksWithoutRootPath
-                            ),
-                        ?event(store_remote_node,
-                            {linked_cached,
-                                {failed_links, LinkResults}
-                            }
-                        ),
-                        case LinkResults of
-                            [] -> ok;
-                            _ -> {failed_links, LinkResults}
-                        end;
+                        ok;
                     {error, Err} ->
                         ?event(store_remote_node, error_on_local_cache_write),
                         ?event(warning, {error_caching_remote_node_data, Err}),
@@ -218,6 +192,7 @@ group(Opts = #{ <<"node">> := _Node }, #{ <<"group">> := Path }, _NodeOpts) ->
 remote_write_value(Opts = #{ <<"node">> := Node }, Value) ->
     Msg = #{
         <<"path">> => <<"/~cache@1.0/write">>,
+        <<"type">> => <<"cache-write">>,
         <<"method">> => <<"POST">>,
         <<"body">> => Value
     },
@@ -240,6 +215,7 @@ remote_write_value(Opts = #{ <<"node">> := Node }, Value) ->
 remote_link(Opts = #{ <<"node">> := Node }, Source, Destination) ->
     Msg = #{
         <<"path">> => <<"/~cache@1.0/link">>,
+        <<"type">> => <<"cache-link">>,
         <<"method">> => <<"POST">>,
         <<"source">> => Source,
         <<"destination">> => Destination
@@ -258,6 +234,7 @@ remote_link(Opts = #{ <<"node">> := Node }, Source, Destination) ->
 remote_group(Opts = #{ <<"node">> := Node }, Path) ->
     Msg = #{
         <<"path">> => <<"/~cache@1.0/group">>,
+        <<"type">> => <<"cache-group">>,
         <<"method">> => <<"POST">>,
         <<"group">> => Path
     },

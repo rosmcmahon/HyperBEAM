@@ -80,10 +80,12 @@ request(Method, #{ <<"opts">> := ReqOpts, <<"uri">> := URI }, _Path, Message, Op
         ),
     % We also recalculate the request. The order of precidence here is subtle:
     % We favor the args given to the function, but the URI rules take precidence
-    % over that.
+    % over that. The URI is the route itself, so the message is not routed
+    % again: its own `path' stays as it is, in case it is a committed key.
     {ok, NewMethod, Node, NewPath, NewMsg, NewOpts} =
-        message_to_request(
-            Message#{ <<"path">> => URI, <<"method">> => Method },
+        route_to_request(
+            Message#{ <<"method">> => Method },
+            {ok, URI},
             MergedOpts
         ),
     request(NewMethod, Node, NewPath, NewMsg, NewOpts);
@@ -366,8 +368,10 @@ route_to_request(M, {ok, #{ <<"uri">> := XPath, <<"opts">> := ReqOpts}}, Opts) -
     Method = hb_ao:get(<<"method">>, M, <<"GET">>, Opts),
     % We must remove the path and host from the message, because they are not
     % valid for outbound requests. The path is retrieved from the route, and
-    % the host should already be known to the caller.
-    MsgWithoutMeta = hb_maps:without([<<"path">>, <<"host">>], M, Opts),
+    % the host should already be known to the caller. A committed path or host
+    % stays in the message: the peer verifies the request as it was signed.
+    MsgWithoutMeta =
+        hb_message:without_unless_signed([<<"path">>, <<"host">>], M, Opts),
     Port =
         case maps:get(port, URI, undefined) of
             undefined ->
@@ -397,8 +401,10 @@ route_to_request(M, {ok, Routes}, Opts) ->
     Method = hb_ao:get(<<"method">>, M, <<"GET">>, Opts),
     % We must remove the path and host from the message, because they are not
     % valid for outbound requests. The path is retrieved from the route, and
-    % the host should already be known to the caller.
-    MsgWithoutMeta = hb_maps:without([<<"path">>, <<"host">>], M, Opts),
+    % the host should already be known to the caller. A committed path or host
+    % stays in the message: the peer verifies the request as it was signed.
+    MsgWithoutMeta =
+        hb_message:without_unless_signed([<<"path">>, <<"host">>], M, Opts),
     {ok, Method, Routes, Path, MsgWithoutMeta, Opts};
 route_to_request(M, {error, Reason}, _Opts) ->
     {error, {no_viable_route, {reason, Reason}, {message, M}}}.
@@ -729,11 +735,23 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                 maps:without([<<"body">>], ErrMsg),
                 maps:get(<<"body">>, ErrMsg, <<>>)
             };
-        {404, <<"httpsig@1.0">>, false} ->
+        {Code, <<"httpsig@1.0">>, false} when Code == 403; Code == 404 ->
+            {Title, Description} =
+                case Code of
+                    403 -> {<<"Access denied.">>,
+                        <<"This request does not have permission to perform this operation.">>};
+                    404 -> {<<"Page cannot be found.">>,
+                        <<"This hashpath cannot be resolved on this node, yet...">>}
+                end,
             {ok, ErrMsg} =
                 hb_http_server:static(
                     <<"hyperbuddy@1.0">>,
-                    <<"404.html">>,
+                    <<"error.html">>,
+                    #{
+                        <<"status">> => Code,
+                        <<"title">> => Title,
+                        <<"description">> => Description
+                    },
                     Opts
                 ),
             {Status,
@@ -924,132 +942,66 @@ req_to_tabm_singleton(Req, Body, Opts) ->
         }
     ),
     ?event({req_to_tabm_singleton, {codec, Codec}}),
-    case Codec of
-        <<"httpsig@1.0">> ->
-			?event(debug_http,
-                {req_to_tabm_singleton,
-                    {request, {explicit, Req},
-                    {body, {string, Body}}
-                }}
-            ),
-            httpsig_to_tabm_singleton(PrimitiveMsg, Req, Body, Opts);
-        <<"ans104@1.0">> ->
-            Item = ar_bundles:deserialize(Body),
-            ?event(debug_accept,
-                {deserialized_ans104,
-                    {item, Item},
-                    {exact, {explicit, Item}}
-                }
-            ),
-            case ar_bundles:verify_item(Item) of
-                true ->
-                    ?event(ans104, {valid_ans104_signature, Item}),
-                    ANS104 =
+    Decoded =
+        case Codec of
+            <<"httpsig@1.0">> ->
+                % HTTPSig commitments share the transport headers. Retain only
+                % their committed fields before restoring request metadata.
+                {ok, Committed} =
+                    hb_message:with_only_committed(
                         hb_message:convert(
-                            Item,
+                            PrimitiveMsg#{ <<"body">> => Body },
                             <<"structured@1.0">>,
-                            <<"ans104@1.0">>,
+                            Codec,
                             Opts
                         ),
-                    normalize_unsigned(PrimitiveMsg, Req, ANS104, Opts);
-                false ->
-                    throw({invalid_ans104_signature, Item})
-            end;
-        <<"tx@1.0">> ->
-            TX = ar_tx:json_struct_to_tx(hb_json:decode(Body)),
-            ?event(debug_accept,
-                {deserialized_tx,
-                    {tx, TX},
-                    {exact, {explicit, TX}}
-                }
-            ),
-            case ar_tx:verify(TX) of
-                true ->
-                    ?event(debug_tx, {valid_tx_signature, TX}),
-                    StructuredTX =
-                        hb_message:convert(
-                            TX,
-                            <<"structured@1.0">>,
-                            <<"tx@1.0">>,
-                            Opts
-                        ),
-                    normalize_unsigned(PrimitiveMsg, Req, StructuredTX, Opts);
-                false ->
-                    throw({invalid_tx_signature, TX})
-            end;
-        Codec ->
-            % Assume that the codec stores the encoded message in the `body' field.
-            ?event(debug_http, {decoding_body, {codec, Codec}, {body, {string, Body}}}),
-            Decoded =
-                hb_message:convert(
-                    Body,
-                    <<"structured@1.0">>,
-                    Codec,
+                        Opts
+                    ),
+                Committed;
+            ArCodec when ArCodec == <<"tx@1.0">>
+                    orelse ArCodec == <<"ans104@1.0">> ->
+                {ok, TABM} =
+                    hb_ao:raw(ArCodec, <<"deserialize">>, Body, #{}, Opts),
+                hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts);
+            _ ->
+                hb_maps:merge(
+                    PrimitiveMsg,
+                    hb_message:convert(
+                        Body,
+                        <<"structured@1.0">>,
+                        #{
+                            <<"device">> => Codec,
+                            <<"accept-codec">> => <<"structured@1.0">>
+                        },
+                        Opts
+                    ),
                     Opts
-                ),
-            ReqMessage = hb_maps:merge(PrimitiveMsg, Decoded, Opts),
-            ?event(debug_http,
-                {verifying_encoded_message,
-                    {codec, Codec},
-                    {body, {string, Body}},
-                    {decoded, ReqMessage}
-                }
-            ),
-            case hb_message:verify(ReqMessage, all) of
-                true ->
-                    normalize_unsigned(PrimitiveMsg, Req, ReqMessage, Opts);
-                false ->
-                    throw({invalid_commitment, ReqMessage})
-            end
-    end.
-
-%% @doc HTTPSig messages are inherently mixed into the transport layer, so they
-%% require special handling in order to be converted to a normalized message.
-%% In particular, the signatures are verified if present and required by the 
-%% node configuration. Additionally, non-committed fields are removed from the
-%% message if it is signed, with the exception of the `path' and `method' fields.
-httpsig_to_tabm_singleton(PrimMsg, Req, Body, Opts) ->
-    {ok, Decoded} =
-        hb_message:with_only_committed(
-            hb_message:convert(
-                PrimMsg#{ <<"body">> => Body },
-                <<"structured@1.0">>,
-                <<"httpsig@1.0">>,
-                Opts
-            ),
-            Opts
-        ),
-    ?event(debug_http, {decoded, Decoded}, Opts),
-    ForceSignedRequests = hb_opts:get(force_signed_requests, false, Opts),
-    case (not ForceSignedRequests) orelse hb_message:verify(Decoded, all, Opts) of
-        true ->
-            ?event(http_verify, {verified_signature, Decoded}),
-            Signers = hb_message:signers(Decoded, Opts),
-            case Signers =/= [] andalso hb_opts:get(store_all_signed, false, Opts) of
-                true ->
-                    ?event(http_verify, {storing_signed_from_wire, Decoded}),
-                    {ok, _} =
-                        hb_cache:write(Decoded,
-                            Opts#{
-                                <<"store">> =>
-                                    #{
-                                        <<"store-module">> => hb_store_fs,
-                                        <<"name">> => <<"cache-http">>
-                                    }
-                            }
-                        );
-                false ->
-                    do_nothing
-            end,
-            normalize_unsigned(PrimMsg, Req, Decoded, Opts);
-        false ->
-            ?event(http_verify,
-                {invalid_signature,
-                    {signed, Decoded},
-                    {force, ForceSignedRequests}
-                }
-            ),
-            throw({invalid_commitments, Decoded})
+                )
+        end,
+    % Cookie-backed commitments need the request's cookie and peer context.
+    Normalized = normalize_unsigned(PrimitiveMsg, Req, Decoded, Opts),
+    maybe
+        true ?= hb_message:deep_verify(Normalized, Opts),
+        Signers = hb_message:signers(Normalized, Opts),
+        true ?= not hb_opts:get(force_signed_requests, false, Opts)
+            orelse Signers =/= [],
+        case Signers =/= [] andalso hb_opts:get(store_all_signed, false, Opts) of
+            true ->
+                {ok, _} =
+                    hb_cache:write(Decoded,
+                        Opts#{
+                            <<"store">> =>
+                                #{
+                                    <<"store-module">> => hb_store_fs,
+                                    <<"name">> => <<"cache-http">>
+                                }
+                        }
+                    );
+            false -> do_nothing
+        end,
+        Normalized
+    else
+        _ -> throw({invalid_commitments, Normalized})
     end.
 
 %% @doc Add the method and path to a message, if they are not already present.
@@ -1261,6 +1213,258 @@ simple_ao_resolve_signed_test() ->
             test_opts()
         ),
     ?assertEqual(<<"Value1">>, Res).
+
+%% @doc Every ingress codec verifies commitments and applies the node's
+%% signature policy before executing the request.
+ingress_commitments_test_() ->
+    [
+        {binary_to_list(Codec), fun() ->
+            Opts = isolated_test_opts(),
+            CommitCodec = case Codec of
+                <<"json@1.0">> -> <<"httpsig@1.0">>;
+                _ -> Codec
+            end,
+            Msg = #{ <<"body">> => <<"original">> },
+            Signed = hb_message:commit(Msg, Opts, CommitCodec),
+            Unsigned = hb_message:normalize_commitments(Msg, Opts),
+            Invalid = Signed#{ <<"body">> => <<"modified">> },
+            WrongMethod = hb_message:commit(
+                Msg#{ <<"method">> => <<"GET">> }, Opts, CommitCodec),
+            Child = case Codec of
+                <<"tx@1.0">> -> hb_message:commit(Msg, Opts, <<"ans104@1.0">>);
+                _ -> Signed
+            end,
+            lists:foreach(
+                fun(Required) ->
+                    Node = hb_http_server:start_node(
+                        (isolated_test_opts())#{
+                            <<"force-signed-requests">> => Required
+                        }
+                    ),
+                    UnsignedStatus = case Required of true -> 400; false -> 200 end,
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec, Msg, Opts)),
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec, Unsigned, Opts)),
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec,
+                            Msg#{ <<"child">> => Child }, Opts)),
+                    ?assertMatch({ok, 200, _, <<"original">>},
+                        ingress_request(Node, Codec, Signed, Opts)),
+                    ?assertMatch({ok, 400, _, _},
+                        ingress_request(Node, Codec, Invalid, Opts)),
+                    ?assertMatch({ok, 400, _, _},
+                        ingress_request(Node, Codec, WrongMethod, Opts)),
+                    ?assertMatch({ok, 400, _, _},
+                        ingress_request(Node, Codec,
+                            Msg#{ <<"child">> =>
+                                Child#{ <<"body">> => <<"modified">> } }, Opts))
+                end,
+                [false, true]
+            )
+        end}
+    || Codec <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>, <<"json@1.0">>]
+    ].
+
+%% @doc JSON ingress preserves explicit links and verifies inline children.
+ingress_json_links_test() ->
+    Opts = isolated_test_opts(),
+    Req = #{
+        method => <<"POST">>, path => <<"/body">>, qs => <<>>,
+        scheme => <<"http">>, host => <<"localhost">>, port => 80,
+        peer => {{127, 0, 0, 1}, 1234},
+        headers => #{ <<"codec-device">> => <<"json@1.0">> }
+    },
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Child = hb_message:commit(#{ <<"number">> => 42 }, Opts),
+    Msg = #{
+        <<"body">> => <<"original">>,
+        <<"child">> => Child,
+        <<"reference+link">> => ID
+    },
+    Decoded = req_to_tabm_singleton(Req, hb_json:encode(Msg), Opts),
+    ?assertEqual(Child, maps:get(<<"child">>, Decoded)),
+    ?assertMatch({link, ID, _}, maps:get(<<"reference">>, Decoded)),
+    ?assertThrow(
+        {invalid_commitments, _},
+        req_to_tabm_singleton(
+            Req,
+            hb_json:encode(Msg#{ <<"child">> => Child#{ <<"number">> => 43 } }),
+            Opts
+        )
+    ),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)).
+
+%% @doc Send the codec's wire representation directly to a real HTTP node.
+ingress_request(Node, Codec, Msg, Opts) ->
+    Wire = hb_message:convert(
+        Msg, #{ <<"device">> => Codec, <<"bundle">> => true }, Opts),
+    {Headers, Body} = case Codec of
+        <<"httpsig@1.0">> ->
+            {maps:remove(<<"body">>, Wire), maps:get(<<"body">>, Wire, <<>>)};
+        <<"ans104@1.0">> -> {#{}, ar_bundles:serialize(Wire)};
+        <<"tx@1.0">> -> {#{}, hb_json:encode(ar_tx:tx_to_json_struct(Wire))};
+        _ -> {#{}, Wire}
+    end,
+    hb_http_client:request(
+        #{
+            peer => Node,
+            path => <<"/body">>,
+            method => <<"POST">>,
+            headers => Headers#{ <<"codec-device">> => Codec },
+            body => Body
+        },
+        Opts
+    ).
+
+%% @doc Browser requests receive friendly, templated authorization and missing
+%% resource pages, with the corresponding HTTP status.
+client_error_pages_test() ->
+    Node = hb_http_server:start_node(isolated_test_opts()),
+    lists:foreach(
+        fun({Path, Status, Title}) ->
+            {ok, {{_, Status, _}, Headers, Body}} = httpc:request(
+                get,
+                {binary_to_list(<<Node/binary, Path/binary>>), []},
+                [],
+                [{body_format, binary}]
+            ),
+            ?assertEqual("text/html", proplists:get_value("content-type", Headers)),
+            ?assertNotEqual(nomatch, binary:match(Body, Title)),
+            ?assertEqual(nomatch, binary:match(Body, <<"{{">>)),
+            ?assertEqual(nomatch, binary:match(Body, <<"not_authorized">>))
+        end,
+        [
+            {<<"/~cache@1.0/group">>, 403, <<"Access denied.">>},
+            {<<"/~cache@1.0/read?read=missing">>, 404, <<"Page cannot be found.">>}
+        ]
+    ).
+
+%% @doc A request whose commitment carries the operator's address but was not
+%% made with the operator's key is refused, and the node message stays as it
+%% is.
+forged_commitment_rejected_test() ->
+    Opts = test_opts(),
+    Node = hb_http_server:start_node(Opts),
+    Update =
+        #{
+            <<"path">> => <<"/~meta@1.0/info">>,
+            <<"method">> => <<"POST">>,
+            <<"short-trace-len">> => 7,
+            <<"type">> => <<"node-message">>
+        },
+    Genuine = hb_message:commit(Update, Opts),
+    [{_, GenuineComm}] =
+        maps:to_list(hb_maps:get(<<"commitments">>, Genuine, Opts)),
+    Attacker = isolated_test_opts(),
+    Signed = hb_message:commit(Update, Attacker),
+    [{ID, Comm}] = maps:to_list(hb_maps:get(<<"commitments">>, Signed, Opts)),
+    Forged =
+        Signed#{
+            <<"commitments">> =>
+                #{
+                    ID =>
+                        Comm#{
+                            <<"keyid">> =>
+                                hb_maps:get(<<"keyid">>, GenuineComm, Opts),
+                            <<"committer">> =>
+                                hb_maps:get(<<"committer">>, GenuineComm, Opts)
+                        }
+                }
+        },
+    ?assertEqual(
+        hb_message:signers(Genuine, Opts),
+        hb_message:signers(Forged, Opts)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        post(Node, Forged, Attacker)
+    ),
+    {ok, Unchanged} = get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertNotEqual(7, hb_ao:get(<<"short-trace-len">>, Unchanged, Opts)),
+    ?assertMatch({ok, _}, post(Node, Genuine, Opts)),
+    {ok, Changed} = get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertEqual(7, hb_ao:get(<<"short-trace-len">>, Changed, Opts)).
+%% @doc A request signed by the client and relayed through a router node
+%% reaches the peer with its commitment intact. The peer stores every signed
+%% request it receives, so the stored copy must read back and verify with its
+%% committed `path' in place.
+relayed_signed_request_test() ->
+    Peer =
+        hb_http_server:start_node(
+            (isolated_test_opts())#{ <<"store-all-signed">> => true }
+        ),
+    Router =
+        hb_http_server:start_node(
+            (isolated_test_opts())#{
+                <<"routes">> => [
+                    #{
+                        <<"template">> => <<"/key1">>,
+                        <<"nodes">> => [#{ <<"prefix">> => Peer }]
+                    }
+                ],
+                <<"on">> => #{
+                    <<"request">> => #{ <<"device">> => <<"relay@1.0">> }
+                }
+            }
+        ),
+    ClientOpts = isolated_test_opts(),
+    Request =
+        hb_message:commit(
+            #{ <<"path">> => <<"/key1">>, <<"key1">> => <<"Value1">> },
+            ClientOpts
+        ),
+    ?assertEqual({ok, <<"Value1">>}, post(Router, Request, ClientOpts)),
+    % Read the request back from the store that the peer writes signed
+    % requests to, by the ID of the client's signature.
+    {ok, SignedID, _} =
+        hb_message:commitment(
+            #{ <<"type">> => <<"rsa-pss-sha512">> },
+            Request,
+            ClientOpts
+        ),
+    StoreOpts =
+        #{
+            <<"store">> =>
+                #{
+                    <<"store-module">> => hb_store_fs,
+                    <<"name">> => <<"cache-http">>
+                }
+        },
+    {ok, Stored} = hb_cache:read(SignedID, StoreOpts),
+    Loaded = hb_cache:ensure_all_loaded(Stored, StoreOpts),
+    ?assertEqual(
+        <<"/key1">>,
+        hb_maps:get(<<"path">>, Loaded, not_found, StoreOpts)
+    ),
+    ?assert(hb_message:verify(Loaded, all, StoreOpts)),
+    ?assertEqual(
+        hb_message:signers(Request, ClientOpts),
+        hb_message:signers(Loaded, StoreOpts)
+    ).
+%% @doc Routing must retain signed fields even when the HTTP destination differs.
+signed_routing_fields_test() ->
+    Opts = test_opts(),
+    Node = hb_http_server:start_node(),
+    Signed = hb_message:commit(#{
+        <<"path">> => <<"/value">>,
+        <<"host">> => <<"application.example">>,
+        <<"method">> => <<"POST">>,
+        <<"value">> => <<"preserved">>
+    }, Opts),
+    Route = #{ <<"uri">> => <<Node/binary, "/value">>, <<"opts">> => #{} },
+    lists:foreach(
+        fun(Routing) ->
+            {ok, _, _, _, Prepared, _} =
+                route_to_request(Signed, {ok, Routing}, Opts),
+            ?assert(hb_message:verify(Prepared, all, Opts)),
+            ?assertEqual(<<"/value">>, maps:get(<<"path">>, Prepared)),
+            ?assertEqual(<<"application.example">>, maps:get(<<"host">>, Prepared))
+        end,
+        [Route, #{ <<"nodes">> => [Route] }]
+    ),
+    ?assertEqual({ok, <<"preserved">>},
+        request(<<"POST">>, Route, <<"/ignored">>, Signed, Opts)).
 
 paranoid_http_result_test() ->
     % The `http_result' topic verifies each response at the reply boundary (in

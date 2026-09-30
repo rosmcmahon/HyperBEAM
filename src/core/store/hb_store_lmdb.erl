@@ -32,6 +32,7 @@
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
 -define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
                                                 % every 5,000 write operations.
+-define(MAX_KEY_SIZE, 511).                     % LMDB's key size limit, bytes.
 
 %% @doc Start the LMDB storage system for a given database configuration.
 %%
@@ -153,6 +154,10 @@ write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
     {error, not_found};
 write(Opts, PathParts, Value) when is_list(PathParts) ->
     write(Opts, hb_store_utils:to_path(PathParts), Value);
+write(_Opts, Path, _Value) when byte_size(Path) > ?MAX_KEY_SIZE ->
+    % elmdb accepts a longer key, fails to flush it, and then fails every
+    % later operation on the database.
+    {error, 'key-too-long'};
 write(Opts, Path, Value) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
     ?event_debug({elmdb_write, {db, DBInstance}, {path, Path}, {value, Value}}),
@@ -423,14 +428,15 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
 
 %% @doc The children of a group through the NIF's cursor: every one, or
 %% those the request names from its `from' in its direction, no more than
-%% its limit -- a batch being every child: LMDB reads a page at a time only
-%% from a key's fixed-size duplicate values, and the database holds none.
+%% its limit. A `batch' uses the store's `list-batch-size' (default 256,
+%% minimum 2 for inclusive cursor progress), independently of the write
+%% flush threshold `batch-size'. An `all' request remains unbounded.
 list_children(Opts, ResolvedPath, Req) ->
     #{
         <<"from">> := From,
         <<"limit">> := Limit,
         <<"direction">> := Direction
-    } = hb_store_utils:list_request_bounds(Req),
+    } = hb_store_utils:list_request_bounds(Req, Opts),
     #{ <<"db">> := DBInstance } = find_env(Opts),
     Options =
         [ {from, From} || From =/= none ] ++
@@ -774,6 +780,19 @@ basic_test() ->
     ?assertEqual(Value, <<"World2">>),
     ok = test_stop(StoreOpts).
 
+%% @doc A 511-byte key is written, a 512-byte key returns an error, and the
+%% store still reads the first key afterwards.
+long_key_test() ->
+    StoreOpts = hb_test_utils:test_store(?MODULE),
+    MaxKey = binary:copy(<<"k">>, ?MAX_KEY_SIZE),
+    ?assertEqual(ok, write(StoreOpts, MaxKey, <<"held">>)),
+    ?assertEqual(
+        {error, 'key-too-long'},
+        write(StoreOpts, <<MaxKey/binary, "k">>, <<"refused">>)
+    ),
+    ?assertEqual({ok, <<"held">>}, test_read(StoreOpts, MaxKey)),
+    ok = test_stop(StoreOpts).
+
 %% @doc List test - verifies prefix-based key listing functionality.
 %%
 %% This test creates several keys with hierarchical names and verifies that
@@ -783,10 +802,12 @@ list_test() ->
     StoreOpts = #{
         <<"store-module">> => ?MODULE,
         <<"name">> => <<"/tmp/store-2">>,
+        <<"list-batch-size">> => 2,
         <<"capacity">> => ?DEFAULT_SIZE
     },
     test_reset(StoreOpts),
     ?assertEqual({ok, []}, test_list(StoreOpts, <<"colors">>)),
+    test_group(StoreOpts, <<"colors">>),
     % Create immediate children under colors/
     test_write(StoreOpts, <<"colors/red">>, <<"1">>),
     test_write(StoreOpts, <<"colors/blue">>, <<"2">>),
@@ -808,6 +829,19 @@ list_test() ->
     % Should NOT include deeply nested items like foo, bar, deep, value
     ExpectedChildren = [<<"blue">>, <<"green">>, <<"multi">>, <<"nested">>, <<"primary">>, <<"red">>],
     ?assert(lists:all(fun(Key) -> lists:member(Key, ExpectedChildren) end, ListResult)),
+    % Batches are bounded in both directions; explicit limits remain independent.
+    lists:foreach(
+        fun({Limit, Direction, Expected}) ->
+            ?assertEqual({ok, Expected}, list(StoreOpts, #{
+                <<"list">> => <<"colors">>, <<"from">> => <<"multi">>,
+                <<"limit">> => Limit, <<"direction">> => Direction
+            }, #{}))
+        end,
+        [{batch, asc, [<<"multi">>, <<"nested">>]},
+            {batch, desc, [<<"multi">>, <<"green">>]},
+            {1, asc, [<<"multi">>]},
+            {all, asc, [<<"multi">>, <<"nested">>, <<"primary">>, <<"red">>]}]
+    ),
     % Test listing a nested directory - should only show immediate children
     {ok, NestedListResult} = test_list(StoreOpts, <<"colors/multi">>),
     ?event_debug({nested_list_result, NestedListResult}),

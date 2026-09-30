@@ -18,6 +18,12 @@ info(_Opts) ->
     }.
 
 %% @doc Lookup a process by name.
+-spec lookup(
+    binary(),
+    #{ _ => _ },
+    #{ spawn => boolean(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _}.
 lookup(Name, _Base, Req, Opts) ->
     ?event(node_process, {lookup, {name, Name}}),
     LookupRes =
@@ -195,7 +201,10 @@ lookup_spawn_test() ->
             hb_cache:ensure_all_loaded(Process2, Opts),
             Opts
         ),
-    ?assertEqual(LoadedProcess1, LoadedProcess2).
+    ?assertEqual(
+        hb_private:reset(LoadedProcess1),
+        hb_private:reset(LoadedProcess2)
+    ).
 
 %% @doc Test that a process can be spawned, executed upon, and its result retrieved.
 lookup_execute_test() ->

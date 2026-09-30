@@ -26,6 +26,7 @@
 -define(SUPPORTED_TYPES, [<<"integer">>, <<"float">>, <<"atom">>, <<"list">>]).
 
 %% @doc Route commitments through `httpsig@1.0'.
+-spec commit(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 commit(Msg, Req, Opts) ->
     {ok,
         hb_message:commit(
@@ -36,6 +37,7 @@ commit(Msg, Req, Opts) ->
     }.
 
 %% @doc Route verification through `httpsig@1.0'.
+-spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 verify(Msg, Req, Opts) ->
     {ok,
         hb_message:verify(
@@ -46,6 +48,11 @@ verify(Msg, Req, Opts) ->
     }.
 
 %% @doc Convert a rich message into a 'Type-Annotated-Binary-Message' (TABM).
+-spec from(
+    binary() | [_] | #{ _ => _ },
+    #{ 'encode-types' => [binary()], bundle => boolean(), _ => _ },
+    #{ _ => _ }
+) -> {ok, binary() | [_] | #{ _ => _ }}.
 from(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
 from(List, Req, Opts) when is_list(List) ->
     % Encode the list as a map, then -- if our request indicates that we are
@@ -224,13 +231,26 @@ linkify_mode(Req, Opts) ->
     end.
 
 %% @doc Convert a TABM into a native HyperBEAM message.
-to(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
-to(TABM0, Req, Opts) when is_list(TABM0) ->
+-spec to(binary() | [_] | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary() | [_] | #{ _ => _ }} | {error, #{ _ => _ }}.
+to(TABM, Req, Opts) ->
+    try decode(TABM, Req, Opts)
+    catch
+        error:badarg -> invalid_types();
+        error:function_clause -> invalid_types();
+        error:{badmatch, _} -> invalid_types();
+        error:{case_clause, _} -> invalid_types();
+        throw:{unexpected_type, _, _} -> invalid_types()
+    end.
+
+%% @doc Decode types recursively, leaving malformed inputs to the codec boundary.
+decode(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
+decode(TABM0, Req, Opts) when is_list(TABM0) ->
     % If we receive a list, we convert it to a message and run `to/3' on it. 
     % Finally, we convert the result back to a list.
-    {ok, TABM1} = to(hb_util:list_to_numbered_message(TABM0), Req, Opts),
+    {ok, TABM1} = decode(hb_util:list_to_numbered_message(TABM0), Req, Opts),
     {ok, hb_util:numbered_keys_to_list(TABM1, Opts)};
-to(TABM0, Req, Opts) ->
+decode(TABM0, Req, Opts) ->
     Types = decode_ao_types(TABM0, Opts),
     % Decode all links to their HyperBEAM-native, resolvable form.
     TABM1 = hb_link:decode_all_links(TABM0),
@@ -252,7 +272,7 @@ to(TABM0, Req, Opts) ->
             (RawKey, ChildTABM, Acc) when is_map(ChildTABM) or is_list(ChildTABM) ->
                 % Decode the child TABM
                 Acc#{
-                    RawKey => hb_util:ok(to(ChildTABM, Req, Opts))
+                    RawKey => hb_util:ok(decode(ChildTABM, Req, Opts))
                 };
             (RawKey, Value, Acc) ->
                 % We encountered a key that already has a converted type.
@@ -286,7 +306,17 @@ encode_ao_types(Types, _Opts) ->
 
 %% @doc Device key for parsing an `ao-types' field.
 decode_types(Base, Req, Opts) ->
-    {ok, decode_ao_types(hb_maps:get(<<"body">>, Req, Base, Opts), Opts)}.
+    Types = hb_maps:get(<<"body">>, Req, Base, Opts),
+    try {ok, decode_ao_types(Types, Opts)}
+    catch
+        error:badarg -> invalid_types();
+        error:function_clause -> invalid_types();
+        error:{badmatch, _} -> invalid_types()
+    end.
+
+%% @doc Reject malformed types without reflecting caller-controlled data.
+invalid_types() ->
+    {error, #{ <<"status">> => 400, <<"body">> => <<"Invalid AO types.">> }}.
 
 %% @doc Parse the `ao-types' field of a TABM if present, and return a map of
 %% keys and their types. If the given value is a list, we return an empty map
@@ -380,6 +410,31 @@ decode_value(Type, Value) ->
     hb_util:decode(Type, Value).
 
 %%% Tests
+
+malformed_types_return_error_test() ->
+    lists:foreach(
+        fun(Types) ->
+            Msg = #{ <<"ao-types">> => Types, <<"a">> => <<"text">> },
+            lists:foreach(
+                fun(Input) ->
+                    ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
+                        <<"structured@1.0">>, <<"to">>, Input, #{}, #{}
+                    ))
+                end,
+                [Msg, #{ <<"nested">> => Msg }, [Msg]]
+            )
+        end,
+        [<<"a=1.2345">>, <<"a=1">>, <<"a=?1">>,
+            <<"a=\"unknown-type\"">>, <<"a=\"float\"">>, <<"a=\"integer\"">>]
+    ),
+    ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
+        <<"structured@1.0">>, <<"decode-types">>, <<"a=1">>, #{}, #{}
+    )),
+    ?assertEqual({ok, #{ <<"a">> => 42 }}, hb_ao:raw(
+        <<"structured@1.0">>, <<"to">>,
+        #{ <<"ao-types">> => <<"a=\"integer\"">>, <<"a">> => <<"42">> },
+        #{}, #{}
+    )).
 
 list_encoding_test() ->
     % Test that we can encode and decode a list of integers.

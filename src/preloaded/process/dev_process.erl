@@ -11,7 +11,7 @@
 %%% computation step the device caches the result at a path relative to the
 %%% process definition itself, such that the process message's ID can act as an
 %%% immutable reference to the process's growing list of interactions. See 
-%%% `dev_process_cache' for details.
+%%% `lib_process_cache' for details.
 %%% 
 %%% The external API of the device is as follows:
 %%% <pre>
@@ -40,7 +40,7 @@
 %%%     Cache-Keys:      A list of the keys that should be cached for all 
 %%%                      assignments, in addition to `/Results'.
 -module(dev_process).
--device_libraries([lib_process]).
+-device_libraries([lib_process, lib_process_cache]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
 -export([target_slot/2]).
@@ -79,6 +79,11 @@ info(_Base) ->
 
 %% @doc Return the process state with the device swapped out for the device
 %% of the given key.
+-spec as(
+    #{ 'input-prefix' => binary(), _ => _ },
+    #{ as => binary(), 'as-device' => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ device := binary(), _ => _ }}.
 as(RawBase, Req, Opts) ->
     {ok, Base} = ensure_loaded(RawBase, Req, Opts),
     Key = 
@@ -126,13 +131,22 @@ as(RawBase, Req, Opts) ->
 %% _must_ be set in all processes aside those marked with `ao.TN.1' variant.
 %% This is in order to ensure that post-mainnet processes do not default to
 %% using infrastructure that should not be present on nodes in the future.
+-spec default_device(
+    #{ 'process/variant' => binary(), _ => _ },
+    binary(),
+    #{ _ => _ }
+) -> binary().
 default_device(Base, Key, Opts) ->
     lib_process:default_device(Base, Key, Opts).
 
 %% @doc Wraps functions in the Scheduler device.
+-spec schedule(#{ scheduler => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 schedule(Base, Req, Opts) ->
     lib_process:run_as(<<"scheduler">>, Base, Req, Opts).
 
+-spec slot(#{ scheduler => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 slot(Base, Req, Opts) ->
     ?event({slot_called, {base, Base}, {req, Req}}),
     lib_process:run_as(<<"scheduler">>, Base, Req, Opts).
@@ -140,6 +154,8 @@ slot(Base, Req, Opts) ->
 next(Base, _Req, Opts) ->
     lib_process:run_as(<<"scheduler">>, Base, next, Opts).
 
+-spec snapshot(#{ execution => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 snapshot(RawBase, _Req, Opts) ->
     Base = lib_process:ensure_process_key(RawBase, Opts),
     {ok, SnapshotMsg} =
@@ -190,6 +206,19 @@ init(Base, Req, Opts) ->
 %%   handlers and previewing results. The POST method is the key entry point
 %%   for the dryrun functionality that allows external clients to test
 %%   message processing without side effects.
+-spec compute(
+    #{ initialized => binary(), 'at-slot' => integer(), _ => _ },
+    #{
+        compute => integer(),
+        slot => integer(),
+        init => binary(),
+        push => _,
+        'result-depth' => _,
+        async => _,
+        'max-depth' => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _} | {failure, _}.
 compute(Base, Req, Opts) ->
     ProcBase = lib_process:ensure_process_key(Base, Opts),
     ProcID = lib_process:process_id(ProcBase, #{}, Opts),
@@ -207,7 +236,7 @@ compute(Base, Req, Opts) ->
             end;
         RawSlot ->
             Slot = hb_util:int(RawSlot),
-            case dev_process_cache:read(ProcID, Slot, Opts) of
+            case lib_process_cache:read(ProcID, Slot, Opts) of
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
                     ?event(
@@ -343,7 +372,12 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
     {RuntimeMicroSecs, Res} =
         timer:tc(
             fun() ->
-                lib_process:run_as(<<"execution">>, PreparedState, Req, Opts)
+                lib_process:run_as(
+                    <<"execution">>,
+                    PreparedState,
+                    Req,
+                    lib_process:execution_opts(Opts)
+                )
             end
         ),
     ?event(
@@ -387,11 +421,11 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {store_ms, StoreTimeMicroSecs div 1000},
                     {computed_slot_size, erlang:external_size(NewProcStateMsgWithSlot)},
                     {action,
-                        hb_ao:get(
-                            <<"body/action">>,
-                            Req,
+                        hb_maps:get(
+                            <<"action">>,
+                            hb_maps:get(<<"body">>, Req, #{}, Opts),
                             no_action_set,
-                            Opts#{ <<"hashpath">> => ignore }
+                            Opts
                         )
                     }
                 }
@@ -518,7 +552,8 @@ dispatch_push(Process, Slot, MaxDepth, Req, Opts) ->
 %% @doc Store the resulting state in the cache, potentially with the snapshot
 %% key. The write is synchronous: callers may notify waiters or run push hooks
 %% as soon as this returns, so the slot must already be cache-visible.
-store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
+store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
+    Opts = lib_process:execution_opts(RawOpts),
     % Cache the `Snapshot' key as frequently as the node is configured to.
     ResMaybeWithSnapshot =
         case ForceSnapshot orelse should_snapshot(Slot, Res, Opts) of
@@ -568,7 +603,7 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
                 WithLastSnapshot
     end,
     ?event(compute, {caching_result, {proc_id, ProcID}, {slot, Slot}}, Opts),
-    dev_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
+    lib_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
     ?event(compute, {caching_completed, {proc_id, ProcID}, {slot, Slot}}, Opts),
     hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts).
 
@@ -623,6 +658,8 @@ should_snapshot_time(Res, Opts) ->
 
 %% @doc Returns the known state of the process at either the current slot, or
 %% the latest slot in the cache depending on the `process-now-from-cache' option.
+-spec now(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {failure, _} | {error, _}.
 now(RawBase, Req, Opts) ->
     Base = lib_process:ensure_process_key(RawBase, Opts),
     ProcessID = lib_process:process_id(Base, #{}, Opts),
@@ -635,7 +672,12 @@ now(RawBase, Req, Opts) ->
                     Opts
                 ),
             ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
-            hb_ao:resolve(
+            lib_process_cache:refresh(
+                ProcessID,
+                hb_util:int(CurrentSlot),
+                Opts
+            ),
+            hb_ao:raw(
                 Base,
                 (hb_maps:with([<<"push">>], Req, Opts))#{
                     <<"path">> => <<"compute">>,
@@ -646,40 +688,63 @@ now(RawBase, Req, Opts) ->
         CacheParam ->
             % We are serving the latest known state from the cache, rather
             % than computing it.
-            LatestKnown = dev_process_cache:latest(ProcessID, [], Opts),
+            LatestKnown = lib_process_cache:latest(ProcessID, [], Opts),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
-                    LatestMsg = without_snapshot(RawLatestMsg, Opts),
-                    ?event(compute_cache,
-                        {serving_latest_cached_state,
-                            {proc_id, ProcessID},
-                            {slot, LatestSlot}
-                        },
-                        Opts
-                    ),
-                    dev_process_worker:notify_compute(
-                        ProcessID,
-                        LatestSlot,
-                        {ok, LatestMsg},
-                        Opts
-                    ),
-                    {ok, LatestMsg};
+                    case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
+                        true ->
+                            LatestMsg = without_snapshot(RawLatestMsg, Opts),
+                            ?event(compute_cache,
+                                {serving_latest_cached_state,
+                                    {proc_id, ProcessID},
+                                    {slot, LatestSlot}
+                                },
+                                Opts
+                            ),
+                            dev_process_worker:notify_compute(
+                                ProcessID,
+                                LatestSlot,
+                                {ok, LatestMsg},
+                                Opts
+                            ),
+                            {ok, LatestMsg};
+                        false ->
+                            ?event(compute_cache,
+                                {latest_cached_state_stale,
+                                    {proc_id, ProcessID},
+                                    {slot, LatestSlot}
+                                },
+                                Opts
+                            ),
+                            uncached_now(
+                                CacheParam,
+                                Base,
+                                Req,
+                                Opts,
+                                <<"No fresh cached state available.">>
+                            )
+                    end;
                 _ ->
-                    if CacheParam =/= always ->
-                        % The node is configured to use the cache if possible,
-                        % but forcing computation is also admissible. Subsequently,
-                        % as no other option is available, we compute the state.
-                        now(Base, Req, Opts#{ <<"process-now-from-cache">> => false });
-                    true ->
-                        % The node is configured to only serve the latest known
-                        % state from the cache, so we return the latest slot.
-                        {failure, <<"No cached state available.">>}
-                    end
+                    uncached_now(CacheParam, Base, Req, Opts)
             end
     end.
 
+uncached_now(CacheParam, Base, Req, Opts) ->
+    uncached_now(CacheParam, Base, Req, Opts, <<"No cached state available.">>).
+
+uncached_now(always, _Base, _Req, _Opts, Failure) ->
+    {failure, Failure};
+uncached_now(<<"always">>, _Base, _Req, _Opts, Failure) ->
+    {failure, Failure};
+uncached_now(_CacheParam, Base, Req, Opts, _Failure) ->
+    % The node is configured to use the cache if possible, but forcing
+    % computation is also admissible.
+    now(Base, Req, Opts#{ <<"process-now-from-cache">> => false }).
+
 %% @doc Recursively push messages to the scheduler until we find a message
 %% that does not lead to any further messages being scheduled.
+-spec push(#{ push => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 push(Base, Req, Opts) ->
     lib_process:run_as(
         <<"push">>,
@@ -703,7 +768,7 @@ ensure_loaded(Base, Req, Opts) ->
             ?event(not_initialized),
             % Try to load the latest complete state from disk.
             LoadRes =
-                dev_process_cache:latest(
+                lib_process_cache:latest(
                     ProcID,
                     [<<"snapshot+link">>],
                     TargetSlot,
@@ -787,6 +852,11 @@ ensure_loaded(Base, Req, Opts) ->
                             {slot, TargetSlot}
                         }
                     ),
+                    {ok, _} =
+                        hb_cache:write(
+                            hb_maps:get(<<"process">>, Base, Base, Opts),
+                            lib_process:cache_opts(Opts)
+                        ),
                     init(Base, Req, Opts)
             end
     end.

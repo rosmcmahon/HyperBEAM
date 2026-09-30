@@ -454,6 +454,37 @@ maybe_join(Items, Sep) ->
 
 %%% Tests
 
+%% @doc The steps of a signed request keep its signer, but a step that changes
+%% a signed key is written under its own ID: the cache never writes the step's
+%% content under the request's ID.
+signed_request_steps_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Signed =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"/~meta@1.0/info/address">>,
+                <<"x">> => <<"1">>
+            },
+            Opts
+        ),
+    ID = hb_message:id(Signed, all, Opts),
+    Steps = [ Step || Step <- from(Signed, Opts), is_map(Step) ],
+    ?assertEqual(2, length(Steps)),
+    lists:foreach(
+        fun(Step) ->
+            ?assertEqual(
+                hb_message:signers(Signed, Opts),
+                hb_message:signers(Step, Opts)
+            ),
+            {ok, _} = hb_cache:write(Step, Opts)
+        end,
+        Steps
+    ),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)).
+
 parse_explicit_message_test() ->
     Singleton1 = #{
         <<"path">> => <<"/a">>,

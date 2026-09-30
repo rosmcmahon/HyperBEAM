@@ -261,10 +261,12 @@ raw_default_message() ->
                 <<"capacity">> => 1024 * 1024 * 1024,
                 <<"read-only">> => true
             },
-        % Store for resolved device reference -> loaded module atom,
-        % shared across processes so the first caller to resolve a
-        % device spares the rest the index read and archive
-        % extraction. Defaults to a `hb_store_volatile`.
+        % Store for resolved device reference -> loaded module atom and
+        % module -> function schemas, shared across processes so the first
+        % caller to resolve a device spares the rest the index read, archive
+        % extraction and schema extraction. The schemas are extremely hot, and
+        % so are written as fully loaded messages as a single Erlang term. As a
+        % consequence, the store must be a `hb_store_volatile`.
         <<"loaded-device-store">> =>
             [
                 #{
@@ -273,7 +275,7 @@ raw_default_message() ->
                 }
             ],
         % Default execution cache control options
-        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
+        <<"cache-control">> => [],
         <<"cache-lookup-hueristics">> => false,
         % Should we await in-progress executions, rather than re-running?
         % Has three settings: false, only `named' executions, or all executions.
@@ -493,24 +495,15 @@ raw_default_message() ->
                     <<"index-store">> =>
                         [?DEFAULT_PRIMARY_STORE, ?DEFAULT_OFFSET_INDEX],
                     <<"local-store">> => [?DEFAULT_PRIMARY_STORE],
-                    <<"remote-index">> => false
-                },
-                #{
-                    <<"store-module">> => hb_store_gateway,
-                    <<"subindex">> => [
-                        #{
-                            <<"name">> => <<"Data-Protocol">>,
-                            <<"value">> => <<"ao">>
-                        }
-                    ],
-                    <<"local-store">> => [?DEFAULT_PRIMARY_STORE]
-                },
-                #{
-                    <<"store-module">> => hb_store_gateway,
-                    <<"local-store">> => [?DEFAULT_PRIMARY_STORE]
+                    <<"remote-index">> => true
                 }
             ],
         <<"match-index">> => [?DEFAULT_PRIMARY_STORE],
+        <<"attested-store">> =>
+            #{
+                <<"store-module">> => hb_store_lmdb,
+                <<"name">> => <<"cache-attested">>
+            },
         <<"priv-store">> =>
             [
                 #{
@@ -521,16 +514,19 @@ raw_default_message() ->
         % default_index => #{ <<"device">> => <<"hyperbuddy@1.0">> },
         % Should we use the latest cached state of a process when computing?
         <<"process-now-from-cache">> => false,
-        % Should we trust the GraphQL API when converting to ANS-104? Some GQL
-        % services do not provide the `anchor' or `last_tx' fields, so their
-        % responses are not verifiable.
-        <<"ans104-trust-gql">> => true,
+        % Maximum age, in seconds, for `/now' to serve from the process cache.
+        <<"process-now-max-age">> => infinity,
+        % Should the node serve ANS-104 items from GraphQL indexes whose
+        % signatures it cannot verify? Gateways serve only an item's data and
+        % may leave out its `anchor', so such items are served without commitments
+        % when this is enabled, and refused otherwise.
+        <<"ans104-trust-gql">> => false,
         % Number of chunks to fetch in parallel when loading a TX or dataitem.
         <<"arweave-chunk-fetch-concurrency">> => 5,
         <<"http-extra-opts">> =>
             #{
                 <<"force-message">> => true,
-                <<"cache-control">> => [<<"always">>]
+                <<"cache-control">> => []
             },
         % Should the node store all signed messages?
         <<"store-all-signed">> => true,
@@ -542,7 +538,10 @@ raw_default_message() ->
         },
         <<"on">> => #{
             <<"cache-write">> =>
-                #{ <<"device">> => <<"match@1.0">>, <<"path">> => <<"index">> },
+                #{ <<"device">> => <<"match@1.0">>, <<"path">> => <<"index">>,
+                    <<"match-paths">> => #{
+                        <<"field-target">> => <<"recipient~query@1.0">>
+                    } },
             <<"request">> =>
                 [
                     #{

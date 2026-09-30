@@ -39,6 +39,8 @@ info() ->
 
 %% @doc Route either `POST' or `GET' requests to the correct handler for known
 %% location records.
+-spec known(#{ _ => _ }, #{ method => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _}.
 known(Base, Req, Opts) ->
     case hb_ao:get(<<"method">>, Req, <<"GET">>, Opts) of
         <<"POST">> -> write_foreign(Base, Req, Opts);
@@ -46,6 +48,7 @@ known(Base, Req, Opts) ->
     end.
 
 %% @doc List all known location records.
+-spec all(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, [_]} | {error, _}.
 all(_Base, _Req, Opts) ->
     dev_location_cache:list(Opts).
 
@@ -53,14 +56,23 @@ all(_Base, _Req, Opts) ->
 %% cache. If an address is provided, we search for the location of that
 %% specific scheduler. Otherwise, we return the location record for the current
 %% node's scheduler, if it has been established.
-read(Address, _Base, _Req, Opts) ->
-    read(Address, Opts).
+-spec read(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}
+    | {error, #{ status := integer(), body := binary(), _ => _ }}.
+read(Address, _Base, Req, Opts) ->
+    read(Address, hb_maps:get(<<"variant">>, Req, undefined, Opts), Opts).
 read(Address, Opts) ->
+    read(Address, undefined, Opts).
+read(Address, Variant, Opts) ->
     % Search for the location of the scheduler in the scheduler-location cache.
-    case dev_location_cache:read(Address, Opts) of
-        {ok, Location} -> {ok, Location};
+    maybe
+        {ok, Cached} ?= dev_location_cache:read(Address, Opts),
+        true ?= Variant =:= undefined orelse
+            Variant =:= hb_maps:get(<<"variant">>, Cached, <<"ao.N.1">>, Opts),
+        {ok, Cached}
+    else
         _ ->
-            case hb_client_gateway:location(Address, Opts) of
+            case hb_client_gateway:location(Address, Variant, Opts) of
                 {ok, Location} ->
                     dev_location_cache:write(Location, Opts),
                     {ok, Location};
@@ -106,6 +118,8 @@ find_target(Base, RawReq, Opts) ->
 
 %% @doc Generate a new scheduler location record and register it. We both send 
 %% the new scheduler-location to the given registry, and return it to the caller.
+-spec node(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _}.
 node(Base, RawReq, RawOpts) ->
     Opts =
         case hb_ao:resolve(
@@ -405,6 +419,45 @@ latest_nonce(Signer, Nonce, Opts) ->
     end.
 
 %%% Tests
+
+%% @doc One wallet can advertise locations for different scheduler protocols.
+legacy_location_variant_test_() ->
+    {timeout, 90, fun legacy_location_variant/0}.
+legacy_location_variant() ->
+    Opts = #{
+        <<"store">> => [hb_test_utils:test_store() | hb_opts:get(store, [], #{})],
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    hb_http_server:start_node(Opts#{ <<"port">> => 0 }),
+    Address = <<"_GQ33BkPtZrqxA84vM8Zk-N2aO0toNNu_C-l-rawrBA">>,
+    LegacyReq = #{ <<"path">> => Address, <<"variant">> => <<"ao.TN.1">> },
+    {ok, Legacy} = hb_client_gateway:location(Address, <<"ao.TN.1">>, Opts),
+    ?assertEqual(<<"ao.TN.1">>, hb_maps:get(<<"variant">>, Legacy, Opts)),
+    ?assert(hb_message:verify(Legacy, signers, Opts)),
+    Base = #{ <<"device">> => <<"location@1.0">> },
+    {ok, Modern} = hb_ao:resolve(Base, Address, Opts),
+    ?assertEqual(<<"ao.N.1">>, hb_maps:get(<<"variant">>, Modern, Opts)),
+    {ok, CachedLegacy} = hb_ao:resolve(Base, LegacyReq, Opts),
+    ?assertEqual(Legacy, hb_private:reset(hb_cache:ensure_all_loaded(CachedLegacy, Opts))),
+    ?assert(hb_message:verify(CachedLegacy, signers, Opts)),
+    {ok, Again} = hb_ao:resolve(Base, LegacyReq, Opts),
+    ?assertEqual(hb_message:id(Legacy, none, Opts),
+        hb_message:id(Again, none, Opts)),
+    {ok, ModernAgain} = hb_ao:resolve(Base,
+        LegacyReq#{ <<"variant">> => <<"ao.N.1">> }, Opts),
+    ?assertEqual(hb_message:id(Modern, none, Opts),
+        hb_message:id(ModernAgain, none, Opts)),
+    {ok, Proc} = hb_client_gateway:read(
+        <<"0syT13r0s0tgPmIed95bJnuSqaD29HQNN8D3ElLSrsc">>, Opts),
+    {ok, Redirect} = hb_ao:resolve(
+        #{ <<"device">> => <<"process@1.0">>, <<"process">> => Proc },
+        <<"slot">>,
+        Opts#{ <<"scheduler-follow-redirects">> => false }
+    ),
+    ?assertEqual(307, hb_maps:get(<<"status">>, Redirect, Opts)),
+    ?assertEqual(<<"ao.TN.1">>, hb_maps:get(<<"variant">>, Redirect, Opts)),
+    ?assertEqual(<<"https://su-router.ao-testnet.xyz">>,
+        hb_maps:get(<<"location">>, Redirect, Opts)).
 
 register_scheduler_test() ->
     Opts = #{ <<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => ar_wallet:new() },

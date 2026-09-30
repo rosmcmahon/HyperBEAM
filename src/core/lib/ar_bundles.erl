@@ -338,6 +338,8 @@ encode_signature_type(ethereum) ->
     <<3, 0>>;
 encode_signature_type(solana) ->
     <<4, 0>>;
+encode_signature_type(typed_ethereum) ->
+    <<7, 0>>;
 encode_signature_type(SigType) ->
     ?event(warning, {error_encoding_signature_type, {sig_type, SigType}}),
     {unsupported_tx_format, SigType}.
@@ -1262,3 +1264,21 @@ deserialize_ethereum_transaction_test() ->
     ?assertEqual(<<"0x626334b6ef6D3e8537E9f8d97d65f59832219315">>,
         hb_util:human_id(ar_wallet:to_address(Deserialized#tx.owner, Deserialized#tx.signature_type))),
     ?assert(verify_item(Deserialized)).
+
+deserialize_typed_ethereum_transaction_test() ->
+    % ans104-item-typed-ethereum.bin is dataitem 9lLtZcFf6wZFxxQCbdZtdaRA1YrRXYzwUxq57Xry7BI
+    {ok, Serialized} = file:read_file(<<"test/arbundles.js/ans104-item-typed-ethereum.bin">>),
+    Deserialized = deserialize(Serialized),
+    ?assertEqual(typed_ethereum, Deserialized#tx.signature_type),
+    ?assertEqual([{<<"tag1">>, <<"value1">>}], Deserialized#tx.tags),
+    ?assertEqual(<<"0x2c7536e3605d9c16a7a3d7b1898e529396a65c23">>, Deserialized#tx.owner),
+    ?assertEqual(<<"0x2c7536E3605D9C16a7a3D7b1898e529396a65c23">>,
+        hb_util:human_id(ar_wallet:to_address(Deserialized#tx.owner, Deserialized#tx.signature_type))),
+    ?assert(verify_item(Deserialized)),
+    ?assertNot(verify_item(Deserialized#tx{data = <<"changed">>})),
+    ?assertNot(
+        verify_item(
+            Deserialized#tx{owner = <<"0x0000000000000000000000000000000000000000">>}
+        )
+    ),
+    ?assertEqual(Serialized, serialize(Deserialized)).

@@ -2,7 +2,7 @@
 %%% records to and from TABMs.
 -module(dev_tx).
 -device_libraries([lib_arweave_common]).
--export([from/3, to/3, to_hint/3, commit/3, verify/3]).
+-export([from/3, to/3, to_hint/3, commit/3, verify/3, deserialize/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -10,9 +10,17 @@
     <<"anchor">>, <<"format">>, <<"quantity">>, <<"reward">>, <<"target">>,
     <<"data_root">>, <<"data_size">> ]).
 
+%% @doc Deserialize a JSON-encoded transaction to a TABM.
+deserialize(#{ <<"body">> := Body }, Req, Opts) ->
+    deserialize(Body, Req, Opts);
+deserialize(Body, Req, Opts) when is_binary(Body) ->
+    from(ar_tx:json_struct_to_tx(hb_json:decode(Body)), Req, Opts).
+
 %% @doc Sign a message using the `priv-wallet' key in the options. Supports both
 %% the `hmac-sha256' and `rsa-pss-sha256' algorithms, offering unsigned and
 %% signed commitments.
+-spec commit(#{ _ => _ }, #{ type := binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
     commit(Msg, Req#{ <<"type">> => <<"unsigned-sha256">> }, Opts);
 commit(Msg, Req = #{ <<"type">> := <<"signed">> }, Opts) ->
@@ -47,6 +55,7 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
     }.
 
 %% @doc Verify an L1 TX commitment.
+-spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
     OnlyWithCommitment =
@@ -60,17 +69,27 @@ verify(Msg, Req, Opts) ->
     ?event({verify, {only_with_commitment, {explicit, OnlyWithCommitment}}}),
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, {explicit, TX}}}),
-    Res = ar_tx:verify(TX),
+    Res =
+        tx_verifies(TX, Req, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment),
     {ok, Res}.
 
+%% @doc An unsigned commitment verifies when the transaction's unsigned ID is
+%% the ID of the commitment; a signed one when its signature verifies.
+tx_verifies(TX, #{ <<"type">> := <<"unsigned-sha256">> }, Msg) ->
+    [ID] = maps:keys(maps:get(<<"commitments">>, Msg, #{})),
+    hb_util:human_id(ar_tx:id(TX, unsigned)) =:= hb_util:human_id(ID);
+tx_verifies(TX, _Req, _Msg) ->
+    ar_tx:verify(TX).
+
 %% @doc Convert a #tx record into a message map recursively.
+-spec from(binary() | #tx{}, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary() | #{ _ => _ }}.
 from(Binary, _Req, _Opts) when is_binary(Binary) -> {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
     case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        false ->
-            do_from(TX, Req, Opts);
-        {<<"ao-type">>, <<"binary">>} ->
-            {ok, TX#tx.data}
+        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data};
+        _ -> do_from(TX, Req, Opts)
     end.
 do_from(RawTX, Req, Opts) ->
     ?event({from, {raw_tx, hb_util:human_id(RawTX#tx.id)}}),
@@ -114,6 +133,11 @@ to_hint(Msg, Req, Opts) ->
 %% message's device in order to get the keys that we will be checkpointing. We 
 %% do this recursively to handle nested messages. The base case is that we hit
 %% a binary, which we return as is.
+-spec to(
+    binary() | #tx{} | #{ _ => _ },
+    #{ bundle => boolean(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #tx{}}.
 to(Binary, _Req, _Opts) when is_binary(Binary) ->
     % ar_tx cannot serialize just a simple binary or get an ID for it, so
     % we turn it into a TX record with a special tag, tx_to_message will
@@ -933,9 +957,30 @@ ao_data_key_test() ->
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"body">>, <<"tag1">>],
         <<"type">> => ?RSA_SIGN_TYPE,
-        <<"bundle">> => <<"false">>
+        <<"bundle">> => <<"false">>,
+        <<"original-tags">> => #{
+            <<"1">> => #{ <<"name">> => <<"ao-data-key">>, <<"value">> => <<"body">> },
+            <<"2">> => #{ <<"name">> => <<"tag1">>, <<"value">> => <<"value1">> }
+        }
     },
-    do_tabm_roundtrips(UnsignedTX, UnsignedTABM, SignedCommitment).
+    % The `ao-data-key' tag is not a normal tag, so the decoded message carries
+    % it in an unsigned commitment and encodes to the same TX again.
+    Req = #{ <<"bundle">> => false },
+    TX = hb_util:ok(to(UnsignedTABM, Req, #{})),
+    ?assertEqual(
+        UnsignedTX#tx{ unsigned_id = ar_tx:generate_id(UnsignedTX, unsigned) },
+        TX
+    ),
+    TABM = hb_util:ok(from(TX, Req, #{})),
+    ?assertEqual(UnsignedTABM, hb_message:uncommitted(TABM)),
+    ?assertEqual(TX, hb_util:ok(to(TABM, Req, #{}))),
+    do_signed_tabm_roundtrip(
+        UnsignedTX,
+        UnsignedTABM,
+        SignedCommitment,
+        #{ <<"device">> => <<"tx@1.0">>, <<"bundle">> => false },
+        Req
+    ).
 
 unsorted_tags_test() ->
     TX = #tx{
@@ -1199,6 +1244,36 @@ format_one_roundtrip_test() ->
     ),
     ?assertEqual(Signed#tx.tags, Roundtripped#tx.tags),
     ?assert(ar_tx:verify(Roundtripped)).
+
+%% @doc Ensure that a message does not verify when the values of its committed
+%% keys differ from those of the signed TX. The TX's tags and fields are
+%% restored from its commitment, so the signature alone does not cover them.
+modified_committed_value_test() ->
+    Signed = ar_tx:sign(
+        #tx{
+            format = 2,
+            target = crypto:strong_rand_bytes(32),
+            quantity = 100,
+            reward = 1,
+            tags = [{<<"Content-Type">>, <<"application/json">>}]
+        },
+        hb:wallet()
+    ),
+    Structured = hb_message:convert(
+        Signed,
+        <<"structured@1.0">>,
+        <<"tx@1.0">>,
+        #{}
+    ),
+    ?event({structured, Structured}),
+    ?assert(hb_message:verify(Structured, all, #{})),
+    ModifiedTag =
+        Structured#{
+            <<"content-type">> => <<"application/json; charset=utf-8">>
+        },
+    ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
+    ModifiedField = Structured#{ <<"quantity">> => <<"1">> },
+    ?assertNot(hb_message:verify(ModifiedField, all, #{})).
 
 duplicate_tags_roundtrip_test() ->
     Signed = ar_tx:sign(

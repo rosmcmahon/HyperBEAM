@@ -1,11 +1,12 @@
 %%% @doc Implements a two-step authentication process for HTTP requests, using
 %%% the `Basic' authentication scheme. This device is a viable implementation
 %%% of the `generator' interface type employed by `~auth-hook@1.0', as well as
-%%% the `~message@1.0' commitment scheme interface.
+%%% the access-control interface used by `~secret@1.0'.
 %%%
-%%% `http-auth@1.0`'s `commit' and `verify' keys proxy to the `~httpsig@1.0'
-%%% secret key HMAC commitment scheme, utilizing a secret key derived from the
-%%% user's authentication information. Callers may also utilize the `generate'
+%%% `http-auth@1.0`'s `commit' key records the committer (the hash) of a secret
+%%% key derived from the user's authentication information in the base message,
+%%% and its `verify' key checks that the key derived from a request hashes to
+%%% that committer. Callers may also use the `generate'
 %%% key directly to derive entropy from HTTP Authorization headers provided by
 %%% the user. If no Authorization header is provided, the `generate' key will
 %%% return a `401 Unauthorized` response, which triggers a recipient's browser
@@ -44,50 +45,81 @@
 %% to the `/generate' path with the `salt' request key.
 -define(DEFAULT_SALT, <<"constant:ao">>).
 
-%% @doc Generate or extract a new secret and commit to the message with the
-%% `~httpsig@1.0/commit?type=hmac-sha256&scheme=secret' commitment mechanism.
+%% @doc Generate or extract a secret and bind it to the base message by
+%% recording its committer.
+-spec commit(
+    #{ _ => _ },
+    #{
+        secret => binary(),
+        authorization => binary(),
+        raw => boolean(),
+        alg => atom(),
+        salt => binary(),
+        iterations => integer(),
+        'key-length' => integer(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _}.
 commit(Base, Req, Opts) ->
     case generate(Base, Req, Opts) of
         {ok, Key} ->
-            {ok, CommitRes} =
-                hb_ao:resolve(
-                    #{ <<"device">> => <<"httpsig@1.0">> },
-                    Req#{
-                        <<"path">> => <<"proxy-commit">>,
-                        <<"commitment-device">> => <<"http-auth@1.0">>,
-                        <<"secret">> => Key,
-                        <<"message">> => Base
-                    },
-                    Opts
-                ),
-            ?event({commit_result, CommitRes}),
-            {ok, CommitRes};
+            Bound =
+                Base#{
+                    <<"committer">> => hb_util:secret_key_to_committer(Key)
+                },
+            ?event({commit_result, Bound}),
+            {ok, Bound};
         {error, Err} ->
             {error, Err}
     end.
 
-%% @doc Verify a given `Base' message with a derived `Key' using the
-%% `~httpsig@1.0' secret key HMAC commitment scheme.
+%% @doc Verify that the key derived from the request's authentication
+%% information hashes to the committer recorded in the base message.
+-spec verify(
+    #{ _ => _ },
+    #{
+        secret => binary(),
+        authorization => binary(),
+        raw => boolean(),
+        alg => atom(),
+        salt => binary(),
+        iterations => integer(),
+        'key-length' => integer(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, boolean()} | {error, #{ status := integer(), _ => _ }}.
 verify(Base, RawReq, Opts) ->
     ?event({verify_invoked, {priv_base, Base}, {priv_req, RawReq}}),
-    {ok, Key} = generate(Base, RawReq, Opts),
-    ?event({verify_found_key, {priv_key, Key}, {priv_base, Base}, {priv_req, RawReq}}),
-    {ok, VerifyRes} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"httpsig@1.0">> },
-            RawReq#{
-                <<"path">> => <<"proxy-verify">>,
-                <<"secret">> => Key,
-                <<"message">> => Base
-            },
-            Opts
-        ),
-    ?event({verify_result, VerifyRes}),
-    {ok, VerifyRes}.
+    case generate(Base, RawReq, Opts) of
+        {ok, Key} ->
+            ?event({verify_found_key, {priv_key, Key}, {priv_base, Base}}),
+            Committer = hb_maps:get(<<"committer">>, Base, undefined, Opts),
+            VerifyRes = hb_util:secret_key_to_committer(Key) =:= Committer,
+            ?event({verify_result, VerifyRes}),
+            {ok, VerifyRes};
+        {error, Err} ->
+            {error, Err}
+    end.
 
 %% @doc Collect authentication information from the client. If the `raw' flag
 %% is set to `true', return the raw authentication information. Otherwise,
 %% derive a key from the authentication information and return it.
+-spec generate(
+    #{ _ => _ },
+    #{
+        secret => binary(),
+        authorization => binary(),
+        raw => boolean(),
+        alg => atom(),
+        salt => binary(),
+        iterations => integer(),
+        'key-length' => integer(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, binary()} | {error, #{ status := integer(), _ => _ }}.
 generate(_Msg, ReqLink, Opts) when ?IS_LINK(ReqLink) ->
     generate(_Msg, hb_cache:ensure_loaded(ReqLink, Opts), Opts);
 generate(_Msg, #{ <<"secret">> := Secret }, _Opts) ->

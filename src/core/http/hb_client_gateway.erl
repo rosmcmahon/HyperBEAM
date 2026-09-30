@@ -11,7 +11,7 @@
 -export([query/2, query/3, query/4, query/5]).
 -export([read/2, data/2, result_to_message/2, item_spec/0]).
 %% Application-specific data access functions:
--export([device/3, location/2]).
+-export([device/3, location/2, location/3]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -133,27 +133,40 @@ data(ID, Opts) ->
 %% Current AO location records use lowercase tags. Nodes may disable the
 %% fallback to legacy capitalized tags with `scheduler-legacy-locations'.
 location(Address, Opts) ->
+    location(Address, undefined, Opts).
+location(Address, Variant, Opts) ->
     maybe
         % Fallback to legacy capitalized tags if a lower-case result is not
         % available and `scheduler-legacy-locations' is enabled.
         Error = {error, _} ?=
-            do_location(Address, <<"type">>, <<"[\"location\"]">>, Opts),
+            do_location(Address, Variant, <<"type">>, [<<"location">>], Opts),
         true ?= hb_opts:get(scheduler_legacy_locations, true, Opts)
             orelse Error,
         do_location(
             Address,
+            Variant,
             <<"Type">>,
-            <<"[\"Location\", \"Scheduler-Location\"]">>,
+            [<<"Location">>, <<"Scheduler-Location">>],
             Opts
         )
     end.
-do_location(Address, TagName, TagValues, Opts) ->
+do_location(Address, Variant, TagName, TagValues, Opts) ->
+    VariantTags =
+        case Variant of
+            undefined -> [];
+            _ ->
+                VariantTag =
+                    case TagName of
+                        <<"type">> -> <<"variant">>;
+                        <<"Type">> -> <<"Variant">>
+                    end,
+                [#{ <<"name">> => VariantTag, <<"values">> => [Variant] }]
+        end,
     Query =
-        <<"query($Addresses: [String!]!) { ",
+        <<"query($Addresses: [String!]!, $Tags: [TagFilter!]!) { ",
                 "transactions(",
                 "owners: $Addresses, ",
-                "tags: { name: \"", TagName/binary, "\" values: ",
-                    TagValues/binary, " }, ",
+                "tags: $Tags, ",
                 "first: 1",
             "){ ",
                 "edges { ",
@@ -161,7 +174,11 @@ do_location(Address, TagName, TagValues, Opts) ->
                 " } ",
             "} ",
         "}">>,
-    Variables = #{ <<"Addresses">> => [Address] },
+    Variables = #{
+        <<"Addresses">> => [Address],
+        <<"Tags">> =>
+            [#{ <<"name">> => TagName, <<"values">> => TagValues } | VariantTags]
+    },
     case query(Query, Variables, Opts) of
         {error, Reason} ->
             ?event({scheduler_location, {query, Query}, {error, Reason}}),
@@ -403,18 +420,25 @@ result_to_message(ExpectedID, Item, Opts) ->
         hb_util:decode(
             hb_maps:get(<<"signature">>, Item, not_found, GQLOpts)
         ),
+	Owner =
+        hb_util:decode(
+            hb_util:deep_get(<<"owner/key">>, Item, GQLOpts)
+        ),
 	SignatureType =
-        case byte_size(Signature) of
-            64 -> {eddsa, ed25519};
-            65 -> ethereum;
-            512 -> {rsa, 65537};
+        case {byte_size(Signature), byte_size(Owner)} of
+            {64, _} -> {eddsa, ed25519};
+            {65, 42} -> typed_ethereum;
+            {65, _} -> ethereum;
+            {512, _} -> {rsa, 65537};
             _ -> unsupported_tx_signature_type
         end,
     TX =
         ar_tx:reset_ids(#tx {
             format = ans104,
             anchor =
-                normalize_null(hb_maps:get(<<"anchor">>, Item, not_found, GQLOpts)),
+                decode_or_null(
+                    hb_maps:get(<<"anchor">>, Item, not_found, GQLOpts)
+                ),
             signature = Signature,
             signature_type = SignatureType,
             target =
@@ -427,10 +451,7 @@ result_to_message(ExpectedID, Item, Opts) ->
                         GQLOpts
                     )
                 ),
-            owner =
-                hb_util:decode(
-                    hb_util:deep_get(<<"owner/key">>, Item, GQLOpts)
-                ),
+            owner = Owner,
             tags =
                 [
                     {normalize_graphql_tag_name(Name, Value), Value}
@@ -445,66 +466,36 @@ result_to_message(ExpectedID, Item, Opts) ->
     TABM = hb_message:convert(TX, tabm, <<"ans104@1.0">>, Opts),
     ?event({decoded_tabm, TABM}),
     Structured = hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts),
-    % Some graphql nodes do not grant the `anchor' or `last_tx' fields, so we
-    % verify the data item and optionally add the explicit keys as committed
-    % fields _if_ the node desires it.
-    Embedded =
-        case try ar_bundles:verify_item(TX) catch _:_ -> false end of
-            true ->
-                ?event({gql_verify_succeeded, Structured}),
-                Structured;
-            _ ->
-                % The item does not verify on its own, but does the node choose
-                % to trust the GraphQL API anyway?
-                case hb_opts:get(ans104_trust_gql, false, Opts) of
-                    false ->
-                        ?event(
-                            warning,
-                            {gql_verify_failed, returning_unverifiable_tx}
-                        ),
-                        Structured;
-                    true ->
-                        % The node trusts the GraphQL API, so we add the explicit
-                        % keys as committed fields.
-                        ?event(warning,
-                            {gql_verify_failed,
-                                adding_trusted_fields,
-                                {tags, Tags}
-                            }
-                        ),
-                        Comms = hb_maps:get(<<"commitments">>, Structured, #{}, Opts),
-                        AttName = hd(hb_maps:keys(Comms, Opts)),
-                        Comm = hb_maps:get(AttName, Comms, not_found, Opts),
-                        Structured#{
-                            <<"commitments">> => #{
-                                AttName =>
-                                    Comm#{
-                                        <<"trusted-keys">> =>
-                                            hb_ao:normalize_keys(
-                                                [
-                                                    hb_ao:normalize_key(Name)
-                                                ||
-                                                    #{ <<"name">> := Name } <-
-                                                        hb_maps:values(
-                                                            hb_ao:normalize_keys(
-                                                                Tags,
-                                                                Opts
-                                                            ),
-                                                            Opts
-                                                        )
-                                                ],
-												Opts
-                                            )
-                                    }
-                            }
+    % Gateways serve only an item's data, and their indexes may leave out the
+    % `anchor' or change the tags that its signature covers, so the item built
+    % from the result must verify and match the requested ID. Otherwise, the
+    % node serves it uncommitted only if it explicitly trusts the index.
+    IDMatches =
+        ExpectedID =:= undefined orelse
+            hb_util:human_id(TX#tx.id) =:= hb_util:human_id(ExpectedID),
+    case IDMatches andalso
+        (try ar_bundles:verify_item(TX) catch _:_ -> false end)
+    of
+        true ->
+            ?event({gql_verify_succeeded, Structured}),
+            {ok, Structured};
+        false ->
+            case hb_opts:get(ans104_trust_gql, false, Opts) of
+                true ->
+                    ?event(warning,
+                        {gql_verify_failed,
+                            serving_uncommitted,
+                            {id, ExpectedID}
                         }
-                end
-        end,
-    {ok, Embedded}.
-
-normalize_null(null) -> <<>>;
-normalize_null(not_found) -> <<>>;
-normalize_null(Bin) when is_binary(Bin) -> Bin.
+                    ),
+                    {ok, hb_message:uncommitted(Structured, Opts)};
+                false ->
+                    ?event(warning,
+                        {gql_verify_failed, refusing_item, {id, ExpectedID}}
+                    ),
+                    {error, unverifiable_item}
+            end
+    end.
 
 decode_or_null(Bin) when is_binary(Bin) ->
     hb_util:decode(Bin);
@@ -641,43 +632,29 @@ l1_transaction_test() ->
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"Hello World">>, Data).
 
-%% @doc Test l2 message from graphql
+%% @doc Test l2 message from graphql. The gateway index leaves out the item's
+%% anchor, so explicit trust is needed to serve it uncommitted.
 l2_dataitem_test() ->
     _Node = hb_http_server:start_node(#{}),
-    {ok, Res} = read(ID = <<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>, #{}),
-    ?event(gateway, {l2_dataitem, Res}),
-    Opts = #{},
-    CommitmentType = hb_util:deep_get(
-        [<<"commitments">>, ID, <<"type">>],
-        Res,
-        not_found,
-        Opts
+    {ok, Res} = read(
+        <<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>,
+        #{ <<"ans104-trust-gql">> => true }
     ),
-    ?assertEqual(?RSA_SIGN_TYPE, CommitmentType),
+    ?event(gateway, {l2_dataitem, Res}),
+    ?assertEqual([], hb_message:signers(Res, #{})),
+    ?assertNot(maps:is_key(<<"commitments">>, Res)),
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"Hello World">>, Data).
 
-%% @doc ed25519 L2 Transaction test
+%% @doc ed25519 L2 Transaction test. The gateway index leaves out the item's
+%% anchor, so explicit trust is needed to serve it uncommitted.
 l2_dataitem_ed25519_test() ->
     _Node = hb_http_server:start_node(#{}),
     ID = <<"AwrAs-HaBlc8xeI8sw6Wpbi7A0weQWeXYwW20CpX5oM">>,
-    {ok, Res} = read(ID, #{}),
+    {ok, Res} = read(ID, #{ <<"ans104-trust-gql">> => true }),
     ?event(gateway, {l2_dataitem, Res}),
-    Opts = #{},
-    CommitmentType = hb_util:deep_get(
-        [<<"commitments">>, ID, <<"type">>],
-        Res,
-        not_found,
-        Opts
-    ),
-    ?assertEqual(?EDDSA_SIGN_TYPE, CommitmentType),
-    CommitmentCommitter = hb_util:deep_get(
-        [<<"commitments">>, ID, <<"committer">>],
-        Res,
-        not_found,
-        Opts
-    ),
-    ?assertEqual(<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>, CommitmentCommitter),
+    ?assertEqual([], hb_message:signers(Res, #{})),
+    ?assertNot(maps:is_key(<<"commitments">>, Res)),
     %% Check Data
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"{\"displayName\":\"Test Hub\",\"description\":\"This is a test hub created in the test suite\",\"externalurl\":\"\",\"image\":\"\"}">>, Data).
@@ -685,7 +662,50 @@ l2_dataitem_ed25519_test() ->
 %% @doc Test optimistic index
 ao_dataitem_test() ->
     _Node = hb_http_server:start_node(#{}),
-    {ok, Res} = read(<<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>, #{}),
+    {ok, Res} = read(
+        <<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>,
+        #{ <<"ans104-trust-gql">> => true }
+    ),
     ?event(gateway, {l2_dataitem, Res}),
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"Hello World">>, Data).
+
+%% @doc An index that serves an item's anchor lets the item verify against its
+%% real signature, so it is served with its commitment. With the anchor left
+%% out, as arweave.net and goldsky serve bundled items, the signature cannot be
+%% verified: the item is refused unless the node explicitly trusts the index.
+anchor_verification_test() ->
+    {ok, Bin} = file:read_file(<<"test/arbundles.js/ans104-item-ed25519.bin">>),
+    TX = ar_bundles:deserialize(Bin),
+    Item =
+        #{
+            <<"id">> => hb_util:human_id(TX#tx.id),
+            <<"anchor">> => hb_util:encode(TX#tx.anchor),
+            <<"signature">> => hb_util:encode(TX#tx.signature),
+            <<"owner">> => #{ <<"key">> => hb_util:encode(TX#tx.owner) },
+            <<"tags">> =>
+                [
+                    #{ <<"name">> => Name, <<"value">> => Value }
+                ||
+                    {Name, Value} <- TX#tx.tags
+                ],
+            <<"data">> => TX#tx.data
+        },
+    {ok, Verified} = result_to_message(Item, #{}),
+    ?assert(hb_message:verify(Verified, all, #{})),
+    ?assertEqual(
+        [<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>],
+        hb_message:signers(Verified, #{})
+    ),
+    Unanchored = Item#{ <<"anchor">> => <<>> },
+    ?assertEqual({error, unverifiable_item}, result_to_message(Unanchored, #{})),
+    {ok, Uncommitted} = result_to_message(
+        Unanchored, #{ <<"ans104-trust-gql">> => true }
+    ),
+    ?assertEqual([], hb_message:signers(Uncommitted, #{})),
+    ?assertNot(maps:is_key(<<"commitments">>, Uncommitted)),
+    ?assertEqual(TX#tx.data, maps:get(<<"data">>, Uncommitted)),
+    ?assertEqual(
+        {error, unverifiable_item},
+        result_to_message(hb_util:human_id(<<0:256>>), Item, #{})
+    ).

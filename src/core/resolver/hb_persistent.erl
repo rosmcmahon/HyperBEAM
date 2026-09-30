@@ -153,7 +153,9 @@ group(Base, Req, Opts) ->
         ),
     apply(
         Grouper,
-        hb_device:truncate_args(Grouper, [Base, Req, Opts])
+        hb_device:truncate_args(Grouper,
+            [hb_ao:execution_input(Base, Opts),
+                hb_ao:execution_input(Req, Opts), Opts])
     ).
 
 %% @doc Register for performing an AO-Core resolution.

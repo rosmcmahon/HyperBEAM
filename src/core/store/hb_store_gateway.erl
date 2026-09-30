@@ -78,7 +78,7 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
                             {error, not_found};
                         {ok, Message} ->
                             ?event({read_found, {key, ID}}),
-                            hb_store_remote_node:maybe_cache(StoreOpts, Message, [ID]),
+                            hb_store_remote_node:maybe_cache(StoreOpts, Message),
                             extract_path_value(Message, Rest, ReadOpts)
                     catch Class:Reason:Stacktrace ->
                         ?event(
@@ -248,7 +248,8 @@ avoid_double_read_test() ->
     hb_http_server:start_node(#{}),
     %% Setup local node
     ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
-    Data = <<"123">>,
+    % The item's data as the gateway serves it, so that the item verifies.
+    Data = <<"1984">>,
     DefaultResponse = {200, Data},
     Endpoints = [{<<"/arweave/raw/", ID/binary>>, raw, DefaultResponse}],
     %% Start MockServer
@@ -268,13 +269,55 @@ avoid_double_read_test() ->
                 }
             ]
     },
+    LocalOpts = #{ <<"store">> => [Local] },
     {ok, Written} = hb_cache:read(ID, WriteOpts),
-    {ok, Read} = hb_cache:read(ID, #{ <<"store">> => [Local] }),
+    {ok, Read} = hb_cache:read(ID, LocalOpts),
     try
+        % The item verifies, so it is cached under its ID with its commitment.
+        ?assertEqual(
+            [<<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>],
+            hb_message:signers(Written, WriteOpts)
+        ),
+        Loaded = hb_cache:ensure_all_loaded(Read, LocalOpts),
+        ?assert(hb_message:verify(Loaded, all, LocalOpts)),
         ?assert(hb_message:match(Read, Written)),
         %% Check number of requests make to raw
         TXs = hb_mock_server:get_requests(raw, 1, ServerHandle),
         ?assert(length(TXs) == 1)
+    after
+        hb_mock_server:stop(ServerHandle)
+    end.
+
+%% @doc Unverifiable items are refused by default. Explicit trust serves them
+%% without commitments and does not cache them under the requested ID.
+unverifiable_item_not_cached_test() ->
+    hb_http_server:start_node(#{}),
+    ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
+    % Data that the item's signature does not cover.
+    Endpoints = [{<<"/arweave/raw/", ID/binary>>, raw, {200, <<"123">>}}],
+    {ok, MockServer, ServerHandle} = hb_mock_server:start(Endpoints),
+    Local = #{
+        <<"store-module">> => hb_store_fs,
+        <<"name">> => <<"cache-TEST/unverifiable_item_not_cached_test">>
+    },
+    hb_store:reset(Local),
+    Opts = #{
+        <<"store">> =>
+            [
+                #{ <<"store-module">> => hb_store_gateway,
+                    <<"local-store">> => [Local],
+                    <<"routes">> => custom_raw_routes(MockServer)
+                }
+            ]
+    },
+    try
+        ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+        {ok, First} = hb_cache:read(ID, Opts#{ <<"ans104-trust-gql">> => true }),
+        ?assertEqual([], hb_message:signers(First, Opts)),
+        ?assertEqual(<<"123">>, hb_ao:get(<<"data">>, First, Opts)),
+        ?assertEqual({error, not_found}, hb_cache:read(ID, #{ <<"store">> => [Local] })),
+        TXs = hb_mock_server:get_requests(raw, 2, ServerHandle),
+        ?assertEqual(2, length(TXs))
     after
         hb_mock_server:stop(ServerHandle)
     end.
@@ -351,10 +394,15 @@ specific_route_test() ->
                 }
             ]
     },
-    {ok, Response} = hb_cache:read(ID, Opts),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+    {ok, Response} = hb_cache:read(ID, Opts#{ <<"ans104-trust-gql">> => true }),
     %% If the result returns <<"1984">>, it is using the default route, 
     %% not the custom one we defined
-    ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)).
+    ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)),
+    % The custom route serves data that the item's signature does not cover,
+    % so the item is served without its commitment.
+    ?assertEqual([], hb_message:signers(Response, Opts)),
+    ?assertNot(maps:is_key(<<"commitments">>, Response)).
 
 %% @doc Test that the default node config allows for data to be accessed.
 external_http_access_test() ->
@@ -435,6 +483,7 @@ store_opts_test() ->
                 #{
                     <<"store-module">> => hb_store_gateway, 
                     <<"local-store">> => false,
+                    <<"ans104-trust-gql">> => true,
                     <<"subindex">> => [
                         #{
                             <<"name">> => <<"Data-Protocol">>,

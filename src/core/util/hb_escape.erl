@@ -7,8 +7,11 @@
 %%% While most map keys in HyperBEAM are normalized to lowercase, IDs are not.
 %%% Subsequently, we encode all header keys to lowercase %-encoded URI-style
 %%% strings because transmission.
+%%%
+%%% Path components have separate escaping for literal `/` and `%` characters.
 -module(hb_escape).
 -export([encode/1, decode/1, encode_keys/2, decode_keys/2]).
+-export([encode_path_component/1, decode_path_component/1]).
 -export([encode_header/1, decode_header/1]).
 -export([encode_quotes/1, decode_quotes/1]).
 -export([encode_ampersand/1]).
@@ -31,6 +34,20 @@ decode(<<$%, _/binary>>, Original) ->
     iolist_to_binary(lists:reverse(percent_unescape(Original, [])));
 decode(<<_C, Rest/binary>>, Original) ->
     decode(Rest, Original).
+
+%% @doc Escape a literal key as a single path component.
+encode_path_component(Key) ->
+    binary:replace(
+        binary:replace(Key, <<"%">>, <<"%25">>, [global]),
+        <<"/">>, <<"%2f">>, [global]
+    ).
+
+%% @doc Restore a key, decoding exactly one layer of path-component escaping.
+decode_path_component(Key) ->
+    binary:replace(
+        binary:replace(Key, <<"%2f">>, <<"/">>, [global]),
+        <<"%25">>, <<"%">>, [global]
+    ).
 
 encode_header(<<>>) -> <<>>;
 encode_header(<<$\\, Rest/binary>>) -> <<"\\\\", (encode_header(Rest))/binary>>;
