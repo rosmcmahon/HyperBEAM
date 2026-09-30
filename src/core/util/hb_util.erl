@@ -200,8 +200,7 @@ id(Data, Type) when is_list(Data) ->
 %% Pure-ASCII binaries take the fast `hb_util_string' NIF path (identical to
 %% `string:lowercase' for ASCII). Anything with a byte >= 0x80 is delegated to
 %% `string:lowercase', preserving its exact Unicode folding and its `badarg'
-%% throw on invalid UTF-8 — which callers such as `ar_tx' tag parsing rely on
-%% to reject non-string tags.
+%% throw on invalid UTF-8.
 to_lower(Str) when is_binary(Str) ->
     case hb_util_string:lowercase(Str) of
         non_ascii -> string:lowercase(Str);
@@ -1012,8 +1011,7 @@ message_to_ordered_list_metadata_test() ->
     ?assertEqual([one, two], message_to_ordered_list(Msg)).
 
 %% `to_lower/1' must remain byte-for-byte equivalent to `string:lowercase',
-%% including the `badarg' throw on invalid UTF-8 that `ar_tx' tag parsing
-%% relies on to reject non-string tags.
+%% including the `badarg' throw on invalid UTF-8.
 to_lower_equivalence_test_parallel() ->
     Throws = fun(F) -> try F(), false catch error:_ -> true end end,
     Valid = [<<"Content-Type">>, <<"slot">>, <<"ALLCAPS-123">>, <<>>,

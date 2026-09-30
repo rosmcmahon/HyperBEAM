@@ -126,12 +126,22 @@ tags(Item, Opts) ->
     ),
     ao_types(Tags, Opts).
 
-%% @doc Normalize tag keys while preserving IDs and their link forms.
+%% @doc Normalize tag keys while preserving IDs, their link forms and names
+%% that are not UTF-8 text.
 normalize_key(Key) ->
     case hb_link:remove_link_specifier(Key) of
         ID when ?IS_ID(ID) -> Key;
-        _ -> hb_util:to_lower(hb_ao:normalize_key(Key))
+        _ ->
+            NormKey = hb_ao:normalize_key(Key),
+            case is_text(NormKey) of
+                true -> hb_util:to_lower(NormKey);
+                false -> NormKey
+            end
     end.
+
+%% @doc Check whether a tag name is UTF-8 text.
+is_text(Name) ->
+    unicode:characters_to_binary(Name) =:= Name.
 
 %% @doc Ensure the encoded keys in the `ao-types' field are lowercased and
 %% normalized like the other keys in the tags field.
@@ -392,18 +402,15 @@ with_signed_commitment(
 bundle_commitment_key(Tags, Opts) ->
     hb_util:bin(hb_maps:is_key(<<"bundle-format">>, Tags, Opts)).
 
-%% @doc Check whether a list of key-value pairs contains only normalized keys.
+%% @doc Check whether tags contain only normalized UTF-8 keys. Other tag names
+%% need `original-tags' to keep their bytes and order.
 normal_tags(BaseFields, Tags) ->
     ReservedFields = [<<"ao-data-key">>, <<"ao-types">>, <<"data">> | BaseFields],
-    NormalizedKeys =
-        [
-            hb_util:to_lower(hb_ao:normalize_key(Key))
-        ||
-            {Key, _} <- Tags
-        ],
-    length(NormalizedKeys) =:= length(lists:usort(NormalizedKeys)) andalso
+    Keys = [Key || {Key, _} <- Tags],
+    length(Keys) =:= length(lists:usort(Keys)) andalso
         lists:all(
             fun({Key, _}) ->
+                is_text(Key) andalso
                 hb_util:to_lower(hb_ao:normalize_key(Key)) =:= Key andalso
                 not lists:member(Key, ReservedFields)
             end,

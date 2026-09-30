@@ -185,13 +185,25 @@ nested_map_to_string(Map) ->
     lists:map(fun(I) ->
         case maps:get(I, Map) of
             Val when is_map(Val) ->
-                Name = maps:get(<<"name">>, Val),
+                Name = encode_tag_name(maps:get(<<"name">>, Val)),
                 Value = hb_util:encode(maps:get(<<"value">>, Val)),
                 <<I/binary, ":", Name/binary, ":", Value/binary>>;
             Val ->
                 Val
         end
     end, maps:keys(Map)).
+
+%% @doc Percent-encode an original tag name that holds `%', `:', `,', `"',
+%% `\' or a byte outside printable ASCII. Other names are sent as they are.
+encode_tag_name(Name) ->
+    case lists:any(fun escaped_tag_byte/1, binary_to_list(Name)) of
+        true -> hb_escape:encode(Name);
+        false -> Name
+    end.
+
+%% @doc Whether an original tag name byte needs escaping.
+escaped_tag_byte(C) ->
+    lists:member(C, "%:,\"\\") orelse C < 16#20 orelse C > 16#7e.
 
 %% @doc Take a message with a `signature' and `signature-input' key pair and
 %% return a map of commitments.
@@ -317,7 +329,7 @@ decoding_nested_map_binary(Bin) ->
                     [ID, Key, Value] ->
                         Acc#{
                             ID => #{ 
-                                <<"name">> => Key,
+                                <<"name">> => hb_escape:decode(Key),
                                 <<"value">> => hb_util:decode(Value)
                             }
                         };
@@ -578,3 +590,22 @@ escaped_value_test() ->
     ?event(debug_test, {siginfo, {explicit, SigInfo}}),
     ?event(debug_test, {commitments, {explicit, Commitments}}),
     ?assertEqual(#{ ID => Commitment }, Commitments).
+
+%% @doc Original tag names that the `original-tags' string can carry are sent
+%% as they are; other names are percent-encoded and decode to themselves.
+original_tag_names_test() ->
+    Tag = fun(Name, Value) -> #{ <<"name">> => Name, <<"value">> => Value } end,
+    Tags =
+        #{
+            <<"1">> => Tag(<<"Action">>, <<"Transfer">>),
+            <<"2">> => Tag(<<"a:b, c">>, <<"x">>),
+            <<"3">> => Tag(<<"%41">>, <<"y">>),
+            <<"4">> => Tag(<<255>>, <<"z">>)
+        },
+    Wire = nested_map_to_string(Tags),
+    Plain = <<"1:Action:", (hb_util:encode(<<"Transfer">>))/binary>>,
+    ?assert(lists:member(Plain, Wire)),
+    ?assertEqual(
+        Tags,
+        decoding_nested_map_binary(iolist_to_binary(lists:join(<<", ">>, Wire)))
+    ).

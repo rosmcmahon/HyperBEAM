@@ -69,7 +69,7 @@ from(HTTP, _Req, Opts) ->
             Opts
         ),
     MsgWithoutSigs =
-        decode_ids(
+        decode_keys(
             hb_maps:without(
                 [
                     <<"signature">>,
@@ -384,10 +384,7 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
             {ok, EncOriginal}
     end;
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
-    Msg = encode_ids(TABM),
-    % Group the IDs into a dictionary, so that they can be distributed as
-    % HTTP headers. If we did not do this, ID keys would be lower-cased and
-    % their comparability against the original keys would be lost.
+    Msg = encode_keys(TABM),
     Stripped =
         hb_maps:without(
             [
@@ -541,27 +538,35 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
 
-%% @doc Transform all ID fields into their percent-encoded form, as well as
-%% the keys that share a name with the signature headers or the digest of the
-%% body: a message's own `signature' or `content-digest' is data on the wire,
-%% not a commitment or a digest.
-encode_ids(Msg) ->
-    % Find all keys that are IDs.
+%% @doc Percent-encode the keys that hold `%', a capital or a byte outside
+%% printable ASCII: HTTP lowercases header names and carries only printable
+%% ASCII, and `%' starts an escape. Other keys, such as `+link' keys, are sent
+%% as they are. A message's own `signature' or `content-digest' key shares a
+%% name with the signature headers or the digest of the body, so it is encoded
+%% as data on the wire, not read as a commitment or a digest.
+encode_keys(Msg) ->
     maps:from_list(
         lists:map(
-            fun({K, V}) when ?IS_ID(K) -> {hb_escape:encode(K), V};
-                ({<<"signature", Rest/binary>>, V})
+            fun({<<"signature", Rest/binary>>, V})
                         when Rest =:= <<>>; Rest =:= <<"-input">> ->
                     {<<"%73ignature", Rest/binary>>, V};
                 ({<<"content-digest">>, V}) -> {<<"%63ontent-digest">>, V};
-                ({K, V}) -> {K, V}
+                ({K, V}) ->
+                    case lists:any(fun escaped_key_byte/1, binary_to_list(K)) of
+                        true -> {hb_escape:encode(K), V};
+                        false -> {K, V}
+                    end
             end,
             maps:to_list(Msg)
         )
     ).
 
-% @doc Decode all ID fields from their percent-encoded form.
-decode_ids(Msg, _Opts) ->
+%% @doc Whether a key byte needs escaping on the wire.
+escaped_key_byte(C) ->
+    C =:= $% orelse (C >= $A andalso C =< $Z) orelse C < 16#20 orelse C > 16#7e.
+
+%% @doc Decode message keys from their percent-encoded form.
+decode_keys(Msg, _Opts) ->
     maps:from_list(
         lists:map(
             fun({K, V}) -> {hb_escape:decode(K), V} end,
