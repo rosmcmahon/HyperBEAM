@@ -572,18 +572,13 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     ),
     ReqBeforeStream = Req#{ resp_headers => EncodedHeaders },
     PostStreamReq = cowboy_req:stream_reply(Status, #{}, ReqBeforeStream),
-    Fin =
-        case should_finalize_stream(Status, EncodedBody) of
-            true -> fin;
-            false -> nofin
-        end,
-    % Stream the body back to the caller if there is content. If we already
-    % signal a non-content reply, skip.
+    % Stream the body back to the caller if there is content, ending the
+    % stream with it. If we already signal a non-content reply, skip.
     case Status of
         NonContentStatus
             when (NonContentStatus == 204)
             orelse (NonContentStatus == 304) -> skip;
-        _ -> cowboy_req:stream_body(EncodedBody, Fin, PostStreamReq)
+        _ -> cowboy_req:stream_body(EncodedBody, fin, PostStreamReq)
     end,
     EndTime = os:system_time(millisecond),
     ReqDuration = EndTime - hb_maps:get(start_time, Req, undefined, Opts),
@@ -613,13 +608,10 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     ),
     {ok, PostStreamReq, no_state}.
 
-%% @doc Determine if the stream should be finalized.
-should_finalize_stream(429, _EncodedBody) -> true;
-should_finalize_stream(_, _EncodedBody) -> false.
-
 %% @doc Handle replying with cookies if the message contains them. Returns the
-%% new Cowboy `Req` object, and the message with the cookies removed. Both
-%% `set-cookie' and `cookie' fields are treated as viable sources of cookies.
+%% new Cowboy `Req` object, and the message without the cookie keys that no
+%% commitment covers. Both `set-cookie' and `cookie' fields are treated as
+%% viable sources of cookies.
 reply_handle_cookies(Req, Message, Opts) ->
     {ok, Cookies} = cookie(<<"extract">>, Message, #{}, Opts),
     ?event(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
