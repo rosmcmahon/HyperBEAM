@@ -58,10 +58,15 @@ read_request(#{ <<"only-ids">> := true }, Key) when not ?IS_ID(Key) ->
     {error, not_found};
 read_request(Opts = #{ <<"node">> := Node }, Key) ->
     ?event(store_remote_node, {executing_read, {node, Node}, {key, Key}}),
+    Path =
+        case ?IS_ID(Key) of
+            true -> <<"/~cache@1.0/read=", (hb_util:human_id(Key))/binary>>;
+            false -> <<"/~cache@1.0/read">>
+        end,
     HTTPRes =
         hb_http:get(
             Node,
-            #{ <<"path">> => <<"/~cache@1.0/read">>, <<"read">> => Key },
+            #{ <<"path">> => Path, <<"read">> => Key },
             Opts
         ),
     case HTTPRes of

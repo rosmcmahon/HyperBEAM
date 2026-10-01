@@ -185,13 +185,25 @@ nested_map_to_string(Map) ->
     lists:map(fun(I) ->
         case maps:get(I, Map) of
             Val when is_map(Val) ->
-                Name = maps:get(<<"name">>, Val),
+                Name = encode_tag_name(maps:get(<<"name">>, Val)),
                 Value = hb_util:encode(maps:get(<<"value">>, Val)),
                 <<I/binary, ":", Name/binary, ":", Value/binary>>;
             Val ->
                 Val
         end
     end, maps:keys(Map)).
+
+%% @doc Percent-encode an original tag name that holds `%', `:', `,', `"',
+%% `\' or a byte outside printable ASCII. Other names are sent as they are.
+encode_tag_name(Name) ->
+    case lists:any(fun escaped_tag_byte/1, binary_to_list(Name)) of
+        true -> hb_escape:encode(Name);
+        false -> Name
+    end.
+
+%% @doc Whether an original tag name byte needs escaping.
+escaped_tag_byte(C) ->
+    lists:member(C, "%:,\"\\") orelse C < 16#20 orelse C > 16#7e.
 
 %% @doc Take a message with a `signature' and `signature-input' key pair and
 %% return a map of commitments.
@@ -317,7 +329,7 @@ decoding_nested_map_binary(Bin) ->
                     [ID, Key, Value] ->
                         Acc#{
                             ID => #{ 
-                                <<"name">> => Key,
+                                <<"name">> => hb_escape:decode(Key),
                                 <<"value">> => hb_util:decode(Value)
                             }
                         };
@@ -349,13 +361,9 @@ to_siginfo_keys(Msg, Commitment, Opts) ->
     maps:get(<<"committed">>, EncComm).
 
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
-%% format. There are three stages:
-%% 1. Replace `content-digest' with the body keys, if present, and remove the
-%%    @ prefix from the other component identifiers.
-%% 2. Replace the `body' key again with the value of the `ao-body-key' key, if
-%%    present. This is possible because the keys derived from the body often
-%%    contain the `body' key itself.
-%% 3. If the `content-type' starts with `multipart/', we remove it.
+%% format. Replace `content-digest' with the body keys, remove component prefixes,
+%% and restore the body's original key. A multipart `content-type' header is not
+%% a message key; the message's own `content-type' may be in the body instead.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     % 1. Replace the `content-digest' component with the body keys, then remove
     %    specifiers from the other keys and decode them. Only the raw component
@@ -364,6 +372,11 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     WithBody =
         lists:flatmap(
             fun(<<"content-digest">>) -> BodyKeys;
+               (<<"content-type">>) ->
+                    case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
+                        <<"multipart/", _/binary>> -> [];
+                        _ -> [<<"content-type">>]
+                    end;
                (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
                (Key) -> [hb_escape:decode(Key)]
             end,
@@ -392,19 +405,11 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
             false ->
                 WithBody
         end,
-    % 3. If the `content-type' starts with `multipart/', we remove it.
-    ListWithoutContentType =
-        case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
-            <<"multipart/", _/binary>> ->
-                hb_util:list_replace(ListWithoutBodyKey, <<"content-type">>, []);
-            _ ->
-                ListWithoutBodyKey
-        end,
     Normalized =
         hb_ao:normalize_keys(
             lists:map(
                 fun hb_link:remove_link_specifier/1,
-                ListWithoutContentType
+                ListWithoutBodyKey
             )
         ),
     List = hb_util:message_to_ordered_list(Normalized),
@@ -578,3 +583,22 @@ escaped_value_test() ->
     ?event(debug_test, {siginfo, {explicit, SigInfo}}),
     ?event(debug_test, {commitments, {explicit, Commitments}}),
     ?assertEqual(#{ ID => Commitment }, Commitments).
+
+%% @doc Original tag names that the `original-tags' string can carry are sent
+%% as they are; other names are percent-encoded and decode to themselves.
+original_tag_names_test() ->
+    Tag = fun(Name, Value) -> #{ <<"name">> => Name, <<"value">> => Value } end,
+    Tags =
+        #{
+            <<"1">> => Tag(<<"Action">>, <<"Transfer">>),
+            <<"2">> => Tag(<<"a:b, c">>, <<"x">>),
+            <<"3">> => Tag(<<"%41">>, <<"y">>),
+            <<"4">> => Tag(<<255>>, <<"z">>)
+        },
+    Wire = nested_map_to_string(Tags),
+    Plain = <<"1:Action:", (hb_util:encode(<<"Transfer">>))/binary>>,
+    ?assert(lists:member(Plain, Wire)),
+    ?assertEqual(
+        Tags,
+        decoding_nested_map_binary(iolist_to_binary(lists:join(<<", ">>, Wire)))
+    ).

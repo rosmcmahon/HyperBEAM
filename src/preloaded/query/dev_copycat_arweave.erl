@@ -1786,9 +1786,17 @@ tx_with_no_data_test_parallel() ->
 
 non_string_tags_test_parallel() ->
     {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
-    Res = resolve_tx_header(<<"752P6t4cOjMabYHqzC6hyLhxyo4YKZLblg7va_J21YE">>, Opts),
-    ?assertEqual(error, Res),
-    ok.
+    lists:foreach(
+        fun(ID) ->
+            {ok, TX} = resolve_tx_header(ID, Opts),
+            ?assertEqual(ID, hb_util:encode(TX#tx.id)),
+            ?assert(ar_tx:verify(TX))
+        end,
+        [
+            <<"752P6t4cOjMabYHqzC6hyLhxyo4YKZLblg7va_J21YE">>,
+            <<"OvyeU-1pikgs6NpDWcV-ObRhDPkKM5uA5u_qj5xh-UI">>
+        ]
+    ).
 
 list_index_test_parallel() ->
     %% Test block: https://viewblock.io/arweave/block/1827942

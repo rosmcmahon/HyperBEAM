@@ -152,7 +152,6 @@ aos2_to_assignments(ProcID, Body, RawOpts) ->
     assignments_to_bundle(ProcID, ParsedAssignments, false, TimeInfo, Opts).
 
 %% @doc Create and normalize an assignment from an AOS2-style JSON structure.
-%% NOTE: This method is destructive to the verifiability of the assignment.
 aos2_to_assignment(A, RawOpts) ->
     Opts = format_opts(RawOpts),
     % Unwrap the node if it is provided. Handle GraphQL-style responses with edges.
@@ -222,22 +221,13 @@ aos2_normalize_data(JSONStruct) ->
         _ -> JSONStruct#{ <<"data">> => <<>> }
     end.
 
-%% @doc Normalize an AOS2 formatted message to ensure that all field NAMES and
-%% types are correct. This involves converting field names to integers and
-%% specific field names to their canonical form.
-%% NOTE: This will result in a message that is not verifiable! It is, however,
-%% necessary for gaining compatibility with the AOS2-style scheduling API.
-aos2_normalize_types(Msg = #{ <<"timestamp">> := TS }) when is_binary(TS) ->
-    aos2_normalize_types(Msg#{ <<"timestamp">> => hb_util:int(TS) });
+%% @doc Add the slot and missing block hash for the AOS2-style scheduling API,
+%% retaining signed field values.
 aos2_normalize_types(Msg = #{ <<"nonce">> := Nonce })
         when is_binary(Nonce) and not is_map_key(<<"slot">>, Msg) ->
     aos2_normalize_types(
         Msg#{ <<"slot">> => hb_util:int(Nonce) }
     );
-aos2_normalize_types(Msg = #{ <<"epoch">> := DS }) when is_binary(DS) ->
-    aos2_normalize_types(Msg#{ <<"epoch">> => hb_util:int(DS) });
-aos2_normalize_types(Msg = #{ <<"slot">> := Slot }) when is_binary(Slot) ->
-    aos2_normalize_types(Msg#{ <<"slot">> => hb_util:int(Slot) });
 aos2_normalize_types(Msg) when not is_map_key(<<"block-hash">>, Msg) ->
     ?event({missing_block_hash, Msg}),
     aos2_normalize_types(Msg#{ <<"block-hash">> => hb_util:encode(<<0:256>>) });

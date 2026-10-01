@@ -945,7 +945,9 @@ maybe_normalize_result(Res, Opts) ->
 %% signatures. A device cannot carry invalid input commitments into storage.
 normalize_result(Res, Opts) when is_map(Res) ->
     normalize_input(
-        hb_message:without_commitments_unless_verified(Res, Opts), Opts);
+        hb_message:normalize_commitments(Res, Opts,
+            #{ <<"verify">> => all, <<"add-unsigned">> => false }),
+        Opts);
 normalize_result(Res, _Opts) -> Res.
 
 %% @doc Resolve the device function for a loaded base and vary the inputs
@@ -994,54 +996,43 @@ vary_loaded(Base, Req, Opts) ->
 
 %% @doc Remove unsigned commitments from loaded invocation inputs recursively.
 %% Lazy children carry the same rule into loading. Signed subtrees are unchanged.
-execution_input({link, ID, LinkOpts}, _Opts) ->
-    {link, ID, LinkOpts#{ <<"execution-input">> => true }};
-execution_input(Msg, Opts) when is_map(Msg) ->
-    case hb_maps:is_key(<<"commitments">>, Msg, Opts) andalso
-            hb_message:signers(Msg, Opts) =/= [] of
-        false -> maps:map(
-            fun(Key, Value) ->
-                case hb_private:is_private(Key) of
-                    true -> Value;
-                    false -> execution_input(Value, Opts)
-                end
-            end,
-            hb_message:uncommitted(Msg, Opts)
-        );
-        true -> Msg
-    end;
-execution_input(Values, Opts) when is_list(Values) ->
-    [ execution_input(Value, Opts) || Value <- Values ];
-execution_input(Value, _Opts) -> Value.
+execution_input(Msg, Opts) -> normalize_input(Msg, strip, Opts).
 
 %% @doc Name every field of an unsigned varied input, including loaded children
 %% whose IDs participate in their parent's identity. Preserve signed subtrees
 %% and avoid adding commitments to children that have none.
-normalize_input(Msg, Opts) -> normalize_input(Msg, true, Opts).
-normalize_input(Msg, Commit, Opts) when is_map(Msg) ->
+normalize_input(Msg, Opts) -> normalize_input(Msg, root, Opts).
+normalize_input({link, ID, LinkOpts}, strip, _Opts) ->
+    {link, ID, LinkOpts#{ <<"execution-input">> => true }};
+normalize_input(Msg, Mode, Opts) when is_map(Msg) ->
     case hb_maps:is_key(<<"commitments">>, Msg, Opts) andalso
             hb_message:signers(Msg, Opts) =/= [] of
         false ->
+            ChildMode = case Mode of root -> child; _ -> Mode end,
             Unsigned = maps:map(
                 fun(Key, Value) ->
                     case hb_private:is_private(Key) of
                         true -> Value;
-                        false -> normalize_input(Value, false, Opts)
+                        false -> normalize_input(Value, ChildMode, Opts)
                     end
                 end,
                 hb_message:uncommitted(Msg, Opts)
             ),
-            case Commit orelse hb_maps:is_key(<<"commitments">>, Msg, Opts) of
-                true -> hb_message:commit(Unsigned, Opts,
-                    #{ <<"type">> => <<"unsigned">>,
-                        <<"commitment-device">> => <<"httpsig@1.0">> });
+            case Mode == root orelse
+                    (Mode == child andalso hb_maps:is_key(<<"commitments">>, Msg, Opts)) of
+                true -> hb_message:normalize_commitments(
+                    Unsigned,
+                    Opts#{ <<"commitment-device">> => <<"httpsig@1.0">> },
+                    #{ <<"depth">> => shallow }
+                );
                 false -> Unsigned
             end;
         true -> Msg
     end;
-normalize_input(Values, _Commit, Opts) when is_list(Values) ->
-    [ normalize_input(Value, false, Opts) || Value <- Values ];
-normalize_input(Value, _Commit, _Opts) -> Value.
+normalize_input(Values, Mode, Opts) when is_list(Values) ->
+    ChildMode = case Mode of root -> child; _ -> Mode end,
+    [ normalize_input(Value, ChildMode, Opts) || Value <- Values ];
+normalize_input(Value, _Mode, _Opts) -> Value.
 
 %% @doc Catch all return if we are in an infinite loop.
 error_infinite(Base, Req, Opts) ->

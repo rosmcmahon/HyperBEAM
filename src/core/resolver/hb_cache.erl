@@ -256,8 +256,10 @@ normalize_match_spec(MatchSpec, _ReadMode, Opts) ->
 store_match(NormalizedSpec, Opts) ->
     ConvertedMatchSpec =
         maps:from_list([
-            {hb_escape:encode_path_component(Key),
-                store_match_value(Key, Value, Opts)}
+            {
+                hb_escape:encode_path_component(Key),
+                store_match_value(Key, Value, Opts)
+            }
         ||
             {Key, Value} <- maps:to_list(NormalizedSpec)
         ]),
@@ -287,7 +289,7 @@ generate_binary_path(Bin, Opts) ->
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    Msg = verified_unsigned(RawMsg, Opts),
+    Msg = prepare_write(RawMsg, Opts),
     hb_message:paranoid_verify(cache_write, Msg, Opts),
     TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
     ?event_debug(debug_cache, {writing_full_message, {msg, TABM}}),
@@ -316,55 +318,33 @@ write(List, Opts) when is_list(List) ->
 write(Bin, Opts) when is_binary(Bin) ->
     do_write_message(Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
 
-%% @doc Re-check the unsigned commitment that a write would trust as the
-%% address of a message, unless `priv/last-phash2' shows that the message is
-%% unchanged since it was normalized. A message without an unsigned
-%% commitment is written as it is, its ID calculated from its content. The
-%% write links the ID of each signed commitment to the content, so such a
-%% commitment is kept only if it verifies.
-verified_unsigned(Msg, Opts) ->
-    % The nested messages are held to the same rule first: the write links a
-    % nested message by the IDs it is stored under, so its commitments must be
-    % settled before the message that carries it is.
-    Deep =
-        maps:map(
-            fun(Key, Value) ->
-                case hb_private:is_private(Key) orelse Key == <<"commitments">> of
+%% @doc Settle children before naming their parent, including messages inside
+%% commitment metadata. Projection can invalidate commitments over extra fields,
+%% so verify both before selecting the shared fields and after removing them.
+prepare_write(Msg, Opts) when is_map(Msg) ->
+    Deep = maps:map(
+        fun(<<"commitments">>, Value) ->
+                prepare_write(ensure_all_loaded(Value, Opts), Opts);
+           (Key, Value) ->
+                case hb_private:is_private(Key) of
                     true -> Value;
-                    false -> verified_unsigned_value(Value, Opts)
+                    false -> prepare_write(Value, Opts)
                 end
-            end,
-            Msg
-        ),
-    Verified =
-        case hb_message:commitment(#{ <<"type">> => <<"unsigned">> }, Deep, Opts) of
-            not_found -> hb_message:without_commitments_unless_verified(Deep, Opts);
-            _ -> hb_message:normalize_commitments(Deep, Opts, fast, shallow)
         end,
+        Msg
+    ),
+    Settings = #{ <<"verify">> => all, <<"add-unsigned">> => false,
+        <<"depth">> => shallow },
+    Verified = hb_message:normalize_commitments(Deep, Opts, Settings),
     {ok, Committed} = hb_message:with_only_committed(Verified, Opts),
-    % Projecting to the shared committed keys can invalidate a commitment
-    % covering more fields. Settle that identity before naming this child.
     case lists:all(fun hb_private:is_private/1,
             maps:keys(Verified) -- maps:keys(Committed)) of
         true -> Verified;
-        false ->
-            hb_message:normalize_commitments(
-                hb_message:with_commitments(
-                    #{ <<"committer">> => '_' }, Committed, Opts),
-                Opts#{ <<"commitment-device">> => <<"httpsig@1.0">> },
-                verify,
-                shallow
-            )
-    end.
-
-%% @doc Apply the rule of `verified_unsigned/2' to a nested message, and to
-%% every message of a list.
-verified_unsigned_value(Value, Opts) when is_map(Value) ->
-    verified_unsigned(Value, Opts);
-verified_unsigned_value(Values, Opts) when is_list(Values) ->
-    [ verified_unsigned_value(Value, Opts) || Value <- Values ];
-verified_unsigned_value(Value, _Opts) ->
-    Value.
+        false -> hb_message:normalize_commitments(Committed, Opts, Settings)
+    end;
+prepare_write(Values, Opts) when is_list(Values) ->
+    [ prepare_write(Value, Opts) || Value <- Values ];
+prepare_write(Value, _Opts) -> Value.
 
 do_write_message(Bin, Store, Opts) when is_binary(Bin) ->
     % Write the binary in the store at its calculated content-hash.
@@ -1204,9 +1184,24 @@ test_store_modified_signed_message(Store) ->
             Opts
         ),
     SignedID = hb_message:id(Signed, signed, Opts),
-    {ok, _} = write(Signed#{ <<"x">> => <<"2">> }, Opts),
-    ?assertEqual({error, not_found}, read(SignedID, Opts)),
-    {ok, _} = write(Signed, Opts),
+    Changed = Signed#{ <<"x">> => <<"2">> },
+    Unsigned = hb_message:normalize_commitments(hb_message:uncommitted(Changed), Opts),
+    Mixed = Unsigned#{
+        <<"commitments">> => maps:merge(
+            maps:get(<<"commitments">>, Unsigned),
+            maps:get(<<"commitments">>, Signed))
+    },
+    InMetadata = Unsigned#{
+        <<"commitments">> => maps:map(
+            fun(_, Comm) -> Comm#{ <<"child">> => Mixed } end,
+            maps:get(<<"commitments">>, Unsigned))
+    },
+    lists:foreach(fun(Msg) ->
+        {ok, _} = write(Msg, Opts),
+        ?assertEqual({error, not_found}, read(SignedID, Opts))
+    end, [Changed, Mixed, #{ <<"child">> => Mixed },
+        #{ <<"children">> => [Mixed] }, InMetadata]),
+    {ok, _} = write(hb_message:normalize_commitments(Signed, Opts), Opts),
     {ok, Stored} = read(SignedID, Opts),
     Loaded = ensure_all_loaded(Stored, Opts),
     ?assertEqual(<<"1">>, hb_maps:get(<<"x">>, Loaded, not_found, Opts)),

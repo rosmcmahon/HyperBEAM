@@ -952,3 +952,27 @@ test_bundle_uncommitted(Encode, Decode) ->
     end,
     ok.
 
+%% @doc An item that links its nested messages is not bundled, even when its
+%% data bundles a value too large for a tag: it verifies once its links are
+%% loaded, and can be bundled into another item.
+unbundled_with_large_value_test() ->
+    Opts = #{ <<"priv-wallet">> => hb:wallet(), <<"store">> => hb_test_utils:test_store() },
+    Signed =
+        hb_message:commit(
+            #{
+                <<"large">> => binary:copy(<<"a">>, ?MAX_TAG_VALUE_SIZE + 1),
+                <<"nested">> => #{ <<"key">> => <<"value">> }
+            },
+            Opts,
+            #{ <<"device">> => <<"ans104@1.0">>, <<"bundle">> => false }
+        ),
+    Loaded = hb_cache:ensure_all_loaded(Signed, Opts),
+    ?assert(hb_message:verify(Loaded, all, Opts)),
+    Outer =
+        hb_message:commit(
+            #{ <<"signed">> => Signed },
+            Opts,
+            #{ <<"device">> => <<"ans104@1.0">>, <<"bundle">> => true }
+        ),
+    ?assert(hb_message:verify(Outer, all, Opts)).
+

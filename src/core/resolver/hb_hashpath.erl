@@ -810,8 +810,7 @@ result_from_context(Ctx, Opts) ->
                         hb_message:normalize_commitments(
                             hb_ao:set(Original, Result, internal_opts(Opts)),
                             Opts,
-                            fast,
-                            shallow
+                            #{ <<"verify">> => fast, <<"depth">> => shallow }
                         )
                     }
                 end;

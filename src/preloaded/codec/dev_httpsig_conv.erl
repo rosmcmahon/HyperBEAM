@@ -69,7 +69,7 @@ from(HTTP, _Req, Opts) ->
             Opts
         ),
     MsgWithoutSigs =
-        decode_ids(
+        decode_keys(
             hb_maps:without(
                 [
                     <<"signature">>,
@@ -213,13 +213,13 @@ body_to_parts(ContentType, Body, _Opts) ->
 %% @doc Parse a single part of a multipart body into a TABM.
 from_body_part(InlinedKey, Part, Opts) ->
     % Extract the Headers block and Body. Only split on the FIRST double CRLF
-    {RawHeadersBlock, RawBody} =
+    {RawHeadersBlock, RawBody, HasBody} =
         case binary:split(Part, [?DOUBLE_CRLF], []) of
             [XRawHeadersBlock] ->
                 % The message has no body.
-                {XRawHeadersBlock, <<>>};
+                {XRawHeadersBlock, <<>>, false};
             [XRawHeadersBlock, XRawBody] ->
-                {XRawHeadersBlock, XRawBody}
+                {XRawHeadersBlock, XRawBody, true}
         end,
     % Extract individual headers
     RawHeaders = binary:split(RawHeadersBlock, ?CRLF, [global]),
@@ -291,7 +291,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                                 % The message is empty, so we return an empty
                                 % map.
                                 #{};
-                            {_, _, <<>>} ->
+                            {_, _, <<>>} when not HasBody ->
                                 % There is no body to the message, so we return
                                 % just the headers.
                                 RestHeaders;
@@ -384,10 +384,7 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
             {ok, EncOriginal}
     end;
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
-    Msg = encode_ids(TABM),
-    % Group the IDs into a dictionary, so that they can be distributed as
-    % HTTP headers. If we did not do this, ID keys would be lower-cased and
-    % their comparability against the original keys would be lost.
+    Msg = encode_keys(TABM),
     Stripped =
         hb_maps:without(
             [
@@ -476,6 +473,10 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                 % Otherwise, we need to encode the body map as the
                 % multipart body of the HTTP message
                 ?event_debug({encoding_multipart, {bodymap, {explicit, GroupedBodyMap}}}),
+                Parts =
+                    maps:merge(
+                        maps:with([<<"content-type">>], Enc0), GroupedBodyMap
+                    ),
                 PartList = hb_util:to_sorted_list(
                     hb_maps:map(
                         fun(Key, M = #{ <<"body">> := _ }) when map_size(M) =:= 1 ->
@@ -493,7 +494,7 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                         (Key, Value) ->
                             encode_body_part(Key, Value, InlineKey, Opts)
                         end,
-                        GroupedBodyMap,
+                        Parts,
                         Opts
                     ),
                     Opts
@@ -528,40 +529,48 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     % Add the content-digest to the HTTP message. `add_content_digest/1'
     % will return a map with the `content-digest' key set, but the body removed,
     % so we merge the two maps together to maintain the body and the content-digest.
-    Enc2 = case hb_maps:get(<<"body">>, Enc1, <<>>, Opts) of
-        <<>> -> Enc1;
-        _ ->
+    Enc2 = case hb_maps:find(<<"body">>, Enc1, Opts) of
+        {ok, Body} when is_binary(Body) ->
             ?event_debug({adding_content_digest, {msg, Enc1}}),
             hb_maps:merge(
                 Enc1,
                 dev_httpsig:add_content_digest(Enc1, Opts),
                 Opts
-            )
+            );
+        _ -> Enc1
     end,
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
 
-%% @doc Transform all ID fields into their percent-encoded form, as well as
-%% the keys that share a name with the signature headers or the digest of the
-%% body: a message's own `signature' or `content-digest' is data on the wire,
-%% not a commitment or a digest.
-encode_ids(Msg) ->
-    % Find all keys that are IDs.
+%% @doc Percent-encode the keys that hold `%', a capital or a byte outside
+%% printable ASCII: HTTP lowercases header names and carries only printable
+%% ASCII, and `%' starts an escape. Other keys, such as `+link' keys, are sent
+%% as they are. A message's own `signature' or `content-digest' key shares a
+%% name with the signature headers or the digest of the body, so it is encoded
+%% as data on the wire, not read as a commitment or a digest.
+encode_keys(Msg) ->
     maps:from_list(
         lists:map(
-            fun({K, V}) when ?IS_ID(K) -> {hb_escape:encode(K), V};
-                ({<<"signature", Rest/binary>>, V})
+            fun({<<"signature", Rest/binary>>, V})
                         when Rest =:= <<>>; Rest =:= <<"-input">> ->
                     {<<"%73ignature", Rest/binary>>, V};
                 ({<<"content-digest">>, V}) -> {<<"%63ontent-digest">>, V};
-                ({K, V}) -> {K, V}
+                ({K, V}) ->
+                    case lists:any(fun escaped_key_byte/1, binary_to_list(K)) of
+                        true -> {hb_escape:encode(K), V};
+                        false -> {K, V}
+                    end
             end,
             maps:to_list(Msg)
         )
     ).
 
-% @doc Decode all ID fields from their percent-encoded form.
-decode_ids(Msg, _Opts) ->
+%% @doc Whether a key byte needs escaping on the wire.
+escaped_key_byte(C) ->
+    C =:= $% orelse (C >= $A andalso C =< $Z) orelse C < 16#20 orelse C > 16#7e.
+
+%% @doc Decode message keys from their percent-encoded form.
+decode_keys(Msg, _Opts) ->
     maps:from_list(
         lists:map(
             fun({K, V}) -> {hb_escape:decode(K), V} end,
@@ -769,13 +778,13 @@ encode_http_flat_msg(Httpsig, Opts) ->
             hb_maps:to_list(hb_maps:without([<<"body">>, <<"priv">>], Httpsig, Opts), Opts)
         ),
     EncodedHeaders = iolist_to_binary(lists:join(?CRLF, lists:reverse(HeaderList))),
-    case hb_maps:get(<<"body">>, Httpsig, <<>>, Opts) of
-        <<>> -> EncodedHeaders;
+    case hb_maps:find(<<"body">>, Httpsig, Opts) of
+        error -> EncodedHeaders;
         % Some-Headers: some-value
         % content-type: image/png
         % 
         % <body>
-        SubBody -> <<EncodedHeaders/binary, ?DOUBLE_CRLF/binary, SubBody/binary>>
+        {ok, SubBody} -> <<EncodedHeaders/binary, ?DOUBLE_CRLF/binary, SubBody/binary>>
     end.
 
 %% @doc All maps are encoded into the body of the HTTP message
@@ -826,6 +835,79 @@ multipart_header_bytes_roundtrip_test() ->
     }),
     ?assertEqual({ok, Value}, hb_http:post(Node,
         <<"/nested/value">>, Signed, Opts)).
+
+%% @doc Multipart parts distinguish an absent body from an empty binary body,
+%% including when the empty value is covered by a nested commitment.
+multipart_empty_body_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    lists:foreach(
+        fun(Child) ->
+            Signed = hb_message:commit(Child, Opts),
+            Parent = #{ <<"child">> => Signed },
+            Encoded =
+                hb_message:convert(
+                    Parent,
+                    #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true },
+                    Opts
+                ),
+            Decoded =
+                hb_message:convert(
+                    Encoded, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts
+                ),
+            ?assertEqual(true, hb_message:deep_verify(Decoded, Opts)),
+            ?assertEqual(
+                Child,
+                hb_message:uncommitted(
+                    hb_maps:get(<<"child">>, Decoded, undefined, Opts)
+                )
+            )
+        end,
+        [
+            #{ <<"body">> => <<>> },
+            #{ <<"value">> => <<"present">>, <<"body">> => <<>> },
+            #{ <<"value">> => <<"present">> }
+        ]
+    ).
+
+%% @doc A multipart encoding preserves the message's content-type.
+multipart_content_type_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Msg = #{
+        <<"content-type">> => <<"text/plain">>,
+        <<"body">> => <<"Example message.">>,
+        <<"nested">> => #{ <<"value">> => 42 }
+    },
+    Signed = hb_message:commit(Msg, Opts, #{ <<"bundle">> => true }),
+    ?assert(
+        lists:member(<<"content-type">>, hb_message:committed(Signed, all, Opts))
+    ),
+    Encoded =
+        hb_message:convert(
+            Signed,
+            #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true },
+            Opts
+        ),
+    Decoded =
+        hb_message:convert(Encoded, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts),
+    ?assertEqual(true, hb_message:deep_verify(Decoded, Opts)),
+    ?assert(
+        lists:member(<<"content-type">>, hb_message:committed(Decoded, all, Opts))
+    ),
+    ?assertNot(
+        hb_message:verify(
+            Decoded#{ <<"content-type">> => <<"text/html">> }, all, Opts
+        )
+    ),
+    ?assertEqual(
+        Msg,
+        hb_message:uncommitted(hb_cache:ensure_all_loaded(Decoded, Opts), Opts)
+    ).
 
 group_maps_test() ->
    Map = #{

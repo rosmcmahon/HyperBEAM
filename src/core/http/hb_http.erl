@@ -133,7 +133,8 @@ request(Method, Peer, Path, RawMessage, Opts) ->
     end.
 
 request_response(Method, Peer, Path, Response, Duration, Opts) ->
-    {_ErlStatus, Status, Headers, Body} = Response,
+    {_ErlStatus, Status, RawHeaders, Body} = Response,
+    Headers = [{hb_util:to_lower(Key), Value} || {Key, Value} <- RawHeaders],
     % Convert the set-cookie headers into a cookie message, if they are present.
     % We do this by extracting the set-cookie headers and converting them into a
     % cookie message if they are present.
@@ -328,7 +329,7 @@ outbound_result_to_message(Codec, Status, Headers, Body, Opts) ->
 http_response_to_httpsig(Status, HeaderMap, Body, Opts) ->
     BinStatus = hb_util:bin(Status),
     BodyMap = case byte_size(Body) of
-        0 -> #{};
+        0 when not is_map_key(<<"content-digest">>, HeaderMap) -> #{};
         _ -> #{ <<"body">> => Body }
     end,
     ConvertFrom = 
@@ -417,7 +418,7 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
     % Verify the outbound message if paranoid mode is enabled for http_request
     hb_message:paranoid_verify(http_request, Message, Opts),
     % Generate a `cookie' key for the message, if an unencoded cookie is
-    % present.
+    % present. The message keeps the cookie keys a commitment covers.
     {MaybeCookie, WithoutCookie} =
         case cookie(<<"extract">>, Message, #{}, Opts) of
             {ok, NoCookies} when map_size(NoCookies) == 0 ->
@@ -430,11 +431,12 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
                         #{ <<"format">> => <<"cookie">> },
                         Opts
                     ),
-                {ok, CookieReset} = cookie(<<"reset">>, Message, #{}, Opts),
                 ?event(debug_http, {cookie_lines, CookieLines}),
                 {
                     #{ <<"cookie">> => CookieLines },
-                    CookieReset
+                    hb_message:without_unless_signed(
+                        [<<"cookie">>, <<"set-cookie">>], Message, Opts
+                    )
                 }
         end,
     % Remove the private components from the message, if they are present.
@@ -571,18 +573,13 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     ),
     ReqBeforeStream = Req#{ resp_headers => EncodedHeaders },
     PostStreamReq = cowboy_req:stream_reply(Status, #{}, ReqBeforeStream),
-    Fin =
-        case should_finalize_stream(Status, EncodedBody) of
-            true -> fin;
-            false -> nofin
-        end,
-    % Stream the body back to the caller if there is content. If we already
-    % signal a non-content reply, skip.
+    % Stream the body back to the caller if there is content, ending the
+    % stream with it. If we already signal a non-content reply, skip.
     case Status of
         NonContentStatus
             when (NonContentStatus == 204)
             orelse (NonContentStatus == 304) -> skip;
-        _ -> cowboy_req:stream_body(EncodedBody, Fin, PostStreamReq)
+        _ -> cowboy_req:stream_body(EncodedBody, fin, PostStreamReq)
     end,
     EndTime = os:system_time(millisecond),
     ReqDuration = EndTime - hb_maps:get(start_time, Req, undefined, Opts),
@@ -612,13 +609,10 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     ),
     {ok, PostStreamReq, no_state}.
 
-%% @doc Determine if the stream should be finalized.
-should_finalize_stream(429, _EncodedBody) -> true;
-should_finalize_stream(_, _EncodedBody) -> false.
-
 %% @doc Handle replying with cookies if the message contains them. Returns the
-%% new Cowboy `Req` object, and the message with the cookies removed. Both
-%% `set-cookie' and `cookie' fields are treated as viable sources of cookies.
+%% new Cowboy `Req` object, and the message without the cookie keys that no
+%% commitment covers. Both `set-cookie' and `cookie' fields are treated as
+%% viable sources of cookies.
 reply_handle_cookies(Req, Message, Opts) ->
     {ok, Cookies} = cookie(<<"extract">>, Message, #{}, Opts),
     ?event(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
@@ -656,11 +650,12 @@ reply_handle_cookies(Req, Message, Opts) ->
                     Req,
                     SetCookieLines
                 ),
-            {ok, CookieReset} = cookie(<<"reset">>, Message, #{}, Opts),
             {
                 ok,
                 FinalReq,
-                CookieReset
+                hb_message:without_unless_signed(
+                    [<<"cookie">>, <<"set-cookie">>], Message, Opts
+                )
             }
     end.
 
@@ -1202,6 +1197,18 @@ simple_ao_resolve_unsigned_test() ->
     URL = hb_http_server:start_node(),
     TestMsg = #{ <<"path">> => <<"/key1">>, <<"key1">> => <<"Value1">> },
     ?assertEqual({ok, <<"Value1">>}, post(URL, TestMsg, test_opts())).
+
+%% @doc An empty body is preserved in signed HTTP requests and responses.
+empty_body_http_test() ->
+    Origin = isolated_test_opts(),
+    Client = isolated_test_opts(),
+    Signed = hb_message:commit(#{ <<"body">> => <<>> }, Origin),
+    URL = hb_http_server:start_node(Origin),
+    {ok, ID} = hb_cache:write(Signed, Origin),
+    {ok, Reply} = get(URL, ID, Client#{ <<"http-only-result">> => false }),
+    ?assertEqual(<<>>, hb_maps:get(<<"body">>, Reply, missing, Client)),
+    ?assertEqual(true, hb_message:deep_verify(Reply, Client)),
+    ?assertEqual({ok, <<>>}, post(URL, <<"/body">>, Signed, Client)).
 
 simple_ao_resolve_signed_test() ->
     URL = hb_http_server:start_node(),

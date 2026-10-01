@@ -117,17 +117,21 @@ type_from_tags(Item) ->
     Format = tagfind(<<"bundle-format">>, Item#tx.tags, <<>>),
     Version = tagfind(<<"bundle-version">>, Item#tx.tags, <<>>),
     MapTXID = tagfind(<<"bundle-map">>, Item#tx.tags, <<>>),
-    case {hb_util:to_lower(Format), hb_util:to_lower(Version), MapTXID} of
+    Lower = fun hb_util_string:lowercase/1,
+    case {Lower(Format), Lower(Version), MapTXID} of
         {<<"binary">>, <<"2.0.0">>, <<>>} -> list;
         {<<"binary">>, <<"2.0.0">>, _} -> map;
         _ -> binary
     end.
 
-%% @doc Case-insensitively find a tag in a list and return its value.
+%% @doc Find a tag by its exact name, or case-insensitively when both names are
+%% ASCII, and return its value.
 tagfind(Key, Tags, Default) ->
-    LowerCaseKey = hb_util:to_lower(Key),
+    LowerCaseKey = hb_util_string:lowercase(Key),
     Found = lists:search(fun({TagName, _}) ->
-        hb_util:to_lower(TagName) == LowerCaseKey
+        TagName =:= Key orelse
+            (is_binary(LowerCaseKey) andalso
+                hb_util_string:lowercase(TagName) =:= LowerCaseKey)
     end, Tags),
     case Found of
         {value, {_TagName, Value}} -> Value;
@@ -231,10 +235,9 @@ maybe_add_bundle_tags(BundleType, TX) ->
             ManifestID = ar_bundles:id(TX#tx.manifest, unsigned),
             ?BUNDLE_TAGS ++ [{<<"bundle-map">>, hb_util:encode(ManifestID)}]
     end,
-    ExistingTagNames = [hb_util:to_lower(TagName) || {TagName, _} <- TX#tx.tags],
     FilteredBundleTags = lists:filter(
         fun({TagName, _}) ->
-            not lists:member(hb_util:to_lower(TagName), ExistingTagNames)
+            tagfind(TagName, TX#tx.tags, not_found) =:= not_found
         end,
         BundleTags
     ),
@@ -898,6 +901,26 @@ test_generate_chunk_tree_and_validate_path(Data, ChallengeLocation) ->
     ?assertEqual(RealChunkID, PathChunkID),
     ?assert(ChallengeLocation >= StartOffset),
     ?assert(ChallengeLocation < EndOffset).
+
+%% @doc A tag with a name that is not UTF-8 is found by its exact bytes, ASCII
+%% names are found case-insensitively, and bundle tags whose values are not
+%% ASCII do not make the item a bundle.
+binary_tags_test() ->
+    Tags = [
+        {<<24, 224, 17>>, <<255>>},
+        {<<"BuNdLe-FoRmAt">>, <<"BiNaRy">>},
+        {<<"Bundle-Version">>, <<"2.0.0">>}
+    ],
+    ?assertEqual(<<"BiNaRy">>, tagfind(<<"bundle-format">>, Tags, not_found)),
+    ?assertEqual(<<255>>, tagfind(<<24, 224, 17>>, Tags, not_found)),
+    ?assertEqual(not_found, tagfind(<<254>>, Tags, not_found)),
+    ?assertEqual(list, type(#tx{ format = ans104, tags = Tags })),
+    ?assertEqual(binary, type(#tx{
+        tags = [{<<"Bundle-Format">>, <<255>>} | Tags]
+    })),
+    ?assertEqual(binary, type(#tx{
+        tags = [{<<"Bundle-Version">>, <<255>>} | Tags]
+    })).
 
 
 %%===================================================================

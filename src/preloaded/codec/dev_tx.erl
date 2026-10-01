@@ -1220,6 +1220,71 @@ real_2048_bit_rsa_tx_test() ->
         [<<"tj76flZk936u0S2owyEzUFBvBAYle9Al5LH8zJ7icNc">>]
     ).
 
+%% @doc Binary tag names and values survive conversion, caching and HTTP,
+%% including duplicates and literal escaping delimiters in the original tags.
+binary_tags_roundtrip_test() ->
+    Wallet = ar_wallet:new(),
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    Opts = #{
+        <<"store">> => [Store | hb_opts:get(store, [], #{})],
+        <<"priv-wallet">> => Wallet,
+        <<"port">> => 0
+    },
+    Node = hb_http_server:start_node(Opts),
+    Signed = ar_tx:sign(#tx{
+        format = 2,
+        tags = [
+            {<<"Tag", 255, ":, %ff">>, <<0, 255, "\r\n">>},
+            {<<"Tag", 255, ":, %ff">>, <<"second">>},
+            {<<"%ff">>, <<"literal percent">>},
+            {<<255>>, <<"binary name">>},
+            {<<"É"/utf8>>, <<"unicode name">>}
+        ]
+    }, Wallet),
+    try
+        Msg = hb_message:convert(
+            Signed, <<"structured@1.0">>, <<"tx@1.0">>, Opts),
+        ?assertEqual(<<"literal percent">>, hb_maps:get(<<"%ff">>, Msg)),
+        ?assertEqual(<<"binary name">>, hb_maps:get(<<255>>, Msg)),
+        ?assertEqual(<<"unicode name">>, hb_maps:get(<<"é"/utf8>>, Msg)),
+        ?assert(hb_maps:is_key(<<"Tag", 255, ":, %ff">>, Msg)),
+        ?assertNot(hb_message:verify(
+            Msg#{ <<255>> => <<"changed">> }, all, Opts)),
+        {ok, _} = hb_cache:write(Msg, Opts),
+        ID = hb_util:human_id(Signed#tx.id),
+        {ok, Remote} = hb_http:get(
+            Node, <<"/~cache@1.0/read&read=", ID/binary>>, Opts),
+        ?assert(hb_message:verify(Remote,
+            #{ <<"commitment-ids">> => [ID] }, Opts)),
+        Back = hb_message:convert(
+            Remote, <<"tx@1.0">>, <<"structured@1.0">>, Opts),
+        ?assertEqual(Signed#tx.tags, Back#tx.tags),
+        ?assertEqual(Signed#tx.id, Back#tx.id),
+        ?assert(ar_tx:verify(Back))
+    after
+        cowboy:stop_listener(hb_util:human_id(ar_wallet:to_address(Wallet))),
+        hb_store:stop(Store)
+    end.
+
+%% @doc Tags with names that are not UTF-8 keep their order through an
+%% `httpsig@1.0' round trip, and the transaction still verifies.
+binary_tag_order_test() ->
+    Signed = ar_tx:sign(
+        #tx{
+            format = 2,
+            tags = [{<<255>>, <<"last">>}, {<<254>>, <<"first">>}]
+        },
+        hb:wallet()
+    ),
+    Msg = hb_message:convert(Signed, <<"structured@1.0">>, <<"tx@1.0">>, #{}),
+    Wire = hb_message:convert(Msg, <<"httpsig@1.0">>, #{}),
+    Read =
+        hb_message:convert(Wire, <<"structured@1.0">>, <<"httpsig@1.0">>, #{}),
+    Back = hb_message:convert(Read, <<"tx@1.0">>, <<"structured@1.0">>, #{}),
+    ?assertEqual(Signed#tx.tags, Back#tx.tags),
+    ?assertEqual(Signed#tx.id, Back#tx.id),
+    ?assert(ar_tx:verify(Back)).
+
 format_one_roundtrip_test() ->
     Signed = ar_tx:sign(
         #tx{
