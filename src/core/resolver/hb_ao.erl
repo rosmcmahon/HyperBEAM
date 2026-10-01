@@ -501,7 +501,7 @@ resolve_stage(4, Func, Base, Req, Original, Opts) ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then
             % wait.
-            case hb_persistent:await(Leader, Base, Req, Opts) of
+            case hb_persistent:await(Leader, Base, Req, maps:without(?TEMP_OPTS, Opts)) of
                 {error, leader_died} ->
                     ?event(
                         ao_core,
