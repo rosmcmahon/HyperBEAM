@@ -454,7 +454,7 @@ normalize(Base, _Req, RawOpts) ->
 
 %% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message.
 decode(EncMsg, Opts) ->
-    hb_message:normalize_commitments(do_decode(EncMsg, Opts), Opts, verify).
+    hb_message:normalize_commitments(do_decode(EncMsg, Opts), Opts, all).
 do_decode(EncMsg, _Opts) when is_list(EncMsg) andalso length(EncMsg) == 0 ->
     % The value is an empty table, so we assume it is a message rather than
     % a list.
