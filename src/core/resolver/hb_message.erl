@@ -64,10 +64,9 @@
 -export([paranoid_verify/2, paranoid_verify/3]).
 -export([commit/2, commit/3, signers/2, type/1, minimize/1]).
 -export([normalize_commitments/2, normalize_commitments/3]).
--export([normalize_commitments/4, is_signed_key/3]).
+-export([is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
 -export([with_only_committed/2, with_links/3, without_unless_signed/3]).
--export([without_commitments_unless_verified/2]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -75,6 +74,7 @@
 %%% Debugging tools:
 -export([print/1]).
 -include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %% @doc Convert a message from one format to another. Taking a message in the
 %% source format, a target format, and a set of opts. If not given, the source
@@ -250,173 +250,100 @@ id(Msg, RawCommitters, Opts) ->
         hb_ao:raw(<<"message@1.0">>, <<"id">>, Msg, CommSpec, Opts),
     hb_util:human_id(ID).
 
-%% @doc Normalize the IDs in a message, ensuring that there is at least one
-%% unsigned ID present. By forcing this work to occur in strategically positioned
-%% places, we avoid the need to recalculate the IDs for every `hb_message:id`
-%% call. The mode sets how far the existing commitments are trusted: `passive'
-%% adds an unsigned commitment only where none exists; `verify' recomputes the
-%% unsigned commitment and drops every commitment if the committed keys no
-%% longer match it; `fast' verifies unless `priv/last-phash2' shows that the
-%% message is unchanged since it was last normalized. `deep' normalizes every
-%% nested message as well, `shallow' only the message itself.
+%% @doc Normalize loaded messages bottom-up. `verify' selects the commitments
+%% to check: `all', `signed', `unsigned', `passive' (trust existing commitments),
+%% or `fast' (all, unless unchanged since the last fast normalization). A false
+%% verification removes that commitment; errors propagate. `add-unsigned' adds
+%% an unsigned commitment independently if none remains. Defaults: passive, true,
+%% `depth => deep'; shallow leaves children untouched. Private state and
+%% commitment metadata are not traversed. An atom sets only the verify mode.
 normalize_commitments(Msg, Opts) ->
     normalize_commitments(Msg, Opts, passive).
-normalize_commitments(Msg, Opts, Mode) ->
-    normalize_commitments(Msg, Opts, Mode, deep).
-normalize_commitments(Msg, Opts, Mode, deep) when is_map(Msg) ->
-    ?event_debug(debug_normalize_commitments, {normalize_commitments, {msg, Msg}}),
-    NormMsg = 
-        maps:map(
-            fun(Key, Val) when Key == <<"commitments">> orelse Key == <<"priv">> ->
-                Val;
-               (_Key, Val) -> normalize_commitments(Val, Opts, Mode, deep)
-            end,
-            Msg
-        ),
-    do_normalize_commitments(NormMsg, Opts, Mode);
-normalize_commitments(Msg, Opts, Mode, deep) when is_list(Msg) ->
-    ?event_debug(debug_normalize_commitments, {normalize_commitments, {list, Msg}}),
-    lists:map(fun(X) -> normalize_commitments(X, Opts, Mode, deep) end, Msg);
-normalize_commitments(Msg, Opts, Mode, shallow) when is_map(Msg) ->
-    do_normalize_commitments(Msg, Opts, Mode);
-normalize_commitments(Msg, _Opts, _Mode, _Depth) ->
-    Msg.
-
-do_normalize_commitments(Msg, _Opts, _Mode) when ?IS_EMPTY_MESSAGE(Msg) ->
-    Msg;
-do_normalize_commitments(Msg, Opts, passive) ->
-    Commitments = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
-    {UnsignedCommitments, SignedCommitments} = 
-        lists:partition(
-            fun({_, #{ <<"committer">> := _Committer }}) -> false;
-               ({_, _}) -> true
-            end,
-            hb_maps:to_list(Commitments)
-        ),
-    ?event_debug({do_normalize_commitments,
-        {unsigned_commitments, UnsignedCommitments},
-        {maybe_signed_commitment, SignedCommitments}
-    }),
-    case {UnsignedCommitments, SignedCommitments} of
-        {[], _} -> with_unsigned_commitment(Msg, Opts);
-        _ -> Msg
-    end;
-do_normalize_commitments(Msg, Opts, verify) ->
-    UnsignedCommitment = commitment(#{ <<"type">> => <<"unsigned">> }, Msg, Opts),
-    {MaybeUnsignedID, MaybeCommittedSpec} =
-        case UnsignedCommitment of
-            {ok, ID, #{ <<"committed">> := Committed }} ->
-                {ID, committed_spec(Committed, Msg, Opts)};
-            _ -> {undefined, #{}}
+normalize_commitments(Msg, Opts, Mode) when is_atom(Mode) ->
+    normalize_commitments(Msg, Opts, #{ <<"verify">> => Mode });
+normalize_commitments(Msg, Opts, Settings) when is_map(Msg) ->
+    Deep =
+        case hb_maps:get(<<"depth">>, Settings, deep, Opts) of
+            shallow -> Msg;
+            deep -> maps:map(
+                fun(Key, Value) ->
+                    case Key == <<"commitments">> orelse
+                            hb_private:is_private(Key) of
+                        true -> Value;
+                        false -> normalize_commitments(Value, Opts, Settings)
+                    end
+                end,
+                Msg
+            )
         end,
-    {ok, #{ <<"commitments">> := NormCommitments }} =
-        hb_ao:raw(
-            <<"message@1.0">>,
-            <<"commit">>,
-            uncommitted(Msg),
-            MaybeCommittedSpec#{ <<"type">> => <<"unsigned">> },
-            Opts
-        ),
-    ?event(normalization, {normalizing_commitments, verify}),
-    [NormID] = hb_maps:keys(NormCommitments, Opts),
-    case {MaybeUnsignedID, NormID} of
-        {MatchedID, MatchedID} ->
-            attach_phash2(Msg, Opts);
-        {undefined, _NewID} ->
-            % We did not have an unsigned ID to begin with, so we need to add it.
-            attach_phash2(with_unsigned_commitment(Msg, Opts), Opts);
-        {_OldID, _NewID} ->
-            {ok, #{ <<"commitments">> := NewCommitments }} =
-                hb_ao:raw(
-                    <<"message@1.0">>,
-                    <<"commit">>,
-                    uncommitted(Msg),
-                    #{ <<"type">> => <<"unsigned">> },
-                    Opts
-                ),
-            % We had an unsigned ID to begin with and the new one is different.
-            % This means that the committed keys have changed, so we drop any
-            % other commitments and return only the new unsigned one.
-            attach_phash2(Msg#{ <<"commitments">> => NewCommitments }, Opts)
+    normalize_message(Deep, Opts, Settings);
+normalize_commitments(Values, Opts, Settings) when is_list(Values) ->
+    case hb_maps:get(<<"depth">>, Settings, deep, Opts) of
+        shallow -> Values;
+        deep -> [ normalize_commitments(Value, Opts, Settings) || Value <- Values ]
     end;
-do_normalize_commitments(Msg, Opts, fast) when is_map(Msg) ->
-    ExpectedHash = erlang:phash2(hb_private:reset(Msg)),
-    ?event(normalization,
-        {normalizing_commitments,
-            {expected_hash, ExpectedHash},
-            {priv, hb_private:from_message(Msg)}
-        }
-    ),
-    case hb_private:get(<<"last-phash2">>, Msg, not_found, Opts) of
-        not_found ->
-            do_normalize_commitments(Msg, Opts, verify);
-        ExpectedHash ->
-            Msg;
-        _DifferingHash ->
-            MsgWithHash = attach_phash2(Msg, ExpectedHash, Opts),
-            do_normalize_commitments(MsgWithHash, Opts, verify)
-    end.
+normalize_commitments(Value, _Opts, _Settings) -> Value.
 
-%% @doc Add the unsigned commitment to a message that has none. A cache write
-%% trusts the unsigned commitment and links every commitment ID of the message
-%% to the content, so a signed commitment that does not verify is dropped
-%% before the unsigned commitment is added: no ID is linked to content that
-%% its commitment does not cover.
-with_unsigned_commitment(Msg, Opts) ->
-    Held = without_commitments_unless_verified(Msg, Opts),
-    {ok, #{ <<"commitments">> := Unsigned }} =
-        hb_ao:raw(
-            <<"message@1.0">>,
-            <<"commit">>,
-            uncommitted(Held, Opts),
-            #{ <<"type">> => <<"unsigned">> },
-            Opts
-        ),
-    Held#{
-        <<"commitments">> =>
-            hb_maps:merge(
-                Unsigned,
-                hb_maps:get(<<"commitments">>, Held, #{}, Opts),
+%% @doc Check existing commitments before optionally adding an unsigned one.
+normalize_message(Msg, _Opts, _Settings) when ?IS_EMPTY_MESSAGE(Msg) -> Msg;
+normalize_message(Msg, Opts, Settings = #{ <<"verify">> := fast }) ->
+    Mode =
+        case hb_private:get(<<"verified-commitments">>, Msg, not_found, Opts)
+                == normalization_fast_hash(Msg) of
+            true -> passive;
+            false -> all
+        end,
+    Normalized = normalize_message(Msg, Opts, Settings#{ <<"verify">> => Mode }),
+    hb_private:set(Normalized, <<"verified-commitments">>,
+        normalization_fast_hash(Normalized), Opts);
+normalize_message(Msg, Opts, Settings) ->
+    Mode = hb_maps:get(<<"verify">>, Settings, passive, Opts),
+    Commitments = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
+    Kept = hb_maps:filter(
+        fun(ID, Commitment) ->
+            Signed = hb_maps:is_key(<<"committer">>, Commitment, Opts),
+            Selected =
+                case Mode of
+                    all -> true;
+                    signed -> Signed;
+                    unsigned -> not Signed;
+                    passive -> false
+                end,
+            not Selected orelse verify(
+                Msg#{
+                    <<"commitments">> =>
+                        #{
+                            ID => hb_cache:ensure_all_loaded(Commitment, Opts)
+                        }
+                },
+                #{ <<"commitment-ids">> => [ID] },
                 Opts
             )
-    }.
-
-%% @doc The message with its signed commitments if every one of them
-%% verifies, and without any commitment otherwise: a commitment that does not
-%% verify is not kept.
-without_commitments_unless_verified(Msg, Opts) ->
-    case signers(Msg, Opts) of
-        [] -> Msg;
-        _ ->
-            case verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts) of
-                true -> Msg;
-                false -> uncommitted(Msg, Opts)
-            end
+        end,
+        Commitments,
+        Opts
+    ),
+    Normalized =
+        case hb_maps:size(Kept, Opts) of
+            0 -> uncommitted(Msg, Opts);
+            _ -> Msg#{ <<"commitments">> => Kept }
+        end,
+    case hb_maps:get(<<"add-unsigned">>, Settings, true, Opts) andalso
+            not lists:any(
+                fun(C) -> not hb_maps:is_key(<<"committer">>, C, Opts) end,
+                hb_maps:values(Kept, Opts)
+            ) of
+        true ->
+            Unsigned = commit(uncommitted(Normalized, Opts), Opts,
+                #{ <<"type">> => <<"unsigned">> }),
+            Normalized#{ <<"commitments">> => hb_maps:merge(
+                hb_maps:get(<<"commitments">>, Unsigned, Opts), Kept, Opts) };
+        false -> Normalized
     end.
 
-%% @doc The spec to regenerate the unsigned commitment of a message with. A
-%% commitment that lists a key the message lacks is not a commitment over the
-%% message: the unsigned commitment is regenerated over the keys the message
-%% carries, so its ID differs and every commitment is dropped.
-committed_spec(Committed, Msg, Opts) ->
-    Keys = hb_util:message_to_ordered_list(Committed, Opts),
-    case lists:all(fun(Key) -> is_key_present(Key, Msg) end, Keys) of
-        true -> #{ <<"committed">> => Committed };
-        false -> #{}
-    end.
-
-%% @doc Whether a message carries a key, directly or as a link.
-is_key_present(Key, Msg) ->
-    Base = hb_link:remove_link_specifier(Key),
-    maps:is_key(Base, Msg) orelse maps:is_key(<<Base/binary, "+link">>, Msg).
-
-%% @doc Annotate a message with its phash2 value in the `priv' sub-map,
-%% calculating it if necessary.
-attach_phash2(Msg, Opts) ->
-    ExpectedHash = erlang:phash2(hb_private:reset(Msg)),
-    attach_phash2(Msg, ExpectedHash, Opts).
-attach_phash2(Msg, ExpectedHash, Opts) ->
-    hb_private:set(Msg, <<"last-phash2">>, ExpectedHash, Opts).
+%% @doc Fingerprint the complete public term, including attached commitments.
+normalization_fast_hash(Msg) ->
+    crypto:hash(sha256, term_to_binary(hb_private:reset(Msg))).
 
 %% @doc Return a message with only the committed keys. If no commitments are
 %% present, the message is returned unchanged. This means that you need to
@@ -1110,3 +1037,102 @@ default_tx_message() ->
 default_tx_list() ->
     Keys = lists:map(fun hb_ao:normalize_key/1, record_info(fields, tx)),
     lists:zip(Keys, tl(tuple_to_list(#tx{}))).
+
+%%% Tests
+
+%% @doc Selective verification retains valid partial commitments and checks
+%% every selected ID, including multiple unsigned commitments.
+normalize_commitments_modes_test() ->
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Msg = #{ <<"a">> => 1, <<"b">> => 1 },
+    [SignedA, SignedB, UnsignedA, UnsignedB] =
+        [ commit(Msg, Opts, #{ <<"type">> => Type, <<"committed">> => [Key] })
+        || Type <- [<<"signed">>, <<"unsigned">>], Key <- [<<"a">>, <<"b">>] ],
+    Commitments = lists:foldl(
+        fun(M, Acc) -> maps:merge(Acc, maps:get(<<"commitments">>, M)) end,
+        #{},
+        [SignedA, SignedB, UnsignedA, UnsignedB]
+    ),
+    Changed = Msg#{ <<"b">> => 2, <<"commitments">> => Commitments },
+    lists:foreach(
+        fun({Mode, Retained}) ->
+            Normalized = normalize_commitments(Changed, Opts,
+                #{ <<"verify">> => Mode, <<"add-unsigned">> => false }),
+            Expected = lists:sort(lists:append(
+                [ maps:keys(maps:get(<<"commitments">>, M)) || M <- Retained ])),
+            ?assertEqual(Expected,
+                lists:sort(maps:keys(maps:get(<<"commitments">>, Normalized)))),
+            ?assertEqual(Changed#{ <<"commitments">> =>
+                maps:get(<<"commitments">>, Normalized) }, hb_private:reset(Normalized))
+        end,
+        [{passive, [SignedA, SignedB, UnsignedA, UnsignedB]},
+         {signed, [SignedA, UnsignedA, UnsignedB]},
+         {unsigned, [SignedA, SignedB, UnsignedA]},
+         {all, [SignedA, UnsignedA]}, {fast, [SignedA, UnsignedA]}]
+    ),
+    % Adding an unsigned commitment names all fields, not just signed fields.
+    Added = normalize_commitments(SignedA#{ <<"extra">> => 3 }, Opts, all),
+    ?assertEqual(id(#{ <<"a">> => 1, <<"b">> => 1, <<"extra">> => 3 }, unsigned, Opts),
+        id(Added, unsigned, Opts)),
+    ?assert(verify(Added, #{ <<"commitment-ids">> => <<"all">> }, Opts)),
+    ?assertEqual(SignedA, normalize_commitments(SignedA, Opts,
+        #{ <<"verify">> => all, <<"add-unsigned">> => false })),
+    % A missing key or a renamed ID cannot survive unsigned verification.
+    [UnsignedID] = maps:keys(maps:get(<<"commitments">>, UnsignedA)),
+    Renamed = UnsignedA#{ <<"commitments">> => #{
+        hb_util:human_id(crypto:strong_rand_bytes(32)) =>
+            maps:get(UnsignedID, maps:get(<<"commitments">>, UnsignedA)) } },
+    lists:foreach(fun(M) ->
+        ?assertEqual(uncommitted(M), normalize_commitments(M, Opts,
+            #{ <<"verify">> => unsigned, <<"add-unsigned">> => false }))
+    end, [maps:remove(<<"a">>, UnsignedA), Renamed]).
+
+%% @doc Fast verification rechecks mutations and still honors addition. Deep
+%% normalization handles map/list children without introducing metadata when
+%% addition is disabled; shallow normalization preserves their exact shape.
+normalize_commitments_depth_and_fast_test() ->
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    Signed = commit(#{ <<"a">> => 1 }, Opts),
+    Settings = #{ <<"verify">> => fast, <<"add-unsigned">> => false },
+    Stamped = normalize_commitments(Signed, Opts, Settings),
+    ?assertEqual(Stamped, normalize_commitments(Stamped, Opts, Settings)),
+    Added = normalize_commitments(Stamped, Opts, fast),
+    ?assertEqual(id(#{ <<"a">> => 1 }, unsigned, Opts), id(Added, unsigned, Opts)),
+    Changed = Stamped#{ <<"a">> => 2 },
+    ?assertEqual(#{ <<"a">> => 2 },
+        hb_private:reset(normalize_commitments(Changed, Opts, Settings))),
+    Partial = normalize_commitments(Changed, Opts,
+        #{ <<"verify">> => unsigned, <<"add-unsigned">> => false }),
+    ?assertEqual(#{ <<"a">> => 2 },
+        hb_private:reset(normalize_commitments(Partial, Opts, Settings))),
+    Nested = #{ <<"children">> => [Changed], <<"plain">> => #{ <<"x">> => 1 } },
+    ?assertEqual(Nested, maps:remove(<<"priv">>, normalize_commitments(Nested, Opts,
+        Settings#{ <<"depth">> => shallow }))),
+    ?assertEqual([Changed], normalize_commitments([Changed], Opts,
+        Settings#{ <<"depth">> => shallow })),
+    Deep = normalize_commitments(Nested, Opts,
+        #{ <<"verify">> => all, <<"add-unsigned">> => false }),
+    ?assertEqual(#{ <<"children">> => [#{ <<"a">> => 2 }],
+        <<"plain">> => #{ <<"x">> => 1 } }, hb_private:reset(Deep)),
+    ?assert(deep_verify(normalize_commitments(Nested, Opts, all), Opts)).
+
+%% @doc Commitments should never generally be unloaded, but `hb_message` chooses
+%% to be tolerant of issues here regardless.
+normalize_linked_commitments_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store] },
+    Msg = normalize_commitments(#{ <<"a">> => 1 }, Opts),
+    Commitments = maps:get(<<"commitments">>, Msg),
+    [{ID, Commitment}] = maps:to_list(Commitments),
+    {ok, MetadataID} = hb_cache:write(Commitment, Opts),
+    {ok, CommitmentsID} = hb_cache:write(Commitments, Opts),
+    lists:foreach(
+        fun(Linked) ->
+            Normalized = normalize_commitments(Msg#{ <<"commitments">> => Linked }, Opts,
+                #{ <<"verify">> => all, <<"add-unsigned">> => false }),
+            ?assertEqual(Msg, hb_cache:ensure_all_loaded(Normalized, Opts))
+        end,
+        [#{ ID => {link, MetadataID, #{}} }, {link, CommitmentsID, #{}}]
+    ),
+    ok = hb_store:stop(Store).
