@@ -257,10 +257,10 @@ query(Msg, <<"signature">>, _Args, Opts) ->
     % Return the signature of the transaction.
     % Other TX access methods are defined below.
     case hb_message:commitments(#{ <<"committer">> => '_' }, Msg, Opts) of
-        not_found -> {ok, null};
+        not_found -> {ok, <<>>};
         Commitments ->
             case hb_maps:keys(Commitments) of
-                [] -> {ok, null};
+                [] -> {ok, <<>>};
                 [CommID | _] ->
                     {ok, Commitment} = hb_maps:find(CommID, Commitments, Opts),
                     hb_maps:find(<<"signature">>, Commitment, Opts)
@@ -269,10 +269,10 @@ query(Msg, <<"signature">>, _Args, Opts) ->
 query(Msg, <<"owner">>, _Args, Opts) ->
     ?event({query_owner, Msg}),
     case hb_message:commitments(#{ <<"committer">> => '_' }, Msg, Opts) of
-        not_found -> {ok, null};
+        not_found -> {ok, #{ <<"address">> => <<>>, <<"key">> => <<>> }};
         Commitments ->
             case hb_maps:keys(Commitments) of
-                [] -> {ok, null};
+                [] -> {ok, #{ <<"address">> => <<>>, <<"key">> => <<>> }};
                 [CommID | _] ->
                     {ok, Commitment} = hb_maps:find(CommID, Commitments, Opts),
                     {ok, Address} = hb_maps:find(<<"committer">>, Commitment, Opts),
