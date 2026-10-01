@@ -47,6 +47,8 @@ export class AddonComponent extends pulumi.ComponentResource {
         const confirmations = extConfig.COPYCAT_CONFIRMATIONS ?? '1'
         const retryDepth = extConfig.COPYCAT_RETRY_DEPTH ?? '20'
         const interval = extConfig.COPYCAT_INTERVAL ?? '1-minute'
+        /* full mode caches every item's data (~18 GB/day); start.sh clears the cache past this size */
+        const maxCacheGB = extConfig.HB_MAX_CACHE_GB ?? '50'
         const copycatCron = [
             `/~cron@1.0/every?interval=${interval}`,
             'cron-path=/~copycat@1.0/arweave',
@@ -77,6 +79,7 @@ export class AddonComponent extends pulumi.ComponentResource {
             envs: [
                 'HB_CONFIG=/opt/hb/shepherd-config.json',
                 `HB_CRONS=${copycatCron}`,
+                `HB_MAX_CACHE_GB=${maxCacheGB}`,
             ],
             entrypoints: ['/opt/hb/shepherd-start.sh', '/opt/hb/bin/hb', 'foreground'],
             ports: [{ internal: 8734, external: 8734, ip: '127.0.0.1' }],
