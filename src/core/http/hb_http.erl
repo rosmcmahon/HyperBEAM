@@ -168,7 +168,15 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
     % Merge the set-cookie message into the header map, which itself is
     % constructed from the header key-value pair list.
     HeaderMap = hb_maps:merge(hb_maps:from_list(Headers), MaybeSetCookie, Opts),
-    NormHeaderMap = hb_ao:normalize_keys(HeaderMap, Opts),
+    % A reply to a `HEAD' request, or with a 204 or 304 status, carries no
+    % body. Its `content-digest' is that of the body that it omits, so we remove
+    % it: the reply decodes without a body, rather than with an empty one.
+    BodyHeaderMap =
+        case Method == <<"HEAD">> orelse Status == 204 orelse Status == 304 of
+            true -> hb_maps:without([<<"content-digest">>], HeaderMap, Opts);
+            false -> HeaderMap
+        end,
+    NormHeaderMap = hb_ao:normalize_keys(BodyHeaderMap, Opts),
     ?event(debug_http_outbound,
         {normalized_response_headers, {norm_header_map, NormHeaderMap}},
         Opts
