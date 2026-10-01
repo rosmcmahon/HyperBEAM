@@ -677,7 +677,7 @@ now(RawBase, Req, Opts) ->
                 hb_util:int(CurrentSlot),
                 Opts
             ),
-            hb_ao:raw(
+            hb_ao:resolve(
                 Base,
                 (hb_maps:with([<<"push">>], Req, Opts))#{
                     <<"path">> => <<"compute">>,

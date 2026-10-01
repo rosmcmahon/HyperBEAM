@@ -41,12 +41,10 @@ compute_group(Base, Req, Opts) ->
             ProcID
     end.
 
-%% @doc Return `true' if the requested compute result is already cached.
-compute_cached(ProcID, not_found, Opts) ->
-    case lib_process_cache:latest(ProcID, Opts) of
-        {ok, _Slot, _Msg} -> true;
-        _ -> false
-    end;
+%% @doc Return `true' if no slot is selected or its result is already cached.
+compute_cached(_ProcID, not_found, _Opts) ->
+    % `now' selects the slot before joining its process group.
+    true;
 compute_cached(ProcID, RawSlot, Opts) ->
     case lib_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
         {ok, _Msg} -> true;
@@ -204,8 +202,8 @@ info_test() ->
 grouper_test() ->
     test_init(),
     M1 = hb_process_test_vectors:aos_process(),
-    M2 = #{ <<"path">> => <<"compute">>, <<"v">> => 1 },
-    M3 = #{ <<"path">> => <<"compute">>, <<"v">> => 2 },
+    M2 = #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+    M3 = #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
     M4 = #{ <<"path">> => <<"not-compute">>, <<"v">> => 3 },
     G1 = hb_persistent:group(M1, M2, #{ <<"process-workers">> => true }),
     G2 = hb_persistent:group(M1, M3, #{ <<"process-workers">> => true }),
