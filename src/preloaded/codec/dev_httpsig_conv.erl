@@ -26,7 +26,7 @@
 %%%         - Otherwise encode the value as a part in the multipart response
 %%% 
 -module(dev_httpsig_conv).
--export([to/3, from/3, encode_http_msg/2]).
+-export([to/3, from/3, encode_http_msg/2, encode_key/1]).
 %%% Helper utilities
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -36,6 +36,15 @@
 % https://datatracker.ietf.org/doc/html/rfc7231#section-3.1.1.4
 -define(CRLF, <<"\r\n">>).
 -define(DOUBLE_CRLF, <<?CRLF/binary, ?CRLF/binary>>).
+% A byte that a header name holds as it is: `a-z', `0-9' and the `tchar'
+% punctuation of RFC 9110 other than `%'.
+-define(KEY_BYTE(C),
+    ((C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+        C == $! orelse C == $# orelse C == $$ orelse C == $& orelse
+        C == $' orelse C == $* orelse C == $+ orelse C == $- orelse
+        C == $. orelse C == $^ orelse C == $_ orelse C == $` orelse
+        C == $| orelse C == $~)
+).
 
 %% @doc Convert a HTTP Message into a TABM.
 %% HTTP Structured Field is encoded into it's equivalent TABM encoding.
@@ -143,13 +152,16 @@ body_to_tabm(HTTP, Opts) ->
                 % That is, a body part may contain a `/` in its key, representing
                 % that the nested form is not a direct child of the parent 
                 % message. Subsequently, we need to take just the first
-                % `path part' of the key and return the unique'd list.
+                % `path part' of the key, decode it, and return the unique'd
+                % list.
                 {MessagePaths, _} = lists:unzip(OrderedBodyTABMs),
                 Keys =
                     hb_util:unique(
                         lists:map(
                             fun(Path) ->
-                                hd(binary:split(Path, <<"/">>, [global]))
+                                hb_escape:decode(
+                                    hd(binary:split(Path, <<"/">>, [global]))
+                                )
                             end,
                             MessagePaths
                         )
@@ -542,12 +554,10 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
 
-%% @doc Percent-encode the keys that hold `%', a capital or a byte outside
-%% printable ASCII: HTTP lowercases header names and carries only printable
-%% ASCII, and `%' starts an escape. Other keys, such as `+link' keys, are sent
-%% as they are. A message's own `signature' or `content-digest' key shares a
-%% name with the signature headers or the digest of the body, so it is encoded
-%% as data on the wire, not read as a commitment or a digest.
+%% @doc Percent-encode the keys of a message with `encode_key/1'. A message's
+%% own `signature' or `content-digest' key shares a name with the signature
+%% headers or the digest of the body, so it is encoded as data on the wire, not
+%% read as a commitment or a digest.
 encode_keys(Msg) ->
     maps:from_list(
         lists:map(
@@ -555,19 +565,31 @@ encode_keys(Msg) ->
                         when Rest =:= <<>>; Rest =:= <<"-input">> ->
                     {<<"%73ignature", Rest/binary>>, V};
                 ({<<"content-digest">>, V}) -> {<<"%63ontent-digest">>, V};
-                ({K, V}) ->
-                    case lists:any(fun escaped_key_byte/1, binary_to_list(K)) of
-                        true -> {hb_escape:encode(K), V};
-                        false -> {K, V}
-                    end
+                ({K, V}) -> {encode_key(K), V}
             end,
             maps:to_list(Msg)
         )
     ).
 
-%% @doc Whether a key byte needs escaping on the wire.
-escaped_key_byte(C) ->
-    C =:= $% orelse (C >= $A andalso C =< $Z) orelse C < 16#20 orelse C > 16#7e.
+%% @doc Percent-encode a key as a header name. A header name is a token of the
+%% `tchar' bytes of RFC 9110, and HTTP lowercases it. A key keeps `a-z', `0-9'
+%% and the `tchar' punctuation other than `%', which starts an escape. Every
+%% other byte, including each capital, is written as `%xx' in lowercase hex.
+%% The key is scanned once: up to its first byte to escape, it is kept as it is.
+encode_key(Key) -> encode_key(Key, Key, 0).
+encode_key(Key, <<>>, _N) -> Key;
+encode_key(Key, <<C, Rest/binary>>, N) when ?KEY_BYTE(C) ->
+    encode_key(Key, Rest, N + 1);
+encode_key(Key, _Rest, N) ->
+    <<Kept:N/binary, Escaped/binary>> = Key,
+    Encoded = << <<(encode_key_byte(C))/binary>> || <<C>> <= Escaped >>,
+    <<Kept/binary, Encoded/binary>>.
+
+encode_key_byte(C) when ?KEY_BYTE(C) -> <<C>>;
+encode_key_byte(C) -> <<$%, (hex_digit(C bsr 4)), (hex_digit(C band 15))>>.
+
+hex_digit(D) when D < 10 -> $0 + D;
+hex_digit(D) -> $a + D - 10.
 
 %% @doc Decode message keys from their percent-encoded form.
 decode_keys(Msg, _Opts) ->

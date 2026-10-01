@@ -550,16 +550,16 @@ missing_keys(Msg, Commitment, Opts) ->
         not key_present(Key, Msg)
     ].
 
-%% @doc Calculate if a key or its `+link' TABM variant is present in a message.
-key_present(Key, Keys) -> key_present(true, Key, Keys).
-key_present(TryEncoded, Key, Msg) ->
-    if is_map_key(Key, Msg) orelse is_map_key(<<Key/binary, "+link">>, Msg) ->
-        true;
-    TryEncoded ->
-        key_present(false, hb_escape:encode(Key), Msg);
-    true ->
-        false
-    end.
+%% @doc Calculate if a key or its `+link' TABM variant is present in a message,
+%% as it is or percent-encoded as on the wire.
+key_present(Key, Msg) ->
+    lists:any(
+        fun(K) ->
+            is_map_key(K, Msg)
+                orelse is_map_key(dev_httpsig_conv:encode_key(K), Msg)
+        end,
+        [Key, <<Key/binary, "+link">>]
+    ).
 
 %% @doc create the signature base that will be signed in order to create the
 %% Signature and SignatureInput.
