@@ -168,11 +168,11 @@ from(Msg, Req, Opts) when is_map(Msg) ->
             T ->
                 AoTypes = iolist_to_binary(hb_structured_fields:dictionary(
                     lists:map(
-                        fun({Key, Value}) ->
+                        fun({N, {Key, Value}}) ->
                             {ok, Item} = hb_structured_fields:to_item(Value),
-                            {hb_escape:encode(Key), Item}
+                            {encode_key(N, Key), Item}
                         end,
-                        lists:reverse(T)
+                        lists:enumerate(lists:reverse(T))
                     )
                 )),
                 [{<<"ao-types">>, AoTypes} | Values]
@@ -296,13 +296,30 @@ encode_types(Base, Req, Opts) ->
 encode_ao_types(Types, _Opts) ->
     iolist_to_binary(hb_structured_fields:dictionary(
         lists:map(
-            fun(Key) ->
+            fun({N, Key}) ->
                 {ok, Item} = hb_structured_fields:to_item(maps:get(Key, Types)),
-                {hb_escape:encode(Key), Item}
+                {encode_key(N, Key), Item}
             end,
-            hb_util:to_sorted_keys(Types)
+            lists:enumerate(hb_util:to_sorted_keys(Types))
         )
     )).
+
+%% @doc Percent-encode the key of the `N'th member of an `ao-types'
+%% dictionary. Keys keep `a-z', `0-9', `_', `-' and `.', and write every
+%% other byte as `%xx'. The dictionary parser refuses a member after the
+%% first that starts with `.', so such a key writes its first `.' as `%2e'.
+encode_key(N, Key) ->
+    case << <<(encode_key_char(C))/binary>> || <<C>> <= Key >> of
+        <<".", Rest/binary>> when N > 1 -> <<"%2e", Rest/binary>>;
+        Encoded -> Encoded
+    end.
+
+encode_key_char(C) when C >= $a, C =< $z; C >= $0, C =< $9 -> <<C>>;
+encode_key_char(C) when C == $_; C == $-; C == $. -> <<C>>;
+encode_key_char(C) -> <<$%, (hex_digit(C bsr 4)), (hex_digit(C band 15))>>.
+
+hex_digit(D) when D < 10 -> $0 + D;
+hex_digit(D) -> $a + D - 10.
 
 %% @doc Device key for parsing an `ao-types' field.
 decode_types(Base, Req, Opts) ->

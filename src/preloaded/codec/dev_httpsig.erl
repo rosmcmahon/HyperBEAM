@@ -412,11 +412,16 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
                 }
             )
     end,
-    % Filter the message down to only the requested keys, then encode it.
+    % Filter the message to the requested keys and their types, then encode it.
     MsgWithOnlyInputs =
-        maps:with(
-            Inputs ++ lists:map(fun hb_escape:encode/1, Inputs),
-            Msg
+        with_types(
+            maps:with(
+                Inputs ++ lists:map(fun hb_escape:encode/1, Inputs),
+                Msg
+            ),
+            Inputs,
+            Msg,
+            Opts
         ),
     ?event_debug({msg_with_only_inputs, {priv_msg, maps:without([<<"commitments">>], MsgWithOnlyInputs)}}),
     {ok, EncodedWithSigInfo} =
@@ -510,6 +515,31 @@ input_keys(Msg, RawInputs) ->
         end,
         RawInputs
     ).
+
+%% @doc The committed values with the message's `ao-types' entries for their
+%% keys. A commitment covers the types of its values whether or not it lists
+%% `ao-types'.
+with_types(Values, Keys, #{ <<"ao-types">> := Types }, Opts) ->
+    % Unsigned IDs run this function, so `structured@1.0' is called raw: a
+    % resolution would read the cache and compute IDs.
+    {ok, AllTypes} =
+        hb_ao:raw(<<"structured@1.0">>, <<"decode-types">>, Types, #{}, Opts),
+    case maps:with(Keys, AllTypes) of
+        NoTypes when map_size(NoTypes) =:= 0 -> Values;
+        AllTypes -> Values#{ <<"ao-types">> => Types };
+        CommittedTypes ->
+            {ok, EncodedTypes} =
+                hb_ao:raw(
+                    <<"structured@1.0">>,
+                    <<"encode-types">>,
+                    CommittedTypes,
+                    #{},
+                    Opts
+                ),
+            Values#{ <<"ao-types">> => EncodedTypes }
+    end;
+with_types(Values, _Keys, _Msg, _Opts) ->
+    Values.
 
 %% @doc The keys a commitment lists that the message does not carry.
 missing_keys(Msg, Commitment, Opts) ->
