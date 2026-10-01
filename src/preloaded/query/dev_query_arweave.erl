@@ -20,6 +20,14 @@
 %%% local stores, then `~arweave@2.9/tx' with `exclude-data=true'.
 %%% Their block fields reuse the containing header.
 %%%
+%%% With node option `match-index-every=true', these pages instead list every
+%%% item `~match@1.0' indexes in each block: the L1s its header lists, and
+%%% items at any bundle depth starting within its byte range, ordered by weave
+%%% offset and ID, under `block=...&member=...' cursors. Every height a page
+%%% reads must be recorded by `~copycat@1.0' as indexed in `full' mode, or the
+%%% query returns an error. Heights end at the highest such block within 50
+%%% heights of the tip; with none there, just below that window.
+%%%
 %%% `first' limits the page, clamped between zero and node option
 %%% `max-page-size' (default 100). The schema defaults `first' to 10; calls
 %%% without that argument use `default-page-size' (default 10). `sort' defaults
@@ -112,6 +120,8 @@
 -define(MEMBER_CURSOR, "member=").
 %% The most matches a page's `count' reads by default.
 -define(DEFAULT_MAX_INDEX_COUNT, 1000).
+%% The heights below the tip whose blocks may still await full indexing.
+-define(FULL_INDEX_WINDOW, 50).
 %% The bytes read past an offset when the item's header runs beyond its
 %% chunk: signature, owner, target, anchor and tags, which ANS-104 caps at
 %% 4 KiB.
@@ -1062,24 +1072,32 @@ index_predicates(Args, Opts) ->
         {ok, Predicates}
     end.
 
-%% @doc Page base-layer TX IDs directly from their containing block headers.
+%% @doc Page base-layer TX IDs directly from their containing block headers,
+%% or every item `~match@1.0' indexes within them with `match-index-every'.
 block_transaction_connection(RawArgs, Opts) ->
     Present = fun(_Key, Value) -> Value =/= null end,
     Args = hb_maps:filter(Present, RawArgs, Opts),
+    Every = hb_util:bool(hb_opts:get(match_index_every, false, Opts)),
     Range = case hb_opts:get(query_arweave_ignore_block_ranges, false, Opts) of
         true -> #{};
         false -> hb_maps:filter(Present, hb_maps:get(<<"block">>, Args, #{}, Opts), Opts)
     end,
     maybe
-        {ok, After} ?= block_transaction_cursor(hb_maps:get(<<"after">>, Args, null, Opts)),
+        {ok, After} ?= block_transaction_cursor(
+            hb_maps:get(<<"after">>, Args, null, Opts), Every),
         {ok, Tip} ?= block_index_tip(Opts),
+        Top = case Every of
+            true -> indexed_tip(Tip, Tip - ?FULL_INDEX_WINDOW, Opts);
+            false -> Tip
+        end,
         Bounds = #{
             <<"min">> => max(0, hb_maps:get(<<"min">>, Range, 0, Opts)),
-            <<"max">> => min(Tip, hb_maps:get(<<"max">>, Range, Tip, Opts)),
+            <<"max">> => min(Top, hb_maps:get(<<"max">>, Range, Top, Opts)),
             <<"direction">> => case hb_maps:get(<<"sort">>, Args, <<"HEIGHT_DESC">>, Opts) of
                 <<"HEIGHT_ASC">> -> 1;
                 _ -> -1
-            end
+            end,
+            <<"every">> => Every
         },
         Limit = page_size(Args, Opts),
         {ok, Matches} ?= block_transactions(Bounds, After, Limit + 1, Opts),
@@ -1109,19 +1127,27 @@ block_index_tip(Opts) ->
         Error -> Error
     end.
 
-%% @doc Decode a height and TX ID, accepting the forced-page terminal marker.
-block_transaction_cursor(After) when After =:= null; After =:= <<>> -> {ok, none};
-block_transaction_cursor(After) ->
+%% @doc Decode a height and its position, accepting the forced-page terminal
+%% marker: a TX ID in header pages, a match index member in `every' pages.
+block_transaction_cursor(After, _Every) when After =:= null; After =:= <<>> ->
+    {ok, none};
+block_transaction_cursor(After, Every) ->
     try
-        [<<"block=", H/binary>>, <<"tx=", ID:43/binary>> | Tail] =
+        [<<"block=", H/binary>>, Position | Tail] =
             binary:split(After, <<"&">>, [global]),
         true = Tail =:= [] orelse Tail =:= [<<"remaining=0">>],
         Height = binary_to_integer(H),
         true = Height >= 0,
-        <<_:32/binary>> = hb_util:native_id(ID),
-        {ok, #{ <<"height">> => Height, <<"id">> => ID }}
+        {ok, (block_cursor_position(Position, Every))#{ <<"height">> => Height }}
     catch _:_ -> {error, <<"Invalid cursor.">>}
     end.
+
+%% @doc The position within its height that a block page cursor resumes past.
+block_cursor_position(<<"tx=", ID:43/binary>>, false) ->
+    <<_:32/binary>> = hb_util:native_id(ID),
+    #{ <<"id">> => ID };
+block_cursor_position(<<"member=", Member/binary>>, true) ->
+    #{ <<"member">> => Member }.
 
 %% @doc Start at the cursor's height, clamped to the near end of the range.
 block_transactions(Range = #{ <<"min">> := Min, <<"max">> := Max,
@@ -1137,6 +1163,39 @@ block_transactions(Range = #{ <<"min">> := Min, <<"max">> := Max,
 %% @doc Read enough headers for the page; reuse each header for block fields.
 block_transactions(Height, #{ <<"min">> := Min, <<"max">> := Max }, _After,
         Limit, _Opts) when Height < Min; Height > Max; Limit =:= 0 -> {ok, []};
+block_transactions(Height, Range = #{ <<"every">> := true,
+        <<"direction">> := Direction }, After, Limit, Opts) ->
+    maybe
+        true ?= full_indexed(Height, Opts) orelse
+            {error, <<"Block ", (hb_util:bin(Height))/binary,
+                " is not fully indexed.">>},
+        {ok, Block} ?= read_block(Height, Opts),
+        End = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+        Start = End - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+        Resume = case After of
+            #{ <<"height">> := Height, <<"member">> := Last } ->
+                #{ <<"after">> => Last };
+            _ -> #{}
+        end,
+        % Zero-data L1s may sit at either edge, so both edges are read.
+        Bounds = case Direction of
+            1 -> Resume#{ <<"direction">> => asc, <<"from">> => Start,
+                <<"to">> => End + 1 };
+            -1 -> Resume#{ <<"direction">> => desc, <<"from">> => End,
+                <<"to">> => Start - 1 }
+        end,
+        TXs = hb_maps:get(<<"txs">>, Block, [], Opts),
+        {ok, Items} ?= block_items(Bounds,
+            fun(Item) -> in_block(Item, Start, End, TXs) end, Limit, Opts),
+        Matches = [Item#{
+            <<"block-result">> => {ok, Block},
+            <<"cursor">> => <<"block=", (hb_util:bin(Height))/binary,
+                "&member=", Member/binary>>
+        } || Item = #{ <<"member">> := Member } <- Items],
+        {ok, Rest} ?= block_transactions(Height + Direction, Range, none,
+            Limit - length(Matches), Opts),
+        {ok, Matches ++ Rest}
+    end;
 block_transactions(Height, Range = #{ <<"direction">> := Direction }, After, Limit, Opts) ->
     maybe
         {ok, Block} ?= read_block(Height, Opts),
@@ -1156,6 +1215,59 @@ block_transactions(Height, Range = #{ <<"direction">> := Direction }, After, Lim
         {ok, Rest} ?= block_transactions(Height + Direction, Range, none,
             Limit - length(Matches), Opts),
         {ok, Matches ++ Rest}
+    end.
+
+%% @doc The items `~match@1.0' indexes within a block's bounds that the block
+%% holds, refilled past the last member read until the page is full or the
+%% bounds end.
+block_items(Bounds, InBlock, Limit, Opts) ->
+    maybe
+        {ok, Matches} ?=
+            case locate([], Bounds#{ <<"every">> => true,
+                    <<"limit">> => Limit }, Opts) of
+                unservable -> {error, <<"No match index to list.">>};
+                Located -> Located
+            end,
+        Accepted = lists:filter(InBlock, Matches),
+        case length(Matches) =:= Limit andalso length(Accepted) < Limit of
+            false -> {ok, Accepted};
+            true ->
+                Next = Bounds#{
+                    <<"after">> => maps:get(<<"member">>, lists:last(Matches)) },
+                maybe
+                    {ok, More} ?= block_items(
+                        Next, InBlock, Limit - length(Accepted), Opts),
+                    {ok, Accepted ++ More}
+                end
+        end
+    end.
+
+%% @doc Whether a block holds an indexed item: an L1 its header lists, or
+%% another item starting within its byte range.
+in_block(#{ <<"commitment-device">> := <<"tx@1.0">>, <<"id">> := ID },
+        _Start, _End, TXs) ->
+    lists:member(ID, TXs);
+in_block(#{ <<"offset">> := Offset }, Start, End, _TXs) ->
+    Offset >= Start andalso Offset < End.
+
+%% @doc The highest height from the tip down to the floor that
+%% `~copycat@1.0' has fully indexed, as the heights above it are still being
+%% indexed. With none, the height below the floor.
+indexed_tip(Height, Floor, _Opts) when Height < Floor; Height < 0 -> Height;
+indexed_tip(Height, Floor, Opts) ->
+    case full_indexed(Height, Opts) of
+        true -> Height;
+        false -> indexed_tip(Height - 1, Floor, Opts)
+    end.
+
+%% @doc Whether `~copycat@1.0' recorded a height, with every item of its
+%% bundles, as indexed in `full' mode in the Arweave index store.
+full_indexed(Height, Opts) ->
+    case hb_store_arweave:store_from_opts(Opts) of
+        #{ <<"index-store">> := Store } ->
+            {ok, <<"full">>} =:= hb_store:read(Store,
+                <<"block/", (hb_util:bin(Height))/binary, "/mode">>, Opts);
+        _ -> false
     end.
 
 %% @doc The match the page resumes after, from the cursor of an
@@ -1355,7 +1467,8 @@ match_cursor(#{ <<"member">> := Member }) -> <<?MEMBER_CURSOR, Member/binary>>.
 match_message(#{ <<"id">> := ID, <<"commitment-device">> := <<"tx@1.0">>,
         <<"offset">> := Offset }, Opts) when is_integer(Offset), Offset >= 0 ->
     l1_message(ID, Opts);
-match_message(#{ <<"id">> := ID, <<"cursor">> := <<"block=", _/binary>> }, Opts) ->
+match_message(#{ <<"id">> := ID, <<"commitment-device">> := <<"tx@1.0">>,
+        <<"cursor">> := <<"block=", _/binary>> }, Opts) ->
     l1_message(ID, Opts);
 match_message(#{ <<"id">> := ID }, Opts) when ID =/= <<>> ->
     hb_cache:read(ID, Opts);

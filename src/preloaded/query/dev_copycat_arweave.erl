@@ -13,7 +13,9 @@
 %%% it defaults to false. Both use `arweave-block-store'.
 %%%
 %%% Every transaction header and, in `full' mode, every bundled item an index
-%%% run caches carries its weave offset as `priv/offset'.
+%%% run caches carries its weave offset as `priv/offset'. A bundle's own
+%%% header is not cached, but `full' mode indexes it for `~match@1.0' at its
+%%% offset.
 -module(dev_copycat_arweave).
 -device_libraries([lib_arweave_common]).
 -export([arweave/3]).
@@ -525,6 +527,8 @@ process_tx({{TX, _TXDataRoot}, EndOffset}, BlockStartOffset, IndexMode, Opts) ->
                     counters(0, 0, 0);
                 true when IndexMode =/= shallow ->
                     try
+                        ok = index_bundle_header(
+                            TX, TXStartOffset, IndexMode, Opts),
                         case hb_store_arweave:read_chunks(
                             TXStartOffset, TX#tx.data_size, Opts) of
                             {ok, BundleData} ->
@@ -1103,6 +1107,52 @@ write_tx_header(TX, Offset, Opts) ->
             {error, {Class, Reason}}
     end.
 
+%% @doc Index a bundle transaction's header at its weave offset in `full'
+%% mode, through the node's `match@1.0' `cache-write' handlers alone: caching
+%% the data-free header would shadow the full bundle.
+index_bundle_header(TX, Offset, full, Opts) ->
+    case hb_opts:get(arweave_index_txs, true, Opts) of
+        false -> ok;
+        true ->
+            LocalOpts = hb_store:scope(Opts, local),
+            Msg =
+                hb_message:convert(
+                    TX, <<"structured@1.0">>, <<"tx@1.0">>, LocalOpts),
+            TABM =
+                hb_message:convert(
+                    Msg, tabm, <<"structured@1.0">>, LocalOpts),
+            Commitments = hb_maps:get(<<"commitments">>, TABM, #{}, LocalOpts),
+            Handlers =
+                [
+                    Handler
+                ||
+                    Handler <- hb_hook:find(<<"cache-write">>, LocalOpts),
+                    hb_maps:get(<<"device">>, Handler, undefined, LocalOpts)
+                        =:= <<"match@1.0">>
+                ],
+            {ok, _} =
+                hb_hook:on(
+                    <<"cache-write">>,
+                    #{
+                        <<"body">> =>
+                            hb_private:set(TABM, <<"offset">>, Offset, LocalOpts),
+                        <<"signed-ids">> =>
+                            [
+                                ID
+                            ||
+                                {ID, Commitment} <-
+                                    hb_maps:to_list(Commitments, LocalOpts),
+                                is_map_key(<<"committer">>, Commitment)
+                            ],
+                        <<"priv">> => #{ <<"hook-caller">> => <<"kernel">> }
+                    },
+                    LocalOpts#{ <<"on">> => #{ <<"cache-write">> => Handlers } }
+                ),
+            ok
+    end;
+index_bundle_header(_TX, _Offset, _IndexMode, _Opts) ->
+    ok.
+
 %% @doc A message carrying its weave offset privately, for `hb_cache' to
 %% index it by: an item in a pending bundle is pending itself.
 with_offset(Msg, #{ <<"relative">> := _ }, Opts) ->
@@ -1294,6 +1344,107 @@ block_transaction_pages_test() ->
     after
         cowboy:stop_listener(hb_util:human_id(ar_wallet:to_address(Wallet)))
     end.
+
+%% @doc With `match-index-every', block pages list every indexed item of fully
+%% indexed blocks in weave order, placing zero-data L1s at a shared boundary
+%% by their headers. Heights above the highest fully indexed block are beyond
+%% the tip; a height below it that is not fully indexed is an error.
+block_item_pages_test() ->
+    Blocks = hb_test_utils:test_store(hb_store_lmdb),
+    Index = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+        <<"arweave-block-store">> => Blocks,
+        <<"arweave-index-store">> =>
+            #{ <<"store-module">> => hb_store_arweave, <<"index-store">> => Index },
+        <<"priv-wallet">> => ar_wallet:new(), <<"match-index-every">> => true,
+        <<"query-arweave-remote-block-ranges">> => false,
+        <<"gateway">> => <<"http://127.0.0.1:1">>, <<"routes">> => [] },
+    Cache = fun(Device, Offset) ->
+        Msg = hb_message:commit(
+            #{ <<"test-item">> => hb_util:bin(erlang:unique_integer()) },
+            Opts, Device),
+        {ok, _} = hb_cache:write(
+            hb_private:set(Msg, <<"offset">>, Offset, Opts), Opts),
+        hb_message:id(Msg, signed, Opts)
+    end,
+    % Heights, offsets, IDs and devices: block `H' spans offsets `100 * H' to
+    % `100 * (H + 1)', and zero-data L1s of blocks 0 and 1 share offset 100.
+    Items = [{H, Offset, Cache(Device, Offset), Device} || {H, Offset, Device} <- [
+        {0, 0, <<"tx@1.0">>}, {0, 100, <<"tx@1.0">>},
+        {1, 100, <<"tx@1.0">>}, {1, 100, <<"tx@1.0">>},
+        {1, 150, <<"ans104@1.0">>}, {1, 160, <<"ans104@1.0">>},
+        {2, 200, <<"tx@1.0">>}, {2, 250, <<"ans104@1.0">>},
+        {3, 300, <<"tx@1.0">>}, {3, 350, <<"ans104@1.0">>}]],
+    IDs = fun(Heights) ->
+        [ID || {H, _, ID, _} <- lists:sort(Items), lists:member(H, Heights)]
+    end,
+    L1s = fun(H) -> [ID || {Height, _, ID, <<"tx@1.0">>} <- Items, Height =:= H] end,
+    lists:foreach(
+        fun(H) -> block_index_header(H, 100 * (H + 1), 100, L1s(H), Blocks) end,
+        [0, 1, 2, 3]
+    ),
+    {ok, 0} = hb_ao:resolve(<<"~copycat@1.0/arweave&mode=blocks&from=3&to=0",
+        "&include-proofs=false&include-block-index=true&reindex=false">>, Opts),
+    Mark = fun(H) ->
+        ok = hb_store:write(Index,
+            #{ <<"block/", (hb_util:bin(H))/binary, "/mode">> => <<"full">> }, Opts)
+    end,
+    Query = fun(Vars, QueryOpts) ->
+        {ok, Reply} = hb_ao:resolve(#{ <<"path">> => <<"~query@1.0/graphql">>,
+            <<"method">> => <<"POST">>, <<"body">> => hb_json:encode(#{
+                <<"query">> => <<"query($block:BlockFilter,$sort:SortOrder,",
+                    "$after:String,$first:Int){transactions(block:$block,",
+                    "sort:$sort,after:$after,first:$first){count ",
+                    "pageInfo{hasNextPage} edges{cursor node{id block{height}}}}}">>,
+                <<"variables">> => maps:merge(#{ <<"first">> => 100 }, Vars)
+            }) }, QueryOpts),
+        hb_json:decode(hb_maps:get(<<"body">>, Reply))
+    end,
+    Page = fun(Vars) ->
+        Res = Query(Vars, Opts),
+        ?assertEqual([], maps:get(<<"errors">>, Res, [])),
+        hb_util:deep_get(<<"data/transactions">>, Res, Opts)
+    end,
+    Nodes = fun(#{ <<"edges">> := Edges }) ->
+        [{H, ID} || #{ <<"node">> := #{ <<"id">> := ID,
+            <<"block">> := #{ <<"height">> := H } } } <- Edges]
+    end,
+    Pages = fun Pages(Sort, After) ->
+        #{ <<"edges">> := Edges, <<"pageInfo">> := #{ <<"hasNextPage">> := More } } =
+            Page(#{ <<"sort">> => Sort, <<"after">> => After, <<"first">> => 2 }),
+        case More of
+            true -> Edges ++ Pages(Sort, maps:get(<<"cursor">>, lists:last(Edges)));
+            false -> Edges
+        end
+    end,
+    % Blocks 0 and 2 are fully indexed and block 3, the tip, is in progress.
+    Mark(0),
+    Mark(2),
+    ?assertMatch(#{ <<"edges">> := [], <<"count">> := <<"0">> },
+        Page(#{ <<"block">> => #{ <<"min">> => 3, <<"max">> => 3 } })),
+    ?assertMatch(#{ <<"errors">> := [_ | _] },
+        Query(#{ <<"block">> => #{ <<"min">> => 1, <<"max">> => 1 } }, Opts)),
+    ?assertEqual([{2, ID} || ID <- IDs([2])],
+        Nodes(Page(#{ <<"block">> => #{ <<"min">> => 2, <<"max">> => 2 },
+            <<"sort">> => <<"HEIGHT_ASC">> }))),
+    % With block 1 fully indexed, pages cover blocks 0 to 2 in either order.
+    Mark(1),
+    Asc = Pages(<<"HEIGHT_ASC">>, null),
+    ?assertEqual([{H, ID} || {H, _, ID, _} <- lists:sort(Items), H < 3],
+        Nodes(#{ <<"edges">> => Asc })),
+    ?assertEqual(lists:reverse(Asc), Pages(<<"HEIGHT_DESC">>, null)),
+    ?assertMatch(#{ <<"count">> := <<"8">> }, Page(#{})),
+    ?assertMatch(#{ <<"errors">> := [_ | _] }, Query(#{ <<"after">> =>
+        <<"block=1&tx=", (hd(L1s(1)))/binary>> }, Opts)),
+    % Without the option, a block page lists only its header's L1s.
+    Header = maps:without([<<"match-index-every">>], Opts),
+    ?assertEqual(lists:sort(L1s(1)),
+        lists:sort([ID || {1, ID} <- Nodes(hb_util:deep_get(<<"data/transactions">>,
+            Query(#{ <<"block">> => #{ <<"min">> => 1, <<"max">> => 1 } }, Header),
+            Opts))])),
+    % Marking the tip block extends the pages to it.
+    Mark(3),
+    ?assertEqual([{3, lists:last(IDs([3]))}], Nodes(Page(#{ <<"first">> => 1 }))).
 
 %% @doc Cache a sparse header fixture through ordinary message/cache APIs.
 block_index_header(Height, End, Size, TXs, Store) ->
@@ -2553,6 +2704,62 @@ small_block_full_mode_test() ->
     ?assert(hb_message:verify(L3Header, all, Opts), {verify_failed, L3ID}),
     ?assertEqual(L3ID, hb_message:id(L3Header, signed, Opts)),
     ok.
+
+%% @doc With `match-index-every', a block page of a mainnet block indexed in
+%% `full' mode lists every L1 of its header, bundles included, and its items
+%% to the third layer, in weave order. Its unindexed parent is an error.
+full_mode_block_items_test() ->
+    {_TestStore, _StoreOpts, IndexOpts} = setup_index_opts(),
+    % A block store of its own keeps the compact index, and so the tip,
+    % clear of other runs' blocks.
+    Opts = IndexOpts#{ <<"match-index-every">> => true,
+        <<"arweave-block-store">> => [hb_test_utils:test_store()] },
+    Height = 1889322,
+    {ok, Height} =
+        hb_ao:resolve(
+            <<"~copycat@1.0/arweave&from=1889322&to=1889322&mode=full">>,
+            Opts
+        ),
+    {ok, Block} =
+        hb_ao:resolve(
+            #{ <<"device">> => <<"arweave@2.9">> },
+            #{ <<"path">> => <<"block">>, <<"block">> => Height,
+                <<"include-proofs">> => false },
+            Opts
+        ),
+    Query = fun(Heights, After) ->
+        {ok, Reply} = hb_ao:resolve(#{ <<"path">> => <<"~query@1.0/graphql">>,
+            <<"method">> => <<"POST">>, <<"body">> => hb_json:encode(#{
+                <<"query">> => <<"query($block:BlockFilter,$after:String){",
+                    "transactions(block:$block,after:$after,first:100,",
+                    "sort:HEIGHT_ASC){pageInfo{hasNextPage} edges{cursor}}}">>,
+                <<"variables">> => #{ <<"block">> => Heights, <<"after">> => After }
+            }) }, Opts),
+        hb_json:decode(hb_maps:get(<<"body">>, Reply))
+    end,
+    Pages = fun Pages(After) ->
+        Res = Query(#{ <<"min">> => Height, <<"max">> => Height }, After),
+        ?assertEqual([], maps:get(<<"errors">>, Res, [])),
+        #{ <<"edges">> := Edges, <<"pageInfo">> := #{ <<"hasNextPage">> := More } } =
+            hb_util:deep_get(<<"data/transactions">>, Res, Opts),
+        Cursors = [Cursor || #{ <<"cursor">> := Cursor } <- Edges],
+        case More of
+            true -> Cursors ++ Pages(lists:last(Cursors));
+            false -> Cursors
+        end
+    end,
+    Cursors = Pages(null),
+    Items = [{binary_to_integer(Offset), ID, Device}
+        || <<"block=1889322&member=", Offset:20/binary, ID:43/binary,
+            Device/binary>> <- Cursors],
+    ?assertEqual(length(Cursors), length(Items)),
+    ?assertEqual(lists:sort(Items), Items),
+    ?assertEqual(lists:sort(hb_maps:get(<<"txs">>, Block, [], Opts)),
+        lists:sort([ID || {_, ID, <<"tx@1.0">>} <- Items])),
+    ?assert(lists:member(<<"npAzk_BomjWBQQr_xnmlhdxjyl97EJnNv_MAaXffs1s">>,
+        [ID || {_, ID, _} <- Items])),
+    ?assertMatch(#{ <<"errors">> := [_ | _] },
+        Query(#{ <<"min">> => Height - 1, <<"max">> => Height - 1 }, null)).
 
 %% @doc Every index mode caches L1 transaction headers in the local store, so a
 %% transaction's committed fields -- here its `target' -- are matchable from the

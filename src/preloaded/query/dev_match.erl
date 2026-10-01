@@ -27,8 +27,11 @@
 %%% The request may add `predicates': a list of messages with `name' and
 %%% `values'. Values within each predicate are ORed; predicates and the base's
 %%% pairs are ANDed. An empty values list matches nothing. Ordinary template
-%%% values, including lists, retain their literal meaning.
-%%% Index lookups with no base pairs or request predicates return no matches.
+%%% values, including lists, retain their literal meaning. The request's
+%%% `every=true' ANDs the group holding every entry, which a node writes with
+%%% `match-index-every=true'.
+%%% Index lookups with no base pairs, request predicates or `every' return no
+%%% matches.
 %%% With predicates but no index stores, `locate' returns `not_found'.
 %%%
 %%% Entries are ordered by offset, then ID. At an offset, groups with known
@@ -52,8 +55,10 @@
 %%% `hook-caller=kernel', otherwise returning status 401. Each signed ID is
 %%% indexed with its commitment device and the body's private `offset'
 %%% (default `-1'). Commitments themselves and messages without signed IDs are
-%%% skipped. Success returns the hook request unchanged, including when no
-%%% configured store accepts the entries.
+%%% skipped. With node option `match-index-every=true', each entry is also
+%%% written under the pair `*=*', whose group holds every indexed entry.
+%%% Success returns the hook request unchanged, including when no configured
+%%% store accepts the entries.
 %%%
 %%% Indexed pairs comprise the body's public fields without its commitments,
 %%% plus values computed with only the indexed ID's commitment present.
@@ -126,6 +131,8 @@
 
 %% The store path of the index, under which a published index hashes names.
 -define(PREFIX, <<"~match@1.0/">>).
+%% The name and value of the pair under which every entry is indexed.
+-define(EVERY, <<"*">>).
 %% The width of a key's offset field at a weave offset.
 -define(OFFSET_DIGITS, 20).
 %% A byte above every ID, closing a cursor's offset when reading down.
@@ -297,6 +304,11 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
         ||
             ID <- IDs
         ],
+    Every =
+        case hb_util:bool(hb_opts:get(match_index_every, false, Opts)) of
+            true -> [{?EVERY, ?EVERY}];
+            false -> []
+        end,
     Keys =
         maps:from_list(
             [
@@ -304,7 +316,7 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
             ||
                 Member = #{ <<"id">> := ID } <- Members,
                 {Name, Value} <-
-                    pairs(
+                    Every ++ pairs(
                         Handler,
                         hb_message:with_commitments(ID, Msg, Opts),
                         Opts
@@ -393,6 +405,7 @@ all(Base, Req, Opts) ->
 
 %% @doc Test only the requested predicates, with the same computed pairs as
 %% indexing. The caller selects the candidate's commitments before checking.
+%% `every' holds for any candidate.
 check(Base, Req, Opts) ->
     Names = [hb_ao:normalize_key(hb_maps:get(<<"name">>, P, Opts))
         || P <- hb_maps:get(<<"predicates">>, Req, [], Opts)],
@@ -409,7 +422,7 @@ check(Base, Req, Opts) ->
         fun(Alternatives) ->
             lists:any(fun(Path) -> lists:member(Path, Present) end, Alternatives)
         end,
-        groups(#{}, Req, Opts)
+        groups(#{}, hb_maps:without([<<"every">>], Req, Opts), Opts)
     )}.
 
 %% @doc Unique IDs matching the base pairs and request predicates, within the
@@ -454,8 +467,11 @@ locate(Base, Req, Opts) ->
             end
     end.
 
-%% @doc Each AND predicate's alternative group paths, normalized as templates.
+%% @doc Each AND predicate's alternative group paths, normalized as templates,
+%% after the group of every entry when the request names it.
 groups(Base, Req, Opts) ->
+    [ [group(?EVERY, ?EVERY, Opts)]
+        || hb_util:bool(hb_maps:get(<<"every">>, Req, false, Opts)) ] ++
     [ [group(Name, Value, Opts)] || {Name, Value} <- template(Base, Opts) ] ++
         [
             lists:usort([
@@ -1068,6 +1084,56 @@ weave_order_test() ->
     Literal = #{ <<"literal">> => [<<"1">>, <<"2">>] },
     LiteralID = Cache(Literal, 9),
     ?assertEqual([{9, LiteralID}], matches(Literal, #{}, Opts)).
+
+%% @doc With `match-index-every', entries sharing no pair are located together
+%% by `every' in weave order and within bounds; entries indexed without it
+%% are not. `check' holds `every' for any candidate.
+every_test() ->
+    Opts = (test_opts())#{ <<"priv-wallet">> => ar_wallet:new() },
+    % A flat configuration file supplies the option as a binary.
+    Every = Opts#{ <<"match-index-every">> => <<"true">> },
+    Cache =
+        fun(Msg, Offset, CacheOpts) ->
+            Signed = hb_message:commit(Msg, CacheOpts),
+            cache(Signed, Offset, CacheOpts),
+            [ID] = ids(Signed, CacheOpts),
+            ID
+        end,
+    Late = Cache(#{ <<"a">> => <<"1">> }, 9, Every),
+    Early = Cache(#{ <<"b">> => <<"2">> }, 3, Every),
+    Pending = Cache(#{ <<"c">> => <<"3">> }, infinity, Every),
+    Cache(#{ <<"d">> => <<"4">> }, 5, Opts),
+    ?assertEqual([], matches(#{}, #{}, Every)),
+    ?assertEqual(
+        [{3, Early}, {9, Late}, {infinity, Pending}],
+        matches(#{}, #{ <<"every">> => true }, Every)
+    ),
+    ?assertEqual(
+        [{9, Late}, {3, Early}],
+        matches(
+            #{},
+            #{
+                <<"every">> => true,
+                <<"direction">> => desc,
+                <<"from">> => 9,
+                <<"to">> => -1
+            },
+            Every
+        )
+    ),
+    ?assertEqual(
+        [{9, Late}],
+        matches(#{ <<"a">> => <<"1">> }, #{ <<"every">> => true }, Every)
+    ),
+    ?assertEqual(
+        {ok, true},
+        hb_ao:raw(
+            <<"match@1.0">>,
+            #{ <<"a">> => <<"1">> },
+            #{ <<"path">> => <<"check">>, <<"every">> => true },
+            Every
+        )
+    ).
 
 %% @doc Reject a candidate before reading further predicates, retaining the
 %% advancing group's page. Predicate ordering does not change the intersection.
