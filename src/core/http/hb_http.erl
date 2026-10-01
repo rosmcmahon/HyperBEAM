@@ -769,6 +769,19 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                 maps:without([<<"body">>], ErrMsg),
                 maps:get(<<"body">>, ErrMsg, <<>>)
             };
+        {400, <<"httpsig@1.0">>, false}
+                when is_map_key(<<"offender">>, Message) ->
+            {ok, ErrMsg} =
+                hb_http_server:static(
+                    <<"hyperbuddy@1.0">>,
+                    <<"400.html">>,
+                    hb_maps:with([<<"error">>, <<"offender">>], Message, Opts),
+                    Opts
+                ),
+            {Status,
+                maps:without([<<"body">>], ErrMsg),
+                maps:get(<<"body">>, ErrMsg, <<>>)
+            };
         {_, <<"httpsig@1.0">>, _} ->
             EncMessage =
                 hb_message:convert(

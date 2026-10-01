@@ -102,6 +102,26 @@ p {
     color: #000000;
 }
 
+#parse-error {
+    display: grid;
+    grid-template-columns: max-content auto;
+    align-items: baseline;
+    gap: 12px 24px;
+    max-width: 720px;
+    margin: 0;
+}
+
+#parse-error dt {
+    color: rgb(143, 143, 143);
+}
+
+#parse-error dd {
+    margin: 0;
+    font-family: "Roboto Mono", monospace;
+    color: #000000;
+    overflow-wrap: anywhere;
+}
+
 @keyframes dotsBlink {
     0% {
         opacity: 0;
@@ -136,6 +156,14 @@ p {
     }
 
     #error-text {
+        color: #fafafa;
+    }
+
+    #parse-error dt {
+        color: rgb(180, 180, 180);
+    }
+
+    #parse-error dd {
         color: #fafafa;
     }
 
