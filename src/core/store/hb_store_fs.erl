@@ -90,8 +90,7 @@ write_path(Opts, PathComponents, Value) ->
     Path = add_prefix(Opts, hb_path:to_binary(PathComponents)),
     ?event({writing, Path, byte_size(Value)}),
     filelib:ensure_dir(Path),
-    ok = file:write_file(Path, Value),
-    ok.
+    file:write_file(Path, Value).
 
 %% @doc List contents of a directory in the store, following symlinks as
 %% needed.
@@ -181,7 +180,8 @@ group(Opts = #{ <<"name">> := _DataDir }, #{ <<"group">> := Path }, _NodeOpts) -
     filelib:ensure_dir(P),
    case file:make_dir(P) of
         ok -> ok;
-        {error, eexist} -> ok
+        {error, eexist} -> ok;
+        {error, Reason} -> {error, Reason}
     end.
 
 %% @doc Create a symlink, handling the case where the link would point to itself.
