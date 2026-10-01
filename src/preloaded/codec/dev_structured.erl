@@ -4,6 +4,8 @@
 %%% - `float'
 %%% - `atom'
 %%% - `list'
+%%% - `binary', when named in `encode-types': a binary that is not UTF-8 text,
+%%%   as base64url.
 %%% 
 %%% Encoding to TABM can be limited to a subset of types (with other types
 %%% passing through in their rich representation) by specifying the types 
@@ -101,10 +103,11 @@ from(Msg, Req, Opts) when is_map(Msg) ->
         ),
     NormKeysMap = hb_ao:normalize_keys(NormLinks, Opts),
     EncodeTypes = find_encode_types(HintedReq, Opts),
+    EncodeBinaries = lists:member(<<"binary">>, EncodeTypes),
     {Types, Values} = lists:foldl(
         fun (Key, {Types, Values}) ->
             case hb_maps:find(Key, NormKeysMap, Opts) of
-                {ok, Value} when is_binary(Value) ->
+                {ok, Value} when is_binary(Value), not EncodeBinaries ->
                     {Types, [{Key, Value} | Values]};
                 {ok, Nested} when is_map(Nested) orelse is_list(Nested) ->
                     ?event_debug({from_recursing, {nested, Nested}}),
@@ -120,7 +123,8 @@ from(Msg, Req, Opts) when is_map(Msg) ->
                 {ok, Value} when
                         is_atom(Value)
                         orelse is_integer(Value)
-                        orelse is_float(Value) ->
+                        orelse is_float(Value)
+                        orelse is_binary(Value) ->
                     BinKey = hb_ao:normalize_key(Key),
                     ?event_debug({encode_value, Value}),
                     case maybe_encode_value(Value, EncodeTypes) of
@@ -199,6 +203,7 @@ type(Int) when is_integer(Int) -> <<"integer">>;
 type(Float) when is_float(Float) -> <<"float">>;
 type(Atom) when is_atom(Atom) -> <<"atom">>;
 type(List) when is_list(List) -> <<"list">>;
+type(Bin) when is_binary(Bin) -> <<"binary">>;
 type(Other) -> Other.
 
 %% @doc If a `hint-device` key is present it indicates the desired
@@ -374,12 +379,17 @@ implicit_keys(Req, Opts) ->
 		Opts
     ).
 
-%% @doc Encode a value if it is in the list of supported types.
+%% @doc Encode a value if it is in the list of supported types. A binary that
+%% is UTF-8 text is not encoded.
 maybe_encode_value(Value, EncodeTypes) ->
-    case lists:member(type(Value), EncodeTypes) of
+    case lists:member(type(Value), EncodeTypes) andalso not is_text(Value) of
         true -> encode_value(Value);
         false -> skip
     end.
+
+%% @doc Check whether a value is UTF-8 text.
+is_text(Value) ->
+    is_binary(Value) andalso unicode:characters_to_binary(Value) =:= Value.
 
 %% @doc Convert a term to a binary representation, emitting its type for
 %% serialization as a separate tag.
@@ -418,7 +428,7 @@ encode_value(Values) when is_list(Values) ->
     EncodedList = hb_structured_fields:list(EncodedValues),
     {<<"list">>, iolist_to_binary(EncodedList)};
 encode_value(Value) when is_binary(Value) ->
-    {<<"binary">>, Value};
+    {<<"binary">>, hb_util:encode(Value)};
 encode_value(Value) ->
     Value.
 

@@ -353,6 +353,8 @@ decode(map, Value) ->
             hb_structured_fields:parse_dictionary(iolist_to_binary(Value))
         )
     );
+decode(binary, Value) ->
+    decode(Value);
 decode(BinType, Value) when is_binary(BinType) ->
     decode(
         binary_to_existing_atom(to_lower(BinType), latin1),
