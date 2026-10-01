@@ -64,7 +64,7 @@ from(HTTP, _Req, Opts) ->
     % afterwards.
     Commitments =
         dev_httpsig_siginfo:siginfo_to_commitments(
-            WithBodyKeys,
+            Headers,
             OrderedBodyKeys,
             Opts
         ),
