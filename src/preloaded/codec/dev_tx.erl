@@ -1252,7 +1252,7 @@ binary_tags_roundtrip_test() ->
         {ok, Remote} = hb_http:get(
             Node, <<"/~cache@1.0/read&read=", ID/binary>>, Opts),
         ?assert(hb_message:verify(Remote,
-            #{ <<"commitment-ids">> => [ID] }, Opts)),
+            #{ <<"ids">> => [ID] }, Opts)),
         Back = hb_message:convert(
             Remote, <<"tx@1.0">>, <<"structured@1.0">>, Opts),
         ?assertEqual(Signed#tx.tags, Back#tx.tags),

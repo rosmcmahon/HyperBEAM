@@ -207,7 +207,7 @@ aos2_to_message(JSON, Opts) ->
             Msg = hb_message:with_commitments(ID, Cached, Opts),
             true = hb_message:signers(Msg, Opts) =/= [],
             true = hb_message:verify(
-                Msg, #{ <<"commitment-ids">> => [ID] }, Opts
+                Msg, #{ <<"ids">> => [ID] }, Opts
             ),
             hb_message:with_only_committed(Msg, Opts);
         _ -> Result

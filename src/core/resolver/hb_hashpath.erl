@@ -774,7 +774,7 @@ verify_all_commitments(Value, Opts) ->
 verify_commitments(Value, Opts) when ?IS_LINK(Value) ->
     verify_commitments(hb_cache:ensure_loaded(Value, Opts), Opts);
 verify_commitments(Value, Opts) when is_map(Value) ->
-    hb_message:verify(Value, #{ <<"commitment-ids">> => <<"all">> }, Opts);
+    hb_message:verify(Value, #{ <<"ids">> => <<"all">> }, Opts);
 verify_commitments(_Value, _Opts) -> true.
 
 %% @doc A compact request key denotes the ordinary one-key request message.

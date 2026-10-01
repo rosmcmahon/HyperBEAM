@@ -677,7 +677,7 @@ commitment_identity_test() ->
     lists:foreach(
         fun(Committed) ->
             ?assert(hb_message:verify(
-                Committed, #{ <<"commitment-ids">> => <<"all">> }, Opts)),
+                Committed, #{ <<"ids">> => <<"all">> }, Opts)),
             Forged = Committed#{ <<"commitments">> => maps:map(
                 fun(_, C) -> C#{ <<"committer">> => Victim } end,
                 maps:get(<<"commitments">>, Committed)
@@ -687,7 +687,7 @@ commitment_identity_test() ->
                 Victim => hd(maps:values(maps:get(<<"commitments">>, Committed)))
             } },
             ?assertNot(hb_message:verify(
-                Renamed, #{ <<"commitment-ids">> => <<"all">> }, Opts))
+                Renamed, #{ <<"ids">> => <<"all">> }, Opts))
         end,
         [Signed, Unsigned]
     ),

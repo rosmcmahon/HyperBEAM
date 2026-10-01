@@ -256,7 +256,7 @@ mangle(Base, _Req, Opts) ->
         prod -> {error, <<"`mangle' unavailable in `prod` mode.">>};
         debug ->
             ?no_prod("`mangle' is not safe to use in production."),
-            case hb_message:committed(Base, #{ <<"commitment-ids">> => <<"all">> }, Opts) of
+            case hb_message:committed(Base, #{ <<"ids">> => <<"all">> }, Opts) of
                 [] ->
                     {error, <<"No committed keys to mangle found on base message.">>};
                 [FirstKey|_] ->

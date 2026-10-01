@@ -57,7 +57,7 @@ addresses(_) -> [].
 
 %% @doc Follow committed children without admitting their uncommitted fields.
 signed_keys(Msg, Opts) when is_map(Msg) ->
-    true = hb_message:verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts),
+    true = hb_message:verify(Msg, #{ <<"ids">> => <<"all">> }, Opts),
     {ok, Committed} = hb_message:with_only_committed(Msg, Opts),
     Authorized =
         hb_maps:map(
@@ -68,7 +68,7 @@ signed_keys(Msg, Opts) when is_map(Msg) ->
             Opts
         ),
     % Loading and projecting a child must preserve its parent's signature.
-    true = hb_message:verify(Authorized, #{ <<"commitment-ids">> => <<"all">> }, Opts),
+    true = hb_message:verify(Authorized, #{ <<"ids">> => <<"all">> }, Opts),
     Authorized;
 signed_keys(Link, Opts) when ?IS_LINK(Link) ->
     signed_keys(hb_cache:ensure_loaded(Link, Opts), Opts);

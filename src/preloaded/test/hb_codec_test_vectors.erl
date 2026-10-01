@@ -35,7 +35,7 @@ arweave_commitment_identity_test_() ->
             end,
             Verify = fun(M) ->
                 hb_message:verify(M,
-                    #{ <<"commitment-ids">> => <<"all">> }, Opts)
+                    #{ <<"ids">> => <<"all">> }, Opts)
             end,
             [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Msg)),
             FalseID = hb_util:human_id(<<0:256>>),
