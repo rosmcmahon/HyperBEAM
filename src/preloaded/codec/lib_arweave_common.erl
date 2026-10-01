@@ -3,6 +3,7 @@
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
 -export([verify_committed_keys/5]).
+-export([enforce_tag_names/3]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([signed_children_hint/3]).
@@ -94,6 +95,20 @@ tag_count(TX, TABM) when length(TX#tx.tags) > ?MAX_TAG_COUNT ->
     throw({too_many_keys, TABM});
 tag_count(TX, _TABM) ->
     TX.
+
+%% @doc Throw `invalid_tag_name' if a key of a message names a tag of its item
+%% that decoding gives another key, as decoding lowercases tag names: a
+%% commitment to the item would list the decoded key in place of the message's.
+enforce_tag_names(TX, TABM, Opts) ->
+    case lists:search(
+            fun({Name, _}) ->
+                hb_maps:is_key(Name, TABM, Opts) andalso
+                normalize_key(Name) =/= Name
+            end,
+            TX#tx.tags) of
+        false -> ok;
+        {value, {Name, _}} -> throw({invalid_tag_name, Name})
+    end.
 
 %% @doc Return a TABM message containing the fields of the given decoded
 %% ANS-104 data item that should be included in the base message.

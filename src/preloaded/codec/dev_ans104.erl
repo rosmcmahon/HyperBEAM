@@ -53,6 +53,7 @@ commit(Msg, Req = #{ <<"type">> := Type }, Opts)
     % Convert the given message to an ANS-104 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
+    lib_arweave_common:enforce_tag_names(TX, Msg, Opts),
     case {hb_opts:get(priv_wallet, no_viable_wallet, Opts), Type} of
         {{{?RSA_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?RSA_SIGN_TYPE} ->
             sign_tx(TX, Wallet, Opts);

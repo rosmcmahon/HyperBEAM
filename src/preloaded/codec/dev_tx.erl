@@ -30,6 +30,7 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
     % Convert the given message to an L1 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
+    lib_arweave_common:enforce_tag_names(TX, Msg, Opts),
     Wallet = hb_opts:get(priv_wallet, no_viable_wallet, Opts),
     Signed = ar_tx:sign(TX, Wallet),
     SignedStructured =
