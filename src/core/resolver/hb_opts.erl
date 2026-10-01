@@ -529,7 +529,7 @@ raw_default_message() ->
                 <<"cache-control">> => []
             },
         % Should the node store all signed messages?
-        <<"store-all-signed">> => true,
+        <<"store-all-signed">> => false,
         % Should the node use persistent processes?
         <<"process-workers">> => true,
         % Options for the router device
