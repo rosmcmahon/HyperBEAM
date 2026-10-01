@@ -367,6 +367,9 @@ verify(Self, Req, Opts) ->
             ],
             Req
         ),
+    % Verification derives the IDs of nested messages without writing the
+    % messages to the cache.
+    VerifyOpts = Opts#{ <<"linkify-mode">> => discard },
     % Verify the commitments. Stop execution if any fail.
     Res =
         lists:all(
@@ -417,7 +420,7 @@ verify(Self, Req, Opts) ->
                         },
                         Opts
                     ),
-                Base = hb_message:convert(Covered, tabm, SourceSpec, Opts),
+                Base = hb_message:convert(Covered, tabm, SourceSpec, VerifyOpts),
                 ?event(verify, {verify, {base_found, Base}}),
                 {ok, Res} =
                     verify_commitment(
