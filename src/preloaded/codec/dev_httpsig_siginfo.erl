@@ -283,14 +283,21 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
             CommitmentDeviceKeys,
             maps:remove(<<"alg">>, Commitment1)
         ),
-    % Generate the committed keys by parsing the signature-input list.
+    % Generate the committed keys by parsing the signature-input list. Other
+    % devices list their `committed' keys in order, percent-encoded.
     RawCommittedKeys =
         [
             Key
         ||
             {item, {string, Key}, []} <- SigInput
         ],
-    CommittedKeys = from_siginfo_keys(Msg, BodyKeys, RawCommittedKeys),
+    CommittedKeys =
+        case Commitment2 of
+            #{ <<"commitment-device">> := <<"httpsig@1.0">> } ->
+                from_siginfo_keys(Msg, BodyKeys, RawCommittedKeys);
+            _ ->
+                lists:map(fun hb_escape:decode/1, RawCommittedKeys)
+        end,
     % Merge and cleanup the output:
     % 1. Decode `keyid' and `signature' to raw bytes.
     % 2. Filter undefined keys.
@@ -355,10 +362,21 @@ decoding_nested_map_binary(Bin) ->
 %% - If the list contains a `body' key, we replace it with the `content-digest'
 %%   key.
 %% - Otherwise, we return the list unchanged.
-to_siginfo_keys(Msg, Commitment, Opts) ->
+%% Commitments of devices other than `httpsig@1.0' send their `committed'
+%% lists as they are, in order and percent-encoded: those devices verify them.
+to_siginfo_keys(Msg, Commitment = #{
+        <<"commitment-device">> := <<"httpsig@1.0">> }, Opts) ->
     {ok, _EncMsg, EncComm, _} =
         dev_httpsig:normalize_for_encoding(Msg, Commitment, Opts),
-    maps:get(<<"committed">>, EncComm).
+    maps:get(<<"committed">>, EncComm);
+to_siginfo_keys(_Msg, Commitment, Opts) ->
+    lists:map(
+        fun hb_escape:encode/1,
+        hb_util:message_to_ordered_list(
+            maps:get(<<"committed">>, Commitment, []),
+            Opts
+        )
+    ).
 
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
 %% format. Replace `content-digest' with the body keys, remove component prefixes,
