@@ -2,6 +2,7 @@
 -module(lib_arweave_common).
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
+-export([verify_committed_keys/5]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([to/3, to/6, siginfo/4, fields_to_tx/4]).
@@ -314,6 +315,19 @@ verify_identity(Item, TABM) ->
                             Item#tx.owner, Item#tx.signature_type)
                     )
     end.
+
+%% @doc Check that a commitment's committed keys are the keys of the item
+%% encoded from the message: its data keys, tags and fields, as decoding the
+%% item gives them. Nested items are not decoded, as only their keys are needed.
+verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
+    [Commitment] = maps:values(maps:get(<<"commitments">>, TABM)),
+    TX = ar_bundles:deserialize(Item),
+    Fields = FieldsFun(TX, <<>>, Opts),
+    Tags = tags(TX, Opts),
+    Data = data(TX, #{}, Tags, fun(_, _, _) -> {ok, <<>>} end, Opts),
+    CommittedKeys = hb_maps:get(<<"committed">>, Commitment, #{}, Opts),
+    lists:sort(committed(FieldKeys, TX, Fields, Tags, Data, Opts)) =:=
+        lists:sort(hb_util:message_to_ordered_list(CommittedKeys)).
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(

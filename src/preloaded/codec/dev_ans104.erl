@@ -106,7 +106,10 @@ verify(Msg, Req, Opts) ->
     ?event({verify, {encoded, TX}}),
     Res =
         item_verifies(TX, Req, OnlyWithCommitment) andalso
-            lib_arweave_common:verify_identity(TX, OnlyWithCommitment),
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_committed_keys(
+                ?BASE_FIELDS, TX, fun lib_arweave_common:fields/3,
+                OnlyWithCommitment, Opts),
     {ok, Res}.
 
 %% @doc An unsigned commitment verifies when the item's unsigned ID is the

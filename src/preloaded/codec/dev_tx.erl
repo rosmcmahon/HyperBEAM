@@ -71,7 +71,10 @@ verify(Msg, Req, Opts) ->
     ?event({verify, {encoded, {explicit, TX}}}),
     Res =
         tx_verifies(TX, Req, OnlyWithCommitment) andalso
-            lib_arweave_common:verify_identity(TX, OnlyWithCommitment),
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_committed_keys(
+                ?BASE_FIELDS, TX, fun dev_tx_from:fields/3,
+                OnlyWithCommitment, Opts),
     {ok, Res}.
 
 %% @doc An unsigned commitment verifies when the transaction's unsigned ID is
