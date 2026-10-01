@@ -959,19 +959,24 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                     hb_ao:raw(ArCodec, <<"deserialize">>, Body, #{}, Opts),
                 hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts);
             _ ->
-                hb_maps:merge(
-                    PrimitiveMsg,
-                    hb_message:convert(
-                        Body,
-                        <<"structured@1.0">>,
-                        #{
-                            <<"device">> => Codec,
-                            <<"accept-codec">> => <<"structured@1.0">>
-                        },
+                {ok, Committed} =
+                    hb_message:with_only_committed(
+                        hb_maps:merge(
+                            PrimitiveMsg,
+                            hb_message:convert(
+                                Body,
+                                <<"structured@1.0">>,
+                                #{
+                                    <<"device">> => Codec,
+                                    <<"accept-codec">> => <<"structured@1.0">>
+                                },
+                                Opts
+                            ),
+                            Opts
+                        ),
                         Opts
                     ),
-                    Opts
-                )
+                Committed
         end,
     % Cookie-backed commitments need the request's cookie and peer context.
     Normalized = normalize_unsigned(PrimitiveMsg, Req, Decoded, Opts),
