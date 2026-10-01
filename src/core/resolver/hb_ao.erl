@@ -143,6 +143,9 @@ resolve(SingletonMsg, Opts) ->
 
 resolve(Base, Path, Opts) when not is_map(Path) ->
     resolve(Base, #{ <<"path">> => Path }, Opts);
+resolve(_Base, #{ <<"path">> := Path }, _Opts) when Path == <<>>; Path == [] ->
+    % The empty path names no key.
+    {error, not_found};
 resolve(Base, Req, Opts) ->
     PathParts = hb_path:from_message(request, Req, Opts),
     ?event(
