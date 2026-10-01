@@ -274,6 +274,11 @@ committers(_, _, _) ->
 ) -> {ok, #{ commitments := #{ _ => _ }, _ => _ }}.
 commit(Self, Req, Opts) ->
     {ok, Base} = hb_message:find_target(Self, Req, Opts),
+    % The empty key names no key, so no codec carries a commitment to it.
+    case is_map_key(<<>>, Base) of
+        true -> throw({invalid_key, <<>>});
+        false -> ok
+    end,
     AttDev =
         case hb_maps:get(<<"commitment-device">>, Req, not_specified, Opts) of
             not_specified ->
