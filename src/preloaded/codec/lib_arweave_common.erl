@@ -520,13 +520,12 @@ deduplicating_from_list(Tags, Opts) ->
 
 %%% Encoding helpers.
 
-%% @doc Apply the `bundle' hint from a signed commitment for `Device'.
-%% Returns `not_found' when no signed commitment for `Device' exists.
+%% @doc Apply the `bundle' hint from the commitment for `Device', signed or
+%% unsigned. Returns `not_found' when no commitment for `Device' exists.
 bundle_hint(Device, Msg, Req, Opts) ->
     case hb_message:commitment(
             #{
-                <<"commitment-device">> => Device,
-                <<"committer">> => '_'
+                <<"commitment-device">> => Device
             },
             Msg,
             Opts) of

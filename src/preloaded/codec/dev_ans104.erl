@@ -148,7 +148,7 @@ do_from(RawTX, Req, Opts) ->
     ?event({from, {parsed_message, WithCommitments}}),
     {ok, WithCommitments}.
 
-%% @doc Inspect a message's signed ans104 commitment and, if it carries an
+%% @doc Inspect a message's ans104 commitment and, if it carries an
 %% explicit `bundle' field, mirror that value onto the request `Req'. Bundling
 %% is turned off for a message with a nested message signed by another device.
 to_hint(Msg, Req, Opts) ->

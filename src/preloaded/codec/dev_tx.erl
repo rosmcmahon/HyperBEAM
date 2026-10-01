@@ -117,7 +117,7 @@ do_from(RawTX, Req, Opts) ->
     ?event({from, {parsed_message, hb_util:human_id(TX#tx.id)}}),
     {ok, WithCommitments}.
 
-%% @doc Inspect a message's signed tx@1.0 commitment and, if the commitment
+%% @doc Inspect a message's tx@1.0 commitment and, if the commitment
 %% carries an explicit `bundle' field, mirror that value onto the request `Req'.
 to_hint(Msg, Req, Opts) ->
     case lib_arweave_common:bundle_hint(<<"tx@1.0">>, Msg, Req, Opts) of
