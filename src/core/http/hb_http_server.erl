@@ -621,8 +621,9 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
 
 %% @doc The status of an error response. A request whose commitments do not
-%% verify is refused as the client's error.
+%% verify or that `hb_singleton' cannot parse is refused as the client's error.
 error_status(throw, {invalid_commitments, _}) -> 400;
+error_status(throw, {invalid_singleton, _, _}) -> 400;
 error_status(_Type, _Details) -> 500.
 
 %% @doc Return the list of allowed methods for the HTTP server.

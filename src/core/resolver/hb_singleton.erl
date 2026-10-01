@@ -131,7 +131,8 @@ type(Value) when is_integer(Value) -> integer;
 type(_Value) -> unknown.
 
 %% @doc Normalize a singleton TABM message into a list of executable AO-Core
-%% messages.
+%% messages. Throws `{invalid_singleton, Type, Offender}' if a part of the
+%% message cannot be parsed, where `Offender' is that part.
 from(RawMsg, Opts) when is_binary(RawMsg) ->
     from(#{ <<"path">> => RawMsg }, Opts);
 from(RawMsg, Opts) ->
@@ -172,19 +173,19 @@ from_path(RelativeRef) ->
     %RelativeRef = hb_escape:decode(RawRelativeRef),
     Decoded = decode_string(RelativeRef),
     ?event_debug(parsing, {parsed_relative_ref, Decoded}),
-    {Path, QKVList} =
-        case hb_util:split_depth_string_aware_single("?", Decoded) of
-            {_Sep, P, QStr} -> {P, cowboy_req:parse_qs(#{ qs => QStr })};
-            {no_match, P, <<>>} -> {P, []}
-        end,
-    {
-        ok,
-        path_parts($/, Path),
+    {_Sep, Path, QStr} = hb_util:split_depth_string_aware_single("?", Decoded),
+    {ok, path_parts($/, Path), parse_query(QStr)}.
+
+%% @doc Parse a query string into a message of its unquoted values, or throw
+%% `invalid_query' naming the query string.
+parse_query(QStr) ->
+    try
         maps:map(
             fun(_, Val) -> hb_util:unquote(Val) end,
-            hb_maps:from_list(QKVList)
+            hb_maps:from_list(cowboy_req:parse_qs(#{ qs => QStr }))
         )
-    }.
+    catch _:_ -> throw({invalid_singleton, invalid_query, QStr})
+    end.
 
 %% @doc Step 2: Decode, split and sanitize the path. Split by `/' but avoid
 %% subpath components, such that their own path parts are not dissociated from
@@ -207,7 +208,7 @@ path_parts(Sep, PathBin) when is_binary(PathBin) ->
             case byte_size(Part) of
                 0 -> false;
                 TooLong when TooLong > ?MAX_SEGMENT_LENGTH ->
-                    throw({error, segment_too_long, Part});
+                    throw({invalid_singleton, segment_too_long, Part});
                 _ -> {true, Part}
             end
         end,
@@ -249,7 +250,7 @@ group_scoped(Map, Msgs) ->
         hb_maps:fold(
             fun(KeyBin, Val, {Ns, Gs}) ->
                 case parse_scope(KeyBin) of
-                    {OkN, RealKey} when OkN > 0 ->
+                    {OkN, RealKey} ->
                         Curr = hb_maps:get(OkN, Ns, #{}),
                         Ns2 = hb_maps:put(OkN, hb_maps:put(RealKey, Val, Curr), Ns),
                         {Ns2, Gs};
@@ -270,8 +271,8 @@ parse_scope(KeyBin) ->
     case binary:split(KeyBin, <<".">>, [global]) of
         [Front, Remainder] ->
             case catch erlang:binary_to_integer(Front) of
-                NInt when is_integer(NInt) -> {NInt + 1, Remainder};
-                _ -> throw({error, invalid_scope, KeyBin})
+                NInt when is_integer(NInt), NInt >= 0 -> {NInt + 1, Remainder};
+                _ -> throw({invalid_singleton, invalid_scope, KeyBin})
             end;
         _ -> global
     end.
@@ -402,6 +403,7 @@ parse_inlined_key_val(Bin, Opts) ->
 decode_string(B) ->
     case catch uri_string:unquote(B) of
         DecodedBin when is_binary(DecodedBin) -> DecodedBin;
+        {error, Type, _} -> throw({invalid_singleton, Type, B});
         _ -> throw({error, cannot_decode, B})
     end.
 
@@ -438,7 +440,10 @@ maybe_typed(Key, Value, Opts) ->
                     Decoded = hb_escape:decode_quotes(RawValue),
                     {typed,
                         OnlyKey,
-                        hb_util:decode(Type, Decoded)
+                        try hb_util:decode(Type, Decoded)
+                        catch _:_ ->
+                            throw({invalid_singleton, invalid_type, Key})
+                        end
                     }
             end
     end.
