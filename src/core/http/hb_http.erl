@@ -418,7 +418,7 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
     % Verify the outbound message if paranoid mode is enabled for http_request
     hb_message:paranoid_verify(http_request, Message, Opts),
     % Generate a `cookie' key for the message, if an unencoded cookie is
-    % present.
+    % present. The message keeps the cookie keys a commitment covers.
     {MaybeCookie, WithoutCookie} =
         case cookie(<<"extract">>, Message, #{}, Opts) of
             {ok, NoCookies} when map_size(NoCookies) == 0 ->
@@ -431,11 +431,12 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
                         #{ <<"format">> => <<"cookie">> },
                         Opts
                     ),
-                {ok, CookieReset} = cookie(<<"reset">>, Message, #{}, Opts),
                 ?event(debug_http, {cookie_lines, CookieLines}),
                 {
                     #{ <<"cookie">> => CookieLines },
-                    CookieReset
+                    hb_message:without_unless_signed(
+                        [<<"cookie">>, <<"set-cookie">>], Message, Opts
+                    )
                 }
         end,
     % Remove the private components from the message, if they are present.
@@ -649,11 +650,12 @@ reply_handle_cookies(Req, Message, Opts) ->
                     Req,
                     SetCookieLines
                 ),
-            {ok, CookieReset} = cookie(<<"reset">>, Message, #{}, Opts),
             {
                 ok,
                 FinalReq,
-                CookieReset
+                hb_message:without_unless_signed(
+                    [<<"cookie">>, <<"set-cookie">>], Message, Opts
+                )
             }
     end.
 

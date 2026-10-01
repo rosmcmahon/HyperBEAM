@@ -146,11 +146,12 @@ store(Base, Req, RawOpts) ->
     {ok, NewBase}.
 
 %% @doc Remove all cookie keys from the given message (including `cookie' and
-%% `set-cookie' in the base, and `priv/cookie' in the request message).
+%% `set-cookie' in the base, unless a commitment covers them, and `priv/cookie'
+%% in the request message).
 reset(Base, RawOpts) ->
     Opts = opts(RawOpts),
     WithoutBaseCookieKeys =
-        hb_maps:without(
+        hb_message:without_unless_signed(
             [<<"cookie">>, <<"set-cookie">>],
             Base,
             Opts
