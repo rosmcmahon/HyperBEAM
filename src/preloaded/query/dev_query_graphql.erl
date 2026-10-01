@@ -163,7 +163,7 @@ handle(_Base, RawReq, Opts) ->
                         Result -> Result
                     end,
                 ?event(graphql_executed),
-                JSON = hb_json:encode(Response),
+                JSON = hb_json:encode(typed_binaries(Response, Opts)),
                 ?event({graphql_response, {bytes, byte_size(JSON)}}),
                 {ok,
                     #{
@@ -177,6 +177,36 @@ handle(_Base, RawReq, Opts) ->
                     {error, Error}
             end
     end.
+
+%% @doc Give each binary in a GraphQL response that is not UTF-8 text as its
+%% base64url, typed `binary' in the `ao-types' of the object that holds it, as
+%% `json@1.0' does. Every response name is kept, including one that starts
+%% with `priv': the names are the query's fields and aliases, not message keys.
+typed_binaries(Map, Opts) when is_map(Map) ->
+    Typed = maps:map(fun(_, Value) -> typed_binaries(Value, Opts) end, Map),
+    case maps:filter(fun(_, V) -> is_binary(V) andalso not is_text(V) end, Typed) of
+        Binaries when map_size(Binaries) == 0 -> Typed;
+        Binaries ->
+            {ok, Types} =
+                hb_ao:raw(
+                    <<"structured@1.0">>,
+                    <<"encode-types">>,
+                    maps:map(fun(_, _) -> <<"binary">> end, Binaries),
+                    #{},
+                    Opts
+                ),
+            maps:merge(
+                Typed#{ <<"ao-types">> => Types },
+                maps:map(fun(_, Value) -> hb_util:encode(Value) end, Binaries)
+            )
+    end;
+typed_binaries(List, Opts) when is_list(List) ->
+    [typed_binaries(Value, Opts) || Value <- List];
+typed_binaries(Value, _Opts) -> Value.
+
+%% @doc Check whether a binary is UTF-8 text.
+is_text(Bin) ->
+    unicode:characters_to_binary(Bin) =:= Bin.
 
 %% @doc Recognize selected fields, including aliases and fragments.
 selects(Name, #document{ definitions = Definitions }) -> selects(Name, Definitions);
