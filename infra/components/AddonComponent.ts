@@ -1,6 +1,7 @@
 import * as pulumi from '@pulumi/pulumi'
 import * as docker from '@pulumi/docker'
 import * as path from 'path'
+import * as fs from 'fs'
 import { execSync } from 'child_process'
 import { naming, type Config } from '../../../../Config'
 import { lokiLogDriver, lokiLogOpts } from '../../../../infra/components/lokiLogConfig'
@@ -39,6 +40,27 @@ export class AddonComponent extends pulumi.ComponentResource {
             skipPush: true,
         }, childOpts)
 
+        /* copycat fully indexes each block (bundles at every depth) once it has `confirmations` blocks on
+         * top, retrying unfinished blocks back to `retryDepth` below the tip. with `match-index-every`,
+         * GraphQL block queries list every item of a fully indexed block and error on an unfinished one. */
+        const extConfig = config.externalConfig?.[name] ?? {}
+        const confirmations = extConfig.COPYCAT_CONFIRMATIONS ?? '1'
+        const retryDepth = extConfig.COPYCAT_RETRY_DEPTH ?? '20'
+        const interval = extConfig.COPYCAT_INTERVAL ?? '1-minute'
+        const copycatCron = [
+            `/~cron@1.0/every?interval=${interval}`,
+            'cron-path=/~copycat@1.0/arweave',
+            'mode=full',
+            `from=-${confirmations}`,
+            `to=-${retryDepth}`,
+            'reindex=false',
+            'include-proofs=false',
+            'include-block-index=true',
+        ].join('&')
+        /* JSON keeps option types; the node falls back to defaults if this fails to load */
+        const nodeConfig = JSON.stringify({ 'match-index-every': true }, null, 2)
+        const startScript = fs.readFileSync(path.join(import.meta.dirname, '../start.sh'), 'utf-8')
+
         const volume = new docker.Volume(`${name}-data`, {
             name: naming(stackName, `${name}-data`),
         }, { ...childOpts, retainOnDelete: true })
@@ -48,6 +70,15 @@ export class AddonComponent extends pulumi.ComponentResource {
             image: image.repoDigest,
             networksAdvanced: [{ name: networkName }],
             volumes: [{ volumeName: volume.name, containerPath: '/data' }],
+            uploads: [
+                { file: '/opt/hb/shepherd-config.json', content: nodeConfig },
+                { file: '/opt/hb/shepherd-start.sh', content: startScript, permissions: '0755' },
+            ],
+            envs: [
+                'HB_CONFIG=/opt/hb/shepherd-config.json',
+                `HB_CRONS=${copycatCron}`,
+            ],
+            entrypoints: ['/opt/hb/shepherd-start.sh', '/opt/hb/bin/hb', 'foreground'],
             ports: [{ internal: 8734, external: 8734, ip: '127.0.0.1' }],
             ulimits: [{ name: 'nofile', soft: 65536, hard: 65536 }],
             logDriver: lokiLogDriver,
