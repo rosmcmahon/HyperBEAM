@@ -561,7 +561,15 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     % Get the CORS request headers from the message, if they exist.
     ReqHdr = cowboy_req:header(<<"access-control-request-headers">>, Req, <<"">>),
     HeadersWithCors = add_cors_headers(HeadersBeforeCors, ReqHdr, Opts),
-    EncodedHeaders = hb_private:reset(HeadersWithCors),
+    % A reply to a `HEAD' request, or with a 204 or 304 status, carries no
+    % body, so it carries no `content-digest' either.
+    ReplyHeaders =
+        case cowboy_req:method(Req) of
+            Method when Method == <<"HEAD">>; Status == 204; Status == 304 ->
+                hb_maps:without([<<"content-digest">>], HeadersWithCors, Opts);
+            _ -> HeadersWithCors
+        end,
+    EncodedHeaders = hb_private:reset(ReplyHeaders),
     ?event(debug_http,
         {http_replying,
             {status, {explicit, Status}},
