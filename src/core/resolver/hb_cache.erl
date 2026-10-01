@@ -256,8 +256,10 @@ normalize_match_spec(MatchSpec, _ReadMode, Opts) ->
 store_match(NormalizedSpec, Opts) ->
     ConvertedMatchSpec =
         maps:from_list([
-            {hb_escape:encode_path_component(Key),
-                store_match_value(Key, Value, Opts)}
+            {
+                hb_escape:encode_path_component(Key),
+                store_match_value(Key, Value, Opts)
+            }
         ||
             {Key, Value} <- maps:to_list(NormalizedSpec)
         ]),
