@@ -344,11 +344,22 @@ verify(Self, Req, Opts) ->
     CommitmentBase = ensure_commitments_loaded(RawBase, Opts),
     Commitments = maps:get(<<"commitments">>, CommitmentBase, #{}),
     % A request with neither `committers' nor `ids' verifies every
-    % commitment of the message.
+    % commitment of the message. `committers=none' without `ids'
+    % verifies every commitment without a committer.
     Selection =
         case maps:with([<<"committers">>, <<"ids">>], Req) of
             None when map_size(None) == 0 ->
                 Req#{ <<"ids">> => <<"all">> };
+            #{ <<"committers">> := <<"none">> }
+                    when not is_map_key(<<"ids">>, Req) ->
+                Unsigned =
+                    maps:filter(
+                        fun(_, Commitment) ->
+                            not maps:is_key(<<"committer">>, Commitment)
+                        end,
+                        Commitments
+                    ),
+                Req#{ <<"ids">> => maps:keys(Unsigned) };
             _ -> Req
         end,
     IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),

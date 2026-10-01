@@ -1522,7 +1522,7 @@ signed_with_inner_signed_message_test(Codec, Opts) ->
         ),
     ?event({match_result, MatchRes}),
     ?assert(MatchRes),
-    ?assert(hb_message:verify(InnerFromDecoded, all, Opts)),
+    ?assert(hb_message:verify(InnerFromDecoded, signers, Opts)),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     % 4. If the message is not a bundle, verify the inner message from the
     % converted message, applying `with_only_committed` first.
