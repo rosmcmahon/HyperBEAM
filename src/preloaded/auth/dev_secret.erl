@@ -1228,7 +1228,7 @@ stored_access_control_verifies_test() ->
     ?assert(
         hb_message:verify(
             AccessControl,
-            #{ <<"commitment-ids">> => <<"all">> },
+            #{ <<"ids">> => <<"all">> },
             #{}
         )
     ),

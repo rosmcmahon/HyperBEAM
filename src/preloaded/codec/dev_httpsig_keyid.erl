@@ -110,8 +110,9 @@ apply_scheme(constant, RawKeyID, _Req) ->
         end,
     {ok, KeyID, KeyID};
 apply_scheme(secret, _KeyID, Req) ->
-    % In the `secret' scheme, the key is hashed to generate a keyid.
-    Secret = maps:get(<<"secret">>, Req, undefined),
+    % In the `secret' scheme, the key is hashed to generate a keyid. The key
+    % is the `secret' in the private element of the request.
+    Secret = maps:get(<<"secret">>, hb_private:from_message(Req), undefined),
     Committer = hb_util:secret_key_to_committer(Secret),
     {ok, Secret, << "secret:", Committer/binary >>};
 apply_scheme(_Scheme, _Key, _KeyID) ->

@@ -35,7 +35,7 @@ arweave_commitment_identity_test_() ->
             end,
             Verify = fun(M) ->
                 hb_message:verify(M,
-                    #{ <<"commitment-ids">> => <<"all">> }, Opts)
+                    #{ <<"ids">> => <<"all">> }, Opts)
             end,
             [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Msg)),
             FalseID = hb_util:human_id(<<0:256>>),
@@ -638,9 +638,9 @@ header_escaping_test(Codec, Opts) ->
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
 
-%% @doc A message's own `signature' key is data, as on an Arweave block. It
-%% is committed, survives the wire beside the signature headers of the same
-%% name, and is not read back as a commitment.
+%% @doc A message's own `signature' key is data. It is committed, survives the
+%% wire beside the signature headers of the same name, and is not read back as
+%% a commitment.
 signature_data_key_test(Codec, Opts) ->
     Msg =
         hb_message:commit(
@@ -1522,7 +1522,7 @@ signed_with_inner_signed_message_test(Codec, Opts) ->
         ),
     ?event({match_result, MatchRes}),
     ?assert(MatchRes),
-    ?assert(hb_message:verify(InnerFromDecoded, all, Opts)),
+    ?assert(hb_message:verify(InnerFromDecoded, signers, Opts)),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     % 4. If the message is not a bundle, verify the inner message from the
     % converted message, applying `with_only_committed` first.

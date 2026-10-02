@@ -279,7 +279,9 @@ target_slot(Req, Opts) ->
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
     case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
-            % We reached the target height so we force a snapshot and return.
+            % The target slot's state is written to the cache when it is
+            % computed, so we only return it here. A slot result is never
+            % written from a state the device did not itself compute.
             ?event(compute_short,
                 {reached_target_slot_returning_state,
                     {proc_id, ProcID},
@@ -287,7 +289,6 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                 },
                 Opts
             ),
-            store_result(true, ProcID, TargetSlot, Base, Req, Opts),
             {ok, without_snapshot(lib_process:as_process(Base, Opts), Opts)};
         CurrentSlot when CurrentSlot < TargetSlot ->
             % Compute the next state transition.
@@ -398,11 +399,13 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     #{ <<"device">> => <<"process@1.0">>, <<"at-slot">> => Slot },
                     Opts
                 ),
+            % Force a snapshot of the target slot so the terminal state is
+            % restorable; intermediate slots snapshot per the configured interval.
             {StoreTimeMicroSecs, ProcStateWithSnapshot} =
                 timer:tc(
                     fun() ->
                         store_result(
-                            false,
+                            Slot == TargetSlot,
                             ProcID,
                             Slot,
                             NewProcStateMsgWithSlot,
@@ -677,7 +680,7 @@ now(RawBase, Req, Opts) ->
                 hb_util:int(CurrentSlot),
                 Opts
             ),
-            hb_ao:raw(
+            hb_ao:resolve(
                 Base,
                 (hb_maps:with([<<"push">>], Req, Opts))#{
                     <<"path">> => <<"compute">>,

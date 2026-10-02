@@ -108,7 +108,9 @@ events(_, _Req, _Opts) ->
         _ => _
     },
     #{ _ => _ }
-) -> {ok, #{ body := binary(), _ => _ }}.
+) ->
+    {ok, #{ body := binary(), _ => _ }}
+    | {error, #{ status := integer(), body := binary() }}.
 format(Base, Req, Opts) ->
     % Find the scope of the environment that should be printed.
     Scope =

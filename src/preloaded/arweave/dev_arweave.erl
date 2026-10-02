@@ -793,9 +793,9 @@ block(Base, RawRequest, Opts) when is_map(Base) ->
         {{ok, Header}, true} ->
             ok = dev_arweave_block_cache:index(#{
                 <<"height">> => hb_maps:get(<<"height">>, Header, not_found, Opts),
-                <<"weave-size">> => hb_maps:get(<<"weave_size">>, Header, not_found, Opts),
-                <<"hash">> => hb_maps:get(<<"indep_hash">>, Header, not_found, Opts),
-                <<"tx-root">> => hb_maps:get(<<"tx_root">>, Header, not_found, Opts)
+                <<"weave-size">> => hb_maps:get(<<"weave-size">>, Header, not_found, Opts),
+                <<"hash">> => hb_maps:get(<<"indep-hash">>, Header, not_found, Opts),
+                <<"tx-root">> => hb_maps:get(<<"tx-root">>, Header, not_found, Opts)
             }, Opts);
         _ -> ok
     end,
@@ -935,6 +935,34 @@ block_proofs(Block, Req, Opts) ->
                 [<<"poa">>, <<"poa2">>], hb_message:uncommitted(Block, Opts), Opts)
     end.
 
+%% @doc Name the fields of a block as message keys: `-' in place of `_', as in
+%% `indep-hash', in the block and in the messages nested in it, and
+%% `block-signature' and `block-nonce' for the block's `signature' and `nonce'.
+%% In `httpsig@1.0', `signature' names the header that carries the signatures
+%% of a message and `nonce' one of their parameters.
+block_keys(Block) ->
+    maps:from_list(
+        lists:map(
+            fun({<<"signature">>, Value}) -> {<<"block-signature">>, Value};
+               ({<<"nonce">>, Value}) -> {<<"block-nonce">>, Value};
+               ({Key, Value}) ->
+                    {hb_util_string:dash_chars(Key), dash_keys(Value)}
+            end,
+            maps:to_list(Block)
+        )
+    ).
+
+%% @doc Put `-' in place of `_' in the keys of a message nested in a block.
+dash_keys(Msg) when is_map(Msg) ->
+    maps:from_list(
+        [
+            {hb_util_string:dash_chars(Key), dash_keys(Value)}
+        ||
+            {Key, Value} <- maps:to_list(Msg)
+        ]
+    );
+dash_keys(Value) -> Value.
+
 %% @doc Return whether the request only permits cached values.
 only_if_cached(Req, Opts) ->
     lists:member(
@@ -952,7 +980,7 @@ current(Base, Request, Opts) ->
     #{ size => integer(), _ => _ },
     #{ size => integer(), _ => _ },
     #{ _ => _ }
-) -> {ok, binary() | #{ _ => _ }} | {error, _}.
+) -> {ok, integer() | binary() | #{ _ => _ }} | {error, _}.
 price(Base, Request, Opts) ->
     Size =
         hb_ao:get_first(
@@ -1143,7 +1171,7 @@ to_message(Path = <<"/block/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body
             },
             Opts
         ),
-    Block = block_proofs(Decoded, Req, Opts),
+    Block = block_proofs(block_keys(Decoded), Req, Opts),
     CacheRes =
         case hb_opts:get(arweave_index_blocks, true, Opts) of
             true -> dev_arweave_block_cache:write(Block, Opts);
@@ -1278,8 +1306,8 @@ block_index_reindex_test() ->
         <<"arweave-block-store">> => Store },
     Hash = hb_util:encode(crypto:strong_rand_bytes(48)),
     Entry = #{ <<"hash">> => Hash, <<"weave_size">> => <<"100">>, <<"tx_root">> => <<>> },
-    Header = #{ <<"indep_hash">> => Hash, <<"height">> => 4,
-        <<"weave_size">> => 100, <<"block_size">> => 100 },
+    Header = #{ <<"indep-hash">> => Hash, <<"height">> => 4,
+        <<"weave-size">> => 100, <<"block-size">> => 100 },
     {ok, ID} = hb_cache:write(Header, #{ <<"store">> => Store }),
     hb_cache:link(ID, Hash, #{ <<"store">> => Store }),
     hb_cache:link(ID, <<"~arweave@2.9/block/height/4">>, #{ <<"store">> => Store }),
@@ -1361,7 +1389,7 @@ include_proofs(Height) ->
             {ok, Header} = hb_ao:resolve(
                 Read#{ <<"include-proofs">> => <<"false">> }, Offline),
             ?assertEqual(Expected, Lean0(Header))
-        end, [Height, hb_maps:get(<<"indep_hash">>, Full)]),
+        end, [Height, hb_maps:get(<<"indep-hash">>, Full)]),
         % Explicit cache controls still apply to proof-free reads.
         ?assertEqual({error, not_found}, hb_ao:resolve(
             CachedReq#{ <<"include-proofs">> => false,

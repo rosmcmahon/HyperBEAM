@@ -147,7 +147,7 @@ cacheable(_Value, _AllowSigned, _Opts) -> true.
 complete(Msg, Opts) ->
     {ok, Committed} = hb_message:with_only_committed(Msg, Opts),
     lists:all(fun hb_private:is_private/1, maps:keys(Msg) -- maps:keys(Committed))
-        andalso hb_message:verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts).
+        andalso hb_message:verify(Msg, #{ <<"ids">> => <<"all">> }, Opts).
 
 %% @doc Generate a message to return when `only_if_cached' was specified, and
 %% we don't have a cached result.

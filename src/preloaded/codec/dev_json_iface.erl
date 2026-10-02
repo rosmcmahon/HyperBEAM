@@ -76,13 +76,30 @@ prep_call(RawM1, RawM2, Opts) ->
             <<"Module">> => Image,
             <<"Block-Height">> => BlockHeight
         },
-    MsgJson = hb_json:encode(MsgProps),
+    MsgJson = struct_to_json(MsgProps, Opts),
     ProcessProps =
         #{
             <<"Process">> => message_to_json_struct(Process, Opts)
         },
-    ProcessJson = hb_json:encode(ProcessProps),
+    ProcessJson = struct_to_json(ProcessProps, Opts),
     env_write(ProcessJson, MsgJson, M1, M2, Opts).
+
+%% @doc Encode a JSON-Struct as a JSON string. As in `json@1.0', a binary that
+%% is not UTF-8 text is given as its base64url, typed `binary' in the
+%% `ao-types' of the object that holds it.
+struct_to_json(Struct, Opts) ->
+    hb_json:encode(
+        hb_message:convert(
+            Struct,
+            tabm,
+            #{
+                <<"device">> => <<"structured@1.0">>,
+                <<"encode-types">> => [<<"binary">>],
+                <<"bundle">> => true
+            },
+            Opts
+        )
+    ).
 
 %% @doc Normalize a message for AOS-compatibility.
 denormalize_message(Message, Opts) ->
@@ -299,8 +316,17 @@ maybe_list_to_binary(List) when is_list(List) ->
 maybe_list_to_binary(Bin) ->
     Bin.
 
+%% @doc Convert a key to HTTP header-case. A key that is not UTF-8 text is
+%% kept as it is.
 header_case_string(Key) ->
     NormKey = hb_ao:normalize_key(Key),
+    case unicode:characters_to_binary(NormKey) =:= NormKey of
+        true -> title_case(NormKey);
+        false -> NormKey
+    end.
+
+%% @doc Capitalize each `-'-separated word of a UTF-8 key.
+title_case(NormKey) ->
     Words = string:lexemes(NormKey, "-"),
     TitleCaseWords =
         lists:map(

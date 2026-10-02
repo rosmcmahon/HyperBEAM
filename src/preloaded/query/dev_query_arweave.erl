@@ -212,7 +212,7 @@ query(_Obj, <<"networkInfo">>, _Args, Opts) ->
 query(_Obj, <<"blocks">>, Args, Opts) ->
     block_connection(Args, Opts);
 query(Block, <<"previous">>, _Args, Opts) ->
-    {ok, hb_maps:get(<<"previous_block">>, Block, null, Opts)};
+    {ok, hb_maps:get(<<"previous-block">>, Block, null, Opts)};
 query(Block, <<"height">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"height">>, Block, null, Opts)};
 query(Block, <<"timestamp">>, _Args, Opts) ->
@@ -637,8 +637,8 @@ match_block(Match, Opts) ->
 resolve_match_block(#{ <<"block-result">> := Result }, Opts) -> {Result, Opts};
 resolve_match_block(Match = #{ <<"offset">> := Offset },
         Opts = #{ <<"query-block">> := Block }) when is_integer(Offset), Offset >= 0 ->
-    End = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
-    Start = End - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+    End = hb_util:int(hb_maps:get(<<"weave-size">>, Block, 0, Opts)),
+    Start = End - hb_util:int(hb_maps:get(<<"block-size">>, Block, 0, Opts)),
     case Start =< Offset andalso Offset =< End
             andalso block_contains(Match, Block, End, Opts) of
         true -> {{ok, Block}, Opts};
@@ -718,8 +718,8 @@ indexed_block(Match = #{ <<"offset">> := Offset }, From, Height, Opts) ->
         Result = read_block(hb_maps:get(<<"hash">>, Entry, not_found, Opts), Opts),
         case Result of
             {ok, Block} ->
-                BlockEnd = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
-                Start = BlockEnd - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+                BlockEnd = hb_util:int(hb_maps:get(<<"weave-size">>, Block, 0, Opts)),
+                Start = BlockEnd - hb_util:int(hb_maps:get(<<"block-size">>, Block, 0, Opts)),
                 case Start =< Offset andalso BlockEnd =:= End
                         andalso block_contains(Match, Block, End, Opts) of
                     true -> {ok, Block};
@@ -763,8 +763,8 @@ block_at_offset(Match = #{ <<"offset">> := Offset }, Heights, Low, High, Opts) -
                 remote -> read_block(Mid, Opts);
                 _ -> read_cached_block(element(Mid, Heights), Opts)
             end,
-        End = hb_util:int(hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
-        Start = End - hb_util:int(hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+        End = hb_util:int(hb_maps:get(<<"weave-size">>, Block, 0, Opts)),
+        Start = End - hb_util:int(hb_maps:get(<<"block-size">>, Block, 0, Opts)),
         case {Offset < Start, Offset > End} of
             {true, _} -> block_at_offset(Match, Heights, Low, Mid - 1, Opts);
             {_, true} -> block_at_offset(Match, Heights, Mid + 1, High, Opts);
@@ -896,13 +896,13 @@ block_range_to_offset_range(Heights, Opts) ->
             RawMin ->
                 case read_block(hb_util:int(RawMin), Opts) of
                     {ok, MinBlock} ->
-                        % The `weave_size` is the size at the _end_ of the block,
+                        % The `weave-size` is the size at the _end_ of the block,
                         % so we must subtract the start from it to find the 
                         % starting byte of the block.
                         WeaveSize = hb_util:int(
-                            hb_maps:get(<<"weave_size">>, MinBlock, 0, Opts)),
+                            hb_maps:get(<<"weave-size">>, MinBlock, 0, Opts)),
                         BlockSize = hb_util:int(
-                            hb_maps:get(<<"block_size">>, MinBlock, 0, Opts)),
+                            hb_maps:get(<<"block-size">>, MinBlock, 0, Opts)),
                         WeaveSize - BlockSize;
                     {error, not_found} -> 0
                 end
@@ -915,7 +915,7 @@ block_range_to_offset_range(Heights, Opts) ->
                 case read_block(hb_util:int(RawMax), Opts) of
                     {ok, MaxBlock} ->
                         hb_util:int(
-                            hb_maps:get(<<"weave_size">>, MaxBlock, 0, Opts)
+                            hb_maps:get(<<"weave-size">>, MaxBlock, 0, Opts)
                         );
                     {error, not_found} -> infinity
                 end
@@ -1723,7 +1723,7 @@ pending_offsets_page_by_cursor_test() ->
         end,
     {ok, BlockMsgID} =
         hb_cache:write(
-            #{ <<"height">> => 1, <<"weave_size">> => 100, <<"block_size">> => 100 },
+            #{ <<"height">> => 1, <<"weave-size">> => 100, <<"block-size">> => 100 },
             Opts
         ),
     hb_cache:link(
@@ -1761,7 +1761,7 @@ bounded_member_pages_test() ->
         lists:enumerate([9, 10, 10, 19, 20])
     ),
     {ok, BlockID} = hb_cache:write(#{ <<"height">> => 1,
-        <<"weave_size">> => 20, <<"block_size">> => 10 }, Opts),
+        <<"weave-size">> => 20, <<"block-size">> => 10 }, Opts),
     hb_cache:link(BlockID, <<"~arweave@2.9/block/height/1">>, Opts),
     Node = hb_http_server:start_node(Opts),
     Query = <<"query($after:String,$sort:SortOrder){transactions(first:1,",

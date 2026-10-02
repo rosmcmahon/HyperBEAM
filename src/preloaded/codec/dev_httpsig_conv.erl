@@ -26,7 +26,7 @@
 %%%         - Otherwise encode the value as a part in the multipart response
 %%% 
 -module(dev_httpsig_conv).
--export([to/3, from/3, encode_http_msg/2]).
+-export([to/3, from/3, encode_http_msg/2, encode_key/1]).
 %%% Helper utilities
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -36,6 +36,15 @@
 % https://datatracker.ietf.org/doc/html/rfc7231#section-3.1.1.4
 -define(CRLF, <<"\r\n">>).
 -define(DOUBLE_CRLF, <<?CRLF/binary, ?CRLF/binary>>).
+% A byte that a header name holds as it is: `a-z', `0-9' and the `tchar'
+% punctuation of RFC 9110 other than `%'.
+-define(KEY_BYTE(C),
+    ((C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+        C == $! orelse C == $# orelse C == $$ orelse C == $& orelse
+        C == $' orelse C == $* orelse C == $+ orelse C == $- orelse
+        C == $. orelse C == $^ orelse C == $_ orelse C == $` orelse
+        C == $| orelse C == $~)
+).
 
 %% @doc Convert a HTTP Message into a TABM.
 %% HTTP Structured Field is encoded into it's equivalent TABM encoding.
@@ -56,30 +65,32 @@ from(HTTP, _Req, Opts) ->
     % Next, we need to potentially parse the body, get the ordering of the body
     % parts, and add them to the TABM.
     {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
-    % Merge the body keys with the headers.
-    WithBodyKeys = maps:merge(Headers, BodyTABM),
-    % Reconstruct the commitments from the signature headers, then remove the
-    % headers and the digest of the body. A key of the message that shares
-    % their name is data and arrives percent-encoded, so the keys are decoded
-    % afterwards.
+    % Merge the body keys with the headers, other than the signature headers and
+    % the digest of the body. A key of the message that shares one of their
+    % names is carried in a body part.
+    WithBodyKeys =
+        maps:merge(
+            hb_maps:without(
+                [
+                    <<"signature">>,
+                    <<"signature-input">>,
+                    <<"content-digest">>
+                ],
+                Headers,
+                Opts
+            ),
+            BodyTABM
+        ),
+    % Reconstruct the commitments from the signature headers.
     Commitments =
         dev_httpsig_siginfo:siginfo_to_commitments(
-            WithBodyKeys,
+            Headers,
             OrderedBodyKeys,
             Opts
         ),
     MsgWithoutSigs =
         decode_keys(
-            hb_maps:without(
-                [
-                    <<"signature">>,
-                    <<"signature-input">>,
-                    <<"content-digest">>,
-                    <<"commitments">>
-                ],
-                WithBodyKeys,
-                Opts
-            ),
+            hb_maps:without([<<"commitments">>], WithBodyKeys, Opts),
             Opts
         ),
     MsgWithSigs =
@@ -143,13 +154,16 @@ body_to_tabm(HTTP, Opts) ->
                 % That is, a body part may contain a `/` in its key, representing
                 % that the nested form is not a direct child of the parent 
                 % message. Subsequently, we need to take just the first
-                % `path part' of the key and return the unique'd list.
+                % `path part' of the key, decode it, and return the unique'd
+                % list.
                 {MessagePaths, _} = lists:unzip(OrderedBodyTABMs),
                 Keys =
                     hb_util:unique(
                         lists:map(
                             fun(Path) ->
-                                hd(binary:split(Path, <<"/">>, [global]))
+                                hb_escape:decode(
+                                    hd(binary:split(Path, <<"/">>, [global]))
+                                )
                             end,
                             MessagePaths
                         )
@@ -261,51 +275,42 @@ from_body_part(InlinedKey, Part, Opts) ->
                             false -> no_part_name_found
                         end
                 end,
-            Commitments =
-                dev_httpsig_siginfo:siginfo_to_commitments(
-                    Headers#{ PartName => RawBody },
-                    [PartName],
-                    Opts
-                ),
+            % The headers of a part are keys of the message that it holds. Its
+            % commitments are encoded as its `commitments' parts, so headers
+            % named `signature' and `signature-input' are data.
             RestHeaders =
                 hb_maps:without(
                     [<<"ao-body-key">>, <<"content-disposition">>],
                     Headers,
                     Opts
                 ),
-            PartNameSplit = binary:split(PartName, <<"/">>, [global]),
-            NestedPartName = lists:last(PartNameSplit),
+            WithoutTypes = maps:without([<<"ao-types">>], RestHeaders),
+            Types =
+                hb_maps:get(
+                    <<"ao-types">>,
+                    RestHeaders,
+                    <<>>,
+                    Opts
+                ),
             ParsedPart =
-                case hb_maps:size(Commitments, Opts) of
-                    0 ->
-                        WithoutTypes = maps:without([<<"ao-types">>], RestHeaders),
-                        Types =
-                            hb_maps:get(
-                                <<"ao-types">>,
-                                RestHeaders,
-                                <<>>,
-                                Opts
-                            ),
-                        case {hb_maps:size(WithoutTypes, Opts), Types, RawBody} of
-                            {0, <<"empty-message">>, <<>>} ->
-                                % The message is empty, so we return an empty
-                                % map.
-                                #{};
-                            {_, _, <<>>} when not HasBody ->
-                                % There is no body to the message, so we return
-                                % just the headers.
-                                RestHeaders;
-                            {0, _, _} ->
-                                % There are no headers besides content-disposition,
-                                % so we return the body as is.
-                                RawBody;
-                            {_, _, _} ->
-                                % There are other headers, so we need to parse
-                                % the body as a TABM.
-                                {_, RawBodyKey} = inline_key(Headers),
-                                RestHeaders#{ RawBodyKey => RawBody }
-                        end;
-                    _ -> maps:get(NestedPartName, Commitments, #{})
+                case {hb_maps:size(WithoutTypes, Opts), Types, RawBody} of
+                    {0, <<"empty-message">>, <<>>} ->
+                        % The message is empty, so we return an empty
+                        % map.
+                        #{};
+                    {_, _, <<>>} when not HasBody ->
+                        % There is no body to the message, so we return
+                        % just the headers.
+                        RestHeaders;
+                    {0, _, _} ->
+                        % There are no headers besides content-disposition,
+                        % so we return the body as is.
+                        RawBody;
+                    {_, _, _} ->
+                        % There are other headers, so we need to parse
+                        % the body as a TABM.
+                        {_, RawBodyKey} = inline_key(Headers),
+                        RestHeaders#{ RawBodyKey => RawBody }
                 end,
             {PartName, ParsedPart}
     end.
@@ -384,17 +389,9 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
             {ok, EncOriginal}
     end;
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
-    Msg = encode_keys(TABM),
     Stripped =
-        hb_maps:without(
-            [
-                <<"commitments">>,
-                <<"signature">>,
-                <<"signature-input">>,
-                <<"priv">>
-            ],
-            Msg,
-            Opts
+        encode_keys(
+            hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts)
         ),
     {InlineFieldHdrs, InlineKey} = inline_key(Stripped),
     Intermediate =
@@ -405,9 +402,9 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
         ),
     % Finally, add the signatures to the encoded HTTP message with the
     % commitments from the original message. A `signature' key of the message
-    % itself is data, as on an Arweave block, not a commitment.
-    CommitmentsMap = maps:get(<<"commitments">>, Msg, #{}),
-    ?event_debug({converting_commitments_to_siginfo, Msg}),
+    % itself is data, not a commitment.
+    CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
+    ?event_debug({converting_commitments_to_siginfo, TABM}),
     {ok,
         maps:merge(
             Intermediate,
@@ -435,6 +432,14 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                (Key, Value, AccMap) when Key =:= InlineKey andalso InlineKey =/= not_set ->
                     OldBody = maps:get(<<"body">>, AccMap, #{}),
                     AccMap#{ <<"body">> => OldBody#{ InlineKey => Value } };
+               (Key, Value, AccMap)
+                        when Key =:= <<"signature">>;
+                            Key =:= <<"signature-input">>;
+                            Key =:= <<"content-digest">> ->
+                    % The signatures and the digest of the body are headers of
+                    % these names, so a key of the message that shares one is
+                    % carried in a body part.
+                    field_to_http(AccMap, {Key, Value}, #{ where => body });
                (Key, Value, AccMap) ->
                     field_to_http(AccMap, {Key, Value}, #{})
             end,
@@ -542,41 +547,47 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
 
-%% @doc Percent-encode the keys that hold `%', a capital or a byte outside
-%% printable ASCII: HTTP lowercases header names and carries only printable
-%% ASCII, and `%' starts an escape. Other keys, such as `+link' keys, are sent
-%% as they are. A message's own `signature' or `content-digest' key shares a
-%% name with the signature headers or the digest of the body, so it is encoded
-%% as data on the wire, not read as a commitment or a digest.
-encode_keys(Msg) ->
+%% @doc Percent-encode the keys of a message, and of each message nested in it,
+%% with `encode_key/1'.
+encode_keys(Msg) when is_map(Msg) ->
     maps:from_list(
         lists:map(
-            fun({<<"signature", Rest/binary>>, V})
-                        when Rest =:= <<>>; Rest =:= <<"-input">> ->
-                    {<<"%73ignature", Rest/binary>>, V};
-                ({<<"content-digest">>, V}) -> {<<"%63ontent-digest">>, V};
-                ({K, V}) ->
-                    case lists:any(fun escaped_key_byte/1, binary_to_list(K)) of
-                        true -> {hb_escape:encode(K), V};
-                        false -> {K, V}
-                    end
-            end,
+            fun({K, V}) -> {encode_key(K), encode_keys(V)} end,
             maps:to_list(Msg)
         )
-    ).
+    );
+encode_keys(Value) -> Value.
 
-%% @doc Whether a key byte needs escaping on the wire.
-escaped_key_byte(C) ->
-    C =:= $% orelse (C >= $A andalso C =< $Z) orelse C < 16#20 orelse C > 16#7e.
+%% @doc Percent-encode a key as a header name. A header name is a token of the
+%% `tchar' bytes of RFC 9110, and HTTP lowercases it. A key keeps `a-z', `0-9'
+%% and the `tchar' punctuation other than `%', which starts an escape. Every
+%% other byte, including each capital, is written as `%xx' in lowercase hex.
+%% The key is scanned once: up to its first byte to escape, it is kept as it is.
+encode_key(Key) -> encode_key(Key, Key, 0).
+encode_key(Key, <<>>, _N) -> Key;
+encode_key(Key, <<C, Rest/binary>>, N) when ?KEY_BYTE(C) ->
+    encode_key(Key, Rest, N + 1);
+encode_key(Key, _Rest, N) ->
+    <<Kept:N/binary, Escaped/binary>> = Key,
+    Encoded = << <<(encode_key_byte(C))/binary>> || <<C>> <= Escaped >>,
+    <<Kept/binary, Encoded/binary>>.
 
-%% @doc Decode message keys from their percent-encoded form.
-decode_keys(Msg, _Opts) ->
+encode_key_byte(C) when ?KEY_BYTE(C) -> <<C>>;
+encode_key_byte(C) -> <<$%, (hex_digit(C bsr 4)), (hex_digit(C band 15))>>.
+
+hex_digit(D) when D < 10 -> $0 + D;
+hex_digit(D) -> $a + D - 10.
+
+%% @doc Decode the keys of a message, and of each message nested in it, from
+%% their percent-encoded form.
+decode_keys(Msg, Opts) when is_map(Msg) ->
     maps:from_list(
         lists:map(
-            fun({K, V}) -> {hb_escape:decode(K), V} end,
+            fun({K, V}) -> {hb_escape:decode(K), decode_keys(V, Opts)} end,
             maps:to_list(Msg)
         )
-    ).
+    );
+decode_keys(Value, _Opts) -> Value.
 
 %% @doc Merge maps at the same level, if possible.
 group_maps(Map) ->

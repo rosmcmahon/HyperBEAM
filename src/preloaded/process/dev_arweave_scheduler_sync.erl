@@ -191,7 +191,7 @@ validate_blocks([], State, _Opts) ->
 validate_blocks([{Height, Block} | Blocks], State, Opts) ->
     maybe
         ok ?= validate_block(Height, State, Block, Opts),
-        BlockHash = hb_maps:get(<<"indep_hash">>, Block, not_found, Opts),
+        BlockHash = hb_maps:get(<<"indep-hash">>, Block, not_found, Opts),
         true ?= is_binary(BlockHash),
         validate_blocks(
             Blocks,
@@ -898,7 +898,7 @@ response_status(_) -> 999.
 
 validate_block(Height, State, Block, Opts) ->
     ActualHeight = hb_util:int(hb_maps:get(<<"height">>, Block, -1, Opts)),
-    Previous = hb_maps:get(<<"previous_block">>, Block, not_found, Opts),
+    Previous = hb_maps:get(<<"previous-block">>, Block, not_found, Opts),
     ExpectedPrevious = hb_maps:get(<<"block-hash">>, State, not_found, Opts),
     case {
         ActualHeight =:= Height,
@@ -1129,8 +1129,8 @@ block_validation_test() ->
     Block =
         #{
             <<"height">> => 101,
-            <<"previous_block">> => <<"previous">>,
-            <<"indep_hash">> => <<"one">>
+            <<"previous-block">> => <<"previous">>,
+            <<"indep-hash">> => <<"one">>
         },
     ?assertEqual(ok, validate_block(101, State, Block, #{})),
     ?assertMatch({error, _}, validate_block(100, State, Block, #{})),
@@ -1139,15 +1139,15 @@ block_validation_test() ->
         validate_block(
             101,
             State,
-            Block#{ <<"previous_block">> => <<"other">> },
+            Block#{ <<"previous-block">> => <<"other">> },
             #{}
         )
     ),
     NextBlock =
         #{
             <<"height">> => 102,
-            <<"previous_block">> => <<"one">>,
-            <<"indep_hash">> => <<"two">>
+            <<"previous-block">> => <<"one">>,
+            <<"indep-hash">> => <<"two">>
         },
     ?assertEqual(
         {ok,
@@ -1163,7 +1163,7 @@ block_validation_test() ->
         validate_blocks(
             [
                 {101, Block},
-                {102, NextBlock#{ <<"previous_block">> => <<"wrong">> }}
+                {102, NextBlock#{ <<"previous-block">> => <<"wrong">> }}
             ],
             State,
             #{}
@@ -1189,7 +1189,7 @@ block_cache_refresh_test_() ->
                 <<"block">> => Height },
             try
                 {ok, Canonical} = fetch_block(Height, Opts),
-                Orphan = Canonical#{ <<"indep_hash">> =>
+                Orphan = Canonical#{ <<"indep-hash">> =>
                     <<"kOJgXHI4xd7gTjHGg5j9OimYygCIGyGrenmcGimIeR3jxBLZKXA9V2TKxP7J1V2v">> },
                 ?assertNotEqual(Orphan, Canonical),
                 BlockOpts = Opts#{ <<"store">> => [Blocks] },

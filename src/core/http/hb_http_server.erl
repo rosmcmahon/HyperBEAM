@@ -130,21 +130,32 @@ content_type(Filename) ->
         _ -> <<"text/plain">>
     end.
 
-%% @doc Apply a simple binary replacement template to a static file.
+%% @doc Apply a simple binary replacement template to a static file. Values are
+%% inserted as HTML text.
 apply_static_template(Body, Template) when is_map(Template) ->
     apply_static_template(Body, maps:to_list(Template));
 apply_static_template(Body, []) ->
     Body;
 apply_static_template(Body, [{Key, Value} | Rest]) ->
     apply_static_template(
-        re:replace(
+        binary:replace(
             Body,
-            <<"\\{\\{", Key/binary, "\\}\\}">>,
-            hb_util:bin(Value),
-            [global, {return, binary}]
+            <<"{{", Key/binary, "}}">>,
+            escape_html(hb_util:bin(Value)),
+            [global]
         ),
         Rest
     ).
+
+%% @doc Escape the characters that HTML reads as markup.
+escape_html(Bin) ->
+    << <<(escape_html_char(Char))/binary>> || <<Char>> <= Bin >>.
+
+escape_html_char($&) -> <<"&amp;">>;
+escape_html_char($<) -> <<"&lt;">>;
+escape_html_char($>) -> <<"&gt;">>;
+escape_html_char($") -> <<"&quot;">>;
+escape_html_char(Char) -> <<Char>>.
 
 %% @doc Print the greeter message to the console. Includes the version, operator
 %% address, URL to access the node, and the wider configuration (including the
@@ -596,7 +607,7 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     DetailsStr = hb_util:bin(hb_format:message(Details, NodeMsg, 1)),
     StacktraceStr = hb_util:bin(hb_format:trace(Stacktrace)),
     ErrorMsg =
-        #{
+        (parse_error(Details))#{
             <<"status">> => error_status(Type, Details),
             <<"type">> => hb_util:bin(hb_format:message(Type)),
             <<"details">> => DetailsStr,
@@ -621,9 +632,16 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
 
 %% @doc The status of an error response. A request whose commitments do not
-%% verify is refused as the client's error.
+%% verify or that `hb_singleton' cannot parse is refused as the client's error.
 error_status(throw, {invalid_commitments, _}) -> 400;
+error_status(throw, {invalid_singleton, _, _}) -> 400;
 error_status(_Type, _Details) -> 500.
+
+%% @doc The error type and offender of a request that `hb_singleton' cannot
+%% parse, for the reply to name them.
+parse_error({invalid_singleton, Error, Offender}) ->
+    #{ <<"error">> => hb_util:bin(Error), <<"offender">> => Offender };
+parse_error(_Details) -> #{}.
 
 %% @doc Return the list of allowed methods for the HTTP server.
 allowed_methods(Req, State) ->

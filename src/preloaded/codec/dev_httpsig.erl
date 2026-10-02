@@ -412,11 +412,16 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
                 }
             )
     end,
-    % Filter the message down to only the requested keys, then encode it.
+    % Filter the message to the requested keys and their types, then encode it.
     MsgWithOnlyInputs =
-        maps:with(
-            Inputs ++ lists:map(fun hb_escape:encode/1, Inputs),
-            Msg
+        with_types(
+            maps:with(
+                Inputs ++ lists:map(fun hb_escape:encode/1, Inputs),
+                Msg
+            ),
+            Inputs,
+            Msg,
+            Opts
         ),
     ?event_debug({msg_with_only_inputs, {priv_msg, maps:without([<<"commitments">>], MsgWithOnlyInputs)}}),
     {ok, EncodedWithSigInfo} =
@@ -454,11 +459,13 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
     % Calculate the keys that have been removed from the message, as a result
     % of being added to the body. These keys will need to be removed from the
     % `committed' list and re-added where the `content-digest' was in the
-    % `from_siginfo_keys' call.
+    % `from_siginfo_keys' call. A `content-digest' key of the message is always
+    % in the body: the header of that name is the digest of the body.
     BodyKeys =
         lists:filter(
             fun(Key) ->
-                not key_present(Key, Encoded) orelse
+                Key =:= <<"content-digest">> orelse
+                    not key_present(Key, Encoded) orelse
                     (Key =:= <<"content-type">> andalso
                         maps:get(Key, MsgWithOnlyInputs, undefined) =/=
                             maps:get(Key, Encoded, undefined))
@@ -511,6 +518,31 @@ input_keys(Msg, RawInputs) ->
         RawInputs
     ).
 
+%% @doc The committed values with the message's `ao-types' entries for their
+%% keys. A commitment covers the types of its values whether or not it lists
+%% `ao-types'.
+with_types(Values, Keys, #{ <<"ao-types">> := Types }, Opts) ->
+    % Unsigned IDs run this function, so `structured@1.0' is called raw: a
+    % resolution would read the cache and compute IDs.
+    {ok, AllTypes} =
+        hb_ao:raw(<<"structured@1.0">>, <<"decode-types">>, Types, #{}, Opts),
+    case maps:with(Keys, AllTypes) of
+        NoTypes when map_size(NoTypes) =:= 0 -> Values;
+        AllTypes -> Values#{ <<"ao-types">> => Types };
+        CommittedTypes ->
+            {ok, EncodedTypes} =
+                hb_ao:raw(
+                    <<"structured@1.0">>,
+                    <<"encode-types">>,
+                    CommittedTypes,
+                    #{},
+                    Opts
+                ),
+            Values#{ <<"ao-types">> => EncodedTypes }
+    end;
+with_types(Values, _Keys, _Msg, _Opts) ->
+    Values.
+
 %% @doc The keys a commitment lists that the message does not carry.
 missing_keys(Msg, Commitment, Opts) ->
     [
@@ -520,16 +552,16 @@ missing_keys(Msg, Commitment, Opts) ->
         not key_present(Key, Msg)
     ].
 
-%% @doc Calculate if a key or its `+link' TABM variant is present in a message.
-key_present(Key, Keys) -> key_present(true, Key, Keys).
-key_present(TryEncoded, Key, Msg) ->
-    if is_map_key(Key, Msg) orelse is_map_key(<<Key/binary, "+link">>, Msg) ->
-        true;
-    TryEncoded ->
-        key_present(false, hb_escape:encode(Key), Msg);
-    true ->
-        false
-    end.
+%% @doc Calculate if a key or its `+link' TABM variant is present in a message,
+%% as it is or percent-encoded as on the wire.
+key_present(Key, Msg) ->
+    lists:any(
+        fun(K) ->
+            is_map_key(K, Msg)
+                orelse is_map_key(dev_httpsig_conv:encode_key(K), Msg)
+        end,
+        [Key, <<Key/binary, "+link">>]
+    ).
 
 %% @doc create the signature base that will be signed in order to create the
 %% Signature and SignatureInput.
@@ -647,7 +679,7 @@ commitment_identity_test() ->
     lists:foreach(
         fun(Committed) ->
             ?assert(hb_message:verify(
-                Committed, #{ <<"commitment-ids">> => <<"all">> }, Opts)),
+                Committed, #{ <<"ids">> => <<"all">> }, Opts)),
             Forged = Committed#{ <<"commitments">> => maps:map(
                 fun(_, C) -> C#{ <<"committer">> => Victim } end,
                 maps:get(<<"commitments">>, Committed)
@@ -657,7 +689,7 @@ commitment_identity_test() ->
                 Victim => hd(maps:values(maps:get(<<"commitments">>, Committed)))
             } },
             ?assertNot(hb_message:verify(
-                Renamed, #{ <<"commitment-ids">> => <<"all">> }, Opts))
+                Renamed, #{ <<"ids">> => <<"all">> }, Opts))
         end,
         [Signed, Unsigned]
     ),
@@ -762,7 +794,7 @@ commit_secret_key_test() ->
             Opts,
             #{
                 <<"type">> => <<"hmac-sha256">>,
-                <<"secret">> => <<"test-secret">>,
+                <<"priv">> => #{ <<"secret">> => <<"test-secret">> },
                 <<"commitment-device">> => <<"httpsig@1.0">>,
                 <<"scheme">> => <<"secret">>
             }
@@ -774,14 +806,20 @@ commit_secret_key_test() ->
     ?assert(
         hb_message:verify(
             CommittedMsg,
-            #{ <<"committers">> => Committers, <<"secret">> => <<"test-secret">> },
+            #{
+                <<"committers">> => Committers,
+                <<"priv">> => #{ <<"secret">> => <<"test-secret">> }
+            },
             #{}
         )
     ),
     ?assertNot(
         hb_message:verify(
             CommittedMsg,
-            #{ <<"committers">> => Committers, <<"secret">> => <<"bad-secret">> },
+            #{
+                <<"committers">> => Committers,
+                <<"priv">> => #{ <<"secret">> => <<"bad-secret">> }
+            },
             #{}
         )
     ).

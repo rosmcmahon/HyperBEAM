@@ -316,7 +316,7 @@ normalize_message(Msg, Opts, Settings) ->
                             ID => hb_cache:ensure_all_loaded(Commitment, Opts)
                         }
                 },
-                #{ <<"commitment-ids">> => [ID] },
+                #{ <<"ids">> => [ID] },
                 Opts
             )
         end,
@@ -362,7 +362,7 @@ with_only_committed(Msg, Opts) when is_map(Msg) ->
                 CommittedKeys =
                     hb_message:committed(
                         Msg,
-                        #{ <<"commitment-ids">> => <<"all">> },
+                        #{ <<"ids">> => <<"all">> },
                         Opts
                     ),
                 % Add the ao-body-key to the committed list if it is not
@@ -493,7 +493,7 @@ committed(Msg, all, Opts) ->
 committed(Msg, none, Opts) ->
     committed(Msg, #{ <<"committers">> => <<"none">> }, Opts);
 committed(Msg, List, Opts) when is_list(List) ->
-    committed(Msg, #{ <<"commitment-ids">> => List }, Opts);
+    committed(Msg, #{ <<"ids">> => List }, Opts);
 committed(Msg, CommittersMsg, Opts) ->
     ?event(
         {committed,
@@ -517,7 +517,9 @@ verify(Msg) -> verify(Msg, all).
 verify(Msg, Committers) ->
     verify(Msg, Committers, #{}).
 verify(Msg, all, Opts) ->
-    verify(Msg, <<"all">>, Opts);
+    verify(Msg, #{ <<"ids">> => <<"all">> }, Opts);
+verify(Msg, none, Opts) ->
+    verify(Msg, <<"none">>, Opts);
 verify(Msg, signers, Opts) ->
     verify(Msg, hb_message:signers(Msg, Opts), Opts);
 verify(Msg, Committers, Opts) when not is_map(Committers) ->
@@ -601,7 +603,7 @@ deep_verify(Path, Msg, Opts) when is_map(Msg) ->
                 uncommitted(hb_private:reset(Msg), Opts)
             ),
         Verified =
-            try verify(Msg, #{ <<"commitment-ids">> => <<"all">> }, Opts)
+            try verify(Msg, #{ <<"ids">> => <<"all">> }, Opts)
             catch _:_ -> false
             end,
         case Verified of
@@ -1074,7 +1076,7 @@ normalize_commitments_modes_test() ->
     Added = normalize_commitments(SignedA#{ <<"extra">> => 3 }, Opts, all),
     ?assertEqual(id(#{ <<"a">> => 1, <<"b">> => 1, <<"extra">> => 3 }, unsigned, Opts),
         id(Added, unsigned, Opts)),
-    ?assert(verify(Added, #{ <<"commitment-ids">> => <<"all">> }, Opts)),
+    ?assert(verify(Added, #{ <<"ids">> => <<"all">> }, Opts)),
     ?assertEqual(SignedA, normalize_commitments(SignedA, Opts,
         #{ <<"verify">> => all, <<"add-unsigned">> => false })),
     % A missing key or a renamed ID cannot survive unsigned verification.

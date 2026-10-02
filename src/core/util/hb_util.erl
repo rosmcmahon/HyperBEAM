@@ -353,6 +353,8 @@ decode(map, Value) ->
             hb_structured_fields:parse_dictionary(iolist_to_binary(Value))
         )
     );
+decode(binary, Value) ->
+    decode(Value);
 decode(BinType, Value) when is_binary(BinType) ->
     decode(
         binary_to_existing_atom(to_lower(BinType), latin1),
@@ -826,8 +828,8 @@ binary_to_strings(Bin) when is_binary(Bin) ->
         _:_ ->
         try
             lists:map(
-                fun unquote/1,
-                split_depth_string_aware(<<",">>, Bin)
+                fun(Part) -> unquote(string:trim(Part)) end,
+                split_depth_string_aware($,, Bin)
             )
         catch
             _:_ ->

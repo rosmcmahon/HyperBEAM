@@ -168,7 +168,15 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
     % Merge the set-cookie message into the header map, which itself is
     % constructed from the header key-value pair list.
     HeaderMap = hb_maps:merge(hb_maps:from_list(Headers), MaybeSetCookie, Opts),
-    NormHeaderMap = hb_ao:normalize_keys(HeaderMap, Opts),
+    % A reply to a `HEAD' request, or with a 204 or 304 status, carries no
+    % body. Its `content-digest' is that of the body that it omits, so we remove
+    % it: the reply decodes without a body, rather than with an empty one.
+    BodyHeaderMap =
+        case Method == <<"HEAD">> orelse Status == 204 orelse Status == 304 of
+            true -> hb_maps:without([<<"content-digest">>], HeaderMap, Opts);
+            false -> HeaderMap
+        end,
+    NormHeaderMap = hb_ao:normalize_keys(BodyHeaderMap, Opts),
     ?event(debug_http_outbound,
         {normalized_response_headers, {norm_header_map, NormHeaderMap}},
         Opts
@@ -561,7 +569,15 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     % Get the CORS request headers from the message, if they exist.
     ReqHdr = cowboy_req:header(<<"access-control-request-headers">>, Req, <<"">>),
     HeadersWithCors = add_cors_headers(HeadersBeforeCors, ReqHdr, Opts),
-    EncodedHeaders = hb_private:reset(HeadersWithCors),
+    % A reply to a `HEAD' request, or with a 204 or 304 status, carries no
+    % body, so it carries no `content-digest' either.
+    ReplyHeaders =
+        case cowboy_req:method(Req) of
+            Method when Method == <<"HEAD">>; Status == 204; Status == 304 ->
+                hb_maps:without([<<"content-digest">>], HeadersWithCors, Opts);
+            _ -> HeadersWithCors
+        end,
+    EncodedHeaders = hb_private:reset(ReplyHeaders),
     ?event(debug_http,
         {http_replying,
             {status, {explicit, Status}},
@@ -747,6 +763,19 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                         <<"title">> => Title,
                         <<"description">> => Description
                     },
+                    Opts
+                ),
+            {Status,
+                maps:without([<<"body">>], ErrMsg),
+                maps:get(<<"body">>, ErrMsg, <<>>)
+            };
+        {400, <<"httpsig@1.0">>, false}
+                when is_map_key(<<"offender">>, Message) ->
+            {ok, ErrMsg} =
+                hb_http_server:static(
+                    <<"hyperbuddy@1.0">>,
+                    <<"400.html">>,
+                    hb_maps:with([<<"error">>, <<"offender">>], Message, Opts),
                     Opts
                 ),
             {Status,
@@ -959,19 +988,24 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                     hb_ao:raw(ArCodec, <<"deserialize">>, Body, #{}, Opts),
                 hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts);
             _ ->
-                hb_maps:merge(
-                    PrimitiveMsg,
-                    hb_message:convert(
-                        Body,
-                        <<"structured@1.0">>,
-                        #{
-                            <<"device">> => Codec,
-                            <<"accept-codec">> => <<"structured@1.0">>
-                        },
+                {ok, Committed} =
+                    hb_message:with_only_committed(
+                        hb_maps:merge(
+                            PrimitiveMsg,
+                            hb_message:convert(
+                                Body,
+                                <<"structured@1.0">>,
+                                #{
+                                    <<"device">> => Codec,
+                                    <<"accept-codec">> => <<"structured@1.0">>
+                                },
+                                Opts
+                            ),
+                            Opts
+                        ),
                         Opts
                     ),
-                    Opts
-                )
+                Committed
         end,
     % Cookie-backed commitments need the request's cookie and peer context.
     Normalized = normalize_unsigned(PrimitiveMsg, Req, Decoded, Opts),

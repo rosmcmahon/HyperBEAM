@@ -30,6 +30,7 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
     % Convert the given message to an L1 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
+    lib_arweave_common:enforce_tag_names(TX, Msg, Opts),
     Wallet = hb_opts:get(priv_wallet, no_viable_wallet, Opts),
     Signed = ar_tx:sign(TX, Wallet),
     SignedStructured =
@@ -58,20 +59,16 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
 -spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
-    OnlyWithCommitment =
-        hb_private:reset(
-            hb_message:with_commitments(
-                Req,
-                Msg,
-                Opts
-            )
-        ),
+    OnlyWithCommitment = hb_private:reset(Msg),
     ?event({verify, {only_with_commitment, {explicit, OnlyWithCommitment}}}),
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, {explicit, TX}}}),
     Res =
         tx_verifies(TX, Req, OnlyWithCommitment) andalso
-            lib_arweave_common:verify_identity(TX, OnlyWithCommitment),
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_committed_keys(
+                ?BASE_FIELDS, TX, fun dev_tx_from:fields/3,
+                OnlyWithCommitment, Opts),
     {ok, Res}.
 
 %% @doc An unsigned commitment verifies when the transaction's unsigned ID is
@@ -121,12 +118,12 @@ do_from(RawTX, Req, Opts) ->
     ?event({from, {parsed_message, hb_util:human_id(TX#tx.id)}}),
     {ok, WithCommitments}.
 
-%% @doc Inspect a message's signed tx@1.0 commitment and, if the commitment
+%% @doc Inspect a message's tx@1.0 commitment and, if the commitment
 %% carries an explicit `bundle' field, mirror that value onto the request `Req'.
 to_hint(Msg, Req, Opts) ->
     case lib_arweave_common:bundle_hint(<<"tx@1.0">>, Msg, Req, Opts) of
         not_found -> hb_ao:raw(<<"ans104@1.0">>, <<"to-hint">>, Msg, Req, Opts);
-        Hint -> Hint
+        Hint -> lib_arweave_common:signed_children_hint(Msg, Hint, Opts)
     end.
 %% @doc Internal helper to translate a message to its #tx record representation,
 %% which can then be used by ar_tx to serialize the message. We call the 
@@ -1255,7 +1252,7 @@ binary_tags_roundtrip_test() ->
         {ok, Remote} = hb_http:get(
             Node, <<"/~cache@1.0/read&read=", ID/binary>>, Opts),
         ?assert(hb_message:verify(Remote,
-            #{ <<"commitment-ids">> => [ID] }, Opts)),
+            #{ <<"ids">> => [ID] }, Opts)),
         Back = hb_message:convert(
             Remote, <<"tx@1.0">>, <<"structured@1.0">>, Opts),
         ?assertEqual(Signed#tx.tags, Back#tx.tags),

@@ -53,6 +53,7 @@ commit(Msg, Req = #{ <<"type">> := Type }, Opts)
     % Convert the given message to an ANS-104 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
+    lib_arweave_common:enforce_tag_names(TX, Msg, Opts),
     case {hb_opts:get(priv_wallet, no_viable_wallet, Opts), Type} of
         {{{?RSA_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?RSA_SIGN_TYPE} ->
             sign_tx(TX, Wallet, Opts);
@@ -93,20 +94,16 @@ sign_tx(TX, Wallet, Opts) ->
 -spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
-    OnlyWithCommitment =
-        hb_private:reset(
-            hb_message:with_commitments(
-                Req,
-                Msg,
-                Opts
-            )
-        ),
+    OnlyWithCommitment = hb_private:reset(Msg),
     ?event({verify, {only_with_commitment, OnlyWithCommitment}}),
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, TX}}),
     Res =
         item_verifies(TX, Req, OnlyWithCommitment) andalso
-            lib_arweave_common:verify_identity(TX, OnlyWithCommitment),
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_committed_keys(
+                ?BASE_FIELDS, TX, fun lib_arweave_common:fields/3,
+                OnlyWithCommitment, Opts),
     {ok, Res}.
 
 %% @doc An unsigned commitment verifies when the item's unsigned ID is the
@@ -152,13 +149,16 @@ do_from(RawTX, Req, Opts) ->
     ?event({from, {parsed_message, WithCommitments}}),
     {ok, WithCommitments}.
 
-%% @doc Inspect a message's signed ans104 commitment and, if it carries an
-%% explicit `bundle' field, mirror that value onto the request `Req'.
+%% @doc Inspect a message's ans104 commitment and, if it carries an
+%% explicit `bundle' field, mirror that value onto the request `Req'. Bundling
+%% is turned off for a message with a nested message signed by another device.
 to_hint(Msg, Req, Opts) ->
-    case lib_arweave_common:bundle_hint(<<"ans104@1.0">>, Msg, Req, Opts) of
-        not_found -> {ok, Req};
-        Hint -> Hint
-    end.
+    Hint =
+        case lib_arweave_common:bundle_hint(<<"ans104@1.0">>, Msg, Req, Opts) of
+            not_found -> {ok, Req};
+            Found -> Found
+        end,
+    lib_arweave_common:signed_children_hint(Msg, Hint, Opts).
 
 %% @doc Internal helper to translate a message to its #tx record representation,
 %% which can then be used by ar_bundles to serialize the message. We call the 

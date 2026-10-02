@@ -2,8 +2,11 @@
 -module(lib_arweave_common).
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
+-export([verify_committed_keys/5]).
+-export([enforce_tag_names/3]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
+-export([signed_children_hint/3]).
 -export([to/3, to/6, siginfo/4, fields_to_tx/4]).
 -export([bundle_header/2, bundle_header/3]).
 -include("include/hb.hrl").
@@ -92,6 +95,20 @@ tag_count(TX, TABM) when length(TX#tx.tags) > ?MAX_TAG_COUNT ->
     throw({too_many_keys, TABM});
 tag_count(TX, _TABM) ->
     TX.
+
+%% @doc Throw `invalid_tag_name' if a key of a message names a tag of its item
+%% that decoding gives another key, as decoding lowercases tag names: a
+%% commitment to the item would list the decoded key in place of the message's.
+enforce_tag_names(TX, TABM, Opts) ->
+    case lists:search(
+            fun({Name, _}) ->
+                hb_maps:is_key(Name, TABM, Opts) andalso
+                normalize_key(Name) =/= Name
+            end,
+            TX#tx.tags) of
+        false -> ok;
+        {value, {Name, _}} -> throw({invalid_tag_name, Name})
+    end.
 
 %% @doc Return a TABM message containing the fields of the given decoded
 %% ANS-104 data item that should be included in the base message.
@@ -315,6 +332,19 @@ verify_identity(Item, TABM) ->
                     )
     end.
 
+%% @doc Check that a commitment's committed keys are the keys of the item
+%% encoded from the message: its data keys, tags and fields, as decoding the
+%% item gives them. Nested items are not decoded, as only their keys are needed.
+verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
+    [Commitment] = maps:values(maps:get(<<"commitments">>, TABM)),
+    TX = ar_bundles:deserialize(Item),
+    Fields = FieldsFun(TX, <<>>, Opts),
+    Tags = tags(TX, Opts),
+    Data = data(TX, #{}, Tags, fun(_, _, _) -> {ok, <<>>} end, Opts),
+    CommittedKeys = hb_maps:get(<<"committed">>, Commitment, #{}, Opts),
+    lists:sort(committed(FieldKeys, TX, Fields, Tags, Data, Opts)) =:=
+        lists:sort(hb_util:message_to_ordered_list(CommittedKeys)).
+
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
         BaseFields, Item, Device, FieldCommitments,
@@ -505,13 +535,12 @@ deduplicating_from_list(Tags, Opts) ->
 
 %%% Encoding helpers.
 
-%% @doc Apply the `bundle' hint from a signed commitment for `Device'.
-%% Returns `not_found' when no signed commitment for `Device' exists.
+%% @doc Apply the `bundle' hint from the commitment for `Device', signed or
+%% unsigned. Returns `not_found' when no commitment for `Device' exists.
 bundle_hint(Device, Msg, Req, Opts) ->
     case hb_message:commitment(
             #{
-                <<"commitment-device">> => Device,
-                <<"committer">> => '_'
+                <<"commitment-device">> => Device
             },
             Msg,
             Opts) of
@@ -523,6 +552,37 @@ bundle_hint(Device, Msg, Req, Opts) ->
             end;
         _ -> not_found
     end.
+
+%% @doc Turn off bundling for a message with a nested message signed by a
+%% device other than `ans104@1.0': its nested messages are then linked. An item
+%% in a bundle can hold only its own ANS-104 signature, so bundling would drop
+%% the nested message's other commitments.
+signed_children_hint(Msg, {ok, Req = #{ <<"bundle">> := true }}, Opts) ->
+    Children =
+        hb_maps:values(
+            hb_maps:without([<<"commitments">>, <<"priv">>], Msg, Opts),
+            Opts
+        ),
+    case lists:any(fun(Child) -> signed_by_other(Child, Opts) end, Children) of
+        true -> {ok, Req#{ <<"bundle">> => false }};
+        false -> {ok, Req}
+    end;
+signed_children_hint(_Msg, Hint, _Opts) ->
+    Hint.
+
+%% @doc Check whether a value is a message with a signed commitment of a device
+%% other than `ans104@1.0'.
+signed_by_other(Value, Opts) ->
+    lists:any(
+        fun(Commitment) ->
+            hb_maps:get(<<"commitment-device">>, Commitment, undefined, Opts)
+                =/= <<"ans104@1.0">>
+        end,
+        hb_maps:values(
+            hb_message:commitments(#{ <<"committer">> => '_' }, Value, Opts),
+            Opts
+        )
+    ).
 
 %% @doc Calculate the fields for a message, returning an initial TX record.
 siginfo(Message, {ok, _, Commitment}, FieldsFun, Opts) ->

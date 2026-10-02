@@ -335,7 +335,7 @@ process_block(BlockRes, Current, To, IndexMode, Opts) ->
     case BlockRes of
         {ok, Block} ->
             ?event(debug_copycat, {{processing_block, Current},
-                {indep_hash, hb_maps:get(<<"indep_hash">>, Block, <<>>)}}),
+                {indep_hash, hb_maps:get(<<"indep-hash">>, Block, <<>>)}}),
             case maybe_index_ids(Block, IndexMode, Opts) of
                 {block_skipped, Results} ->
                     TotalTXs = maps:get(total_txs, Results, 0),
@@ -453,9 +453,9 @@ maybe_index_ids(Block, IndexMode, Opts) ->
             }};
         true ->
             BlockEndOffset = hb_util:int(
-                hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+                hb_maps:get(<<"weave-size">>, Block, 0, Opts)),
             BlockSize = hb_util:int(
-                hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+                hb_maps:get(<<"block-size">>, Block, 0, Opts)),
             BlockStartOffset = BlockEndOffset - BlockSize,
             case resolve_tx_headers(TXIDs, Opts) of
                 error ->
@@ -1299,9 +1299,9 @@ block_transaction_pages_test() ->
 block_index_header(Height, End, Size, TXs, Store) ->
     Opts = #{ <<"store">> => Store },
     Hash = hb_util:encode(crypto:strong_rand_bytes(48)),
-    Block = #{ <<"height">> => Height, <<"weave_size">> => End,
-        <<"block_size">> => Size, <<"txs">> => TXs, <<"tx_root">> => <<>>,
-        <<"indep_hash">> => Hash, <<"hash">> => Hash },
+    Block = #{ <<"height">> => Height, <<"weave-size">> => End,
+        <<"block-size">> => Size, <<"txs">> => TXs, <<"tx-root">> => <<>>,
+        <<"indep-hash">> => Hash, <<"hash">> => Hash },
     {ok, ID} = hb_cache:write(Block, Opts),
     hb_cache:link(ID, Hash, Opts),
     hb_cache:link(ID, <<"~arweave@2.9/block/height/", (hb_util:bin(Height))/binary>>, Opts),

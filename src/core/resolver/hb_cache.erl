@@ -289,9 +289,22 @@ generate_binary_path(Bin, Opts) ->
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    Msg = prepare_write(RawMsg, Opts),
+    write_prepared(prepare_write(RawMsg, Opts), RawMsg, Opts);
+write(List, Opts) when is_list(List) ->
+    write(hb_message:convert(List, tabm, <<"structured@1.0">>, Opts), Opts);
+write(Bin, Opts) when is_binary(Bin) ->
+    do_write_message(Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
+
+%% @doc Write `Msg', the result of `prepare_write/2' on `RawMsg'.
+write_prepared(Msg, RawMsg, Opts) ->
     hb_message:paranoid_verify(cache_write, Msg, Opts),
-    TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
+    % Conversion writes the children that it links only in `offload' mode.
+    Linked =
+        case hb_opts:get(<<"linkify-mode">>, offload, Opts) of
+            offload -> link_prepared(Msg, Opts);
+            _ -> Msg
+        end,
+    TABM = hb_message:convert(Linked, tabm, <<"structured@1.0">>, Opts),
     ?event_debug(debug_cache, {writing_full_message, {msg, TABM}}),
     try
         % The message's private keys are not written, but the `cache-write'
@@ -312,15 +325,35 @@ write(RawMsg, Opts) when is_map(RawMsg) ->
                 Opts
             ),
             erlang:raise(Type, Reason, Stacktrace)
-    end;
-write(List, Opts) when is_list(List) ->
-    write(hb_message:convert(List, tabm, <<"structured@1.0">>, Opts), Opts);
-write(Bin, Opts) when is_binary(Bin) ->
-    do_write_message(Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
+    end.
 
-%% @doc Settle children before naming their parent, including messages inside
-%% commitment metadata. Projection can invalidate commitments over extra fields,
-%% so verify both before selecting the shared fields and after removing them.
+%% @doc Write each child that conversion links with `write_prepared/3', as
+%% `prepare_write/2' has already prepared it, and replace it with a link to its
+%% ID. Values under private keys are not written. Conversion in `offload' mode
+%% writes the children it loads from links with `write/2', which prepares them
+%% first.
+link_prepared(List, Opts) when is_list(List) ->
+    [ link_prepared(true, Child, Opts) || Child <- List ];
+link_prepared(Msg, Opts) ->
+    maps:map(
+        fun(<<"commitments">>, Child) -> Child;
+           (<<"ao-types">>, Child) -> Child;
+           (Key, Child) ->
+                link_prepared(not hb_private:is_private(Key), Child, Opts)
+        end,
+        Msg
+    ).
+link_prepared(true, Child, Opts) when is_map(Child) orelse is_list(Child) ->
+    write_prepared(Child, Child, Opts),
+    ID = hb_message:id(Child, all, Opts#{ <<"linkify-mode">> => discard }),
+    {link, ID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }};
+link_prepared(_Prepared, Child, _Opts) -> Child.
+
+%% @doc Prepare a message to be written: prepare each child, except those under
+%% private keys, and each commitment message, then remove the commitments that
+%% do not verify. If commitments remain and do not commit every key that is not
+%% private, keep only the keys they commit, and again remove the commitments
+%% that do not verify over those keys.
 prepare_write(Msg, Opts) when is_map(Msg) ->
     Deep = maps:map(
         fun(<<"commitments">>, Value) ->

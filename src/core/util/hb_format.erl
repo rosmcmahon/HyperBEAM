@@ -826,7 +826,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
     CommittedKeys =
         hb_message:committed(
             MsgWithNormComms,
-            #{ <<"commitment-ids">> => <<"all">> },
+            #{ <<"ids">> => <<"all">> },
             Opts
         ),
     CommIDs = hb_maps:keys(Comms, Opts),
@@ -837,7 +837,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
                 try
                     hb_message:verify(
                         MsgWithNormComms,
-                        #{ <<"commitment-ids">> => ID },
+                        #{ <<"ids">> => ID },
                         Opts
                     )
                 catch _:_ -> false

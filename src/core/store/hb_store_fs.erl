@@ -90,8 +90,7 @@ write_path(Opts, PathComponents, Value) ->
     Path = add_prefix(Opts, hb_path:to_binary(PathComponents)),
     ?event({writing, Path, byte_size(Value)}),
     filelib:ensure_dir(Path),
-    ok = file:write_file(Path, Value),
-    ok.
+    file:write_file(Path, Value).
 
 %% @doc List contents of a directory in the store, following symlinks as
 %% needed.
@@ -108,12 +107,12 @@ list(Opts, Req = #{ <<"list">> := Path }, NodeOpts) ->
             Error
     end.
 
-%% @doc Convert a name listed by `file:list_dir_all/1' to the bytes it was
-%% written with. The VM decodes names into lists of characters from its native
+%% @doc Convert a name listed by `file:list_dir_all/1' to the key it was
+%% written for. The VM decodes names into lists of characters from its native
 %% file name encoding, and returns names it cannot decode as binaries.
-name(File) when is_binary(File) -> File;
+name(File) when is_binary(File) -> hb_escape:decode(File);
 name(File) ->
-    unicode:characters_to_binary(File, unicode, file:native_name_encoding()).
+    name(unicode:characters_to_binary(File, unicode, file:native_name_encoding())).
 
 %% @doc Replace links in a path successively, returning the final path.
 %% Each element of the path is resolved in turn, with the result of each
@@ -181,7 +180,8 @@ group(Opts = #{ <<"name">> := _DataDir }, #{ <<"group">> := Path }, _NodeOpts) -
     filelib:ensure_dir(P),
    case file:make_dir(P) of
         ok -> ok;
-        {error, eexist} -> ok
+        {error, eexist} -> ok;
+        {error, Reason} -> {error, Reason}
     end.
 
 %% @doc Create a symlink, handling the case where the link would point to itself.
@@ -249,18 +249,20 @@ add_prefix(#{ <<"name">> := Prefix }, Path) ->
     end.
 
 %% @doc Refuse a key that the filesystem would resolve outside the store root.
+%% Percent-encode any other key, so that keys differing only in case or Unicode
+%% normalization do not share a file.
 %%
 %% Keys are caller-supplied. `..' names no AO-Core key, so refusing it costs
 %% nothing; the operating system would otherwise walk it out of the root.
 safe_path(Path) ->
     case binary:match(hb_path:to_binary(Path), [<<"..">>, <<0>>]) of
-        nomatch -> Path;
+        nomatch -> hb_escape:encode(Path);
         _ -> throw({unsafe_store_key, Path})
     end.
 
-%% @doc Remove the directory prefix from a path.
+%% @doc Remove the directory prefix from a path, and decode the key.
 remove_prefix(#{ <<"name">> := Prefix }, Path) ->
-    hb_util:remove_common(Path, Prefix).
+    hb_escape:decode(hb_util:bin(hb_util:remove_common(Path, Prefix))).
 
 %%% TESTS
 

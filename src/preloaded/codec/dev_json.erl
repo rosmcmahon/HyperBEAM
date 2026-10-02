@@ -37,7 +37,8 @@ to(Msg, Req, Opts) ->
     % 1. Convert it to a structured message.
     % 2. Load any linked items if we are in `bundle' mode.
     % 3. Convert it back to a TABM message, this time preserving all types
-    %    aside `atom's -- for which JSON has no native support.
+    %    aside `atom's and binaries that are not UTF-8 text -- for which JSON
+    %    has no native support.
     Restructured =
         hb_message:convert(
             hb_private:reset(Msg),
@@ -56,7 +57,7 @@ to(Msg, Req, Opts) ->
             tabm,
             #{
                 <<"device">> => <<"structured@1.0">>,
-                <<"encode-types">> => [<<"atom">>],
+                <<"encode-types">> => [<<"atom">>, <<"binary">>],
                 <<"bundle">> => Bundle
             },
             ConvOpts

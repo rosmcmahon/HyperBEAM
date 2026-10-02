@@ -90,7 +90,7 @@ id(Base, Req) -> id(Base, Req, #{}).
     binary() | [#{ _ => _ }] | #{ commitments => #{ _ => _ }, _ => _ },
     #{
         committers => _,
-        'commitment-ids' => _,
+        ids => _,
         'id-device' => binary(),
         _ => _
     },
@@ -101,14 +101,15 @@ id(Base, _, NodeOpts) when is_binary(Base) ->
     % format of the message ID return.
     {ok, hb_util:human_id(hb_path:hashpath(Base, NodeOpts))};
 id(List, Req, NodeOpts) when is_list(List) ->
-    % Return the list of IDs for a list of messages.
+    % Return the list of IDs for a list of messages, without writing them.
+    IDOpts = NodeOpts#{ <<"linkify-mode">> => discard },
     SourceSpec =
         hb_message:add_bundle_hint(
             #{ <<"device">> => <<"structured@1.0">> },
             Req#{ <<"device">> => ?DEFAULT_ID_DEVICE },
             NodeOpts
         ),
-    id(hb_message:convert(List, tabm, SourceSpec, NodeOpts), Req, NodeOpts);
+    id(hb_message:convert(List, tabm, SourceSpec, IDOpts), Req, NodeOpts);
 id(RawBase, Req, NodeOpts) ->
     % Ensure that the base message is normalized before proceeding.
     IDOpts = NodeOpts#{ <<"linkify-mode">> => discard },
@@ -274,6 +275,11 @@ committers(_, _, _) ->
 ) -> {ok, #{ commitments := #{ _ => _ }, _ => _ }}.
 commit(Self, Req, Opts) ->
     {ok, Base} = hb_message:find_target(Self, Req, Opts),
+    % The empty key names no key, so no codec carries a commitment to it.
+    case is_map_key(<<>>, Base) of
+        true -> throw({invalid_key, <<>>});
+        false -> ok
+    end,
     AttDev =
         case hb_maps:get(<<"commitment-device">>, Req, not_specified, Opts) of
             not_specified ->
@@ -327,10 +333,10 @@ committed_keys(Commitment, Opts) ->
 %% @doc Verify a message. By default, all commitments are verified. The
 %% `committers' key in the request can be used to specify that only the 
 %% commitments from specific committers should be verified. Similarly, specific
-%% commitments can be specified using the `commitments' key.
+%% commitments can be specified using the `ids' key.
 -spec verify(
     #{ _ => _ },
-    #{ committers => _, 'commitment-ids' => _, commitments => _, _ => _ },
+    #{ committers => _, ids => _, commitments => _, _ => _ },
     #{ _ => _ }
 ) -> {ok, boolean()}.
 verify(Self, Req, Opts) ->
@@ -338,38 +344,41 @@ verify(Self, Req, Opts) ->
     {ok, RawBase} = hb_message:find_target(Self, Req, Opts),
     CommitmentBase = ensure_commitments_loaded(RawBase, Opts),
     Commitments = maps:get(<<"commitments">>, CommitmentBase, #{}),
-    % A request with neither `committers' nor `commitment-ids' verifies every
-    % commitment of the message.
+    % A request with neither `committers' nor `ids' verifies every
+    % commitment of the message. `committers=none' without `ids'
+    % verifies every commitment without a committer.
     Selection =
-        case maps:with([<<"committers">>, <<"commitment-ids">>], Req) of
+        case maps:with([<<"committers">>, <<"ids">>], Req) of
             None when map_size(None) == 0 ->
-                Req#{ <<"commitment-ids">> => <<"all">> };
+                Req#{ <<"ids">> => <<"all">> };
+            #{ <<"committers">> := <<"none">> }
+                    when not is_map_key(<<"ids">>, Req) ->
+                Unsigned =
+                    maps:filter(
+                        fun(_, Commitment) ->
+                            not maps:is_key(<<"committer">>, Commitment)
+                        end,
+                        Commitments
+                    ),
+                Req#{ <<"ids">> => maps:keys(Unsigned) };
             _ -> Req
         end,
     IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),
-    % Generate the new commitment request base messsage by removing the keys
-    % used by this function (path, committers, commitments) and returning the
-    % remaining keys. This message will then be merged with each commitment
-    % message to generate the final request, allowing the caller to pass
-    % additional keys to the commitment device.
-    ReqBase =
-        maps:without(
-            [
-                <<"path">>,
-                <<"committers">>,
-                <<"commitments">>,
-                <<"commitment-ids">>
-            ],
-            Req
-        ),
+    % The commitment device receives the keys of each commitment and the
+    % private element of the request. No other key of the request reaches it.
+    ReqPriv = hb_private:from_message(Req),
+    % Verification derives the IDs of nested messages without writing the
+    % messages to the cache.
+    VerifyOpts = Opts#{ <<"linkify-mode">> => discard },
     % Verify the commitments. Stop execution if any fail.
     Res =
         lists:all(
             fun(CommitmentID) ->
-                Commitment = maps:merge(
-                    ReqBase,
-                    maps:get(CommitmentID, Commitments)
-                ),
+                Commitment =
+                    hb_private:set_priv(
+                        maps:get(CommitmentID, Commitments),
+                        ReqPriv
+                    ),
                 % Build the source spec from the commitment device alone: a
                 % `hint-device' lets the structured codec reproduce each
                 % subtree in the bundle state it was committed in. The verify
@@ -412,7 +421,7 @@ verify(Self, Req, Opts) ->
                         },
                         Opts
                     ),
-                Base = hb_message:convert(Covered, tabm, SourceSpec, Opts),
+                Base = hb_message:convert(Covered, tabm, SourceSpec, VerifyOpts),
                 ?event(verify, {verify, {base_found, Base}}),
                 {ok, Res} =
                     verify_commitment(
@@ -450,7 +459,7 @@ verify_commitment(Base, Commitment, Opts) ->
 %% @doc Return the list of committed keys from a message.
 -spec committed(
     #{ _ => _ },
-    #{ raw => boolean(), committers => _, 'commitment-ids' => _, _ => _ },
+    #{ raw => boolean(), committers => _, ids => _, _ => _ },
     #{ _ => _ }
 ) -> {ok, [binary()]}.
 committed(Self, Req, Opts) ->
@@ -541,7 +550,7 @@ commitment_ids_from_request(Base, Req, Opts) ->
             X when is_list(X) -> X;
             CommitterDescriptor -> hb_ao:normalize_key(CommitterDescriptor)
         end,
-    RawReqCommitments = maps:get(<<"commitment-ids">>, Req, <<"none">>),
+    RawReqCommitments = maps:get(<<"ids">>, Req, <<"none">>),
     ReqCommitments =
         case RawReqCommitments of
             X2 when is_list(X2) -> X2;
