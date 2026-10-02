@@ -394,7 +394,10 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
     Stripped =
         encode_keys(
-            hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts)
+            without_unsigned_commitments(
+                hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts),
+                Opts
+            )
         ),
     {InlineFieldHdrs, InlineKey} = inline_key(Stripped),
     Intermediate =
@@ -560,6 +563,35 @@ encode_keys(Msg) when is_map(Msg) ->
         )
     );
 encode_keys(Value) -> Value.
+
+%% @doc Remove the unsigned commitments (those with no `committer') of a
+%% message and of each message nested in it. A nested message is read from a
+%% store with the commitments that the ID linking it names: its signed
+%% commitments, or the unsigned commitment stored under its unsigned ID if it
+%% has none, whether or not it held that commitment when written. A signature
+%% over a bundled message covers its nested messages with their signed
+%% commitments alone, so it verifies after a write and a read.
+without_unsigned_commitments(Msg, Opts) when is_map(Msg) ->
+    maps:filtermap(
+        fun(<<"commitments">>, Commitments) ->
+                Signed =
+                    hb_maps:filter(
+                        fun(_ID, Commitment) ->
+                            hb_maps:is_key(<<"committer">>, Commitment, Opts)
+                        end,
+                        Commitments,
+                        Opts
+                    ),
+                case map_size(Signed) of
+                    0 -> false;
+                    _ -> {true, Signed}
+                end;
+           (_Key, Value) ->
+                {true, without_unsigned_commitments(Value, Opts)}
+        end,
+        Msg
+    );
+without_unsigned_commitments(Value, _Opts) -> Value.
 
 %% @doc Percent-encode a key as a header name. A header name is a token of the
 %% `tchar' bytes of RFC 9110, and HTTP lowercases it. A key keeps `a-z', `0-9'

@@ -1716,7 +1716,15 @@ nested_signed_bundle_over_http_test() ->
         end,
     ?assert(hb_message:verify(Received, all, ServerOpts)),
     ReceivedInner = maps:get(<<"response">>, Received),
-    ?assertEqual(Inner, ReceivedInner),
+    % A bundle holds the signed commitments of its nested messages alone.
+    ?assertEqual(
+        hb_message:with_only_committers(
+            Inner,
+            hb_message:signers(Inner, ClientOpts),
+            ClientOpts
+        ),
+        ReceivedInner
+    ),
     ?assert(hb_message:verify(ReceivedInner, all, ServerOpts)),
     ?assertEqual(
         ReceivedInner,
