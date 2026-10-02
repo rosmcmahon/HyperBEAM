@@ -810,7 +810,8 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_map(Value) ->
 field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     NormalizedName = hb_ao:normalize_key(Name),
     % The default location where the value is encoded within the HTTP
-    % message depends on its size.
+    % message depends on its size, and on whether it starts or ends with a
+    % space or tab.
     % 
     % So we check whether the size of the value is within the threshold
     % to encode as a header, and otherwise default to encoding in the body.
@@ -819,7 +820,11 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     % value -- this is only a default location if not specified in Opts 
     DefaultWhere =
         case {maps:get(where, Opts, headers), byte_size(Value)} of
-            {headers, Fits} when Fits =< ?MAX_HEADER_LENGTH -> headers;
+            {headers, Fits} when Fits =< ?MAX_HEADER_LENGTH ->
+                case edge_whitespace(Value) of
+                    true -> body;
+                    false -> headers
+                end;
             _ -> body
         end,
     case maps:get(where, Opts, DefaultWhere) of
@@ -829,6 +834,13 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
             OldBody = hb_maps:get(<<"body">>, Httpsig, #{}, Opts),
             Httpsig#{ <<"body">> => OldBody#{ NormalizedName => Value } }
     end.
+
+%% @doc Whether a value starts or ends with a space or tab. HTTP strips them
+%% from a header value, so such a value is not sent as one.
+edge_whitespace(<<>>) -> false;
+edge_whitespace(Value) ->
+    lists:member(binary:first(Value), " \t")
+        orelse lists:member(binary:last(Value), " \t").
 
 %% @doc Multipart headers preserve literal backslashes and line breaks.
 multipart_header_bytes_roundtrip_test() ->
