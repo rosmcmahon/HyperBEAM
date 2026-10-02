@@ -396,17 +396,9 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
             {ok, EncOriginal}
     end;
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
-    Msg = encode_keys(TABM),
     Stripped =
-        hb_maps:without(
-            [
-                <<"commitments">>,
-                <<"signature">>,
-                <<"signature-input">>,
-                <<"priv">>
-            ],
-            Msg,
-            Opts
+        encode_keys(
+            hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts)
         ),
     {InlineFieldHdrs, InlineKey} = inline_key(Stripped),
     Intermediate =
@@ -418,8 +410,8 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
     % Finally, add the signatures to the encoded HTTP message with the
     % commitments from the original message. A `signature' key of the message
     % itself is data, as on an Arweave block, not a commitment.
-    CommitmentsMap = maps:get(<<"commitments">>, Msg, #{}),
-    ?event_debug({converting_commitments_to_siginfo, Msg}),
+    CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
+    ?event_debug({converting_commitments_to_siginfo, TABM}),
     {ok,
         maps:merge(
             Intermediate,
@@ -554,22 +546,24 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
     ?event_debug({final_body_map, {msg, Enc2}}),
     Enc2.
 
-%% @doc Percent-encode the keys of a message with `encode_key/1'. A message's
-%% own `signature' or `content-digest' key shares a name with the signature
-%% headers or the digest of the body, so it is encoded as data on the wire, not
-%% read as a commitment or a digest.
-encode_keys(Msg) ->
+%% @doc Percent-encode the keys of a message, and of each message nested in it,
+%% with `encode_key/1'. A message's own `signature' or `content-digest' key
+%% shares a name with the signature headers or the digest of the body, so it is
+%% encoded as data on the wire, not read as a commitment or a digest.
+encode_keys(Msg) when is_map(Msg) ->
     maps:from_list(
         lists:map(
             fun({<<"signature", Rest/binary>>, V})
                         when Rest =:= <<>>; Rest =:= <<"-input">> ->
-                    {<<"%73ignature", Rest/binary>>, V};
-                ({<<"content-digest">>, V}) -> {<<"%63ontent-digest">>, V};
-                ({K, V}) -> {encode_key(K), V}
+                    {<<"%73ignature", Rest/binary>>, encode_keys(V)};
+                ({<<"content-digest">>, V}) ->
+                    {<<"%63ontent-digest">>, encode_keys(V)};
+                ({K, V}) -> {encode_key(K), encode_keys(V)}
             end,
             maps:to_list(Msg)
         )
-    ).
+    );
+encode_keys(Value) -> Value.
 
 %% @doc Percent-encode a key as a header name. A header name is a token of the
 %% `tchar' bytes of RFC 9110, and HTTP lowercases it. A key keeps `a-z', `0-9'
@@ -591,14 +585,16 @@ encode_key_byte(C) -> <<$%, (hex_digit(C bsr 4)), (hex_digit(C band 15))>>.
 hex_digit(D) when D < 10 -> $0 + D;
 hex_digit(D) -> $a + D - 10.
 
-%% @doc Decode message keys from their percent-encoded form.
-decode_keys(Msg, _Opts) ->
+%% @doc Decode the keys of a message, and of each message nested in it, from
+%% their percent-encoded form.
+decode_keys(Msg, Opts) when is_map(Msg) ->
     maps:from_list(
         lists:map(
-            fun({K, V}) -> {hb_escape:decode(K), V} end,
+            fun({K, V}) -> {hb_escape:decode(K), decode_keys(V, Opts)} end,
             maps:to_list(Msg)
         )
-    ).
+    );
+decode_keys(Value, _Opts) -> Value.
 
 %% @doc Merge maps at the same level, if possible.
 group_maps(Map) ->
