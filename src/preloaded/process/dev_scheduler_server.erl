@@ -55,8 +55,23 @@ start(ProcID, Proc, Opts) ->
                     not_found ->
                         ?event({starting_new_schedule, {proc_id, ProcID}}),
                         {-1, undefined};
-                    {Slot, Base} ->
-                        {Slot, Base}
+                    {Slot, Latest} ->
+                        % The next assignment applies to the state after the
+                        % latest one, as `do_assign/3' sets it.
+                        {
+                            Slot,
+                            next_hashpath(
+                                hb_ao:get_first(
+                                    [
+                                        {Latest, <<"base-hashpath">>},
+                                        {Latest, <<"hash-chain">>}
+                                    ],
+                                    #{ <<"hashpath">> => ignore }
+                                ),
+                                Latest,
+                                #{ hashpath_alg => HashpathAlg, opts => Opts }
+                            )
+                        }
                 end,
             ?event(
                 {scheduler_got_process_info,

@@ -144,16 +144,7 @@ latest(ProcID, RawOpts) ->
                 AssignmentNum,
                 Opts
             ),
-            {
-                AssignmentNum,
-                hb_ao:get_first(
-                    [
-                        {Assignment, <<"base-hashpath">>},
-                        {Assignment, <<"hash-chain">>}
-                    ],
-                    #{ <<"hashpath">> => ignore }
-                )
-            }
+            {AssignmentNum, Assignment}
     end.
 
 %%% Tests
