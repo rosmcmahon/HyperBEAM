@@ -159,7 +159,10 @@ charge(_, RawReq, NodeMsg) ->
     case hb_message:signers(Req, NodeMsg) of
         [] ->
             ?event(payment, {charge, {error, <<"No signers">>}}),
-            {ok, false};
+            {error, #{
+                <<"status">> => 400,
+                <<"body">> => <<"No signers in charge.">>
+            }};
         [Signer] ->
             Price = hb_ao:get(<<"quantity">>, RawReq, 0, NodeMsg),
             NewBalance = debit(Signer, Price, NodeMsg),
