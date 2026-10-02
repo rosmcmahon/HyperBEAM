@@ -65,16 +65,17 @@ from(HTTP, _Req, Opts) ->
     % Next, we need to potentially parse the body, get the ordering of the body
     % parts, and add them to the TABM.
     {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
-    % Merge the body keys with the headers, other than the signature headers and
-    % the digest of the body. A key of the message that shares one of their
-    % names is carried in a body part.
+    % Merge the body keys with the headers, other than the signature headers,
+    % the digest of the body and the length of the HTTP body. A key of the
+    % message that shares one of their names is carried in a body part.
     WithBodyKeys =
         maps:merge(
             hb_maps:without(
                 [
                     <<"signature">>,
                     <<"signature-input">>,
-                    <<"content-digest">>
+                    <<"content-digest">>,
+                    <<"content-length">>
                 ],
                 Headers,
                 Opts
@@ -441,10 +442,11 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                (Key, Value, AccMap)
                         when Key =:= <<"signature">>;
                             Key =:= <<"signature-input">>;
-                            Key =:= <<"content-digest">> ->
-                    % The signatures and the digest of the body are headers of
-                    % these names, so a key of the message that shares one is
-                    % carried in a body part.
+                            Key =:= <<"content-digest">>;
+                            Key =:= <<"content-length">> ->
+                    % The signatures, the digest of the body and the length of
+                    % the HTTP body are headers of these names, so a key of the
+                    % message that shares one is carried in a body part.
                     field_to_http(AccMap, {Key, Value}, #{ where => body });
                (Key, Value, AccMap) ->
                     field_to_http(AccMap, {Key, Value}, #{})
