@@ -264,8 +264,8 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(writes_complete),
             ?event(uploading_message),
-            hb_client_remote:upload(Message, Opts),
-            hb_client_remote:upload(Assignment, Opts),
+            upload(Message, Opts),
+            upload(Assignment, Opts),
             ?event(uploads_complete),
             maybe_inform_recipient(
                 remote_confirmation,
@@ -313,6 +313,23 @@ maybe_inform_recipient(Mode, ReplyPID, Message, Assignment, State) ->
     case maps:get(mode, State) of
         Mode -> ReplyPID ! {scheduled, Message, Assignment};
         _ -> ok
+    end.
+
+%% @doc Upload a message once its assignment is written. The slot is taken by
+%% then, so an exception from the upload is logged and returned as an error,
+%% and the slot counter still moves past the written slot.
+upload(Msg, Opts) ->
+    try hb_client_remote:upload(Msg, Opts)
+    catch
+        Class:Reason:Stack ->
+            ?event(warning,
+                {upload_failed,
+                    {class, Class},
+                    {reason, Reason},
+                    {trace, Stack}
+                }
+            ),
+            {error, Reason}
     end.
 
 %% @doc Find the hashpath of the base state upon which a new assignment should

@@ -132,7 +132,10 @@ post_tx(_Base, Request, Opts, <<"ans104@1.0">>) ->
             <<"body">> => Request
         },
         Opts
-    ).
+    );
+post_tx(_Base, _Request, _Opts, Device) ->
+    ?event(error, {unsupported_commitment_device, Device}),
+    {error, <<"Unsupported commitment device on `POST tx` request.">>}.
 
 post_tx_header(TX, Opts) ->
     JSON = ar_tx:tx_to_json_struct(TX#tx{ data = <<>> }),
