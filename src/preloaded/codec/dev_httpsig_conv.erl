@@ -302,7 +302,7 @@ from_body_part(InlinedKey, Part, Opts) ->
                         % There is no body to the message, so we return
                         % just the headers.
                         RestHeaders;
-                    {0, _, _} ->
+                    {0, <<>>, _} ->
                         % There are no headers besides content-disposition,
                         % so we return the body as is.
                         RawBody;
