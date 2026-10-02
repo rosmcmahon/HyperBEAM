@@ -36,7 +36,6 @@
 -export([from/2, from_path/1, to/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
--define(MAX_SEGMENT_LENGTH, 512).
 
 -type ao_message() :: map() | binary().
 -type tabm_message() :: map().
@@ -200,15 +199,12 @@ normalize_base([{as, DevID, First}|Rest]) -> [{as, DevID, First}|Rest];
 normalize_base([Subres = {resolve, _}|Rest]) -> [Subres|Rest];
 normalize_base(Rest) -> [#{}|Rest].
 
-%% @doc Split the path into segments, filtering out empty segments and
-%% segments that are too long.
+%% @doc Split the path into segments, filtering out empty segments.
 path_parts(Sep, PathBin) when is_binary(PathBin) ->
     Res = lists:filtermap(
         fun(Part) ->
             case byte_size(Part) of
                 0 -> false;
-                TooLong when TooLong > ?MAX_SEGMENT_LENGTH ->
-                    throw({invalid_singleton, segment_too_long, Part});
                 _ -> {true, Part}
             end
         end,
