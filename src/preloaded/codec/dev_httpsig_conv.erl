@@ -484,9 +484,16 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                 % Otherwise, we need to encode the body map as the
                 % multipart body of the HTTP message
                 ?event_debug({encoding_multipart, {bodymap, {explicit, GroupedBodyMap}}}),
+                % The message's own `content-type' header moves into a part.
+                % Part bodies are not escaped, so the part holds the value as
+                % given.
                 Parts =
                     maps:merge(
-                        maps:with([<<"content-type">>], Enc0), GroupedBodyMap
+                        maps:map(
+                            fun(_, Value) -> hb_escape:decode_header(Value) end,
+                            maps:with([<<"content-type">>], Enc0)
+                        ),
+                        GroupedBodyMap
                     ),
                 PartList = hb_util:to_sorted_list(
                     hb_maps:map(
