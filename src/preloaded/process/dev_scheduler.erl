@@ -168,11 +168,13 @@ validate_next_slot(Base, [NextAssignment|Assignments], Lookahead, Last, Opts) ->
                             Opts
                         );
                     false ->
-                        Base#{
-                            <<"scheduler@1.0">> => #{
+                        hb_private:set(
+                            Base,
+                            #{ <<"scheduler@1.0">> => #{
                                 <<"lookahead-worker">> => Lookahead
-                            }
-                        }
+                            }},
+                            Opts
+                        )
                 end,
             ?event(debug_next,
                 {next_returning,
