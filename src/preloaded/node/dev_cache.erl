@@ -199,7 +199,9 @@ setup_test_env() ->
             #{
                 <<"store-module">> => hb_store_remote_node,
                 <<"node">> => Node,
-                <<"priv-wallet">> => Wallet
+                <<"priv-wallet">> => Wallet,
+                % The tests read back the `data/' path of a binary they write.
+                <<"trusted">> => true
             }
 	    ]
     },

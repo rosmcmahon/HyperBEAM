@@ -46,17 +46,20 @@ type(Opts = #{ <<"node">> := Node }, #{ <<"type">> := Key }, _NodeOpts) ->
         Other -> Other
     end.
 
-%% @doc Read a key from the remote node.
-%%
-%% Makes an HTTP GET request to the remote node and returns the
-%% committed message.
+%% @doc Read a key from the remote node. A key that is not an ID names the
+%% remote node's own state, which its reply cannot be checked against, so it
+%% is read only if the store sets `trusted' to `true'.
 %%
 %% @param Opts A map of options (including node configuration).
 %% @param Key The key to read.
 %% @returns `{ok, Msg}' on success or `{error, not_found}' if the key is missing.
-read_request(#{ <<"only-ids">> := true }, Key) when not ?IS_ID(Key) ->
-    {error, not_found};
-read_request(Opts = #{ <<"node">> := Node }, Key) ->
+read_request(Opts, Key) when ?IS_ID(Key) -> remote_read(Opts, Key);
+read_request(Opts = #{ <<"trusted">> := true }, Key) -> remote_read(Opts, Key);
+read_request(_, _) -> {error, not_found}.
+
+%% @doc Make an HTTP GET request for a key to the remote node and return the
+%% committed message.
+remote_read(Opts = #{ <<"node">> := Node }, Key) ->
     ?event(store_remote_node, {executing_read, {node, Node}, {key, Key}}),
     Path =
         case ?IS_ID(Key) of
@@ -86,7 +89,7 @@ read_request(Opts = #{ <<"node">> := Node }, Key) ->
             ?event(store_remote_node, {read_not_found, {key, Key}}),
             {error, not_found}
     end;
-read_request(_, _) -> {error, not_found}.
+remote_read(_, _) -> {error, not_found}.
 read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
     read_request(Opts, Key).
 
@@ -334,6 +337,6 @@ read_only_ids_test() ->
     RemoteStore = [
 		#{ <<"store-module">> => hb_store_remote_node,
            <<"node">> => Node,
-           <<"only-ids">> => true }
+           <<"trusted">> => false }
 	],
     ?assertEqual({error, not_found}, hb_cache:read(ID, #{ <<"store">> => RemoteStore })).
