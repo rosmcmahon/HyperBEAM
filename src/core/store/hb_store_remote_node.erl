@@ -74,8 +74,14 @@ read_request(Opts = #{ <<"node">> := Node }, Key) ->
             % returning the whole response to get the test-key
             Msg = without_transport_commitment(Res, Opts),
             ?event(store_remote_node, {read_found, {result, Msg, response, Res}}),
-            maybe_cache(Opts, Msg),
-            {ok, Msg};
+            case not ?IS_ID(Key) orelse has_id(Msg, Key, Opts) of
+                true ->
+                    maybe_cache(Opts, Msg),
+                    {ok, Msg};
+                false ->
+                    ?event(store_remote_node, {read_other_id, {key, Key}}),
+                    {error, not_found}
+            end;
         {error, _Err} ->
             ?event(store_remote_node, {read_not_found, {key, Key}}),
             {error, not_found}
@@ -83,6 +89,19 @@ read_request(Opts = #{ <<"node">> := Node }, Key) ->
 read_request(_, _) -> {error, not_found}.
 read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
     read_request(Opts, Key).
+
+%% @doc Return whether a message read by an ID has that ID: its uncommitted ID,
+%% the ID of one of its commitments, or the combined ID of its commitments, as
+%% `hb_cache:write/2' links it under. Its commitments must verify, as a reply
+%% names each one by the key that holds it. A binary has the ID of its data.
+has_id(Msg, ID, Opts) when is_map(Msg) ->
+    lists:member(
+        hb_util:human_id(ID),
+        [hb_message:id(Msg, none, Opts), hb_message:id(Msg, all, Opts)] ++
+            hb_maps:keys(hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts)
+    ) andalso hb_message:verify(Msg, all, Opts);
+has_id(Bin, ID, Opts) ->
+    hb_util:human_id(ID) == hb_message:id(Bin, none, Opts).
 
 %% @doc Remove the transport commitments from the response: the replying
 %% node's signature over `hashpath', and its unsigned commitment over the keys
