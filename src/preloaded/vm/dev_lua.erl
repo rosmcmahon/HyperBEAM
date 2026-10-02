@@ -370,9 +370,12 @@ process_response({ok, [Status, MsgResult], NewState}, Priv, Opts) ->
     case decode(MsgResult, Opts) of
         Msg when is_map(Msg) ->
             ?event(lua, {response, {status, Status}, {msg, Msg}}),
+            % Each call encodes its arguments and results as new tables in
+            % the state. Luerl frees the tables that Lua no longer reaches
+            % only when it collects garbage, so collect after each call.
             {hb_util:atom(Status), Msg#{
                 <<"priv">> => Priv#{
-                    <<"state">> => NewState
+                    <<"state">> => luerl:gc(NewState)
                 }
             }};
         NonMsgRes -> {hb_util:atom(Status), NonMsgRes}
