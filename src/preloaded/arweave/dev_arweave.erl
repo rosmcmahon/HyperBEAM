@@ -969,6 +969,18 @@ dash_keys(Msg) when is_map(Msg) ->
     );
 dash_keys(Value) -> Value.
 
+%% @doc Whether a peer's block is the block its path asked for, or an error:
+%% `/block/height/<n>' asks for `height' `n', `/block/hash/<id>' for
+%% `indep-hash' `id', and `/block/current' for any block.
+requested_block(<<"height/", Height/binary>>, Block, Opts) ->
+    hb_maps:get(<<"height">>, Block, not_found, Opts) =:= hb_util:int(Height)
+        orelse {error, 'invalid-block-height'};
+requested_block(<<"hash/", ID/binary>>, Block, Opts) ->
+    hb_maps:get(<<"indep-hash">>, Block, not_found, Opts) =:= ID
+        orelse {error, 'invalid-indep-hash'};
+requested_block(<<"current">>, _Block, _Opts) ->
+    true.
+
 %% @doc Return whether the request only permits cached values.
 only_if_cached(Req, Opts) ->
     lists:member(
@@ -1149,7 +1161,7 @@ to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, Response}, LogExtra, _R
     % A reply without a body carries empty data.
     event_request(Path, <<"GET">>, 200, LogExtra),
     {ok, hb_maps:get(<<"body">>, Response, <<>>, Opts)};
-to_message(Path = <<"/block/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
+to_message(Path = <<"/block/", Ref/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
     Decoded =
         hb_message:convert(
@@ -1164,22 +1176,25 @@ to_message(Path = <<"/block/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body
             Opts
         ),
     Block = block_proofs(block_keys(Decoded), Req, Opts),
-    CacheRes =
-        case hb_opts:get(arweave_index_blocks, true, Opts) of
-            true -> dev_arweave_block_cache:write(Block, Opts);
-            false -> skipped
-        end,
-    ?event(
-        debug_arweave_index,
-        {
-            if CacheRes == skipped -> skipped_caching_arweave_block;
-            true -> cached_arweave_block
+    maybe
+        true ?= requested_block(Ref, Block, Opts),
+        CacheRes =
+            case hb_opts:get(arweave_index_blocks, true, Opts) of
+                true -> dev_arweave_block_cache:write(Block, Opts);
+                false -> skipped
             end,
-            {path, Path},
-            {result, CacheRes}
-        }
-    ),
-    {ok, Block};
+        ?event(
+            debug_arweave_index,
+            {
+                if CacheRes == skipped -> skipped_caching_arweave_block;
+                true -> cached_arweave_block
+                end,
+                {path, Path},
+                {result, CacheRes}
+            }
+        ),
+        {ok, Block}
+    end;
 to_message(Path = <<"/price/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, _Req, _Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
     {ok, hb_util:int(Body)};
