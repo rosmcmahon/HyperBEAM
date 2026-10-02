@@ -459,11 +459,13 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
     % Calculate the keys that have been removed from the message, as a result
     % of being added to the body. These keys will need to be removed from the
     % `committed' list and re-added where the `content-digest' was in the
-    % `from_siginfo_keys' call.
+    % `from_siginfo_keys' call. A `content-digest' key of the message is always
+    % in the body: the header of that name is the digest of the body.
     BodyKeys =
         lists:filter(
             fun(Key) ->
-                not key_present(Key, Encoded) orelse
+                Key =:= <<"content-digest">> orelse
+                    not key_present(Key, Encoded) orelse
                     (Key =:= <<"content-type">> andalso
                         maps:get(Key, MsgWithOnlyInputs, undefined) =/=
                             maps:get(Key, Encoded, undefined))

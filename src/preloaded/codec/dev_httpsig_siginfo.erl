@@ -384,9 +384,8 @@ to_siginfo_keys(_Msg, Commitment, Opts) ->
 %% a message key; the message's own `content-type' may be in the body instead.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     % 1. Replace the `content-digest' component with the body keys, then remove
-    %    specifiers from the other keys and decode them. Only the raw component
-    %    is the digest of the body: a key of the message with that name is
-    %    percent-encoded on the wire.
+    %    specifiers from the other keys and decode them. A key of the message
+    %    named `content-digest' is one of the body keys.
     WithBody =
         lists:flatmap(
             fun(<<"content-digest">>) -> BodyKeys;
