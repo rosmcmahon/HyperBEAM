@@ -90,12 +90,23 @@ sign_tx(TX, Wallet, Opts) ->
         ),
     {ok, SignedStructured}.
 
-%% @doc Verify an ANS-104 commitment.
+%% @doc Verify an ANS-104 commitment. Encoding refuses a message that lacks a
+%% key that its commitment lists, or that bundles such a message, by throwing
+%% `missing_committed_key': the commitment does not verify.
 -spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
     OnlyWithCommitment = hb_private:reset(Msg),
     ?event({verify, {only_with_commitment, OnlyWithCommitment}}),
+    try do_verify(OnlyWithCommitment, Req, Opts)
+    catch
+        throw:{missing_committed_key, Key} ->
+            ?event({verify, {committed_key_missing, Key}}),
+            {ok, false}
+    end.
+
+%% @doc Verify an ANS-104 commitment against the item encoded from the message.
+do_verify(OnlyWithCommitment, Req, Opts) ->
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, TX}}),
     Res =

@@ -55,12 +55,24 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
         )
     }.
 
-%% @doc Verify an L1 TX commitment.
+%% @doc Verify an L1 TX commitment. Encoding refuses a message that lacks a key
+%% that its commitment lists, or that bundles such a message, by throwing
+%% `missing_committed_key': the commitment does not verify.
 -spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
     OnlyWithCommitment = hb_private:reset(Msg),
     ?event({verify, {only_with_commitment, {explicit, OnlyWithCommitment}}}),
+    try do_verify(OnlyWithCommitment, Req, Opts)
+    catch
+        throw:{missing_committed_key, Key} ->
+            ?event({verify, {committed_key_missing, Key}}),
+            {ok, false}
+    end.
+
+%% @doc Verify an L1 TX commitment against the transaction encoded from the
+%% message.
+do_verify(OnlyWithCommitment, Req, Opts) ->
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, {explicit, TX}}}),
     Res =

@@ -7,7 +7,7 @@
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([signed_children_hint/3]).
--export([to/3, to/6, siginfo/4, fields_to_tx/4]).
+-export([to/3, to/6, siginfo/4, fields_to_tx/4, decode/1]).
 -export([bundle_header/2, bundle_header/3]).
 -include("include/hb.hrl").
 
@@ -731,7 +731,7 @@ fields_to_tx(TX, Prefix, Map, Opts) ->
     Anchor =
         case hb_maps:find(<<Prefix/binary, "anchor">>, Map, Opts) of
             {ok, EncodedAnchor} ->
-                case hb_util:safe_decode(EncodedAnchor) of
+                case decode(EncodedAnchor) of
                     {ok, DecodedAnchor} when ?IS_ID(DecodedAnchor) ->
                         DecodedAnchor;
                     _ -> ?DEFAULT_ANCHOR
@@ -741,7 +741,7 @@ fields_to_tx(TX, Prefix, Map, Opts) ->
     Target =
         case hb_maps:find(<<Prefix/binary, "target">>, Map, Opts) of
             {ok, EncodedTarget} ->
-                case hb_util:safe_decode(EncodedTarget) of
+                case decode(EncodedTarget) of
                     {ok, DecodedTarget} when ?IS_ID(DecodedTarget) ->
                         DecodedTarget;
                     _ -> ?DEFAULT_TARGET
@@ -753,6 +753,16 @@ fields_to_tx(TX, Prefix, Map, Opts) ->
         anchor = Anchor,
         target = Target
     }.
+
+%% @doc Decode the base64url string of a field. A string other than the
+%% encoding of the bytes it decodes to, such as one with other padding bits, is
+%% refused: a signature over the bytes covers that encoding alone.
+decode(Encoded) ->
+    maybe
+        {ok, Decoded} ?= hb_util:safe_decode(Encoded),
+        true ?= hb_util:encode(Decoded) =:= Encoded orelse {error, invalid},
+        {ok, Decoded}
+    end.
 
 %% @doc Calculate the data field for a message.
 data(TABM, Req, Opts) ->
