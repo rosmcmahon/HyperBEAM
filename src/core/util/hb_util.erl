@@ -643,18 +643,16 @@ message_to_ordered_list(Message, [], _N, Key, MaybeValue, Opts, Acc) ->
     lists:reverse([Value|Acc]).
 
 ordered_list_value(Key, lookup, Message, Opts) ->
-    case hb_maps:get(Key, Message, undefined, Opts#{ <<"hashpath">> => ignore }) of
-        undefined ->
+    case hb_maps:find(Key, Message, Opts#{ <<"hashpath">> => ignore }) of
+        error ->
             throw(
                 {missing_key,
                     {key, Key},
                     {message, Message}
                 }
             );
-        Value -> Value
+        {ok, Value} -> Value
     end;
-ordered_list_value(Key, undefined, Message, _Opts) ->
-    throw({missing_key, {key, Key}, {message, Message}});
 ordered_list_value(_Key, Value, _Message, Opts) when ?IS_LINK(Value) ->
     hb_cache:ensure_loaded(Value, Opts#{ <<"hashpath">> => ignore });
 ordered_list_value(_Key, Value, _Message, _Opts) ->
