@@ -9,7 +9,7 @@
 %%% in the C/WASM-side.
 
 -module(hb_beamr_io).
--export([size/1, read/3, write/3]).
+-export([size/1, grow/2, read/3, write/3]).
 -export([read_string/2, write_string/2]).
 -export([malloc/2, free/2]).
 -include("include/hb.hrl").
@@ -24,6 +24,15 @@ size(WASM) when is_pid(WASM) ->
     receive
         {execution_result, Size} ->
             {ok, Size}
+    end.
+
+%% @doc Grow the Beamr instance's native memory by a number of 64 KiB pages.
+grow(WASM, 0) when is_pid(WASM) -> ok;
+grow(WASM, Pages) when is_pid(WASM) andalso is_integer(Pages) ->
+    hb_beamr:wasm_send(WASM, {command, term_to_binary({grow, Pages})}),
+    receive
+        ok -> ok;
+        {error, Error} -> {error, Error}
     end.
 
 %% @doc Write a binary to the Beamr instance's native memory at a given offset.
