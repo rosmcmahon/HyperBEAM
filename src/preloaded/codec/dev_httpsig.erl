@@ -519,14 +519,15 @@ input_keys(Msg, RawInputs) ->
     ).
 
 %% @doc The committed values with the message's `ao-types' entries for their
-%% keys. A commitment covers the types of its values whether or not it lists
-%% `ao-types'.
+%% keys and for `.', which marks the message as a list. Whether or not a
+%% commitment lists `ao-types', it covers the types of its values and whether
+%% its message is a list.
 with_types(Values, Keys, #{ <<"ao-types">> := Types }, Opts) ->
     % Unsigned IDs run this function, so `structured@1.0' is called raw: a
     % resolution would read the cache and compute IDs.
     {ok, AllTypes} =
         hb_ao:raw(<<"structured@1.0">>, <<"decode-types">>, Types, #{}, Opts),
-    case maps:with(Keys, AllTypes) of
+    case maps:with([<<".">> | Keys], AllTypes) of
         NoTypes when map_size(NoTypes) =:= 0 -> Values;
         AllTypes -> Values#{ <<"ao-types">> => Types };
         CommittedTypes ->
