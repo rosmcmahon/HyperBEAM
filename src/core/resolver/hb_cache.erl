@@ -447,8 +447,10 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
             maps:without([<<"priv">>], Msg)
         ),
     % Create an operation to link from the root ID the keys are replicated under
-    % to each of the known alternative IDs for the message (the combined 'all'
-    % ID, signed IDs, and _other_ non-root IDs).
+    % to each of the known alternative IDs for the message (signed IDs, and
+    % _other_ non-root IDs). The combined 'all' ID of several signed
+    % commitments is the ID of none of them: the path that attaches them to the
+    % message is written at it.
     Ops =
         lists:foldl(
             fun(AltID, Acc) ->
@@ -460,10 +462,28 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
                 ),
                 [{link, AltID, UncommittedID} | Acc]
             end,
-            [{index_hook, AllID, SignedIDs, UnsignedIDs, Msg} | KeyOps],
-            lists:uniq((SignedIDs ++ UnsignedIDs ++ [AllID])) -- [UncommittedID]
+            [
+                {write, AllID, commitments_path(SignedIDs)}
+            ||
+                length(SignedIDs) > 1
+            ] ++ [{index_hook, AllID, SignedIDs, UnsignedIDs, Msg} | KeyOps],
+            lists:uniq(SignedIDs ++ UnsignedIDs) -- [UncommittedID]
         ),
     {ok, UncommittedID, lists:reverse(Ops)}.
+
+%% @doc The `ao://' path written at the combined ID of a message with several
+%% signed commitments: `with-commitments' of their IDs, which `message@1.0'
+%% resolves on the empty message to the message with them.
+commitments_path(IDs) ->
+    iolist_to_binary([<<"ao://with-commitments=">> | lists:join(<<",">>, IDs)]).
+
+%% @doc Whether a value at an ID is `ao://with-commitments=' followed by only
+%% base64url characters and commas: a path that resolves `with-commitments' on
+%% the empty message, and nothing else.
+is_commitments_path(<<"ao://with-commitments=", List/binary>>) ->
+    re:run(List, <<"\\A[A-Za-z0-9_,-]+\\z">>, [{capture, none}]) =:= match;
+is_commitments_path(_Value) ->
+    false.
 
 write_key_ops(Base, <<"commitments">>, _HPAlg, RawCommitments, Opts, Acc) ->
     Commitments = prepare_commitments(RawCommitments, Opts),
@@ -675,7 +695,10 @@ calculate_all_ids(Msg, UncommittedID, Opts) ->
 
 %% @doc Read the message at a path. Returns in `structured@1.0' format: Either
 %% a richly typed map or a direct binary. If `cache-read-mode' is `raw',
-%% composite reads return lazy links without decoding `ao-types'.
+%% composite reads return lazy links without decoding `ao-types'. An ID that
+%% holds an `ao://' path for which `is_commitments_path/1' is true reads as the
+%% result of the path in `raw' mode, against the local stores alone; any other
+%% `ao://' value at an ID is not found.
 read(Path, Opts) when ?IS_HASHPATH(Path) ->
     hb_hashpath:load(Path, Opts);
 read(Path, Opts) ->
@@ -686,6 +709,11 @@ read(Path, Opts) ->
     } of
         {{ok, Res}, raw} ->
             {ok, Res};
+        {{ok, AOPath = <<"ao://", Singleton/binary>>}, _} when ?IS_ID(Path) ->
+            case is_commitments_path(AOPath) of
+                true -> hb_ao:raw(Singleton, hb_store:scope(Opts, local));
+                false -> {error, not_found}
+            end;
         {{ok, Res}, _} ->
             hb_message:paranoid_verify(cache_read, Res, Opts),
             {ok, Res};

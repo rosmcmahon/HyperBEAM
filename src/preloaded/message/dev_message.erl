@@ -11,6 +11,7 @@
 %%% Commitment-specific keys:
 -export([id/1, id/2, id/3]).
 -export([commit/3, committed/3, committers/1, committers/2, committers/3, verify/3]).
+-export([with_commitments/3]).
 %%% Non-protocol enforced keys:
 -export([index/3]).
 -include_lib("eunit/include/eunit.hrl").
@@ -455,6 +456,64 @@ verify_commitment(Base, Commitment, Opts) ->
             Opts
         ),
     hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts).
+
+%% @doc Attach to the message the commitments whose IDs are listed in the
+%% `with-commitments' key of the request. Each commitment is read by its own
+%% ID, and the message read must have the base's unsigned ID: a commitment
+%% that is not found, or that is over another message, is refused. On the
+%% empty message, the commitments are attached to the message that the first
+%% of them is over.
+with_commitments(Base, Req, Opts) ->
+    Loaded = ensure_commitments_loaded(Base, Opts),
+    read_commitments(
+        hb_util:binary_to_strings(
+            hb_maps:get(<<"with-commitments">>, Req, <<>>, Opts)
+        ),
+        Loaded,
+        hb_message:id(Loaded, none, Opts),
+        Opts
+    ).
+
+%% @doc Read each commitment by its ID and attach it to the message. The
+%% message read by the ID must have the given unsigned ID. The empty message is
+%% replaced by the first message read.
+read_commitments([], Msg, _UnsignedID, _Opts) -> {ok, Msg};
+read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Read = #{ <<"commitments">> := #{ ID := Commitment } }} ->
+            case hb_message:id(Read, none, Opts) of
+                UnsignedID ->
+                    read_commitments(
+                        IDs,
+                        Msg#{
+                            <<"commitments">> =>
+                                (maps:get(<<"commitments">>, Msg, #{}))#{
+                                    ID => Commitment
+                                }
+                        },
+                        UnsignedID,
+                        Opts
+                    );
+                ReadID when ?IS_EMPTY_MESSAGE(Msg) ->
+                    read_commitments(IDs, Read, ReadID, Opts);
+                _ ->
+                    {error,
+                        #{
+                            <<"status">> => 400,
+                            <<"body">> =>
+                                <<"Commitment ", ID/binary,
+                                    " is not over this message.">>
+                        }
+                    }
+            end;
+        _ ->
+            {error,
+                #{
+                    <<"status">> => 404,
+                    <<"body">> => <<"Commitment ", ID/binary, " not found.">>
+                }
+            }
+    end.
 
 %% @doc Return the list of committed keys from a message.
 -spec committed(
