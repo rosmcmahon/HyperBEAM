@@ -34,7 +34,9 @@ info(_) ->
             ]
     }.
 
-%% @doc Start a metering session for the request.
+%% @doc Start a metering session for the request. A node that sets any rate
+%% above 0 estimates each request at `metering-default-estimate' (default 1),
+%% so that P4 runs it only for a payer whose balance is at least that.
 estimate(_Base, EstimateReq, Opts) ->
     {reductions, Reductions} = erlang:process_info(self(), reductions),
     erlang:put(
@@ -45,7 +47,11 @@ estimate(_Base, EstimateReq, Opts) ->
         }
     ),
     consume(?REQUEST_BYTES, body_size(EstimateReq, Opts), Opts),
-    {ok, 0}.
+    Rates = hb_maps:values(hb_opts:get(<<"metering-rates">>, #{}, Opts), Opts),
+    case lists:any(fun(Rate) -> hb_util:int(Rate) > 0 end, Rates) of
+        true -> {ok, hb_opts:get(<<"metering-default-estimate">>, 1, Opts)};
+        false -> {ok, 0}
+    end.
 
 %% @doc Close the metering session and calculate the final AO token price.
 price(_Base, PriceReq, Opts) ->
@@ -170,7 +176,7 @@ consume_price_test() ->
         }
     },
     Metering = #{ <<"device">> => <<"metering@1.0">> },
-    {ok, 0} = hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
+    {ok, 1} = hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
     ok = consume(<<"arweave-bytes">>, 5, Opts),
     {ok, 15} = hb_ao:resolve(Metering, #{ <<"path">> => <<"price">> }, Opts).
 
@@ -198,7 +204,7 @@ beam_reductions_price_test() ->
         <<"metering-rates">> => #{ ?BEAM_REDUCTIONS => 1 }
     },
     Metering = #{ <<"device">> => <<"metering@1.0">> },
-    {ok, 0} = hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
+    {ok, 1} = hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
     lists:foreach(
         fun(_) -> erlang:phash2(rand:bytes(16)) end,
         lists:seq(1, 10)
@@ -307,7 +313,7 @@ request_and_response_bytes_test() ->
     Metering = #{ <<"device">> => <<"metering@1.0">> },
     Request = #{ <<"body">> => binary:copy(<<"q">>, 1000) },
     Response = #{ <<"body">> => binary:copy(<<"r">>, 50000) },
-    {ok, 0} =
+    {ok, 1} =
         hb_ao:resolve(
             Metering,
             #{ <<"path">> => <<"estimate">>, <<"body">> => Request },
@@ -333,7 +339,7 @@ response_bytes_scale_with_payload_test() ->
     Metering = #{ <<"device">> => <<"metering@1.0">> },
     Price =
         fun(Bytes) ->
-            {ok, 0} =
+            {ok, 1} =
                 hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
             {ok, P} =
                 hb_ao:resolve(
@@ -374,7 +380,7 @@ linked_body_metering_respects_bundle_commitment_test() ->
             {ok, _} = hb_cache:write(Response, Opts),
             {ok, LinkedResponse} =
                 hb_cache:read(hb_message:id(Response, all, Opts), Opts),
-            {ok, 0} =
+            {ok, 1} =
                 hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
             {ok, Result} =
                 hb_ao:resolve(
