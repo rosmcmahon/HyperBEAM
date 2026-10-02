@@ -41,8 +41,7 @@ export class AddonComponent extends pulumi.ComponentResource {
         }, childOpts)
 
         /* copycat fully indexes each block (bundles at every depth) once it has `confirmations` blocks on
-         * top, retrying unfinished blocks back to `retryDepth` below the tip. with `match-index-every`,
-         * GraphQL block queries list every item of a fully indexed block and error on an unfinished one. */
+         * top, retrying unfinished blocks back to `retryDepth` below the tip. */
         const extConfig = config.externalConfig?.[name] ?? {}
         const confirmations = extConfig.COPYCAT_CONFIRMATIONS ?? '1'
         const retryDepth = extConfig.COPYCAT_RETRY_DEPTH ?? '20'
@@ -59,8 +58,16 @@ export class AddonComponent extends pulumi.ComponentResource {
             'include-proofs=false',
             'include-block-index=true',
         ].join('&')
+        /* shepherd-feed@1.0 reports bundler uploads (and copycat items, if SHEPHERD_FEED_COPYCAT) to a shepherd
+         * http-api. its start hook rebuilds the default `on` hooks, which setting `on` here replaces. */
+        const feedUrl = extConfig.SHEPHERD_FEED_URL
         /* JSON keeps option types; the node falls back to defaults if this fails to load */
-        const nodeConfig = JSON.stringify({ 'match-index-every': true }, null, 2)
+        const nodeConfig = JSON.stringify(feedUrl ? {
+            'on': { 'start': { 'device': 'shepherd-feed@1.0', 'path': 'install' } },
+            'shepherd-feed-url': feedUrl,
+            'shepherd-feed-token': extConfig.SHEPHERD_FEED_TOKEN ?? '',
+            'shepherd-feed-copycat': extConfig.SHEPHERD_FEED_COPYCAT === 'true',
+        } : {}, null, 2)
         const startScript = fs.readFileSync(path.join(import.meta.dirname, '../start.sh'), 'utf-8')
 
         const volume = new docker.Volume(`${name}-data`, {
