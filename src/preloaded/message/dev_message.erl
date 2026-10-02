@@ -364,21 +364,9 @@ verify(Self, Req, Opts) ->
             _ -> Req
         end,
     IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),
-    % Generate the new commitment request base messsage by removing the keys
-    % used by this function (path, committers, commitments) and returning the
-    % remaining keys. This message will then be merged with each commitment
-    % message to generate the final request, allowing the caller to pass
-    % additional keys to the commitment device.
-    ReqBase =
-        maps:without(
-            [
-                <<"path">>,
-                <<"committers">>,
-                <<"commitments">>,
-                <<"ids">>
-            ],
-            Req
-        ),
+    % The commitment device receives the keys of each commitment and the
+    % private element of the request. No other key of the request reaches it.
+    ReqPriv = hb_private:from_message(Req),
     % Verification derives the IDs of nested messages without writing the
     % messages to the cache.
     VerifyOpts = Opts#{ <<"linkify-mode">> => discard },
@@ -386,10 +374,11 @@ verify(Self, Req, Opts) ->
     Res =
         lists:all(
             fun(CommitmentID) ->
-                Commitment = maps:merge(
-                    ReqBase,
-                    maps:get(CommitmentID, Commitments)
-                ),
+                Commitment =
+                    hb_private:set_priv(
+                        maps:get(CommitmentID, Commitments),
+                        ReqPriv
+                    ),
                 % Build the source spec from the commitment device alone: a
                 % `hint-device' lets the structured codec reproduce each
                 % subtree in the bundle state it was committed in. The verify
