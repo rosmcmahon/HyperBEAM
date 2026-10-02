@@ -333,8 +333,12 @@ verify_identity(Item, TABM) ->
     end.
 
 %% @doc Check that a commitment's committed keys are the keys of the item
-%% encoded from the message: its data keys, tags and fields, as decoding the
-%% item gives them. Nested items are not decoded, as only their keys are needed.
+%% encoded from the message, and that the message gives those keys the types the
+%% item does. The keys are the item's data keys, tags and fields, as decoding
+%% the item gives them; nested items are not decoded, as only their keys are
+%% needed. The item carries the signed types in its `ao-types' tag: an untyped
+%% signed value is a binary, so a message that lists it as another type does not
+%% verify.
 verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
     [Commitment] = maps:values(maps:get(<<"commitments">>, TABM)),
     TX = ar_bundles:deserialize(Item),
@@ -343,7 +347,13 @@ verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
     Data = data(TX, #{}, Tags, fun(_, _, _) -> {ok, <<>>} end, Opts),
     CommittedKeys = hb_maps:get(<<"committed">>, Commitment, #{}, Opts),
     lists:sort(committed(FieldKeys, TX, Fields, Tags, Data, Opts)) =:=
-        lists:sort(hb_util:message_to_ordered_list(CommittedKeys)).
+        lists:sort(hb_util:message_to_ordered_list(CommittedKeys)) andalso
+        holds_types(
+            maps:get(<<"ao-types">>, Tags, <<>>),
+            Commitment,
+            TABM,
+            Opts
+        ).
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
