@@ -652,24 +652,25 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
 should_snapshot(Slot, Res, Opts) ->
     should_snapshot_slots(Slot, Opts) orelse should_snapshot_time(Res, Opts).
 
-%% @doc Calculate if we should snapshot based on the number of slots.
+%% @doc Calculate if we should snapshot based on the number of slots. A value
+%% that is not a positive integer, such as `false' or `0', turns it off.
 should_snapshot_slots(Slot, Opts) ->
-    case hb_opts:get(process_snapshot_slots, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
-        Undef when (Undef == undefined) or (Undef == <<"false">>) ->
-            false;
-        RawSnapshotSlots ->
-            SnapshotSlots = hb_util:int(RawSnapshotSlots),
-            Slot rem SnapshotSlots == 0
+    case hb_util:safe_int(
+            hb_opts:get(process_snapshot_slots, ?DEFAULT_SNAPSHOT_SLOTS, Opts)) of
+        {ok, SnapshotSlots} when SnapshotSlots > 0 ->
+            Slot rem SnapshotSlots == 0;
+        _ ->
+            false
     end.
 
 %% @doc Calculate if we should snapshot based on the elapsed time since the last
-%% snapshot.
+%% snapshot. A value that is not an integer, such as `false', turns it off.
 should_snapshot_time(Res, Opts) ->
-    case hb_opts:get(process_snapshot_time, ?DEFAULT_SNAPSHOT_TIME, Opts) of
-        Undef when (Undef == undefined) or (Undef == <<"false">>) ->
+    case hb_util:safe_int(
+            hb_opts:get(process_snapshot_time, ?DEFAULT_SNAPSHOT_TIME, Opts)) of
+        {error, invalid} ->
             false;
-        RawSecs ->
-            Secs = hb_util:int(RawSecs),
+        {ok, Secs} ->
             case hb_private:get(<<"last-snapshot">>, Res, undefined, Opts) of
                 undefined ->
                     ?event(
