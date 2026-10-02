@@ -44,6 +44,7 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -define(DIRECT_VALUE_LENGTH, 60).
+-define(MAX_KEY_LENGTH, 256).
 
 %% @doc Ensure that a value is loaded from the cache if it is an ID or a link.
 %% If it is not loadable we raise an error. If the value is a message, we will
@@ -394,8 +395,25 @@ do_write_message(List, Store, Opts) when is_list(List) ->
     );
 do_write_message(Msg, Store, Opts) when is_map(Msg) ->
     {ok, UncommittedID, Ops} = write_message_ops(Msg, Opts),
+    % Check the key of every write and link before any reaches the store: a
+    % store that fails one key leaves the message stored without it.
+    lists:foreach(
+        fun({write, Path, _Value}) -> check_key_length(Path);
+           ({link, New, _Existing}) -> check_key_length(New);
+           (_) -> ok
+        end,
+        Ops
+    ),
     run_write_ops(Store, Ops, Opts),
     {ok, UncommittedID}.
+
+%% @doc Throw ``{'key-too-long', Key}'' for a store key over `?MAX_KEY_LENGTH'
+%% bytes: `hb_store_fs' cannot write a file name over 255 bytes, nor
+%% `hb_store_lmdb' a key over 511 bytes.
+check_key_length(Key) when byte_size(Key) > ?MAX_KEY_LENGTH ->
+    throw({'key-too-long', Key});
+check_key_length(_Key) ->
+    ok.
 
 write_message_ops(Bin, Opts) when is_binary(Bin) ->
     Path = generate_binary_path(Bin, Opts),
@@ -1113,9 +1131,11 @@ hashpath_read_result(Other) -> {hit, Other}.
 %% @doc Make a link from one path to another in the store.
 %% Note: Argument order is `link(Src, Dst, Opts)'.
 link(Existing, New, Opts) ->
+    NewPath = hb_path:to_binary(New),
+    check_key_length(NewPath),
     hb_store:link(
         hb_opts:get(store, no_viable_store, Opts),
-        #{ hb_path:to_binary(New) => hb_path:to_binary(Existing) },
+        #{ NewPath => hb_path:to_binary(Existing) },
         Opts
     ).
 
