@@ -26,12 +26,13 @@ normalize(Msg, Opts) when is_map(Opts) ->
 normalize(Msg, false, _Opts) ->
     Msg;
 normalize(Msg, Mode, Opts) when is_map(Msg) ->
+    Private = lists:filter(fun hb_private:is_private/1, maps:keys(Msg)),
     maps:merge(
-        maps:with([<<"commitments">>, <<"priv">>], Msg),
+        maps:with([<<"commitments">> | Private], Msg),
             maps:from_list(
                 lists:map(
                     fun({Key, V}) -> normalize_pair(Key, V, Mode, Opts) end,
-                    maps:to_list(maps:without([<<"commitments">>, <<"priv">>], Msg))
+                    maps:to_list(maps:without([<<"commitments">> | Private], Msg))
                 )
             )
     );
