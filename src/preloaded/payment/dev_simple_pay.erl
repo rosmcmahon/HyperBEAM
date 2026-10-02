@@ -14,12 +14,15 @@
 %%%    subrequest, the two initiating apply messages are not counted towards the
 %%%    message count price.
 %%% 
-%%% The device's ledger is stored in the node message at `simple_pay_ledger',
-%%% and can be topped-up by either the operator, or an external device. The 
-%%% price is specified in the node message at `simple_pay_price'.
+%%% The node keeps the device's balances in a `lib_volatile_ledger', which
+%%% starts from the balances in the node message at `simple_pay_ledger' and
+%%% applies one charge or top-up at a time. The operator can top up balances.
+%%% When the node's VM restarts, the balances return to `simple_pay_ledger'.
+%%% The price is specified in the node message at `simple_pay_price'.
 %%% This device acts as both a pricing device and a ledger device, by p4's
 %%% definition.
 -module(dev_simple_pay).
+-device_libraries([lib_volatile_ledger]).
 -export([estimate/3, charge/3, balance/3, topup/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -158,20 +161,15 @@ charge(_, RawReq, NodeMsg) ->
             ?event(payment, {charge, {error, <<"No signers">>}}),
             {ok, false};
         [Signer] ->
-            UserBalance = get_balance(Signer, NodeMsg),
             Price = hb_ao:get(<<"quantity">>, RawReq, 0, NodeMsg),
+            NewBalance = debit(Signer, Price, NodeMsg),
+            UserBalance = NewBalance + Price,
             ?event(payment,
                 {charge,
                     {user, Signer},
                     {balance, UserBalance},
                     {price, Price}
                 }),
-            {ok, _} =
-                set_balance(
-                    Signer,
-                    NewBalance = UserBalance - Price,
-                    NodeMsg
-                ),
             case NewBalance >= 0 of
                 true ->
                     {ok, true};
@@ -227,51 +225,30 @@ balance(_, RawReq, NodeMsg) ->
         end,
     {ok, get_balance(Target, NodeMsg)}.
 
-%% @doc Adjust a user's balance, normalizing their wallet ID first.
-set_balance(Signer, Amount, NodeMsg) ->
-    LiveNodeMsg = latest_node_msg(NodeMsg),
-    NormSigner = hb_util:human_id(Signer),
-    Ledger = hb_opts:get(simple_pay_ledger, #{}, LiveNodeMsg),
-    ?event(payment,
-        {modifying_balance,
-            {user, NormSigner},
-            {amount, Amount},
-            {ledger_before, Ledger}
-        }
-    ),
-    hb_http_server:set_opts(
-        #{},
-        NewMsg = LiveNodeMsg#{
-            <<"simple-pay-ledger">> =>
-                hb_ao:set(
-                    Ledger,
-                    NormSigner,
-                    Amount,
-                    LiveNodeMsg
-                )
-        }
-    ),
-    {ok, NewMsg}.
+%% @doc Debit a user's balance, normalizing their wallet ID first, and return
+%% the new balance. A negative amount credits the user.
+debit(Signer, Amount, NodeMsg) ->
+    lib_volatile_ledger:debit(
+        ledger(NodeMsg),
+        hb_util:human_id(Signer),
+        Amount,
+        NodeMsg
+    ).
 
-%% @doc Refresh the node message before mutating the ledger.
-latest_node_msg(NodeMsg) ->
-    case hb_opts:get(http_server, no_server_ref, NodeMsg) of
-        no_server_ref ->
-            NodeMsg;
-        _ ->
-            try hb_http_server:get_opts(NodeMsg) of
-                no_node_msg -> NodeMsg;
-                CurrentNodeMsg -> CurrentNodeMsg
-            catch
-                _:_ -> NodeMsg
-            end
-    end.
+%% @doc The node's ledger of balances, starting from `simple_pay_ledger'.
+ledger(NodeMsg) ->
+    #{
+        <<"name">> => <<"simple-pay@1.0">>,
+        <<"balances">> => hb_opts:get(simple_pay_ledger, #{}, NodeMsg)
+    }.
 
 %% @doc Get the balance of a user in the ledger.
 get_balance(Signer, NodeMsg) ->
-    NormSigner = hb_util:human_id(Signer),
-    Ledger = hb_opts:get(simple_pay_ledger, #{}, NodeMsg),
-    hb_ao:get(NormSigner, Ledger, 0, NodeMsg).
+    lib_volatile_ledger:balance(
+        ledger(NodeMsg),
+        hb_util:human_id(Signer),
+        NodeMsg
+    ).
 
 %% @doc Top up the user's balance in the ledger.
 -spec topup(
@@ -286,23 +263,14 @@ topup(_, Req, NodeMsg) ->
         true ->
             Amount = hb_ao:get(<<"amount">>, Req, 0, NodeMsg),
             Recipient = hb_ao:get(<<"recipient">>, Req, undefined, NodeMsg),
-            CurrentBalance = get_balance(Recipient, NodeMsg),
+            NewBalance = debit(Recipient, -Amount, NodeMsg),
             ?event(payment,
                 {topup,
                     {amount, Amount},
                     {recipient, Recipient},
-                    {balance, CurrentBalance},
-                    {expected_new_balance, CurrentBalance + Amount}
+                    {balance, NewBalance}
                 }),
-            {ok, NewNodeMsg} =
-                set_balance(
-                    Recipient,
-                    CurrentBalance + Amount,
-                    NodeMsg
-                ),
-            % Briefly wait for the ledger to be updated.
-            receive after 100 -> ok end,
-            {ok, get_balance(Recipient, NewNodeMsg)}
+            {ok, NewBalance}
     end.
 
 %% @doc Check if the request is from the operator.
