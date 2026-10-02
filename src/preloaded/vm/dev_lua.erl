@@ -459,7 +459,9 @@ normalize(Base, _Req, RawOpts) ->
                     ExternalizedState = binary_to_term(State),
                     InternalizedState = luerl:internalize(ExternalizedState),
                     ?event(snapshot, loaded_state_from_snapshot),
-                    {ok, hb_private:set(Base, <<"state">>, InternalizedState, Opts)}
+                    {ok, LibState} =
+                        dev_lua_lib:reinstall(Base, InternalizedState, Opts),
+                    {ok, hb_private:set(Base, <<"state">>, LibState, Opts)}
             end;
         _ ->
             ?event(snapshot, state_already_initialized),
