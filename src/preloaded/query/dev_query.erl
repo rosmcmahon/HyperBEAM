@@ -212,9 +212,11 @@ match(UserSpec, _Base, Req, Opts) ->
                     ?event({matched, {paths, Matches}}),
                     {ok, length(Matches) > 0}
             end;
-        not_found when ReturnType == <<"boolean">> ->
+        {error, not_found} when ReturnType == <<"boolean">> ->
             {ok, false};
-        not_found ->
+        {error, not_found} when ReturnType == <<"count">> ->
+            {ok, 0};
+        {error, not_found} ->
             {error, not_found}
     end.
 
