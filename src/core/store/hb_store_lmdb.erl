@@ -460,10 +460,13 @@ read_prefix_rows(Opts, Path) ->
 %% Classify the first (marker) row of a bare-prefix scan. `read_prefix' returns
 %% keys in lexicographic order, so the row whose key equals `Path' — when it
 %% exists — always sorts ahead of the `Path/...' descendants and lands first.
+%% A content-addressed `data/' row is a simple value, whatever its bytes.
 %% A `link:' marker chases its target, a `group' marker becomes a composite of
 %% its immediate children, and any other marker is a simple value. When no
 %% marker row is present the path is an implicit group: its descendants (if any)
 %% still resolve to a composite, otherwise the read is a miss.
+prefix_read_result(_Opts, <<"data/", _/binary>> = Path, [{Path, Value} | _]) ->
+    {ok, Value};
 prefix_read_result(Opts, Path, [{Path, <<"link:", Link/binary>>} | _])
         when byte_size(Link) > 0 ->
     read_result(Opts, Link);
