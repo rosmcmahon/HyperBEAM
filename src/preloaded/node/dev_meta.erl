@@ -405,11 +405,15 @@ message_to_status(_Item, _NodeMsg) ->
     default.
 
 %% @doc Sign the result of a device call if the node is configured to do so.
+%% A result that carries a `hashpath' key, such as another node's reply that
+%% this node relays, is returned as it is: signing it would replace its
+%% unsigned commitment and the `hashpath' that the other node committed.
 maybe_sign({Status, Res}, NodeMsg) ->
     {Status, maybe_sign(Res, NodeMsg)};
 maybe_sign(Res, NodeMsg) ->
     ?event({maybe_sign, Res}),
-    case hb_opts:get(force_signed, false, NodeMsg) of
+    case hb_opts:get(force_signed, false, NodeMsg) andalso
+            not hb_maps:is_key(<<"hashpath">>, Res, NodeMsg) of
         true ->
             case hb_private:get(<<"hashpath">>, Res, not_found, NodeMsg) of
                 not_found ->
