@@ -836,12 +836,17 @@ set(Base, NewValuesMsg, Opts) ->
             {original_message, Base}
         }
     ),
-    % Create the map of new values
+    SetMode = maps:get(<<"set-mode">>, NewValuesMsg, <<"deep">>),
+    % Create the map of new values. A deep set keeps an `unset' value whose
+    % path the base still holds: a nested key, which the deep merge removes.
     NewValues = hb_maps:from_list(
         lists:filtermap(
             fun(Key) ->
                 case hb_maps:get(Key, NewValuesMsg, undefined, Opts) of
                     undefined -> false;
+                    unset when SetMode =/= <<"explicit">> ->
+                        hb_util:deep_get(Key, BaseValues, Opts) =/= not_found
+                            andalso {true, {Key, unset}};
                     unset -> false;
                     Value -> {true, {Key, Value}}
                 end
@@ -888,7 +893,7 @@ set(Base, NewValuesMsg, Opts) ->
     % Combine with deep merge or if `set-mode` is `explicit' then just merge.
     Merged =
         hb_private:set_priv(
-            case maps:get(<<"set-mode">>, NewValuesMsg, <<"deep">>) of
+            case SetMode of
                 <<"explicit">> -> maps:merge(BaseValues, NewValues);
                 _ -> do_deep_merge(BaseValues, NewValues, Opts)
             end,
