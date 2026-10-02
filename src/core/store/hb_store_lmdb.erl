@@ -171,7 +171,12 @@ write(Opts, Path, Value) ->
                     {description, Description}
                 }
             ),
-            retry
+            case Type of
+                % The database failed to commit earlier writes and refuses
+                % more. A restart would accept this one without committing it.
+                transaction_error -> {error, Type};
+                _ -> retry
+            end
     end.
 
 %% @doc Read a value from the database by key, with automatic link resolution.
