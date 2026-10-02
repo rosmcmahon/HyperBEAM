@@ -82,11 +82,7 @@ item(_Base, Req, Opts) ->
                             {reason, Reason}
                         }
                     ),
-                    {error, #{
-                        <<"status">> => 500,
-                        <<"error">> => <<"cache-write-failed">>,
-                        <<"details">> => error_to_bin(Reason)
-                    }}
+                    {error, Reason}
             end;
         {error, Reason} ->
             {error, #{
@@ -135,14 +131,21 @@ error_to_bin({error, Reason}) -> error_to_bin(Reason);
 error_to_bin(Reason) ->
     binary:replace(hb_util:bin(Reason), <<"_">>, <<"-">>, [global]).
 
-%% @doc Cache an item.
-%% Returns ok or {error, Reason}.
+%% @doc Cache an item. Returns ok, or {error, Msg} with a 500 status and the
+%% type and details of the failure: an exception of the write, or the badmatch
+%% of a write that returns anything but ok.
 cache_item(Item, Opts) ->
     try
-        dev_bundler_cache:write_item(Item, Opts)
+        ok = dev_bundler_cache:write_item(Item, Opts)
     catch
         Type:ExceptionReason ->
-            {error, {Type, ExceptionReason}}
+            {error, #{
+                <<"status">> => 500,
+                <<"error">> => <<"cache-write-failed">>,
+                <<"type">> => hb_util:bin(Type),
+                <<"details">> =>
+                    hb_util:bin(hb_format:term(ExceptionReason, Opts))
+            }}
     end.
 
 %% @doc Queue an item, optionally blocking until its bundle is complete.
