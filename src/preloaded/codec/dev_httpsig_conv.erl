@@ -308,8 +308,11 @@ from_body_part(InlinedKey, Part, Opts) ->
                         RawBody;
                     {_, _, _} ->
                         % There are other headers, so we need to parse
-                        % the body as a TABM.
-                        {_, RawBodyKey} = inline_key(Headers),
+                        % the body as a TABM. Its key is chosen from the
+                        % part with its body, so a `data' header in the
+                        % part does not take it.
+                        {_, RawBodyKey} =
+                            inline_key(Headers#{ <<"body">> => RawBody }),
                         RestHeaders#{ RawBodyKey => RawBody }
                 end,
             {PartName, ParsedPart}
