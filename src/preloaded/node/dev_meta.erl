@@ -329,9 +329,11 @@ resolve_hook(HookName, InitiatingRequest, Body, NodeMsg) ->
             {error, Other}
     end.
 
-%% @doc Wrap the result of a device call in a status.
+%% @doc Wrap the result of a device call in a status. A result that has a
+%% `status' keeps it as it is: `hb_http:reply/4' takes an integer `status' as
+%% the HTTP status, and any other as the message's own.
 embed_status({ErlStatus, Res}, NodeMsg) when is_map(Res) ->
-    case lists:member(<<"status">>, hb_message:committed(Res, all, NodeMsg)) of
+    case hb_maps:is_key(<<"status">>, Res, NodeMsg) of
         false ->
             HTTPCode = status_code({ErlStatus, Res}, NodeMsg),
             {ok, Res#{ <<"status">> => HTTPCode }};
@@ -370,35 +372,6 @@ status_code(_, _NodeMsg) -> 200.
 %% @doc Get the HTTP status code from a transaction (if it exists).
 message_to_status(#{ <<"body">> := Status }, NodeMsg) when is_atom(Status) ->
     status_code(Status, NodeMsg);
-message_to_status(Item, NodeMsg) when is_map(Item) ->
-    % Note: We use `hb_maps' directly here, such that we do not cause
-    % additional AO-Core calls for every request. This is particularly important
-    % if a remote server is being used for all AO-Core requests by a node.
-    case hb_maps:find(<<"status">>, Item, NodeMsg) of
-        {ok, RawStatus} when is_integer(RawStatus) -> RawStatus;
-        {ok, RawStatus} when is_atom(RawStatus) ->
-            status_code(RawStatus, NodeMsg);
-        {ok, RawStatus} ->
-            % If we can convert the status to an integer, do so.
-            try binary_to_integer(RawStatus)
-            catch
-                error:badarg ->
-                    % We can't convert the status to an integer, but we may be
-                    % able to convert it to an existing atom status code.
-                    try
-                        status_code(
-                            binary_to_existing_atom(RawStatus, latin1),
-                            NodeMsg
-                        )
-                    catch
-                        error:badarg ->
-                            % We can't convert the status to an integer or atom,
-                            % so we return the default status code.
-                            default
-                    end
-            end;
-        _ -> default
-    end;
 message_to_status(Item, NodeMsg) when is_atom(Item) ->
     status_code(Item, NodeMsg);
 message_to_status(_Item, _NodeMsg) ->

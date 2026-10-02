@@ -6,7 +6,7 @@
 -module(hb_http).
 -export([start/0]).
 -export([get/2, get/3, post/3, post/4, request/2, request/4, request/5]).
--export([message_to_request/2, reply/4, accept_to_codec/2]).
+-export([message_to_request/2, reply/4, accept_to_codec/2, http_status/2]).
 -export([req_to_tabm_singleton/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -333,25 +333,37 @@ outbound_result_to_message(Codec, Status, Headers, Body, Opts) ->
         )
     }.
 
-%% @doc Convert a HTTP response to a httpsig message.
+%% @doc Convert a HTTP response to a httpsig message. The message keeps the
+%% `status' that the reply carries, and gets the HTTP status as its `status'
+%% if the reply carries none.
 http_response_to_httpsig(Status, HeaderMap, Body, Opts) ->
-    BinStatus = hb_util:bin(Status),
     BodyMap = case byte_size(Body) of
         0 when not is_map_key(<<"content-digest">>, HeaderMap) -> #{};
         _ -> #{ <<"body">> => Body }
     end,
     ConvertFrom = 
         hb_maps:merge(
-            HeaderMap#{ <<"status">> => BinStatus },
+            HeaderMap,
             BodyMap,
 			Opts
         ),
-    (hb_message:convert(
-        ConvertFrom,
-        #{ <<"device">> => <<"structured@1.0">>, <<"bundle">> => true },
-        <<"httpsig@1.0">>,
-        Opts
-    ))#{ <<"status">> => hb_util:int(Status) }.
+    maps:merge(
+        #{ <<"status">> => hb_util:int(Status) },
+        hb_message:convert(
+            ConvertFrom,
+            #{ <<"device">> => <<"structured@1.0">>, <<"bundle">> => true },
+            <<"httpsig@1.0">>,
+            Opts
+        )
+    ).
+
+%% @doc The HTTP status of a message: its `status' if that is an integer from
+%% 100 to 599, else 200. Any other `status' is the message's own.
+http_status(Msg, Opts) ->
+    case hb_maps:get(<<"status">>, Msg, 200, Opts) of
+        Status when is_integer(Status), Status >= 100, Status =< 599 -> Status;
+        _ -> 200
+    end.
 
 %% @doc Given a message, return the information needed to make the request.
 message_to_request(M, Opts) ->
@@ -542,14 +554,7 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
 
 %% @doc Reply to the client's HTTP request with a message.
 reply(Req, TABMReq, Message, Opts) ->
-    Status =
-        case hb_maps:get(<<"status">>, Message, not_found, Opts) of
-            not_found -> 200;
-            S-> S
-        end,
-    reply(Req, TABMReq, Status, Message, Opts).
-reply(Req, TABMReq, BinStatus, RawMessage, Opts) when is_binary(BinStatus) ->
-    reply(Req, TABMReq, binary_to_integer(BinStatus), RawMessage, Opts);
+    reply(Req, TABMReq, http_status(Message, Opts), Message, Opts).
 reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
     ReplyStartTime = os:system_time(millisecond),
     KeyNormMessage = hb_ao:normalize_keys(RawMessage, Opts),
