@@ -57,6 +57,9 @@ read(_M1, M2, Opts) ->
                             <<"content-type">> => <<"application/aos-2">>
                         }
 					};
+                _ when is_list(Res) ->
+                    % The reply's `ao-result' is the list, as it was written.
+                    {ok, #{ <<"ao-result">> => <<"body">>, <<"body">> => Res }};
                 _ ->
                     {ok, Res}
             end;
