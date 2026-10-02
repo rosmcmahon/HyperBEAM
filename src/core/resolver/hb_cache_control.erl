@@ -211,10 +211,23 @@ cache_source_to_cache_settings(Msg, Opts) ->
 
 %% @doc Convert a cache control list as received via HTTP headers into a 
 %% normalized map of simply whether we should store and/or lookup the result.
+%% A header separates its directives with commas. Directives are ASCII tokens,
+%% compared without regard to case. A value that cannot be read as a list (its
+%% bytes are not UTF-8) names no directive.
+specifiers_to_cache_settings(CCSpecifier) when is_binary(CCSpecifier) ->
+    specifiers_to_cache_settings(
+        try hb_util:binary_to_strings(CCSpecifier)
+        catch error:{cannot_parse_list, _} -> []
+        end
+    );
 specifiers_to_cache_settings(CCSpecifier) when not is_list(CCSpecifier) ->
     specifiers_to_cache_settings([CCSpecifier]);
 specifiers_to_cache_settings(RawCCList) ->
-    CCList = lists:map(fun hb_ao:normalize_key/1, RawCCList),
+    CCList =
+        lists:map(
+            fun(CC) -> hb_util_string:lowercase(hb_ao:normalize_key(CC)) end,
+            RawCCList
+        ),
     #{
         <<"store">> =>
             case lists:member(<<"always">>, CCList) of
