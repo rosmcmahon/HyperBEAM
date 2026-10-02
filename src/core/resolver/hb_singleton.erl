@@ -271,7 +271,8 @@ parse_scope(KeyBin) ->
     case binary:split(KeyBin, <<".">>, [global]) of
         [Front, Remainder] ->
             case catch erlang:binary_to_integer(Front) of
-                NInt when is_integer(NInt), NInt >= 0 -> {NInt + 1, Remainder};
+                NInt when is_integer(NInt), NInt >= 0, Remainder =/= <<>> ->
+                    {NInt + 1, Remainder};
                 _ -> throw({invalid_singleton, invalid_scope, KeyBin})
             end;
         _ -> global
@@ -428,6 +429,8 @@ maybe_subpath(Other, _Opts) -> Other.
 %% interpret as ` ' characters.
 maybe_typed(Key, Value, Opts) ->
     case part([$+, $ ], Key) of
+        % A key with no name, untyped (`<<>>') or typed (`+Type').
+        {_, <<>>, _} -> throw({invalid_singleton, invalid_key, Key});
         {no_match, OnlyKey, <<>>} -> {untyped, OnlyKey, Value};
         {_, OnlyKey, Type} ->
             case {Type, hb_cache:ensure_loaded(Value, Opts)} of
