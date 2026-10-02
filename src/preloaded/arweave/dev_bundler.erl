@@ -93,9 +93,21 @@ item(_Base, Req, Opts) ->
     end.
 
 %% @doc Verify the subject by extracting committed fields and checking signatures.
+%% The item is the subject with its signed ANS-104 commitments alone: an item
+%% in a bundle carries its ANS-104 signature and no other, so a subject with
+%% no such commitment is unsigned, and the item's ID is its ANS-104 ID.
 %% Returns {ok, Item} or {error, Reason}.
 verify_message(Req, Opts) ->
-    case hb_message:with_only_committed(Req, Opts) of
+    ANS104 =
+        hb_message:with_commitments(
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"committer">> => '_'
+            },
+            Req,
+            Opts
+        ),
+    case hb_message:with_only_committed(ANS104, Opts) of
         {ok, Item} ->
             case hb_message:signers(Item, Opts) of
                 [] ->
@@ -717,7 +729,9 @@ nested_bundle_test_parallel() ->
     end.
 
 %% @doc End-to-end bundler test for a nested dataitem where the parent
-%% has bundle=false. The chile is posted on its own first.
+%% has bundle=false. The child is posted on its own first: it is signed with
+%% `httpsig@1.0' alone, so the bundler refuses it, and a plain data item
+%% takes its slot.
 nested_unbundled_bundle_child_posted_test_parallel() ->
     run_nested_unbundled_bundle_test(child_posted).
 
@@ -815,7 +829,11 @@ run_nested_unbundled_bundle_test(Variant) ->
     end.
 
 post_first_item(Node, child_posted, Child, ClientOpts) ->
-    post_structured_item(Node, Child, ClientOpts);
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"details">> := <<"unsigned-item">> }},
+        post_structured_item(Node, Child, ClientOpts)
+    ),
+    post_data_item(Node, new_data_item(1, 10), ClientOpts);
 post_first_item(Node, child_not_posted, _Child, ClientOpts) ->
     post_data_item(Node, new_data_item(1, 10), ClientOpts).
 
