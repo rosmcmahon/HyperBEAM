@@ -72,7 +72,8 @@ push(Base, Req, Opts) ->
                                 },
                                 Opts
                             ),
-                            push_with_mode(Process, Assignment, Opts)
+                            Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
+                            push_with_mode(Process, Req#{ <<"slot">> => Slot }, Opts)
                     end;
                 {error, Res} -> {error, Res}
             end;
