@@ -223,7 +223,7 @@ void wasm_initialize_runtime(void* raw) {
     wasm_extern_vec_t externs;
     wasm_extern_vec_new(&externs, imports.size, stubs);
     wasm_trap_t* trap = NULL;
-    proc->instance = wasm_instance_new_with_args(proc->store, proc->module, &externs, &trap, 0x10000, 0x10000);
+    proc->instance = wasm_instance_new_with_args(proc->store, proc->module, &externs, &trap, 0x10000, 0);
     if (!proc->instance) {
         DRV_DEBUG("Failed to create WASM instance");
         send_error(proc, "Failed to create WASM instance (although module was created).");

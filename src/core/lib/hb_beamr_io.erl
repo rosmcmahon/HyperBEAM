@@ -138,7 +138,7 @@ free(WASM, Ptr) when is_pid(WASM) andalso is_integer(Ptr) ->
 size_test() ->
     WASMPageSize = 65536,
     File1Pages = 1,
-    File2Pages = 193,
+    File2Pages = 192,
     {ok, File} = file:read_file("test/test-print.wasm"),
     {ok, WASM, _Imports, _Exports} = hb_beamr:start(File),
     ?assertEqual({ok, WASMPageSize * File1Pages}, hb_beamr_io:size(WASM)),
@@ -178,7 +178,7 @@ malloc_test() ->
     % Check that we can allocate memory inside the bounds of the WASM module.
     ?assertMatch({ok, _}, malloc(WASM, 100)),
     % Check that we can safely handle out-of-bounds allocations.
-    % The WASM module has a maximum of 259 pages (16MB) of memory, so we
+    % The WASM module has a maximum of 258 pages (16MB) of memory, so we
     % should not be able to allocate more than that.
     ?assertMatch({error, _}, malloc(WASM, 128 * 1024 * 1024)).
 
