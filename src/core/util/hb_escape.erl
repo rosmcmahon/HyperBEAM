@@ -35,7 +35,11 @@ decode(<<$%, _/binary>>, Original) ->
 decode(<<_C, Rest/binary>>, Original) ->
     decode(Rest, Original).
 
-%% @doc Escape a literal key as a single path component.
+%% @doc Escape a literal key as a single path component. The keys `.' and `..'
+%% are escaped in full: as path components, they name the current and parent
+%% directory.
+encode_path_component(<<".">>) -> <<"%2e">>;
+encode_path_component(<<"..">>) -> <<"%2e%2e">>;
 encode_path_component(Key) ->
     binary:replace(
         binary:replace(Key, <<"%">>, <<"%25">>, [global]),
@@ -43,6 +47,8 @@ encode_path_component(Key) ->
     ).
 
 %% @doc Restore a key, decoding exactly one layer of path-component escaping.
+decode_path_component(<<"%2e">>) -> <<".">>;
+decode_path_component(<<"%2e%2e">>) -> <<"..">>;
 decode_path_component(Key) ->
     binary:replace(
         binary:replace(Key, <<"%2f">>, <<"/">>, [global]),

@@ -292,16 +292,20 @@ add_prefix(#{ <<"name">> := Prefix }, Path) ->
             JoinedPath
     end.
 
-%% @doc Refuse a key that the filesystem would resolve outside the store root.
+%% @doc Refuse a key with a `.' or `..' component, which the filesystem reads
+%% as the current or parent directory, and can resolve outside the store root.
 %% Percent-encode any other key, so that keys differing only in case or Unicode
 %% normalization do not share a file.
 %%
-%% Keys are caller-supplied. `..' names no AO-Core key, so refusing it costs
-%% nothing; the operating system would otherwise walk it out of the root.
+%% Keys are caller-supplied. `hb_escape:encode_path_component/1' escapes the
+%% message keys `.' and `..', so neither component names an AO-Core key and
+%% refusing them costs nothing; the operating system would otherwise walk `..'
+%% out of the root.
 safe_path(Path) ->
-    case binary:match(hb_path:to_binary(Path), [<<"..">>, <<0>>]) of
-        nomatch -> hb_escape:encode(Path);
-        _ -> throw({unsafe_store_key, Path})
+    Parts = binary:split(hb_path:to_binary(Path), <<"/">>, [global]),
+    case lists:member(<<".">>, Parts) orelse lists:member(<<"..">>, Parts) of
+        false -> hb_escape:encode(Path);
+        true -> throw({unsafe_store_key, Path})
     end.
 
 %% @doc Remove the directory prefix from a path, and decode the key.
