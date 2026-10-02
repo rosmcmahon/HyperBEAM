@@ -377,6 +377,16 @@ process_response({ok, [Status, MsgResult], NewState}, Priv, Opts) ->
             }};
         NonMsgRes -> {hb_util:atom(Status), NonMsgRes}
     end;
+process_response({ok, Results, _NewState}, _Priv, _Opts) ->
+    % A Lua function returns a result, or a status and a result. Any other
+    % number of values is an error of the script.
+    {error,
+        <<
+            "Lua function returned ",
+            (hb_util:bin(length(Results)))/binary,
+            " values: it must return a result, or a status and a result."
+        >>
+    };
 process_response({lua_error, RawError, State}, _Priv, Opts) ->
     % An error occurred while calling the Lua function. Parse the stack trace
     % and return it.
