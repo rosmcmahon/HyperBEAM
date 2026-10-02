@@ -6,6 +6,7 @@
 -export([encode/2, decode/2]).
 -export([pure_lua_process_benchmark/1]).
 -include("include/hb.hrl").
+-include_lib("luerl/include/luerl.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%% Utility macro to check if a binary is a Lua script content-type.
@@ -418,7 +419,8 @@ process_response({error, Reason, Trace}, _Priv, _Opts) ->
     }}.
 
 %% @doc Snapshot the Lua state from a live computation. Removes the node message
-%% from the private data of the state, then serializes the state to a binary.
+%% from the private data of the state and clears Luerl's `tag', then serializes
+%% the state to a binary.
 -spec snapshot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ body := binary(), _ => _ }} | {error, binary()}.
 snapshot(Base, _Req, Opts) ->
@@ -426,8 +428,12 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         RawState ->
+            % Luerl sets the `tag' of a state to a reference made by the VM
+            % that created it, and never reads it. Without it, equal states
+            % give equal snapshots.
             State = luerl:delete_private(<<"node-message">>, RawState),
-            {ok, #{ <<"body">> => term_to_binary(luerl:externalize(State)) }}
+            Snapshot = luerl:externalize(State#luerl{ tag = undefined }),
+            {ok, #{ <<"body">> => term_to_binary(Snapshot) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
