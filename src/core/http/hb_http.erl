@@ -717,7 +717,7 @@ encode_reply(Status, TABMReq, Message, Opts) ->
 			Opts
         ),
     AcceptBundle =
-        hb_util:atom(
+        hb_util:bool(
             hb_maps:get(<<"accept-bundle">>, TABMReq, false, Opts)
         ),
     ?event(debug_http,
@@ -809,7 +809,7 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                         #{
                             <<"device">> => <<"ans104@1.0">>,
                             <<"bundle">> =>
-                                hb_util:atom(
+                                hb_util:bool(
                                     hb_ao:get(
                                         <<"accept-bundle">>,
                                         {as, <<"message@1.0">>, TABMReq},
