@@ -638,9 +638,9 @@ header_escaping_test(Codec, Opts) ->
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
 
-%% @doc A message's own `signature' key is data, as on an Arweave block. It
-%% is committed, survives the wire beside the signature headers of the same
-%% name, and is not read back as a commitment.
+%% @doc A message's own `signature' key is data. It is committed, survives the
+%% wire beside the signature headers of the same name, and is not read back as
+%% a commitment.
 signature_data_key_test(Codec, Opts) ->
     Msg =
         hb_message:commit(

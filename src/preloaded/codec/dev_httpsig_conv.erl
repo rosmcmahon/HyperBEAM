@@ -402,7 +402,7 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
         ),
     % Finally, add the signatures to the encoded HTTP message with the
     % commitments from the original message. A `signature' key of the message
-    % itself is data, as on an Arweave block, not a commitment.
+    % itself is data, not a commitment.
     CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
     ?event_debug({converting_commitments_to_siginfo, TABM}),
     {ok,

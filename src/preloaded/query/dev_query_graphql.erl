@@ -225,7 +225,7 @@ selects(Name, [_ | Rest]) -> selects(Name, Rest).
 %% `message_query/4' for the HyperBEAM native API, and `dev_query_arweave:query/4'
 %% for the Arweave-compatible API.
 execute(#{object_type := <<"Block">>, opts := Opts}, Block, <<"id">>, _Args) ->
-    {ok, hb_maps:get(<<"indep_hash">>, Block, null, Opts)};
+    {ok, hb_maps:get(<<"indep-hash">>, Block, null, Opts)};
 execute(#{object_type := Type}, _Obj, <<"id">>, _Args)
         when Type =:= <<"Bundle">>; Type =:= <<"Parent">> ->
     {ok, <<>>};

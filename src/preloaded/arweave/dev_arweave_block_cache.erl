@@ -74,7 +74,7 @@ path(Block, _Opts) -> Block.
 write(Block, RawOpts) ->
     Opts = opts(RawOpts),
     {ok, Height} = hb_maps:find(<<"height">>, Block, Opts),
-    {ok, BlockID} = hb_maps:find(<<"indep_hash">>, Block, Opts),
+    {ok, BlockID} = hb_maps:find(<<"indep-hash">>, Block, Opts),
     {ok, BlockHash} = hb_maps:find(<<"hash">>, Block, Opts),
     {ok, MsgID} = hb_cache:write(Block, Opts),
     % Link the independent hash and the dependent hash to the written AO-Core
