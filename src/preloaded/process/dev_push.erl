@@ -193,7 +193,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
         {ok, Outbox} ->
             ?event(push, {push_found_outbox, {outbox, Outbox}}),
             Downstream =
-                hb_maps:map(
+                map_in_order(
                     fun(Key, RawMsgToPush = #{ <<"target">> := Target }) ->
                         MsgToPush =
                             case maybe_evaluate_message(RawMsgToPush, Opts) of
@@ -271,6 +271,30 @@ target_process_not_found(Target) ->
         <<"target">> => Target,
         <<"reason">> => <<"Could not access target process!">>
     }.
+
+%% @doc Apply `Fun' to each message of an outbox in the order that the process
+%% sent them: numbered keys in numeric order, then any other keys in byte
+%% order. Returns the results under the keys of the outbox.
+map_in_order(Fun, Outbox, Opts) ->
+    maps:from_list(
+        lists:map(
+            fun({Key, Msg}) ->
+                {Key, Fun(Key, hb_cache:ensure_loaded(Msg, Opts))}
+            end,
+            lists:sort(
+                fun({KeyA, _}, {KeyB, _}) -> order(KeyA) =< order(KeyB) end,
+                hb_maps:to_list(Outbox, Opts)
+            )
+        )
+    ).
+
+%% @doc The sort term of an outbox key: its number if it has one, else the key.
+%% Erlang orders every number before every binary.
+order(Key) ->
+    case hb_util:safe_int(Key) of
+        {ok, N} -> N;
+        {error, invalid} -> Key
+    end.
 
 
 %% @doc If the outbox message has a path we interpret it as a request to perform
