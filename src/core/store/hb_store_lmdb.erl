@@ -155,8 +155,8 @@ write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
 write(Opts, PathParts, Value) when is_list(PathParts) ->
     write(Opts, hb_store_utils:to_path(PathParts), Value);
 write(_Opts, Path, _Value) when byte_size(Path) > ?MAX_KEY_SIZE ->
-    % elmdb accepts a longer key, fails to flush it, and then fails every
-    % later operation on the database.
+    % elmdb accepts a longer key, fails to flush it, and then refuses every
+    % later write to the database.
     {error, 'key-too-long'};
 write(Opts, Path, Value) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
