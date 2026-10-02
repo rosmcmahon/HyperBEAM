@@ -155,7 +155,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                 }
         end,
     % Determine if we should include the full compute result in our response.
-    IncludeDepth = hb_ao:get(<<"result-depth">>, Assignment, 1, Opts),
+    IncludeDepth = hb_util:int(hb_ao:get(<<"result-depth">>, Assignment, 1, Opts)),
     AdditionalRes =
         case IncludeDepth of
             X when X > 0 -> Result;
