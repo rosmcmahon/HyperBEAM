@@ -230,6 +230,8 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         msg[msg_index++] = 2;
         
         int msg_res = erl_drv_output_term(proc->port_term, msg, msg_index);
+        driver_free(msg);
+        driver_free(out_binary);
         DRV_DEBUG("Read response sent: %d", msg_res);
     }
     else if (strcmp(command, "size") == 0) {
