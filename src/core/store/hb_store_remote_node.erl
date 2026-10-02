@@ -72,11 +72,7 @@ read_request(Opts = #{ <<"node">> := Node }, Key) ->
     case HTTPRes of
         {ok, Res} ->
             % returning the whole response to get the test-key
-            {ok, Msg} =
-                hb_message:with_only_committed(
-                    without_transport_commitment(Res, Opts),
-                    Opts
-                ),
+            Msg = without_transport_commitment(Res, Opts),
             ?event(store_remote_node, {read_found, {result, Msg, response, Res}}),
             maybe_cache(Opts, Msg),
             {ok, Msg};
@@ -88,15 +84,30 @@ read_request(_, _) -> {error, not_found}.
 read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
     read_request(Opts, Key).
 
-%% @doc Remove the transport commitments from the response.
+%% @doc Remove the transport commitments from the response: the replying
+%% node's signature over `hashpath', and its unsigned commitment over the keys
+%% of its reply, once the keys that it does not cover are removed. The reply's
+%% `hashpath' and `status' are removed with them, unless a signed commitment
+%% of the message covers them.
 without_transport_commitment(Msg, Opts) when is_map(Msg) ->
-    WithoutCommitment =
-        hb_message:without_commitments(
-            #{ <<"committed">> => [<<"hashpath">>] },
-            Msg,
+    {ok, Committed} =
+        hb_message:with_only_committed(
+            hb_message:without_commitments(
+                #{ <<"committed">> => [<<"hashpath">>] },
+                Msg,
+                Opts
+            ),
             Opts
         ),
-    hb_message:without_unless_signed([<<"hashpath">>], WithoutCommitment, Opts);
+    hb_message:without_unless_signed(
+        [<<"hashpath">>, <<"status">>],
+        hb_message:without_commitments(
+            #{ <<"keyid">> => <<"constant:ao">> },
+            Committed,
+            Opts
+        ),
+        Opts
+    );
 without_transport_commitment(Res, _Opts) ->
     Res.
 
