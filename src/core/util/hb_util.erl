@@ -828,8 +828,8 @@ binary_to_strings(Bin) when is_binary(Bin) ->
         _:_ ->
         try
             lists:map(
-                fun unquote/1,
-                split_depth_string_aware(<<",">>, Bin)
+                fun(Part) -> unquote(string:trim(Part)) end,
+                split_depth_string_aware($,, Bin)
             )
         catch
             _:_ ->
