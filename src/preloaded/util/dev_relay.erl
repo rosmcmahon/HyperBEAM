@@ -155,8 +155,14 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
         Opts
     ),
     % Let `hb_http:request/2' handle finding the peer and dispatching the
-    % request, unless the peer is explicitly given.
-    HTTPOpts = Opts#{ <<"http-client">> => Client, <<"http-only-result">> => false },
+    % request, unless the peer is explicitly given. Redirects are not followed:
+    % `is_blocked_host/2' checks only the first URL.
+    HTTPOpts =
+        Opts#{
+            <<"http-client">> => Client,
+            <<"http-only-result">> => false,
+            <<"http-redirects">> => 0
+        },
     Res = case RelayPeer of
         not_found ->
             hb_http:request(TargetMod5, HTTPOpts);

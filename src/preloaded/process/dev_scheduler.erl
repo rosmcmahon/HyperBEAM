@@ -822,18 +822,6 @@ remote_slot(<<"ao.TN.1">>, ProcID, Node, Opts) ->
                         <<"block-hash">> => hb_util:encode(<<0:256>>),
                         <<"cache-control">> => <<"no-store">>
                     }};
-                307 ->
-                    ?event({generating_new_redirect, {redirect, Res}}),
-                    % Maintain the same variant, but generate the redirect using
-                    % the new location.
-                    NewRedirect =
-                        generate_redirect(
-                            ProcID,
-                            Res#{ <<"variant">> => <<"ao.TN.1">> },
-                            Opts
-                        ),
-                    ?event({recursing_on_new_redirect, {redirect, NewRedirect}}),
-                    remote_slot(ProcID, NewRedirect, Opts);
                 _ ->
                     {error, Res}
             end;
@@ -1065,20 +1053,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                             {from_remote_cache, length(RemoteAssignments)}
                         }
                     ),
-                    Merged;
-                307 ->
-                    % NOTE: Shouldn't this be using the `Res' location key to
-                    % regenerate the redirect and recurse on that, instead of
-                    % just using the same redirect?
-                    ?event({recursing_on_same_redirect, {redirect, Redirect}}),
-                    do_get_remote_schedule(
-                        ProcID,
-                        LocalAssignments,
-                        From,
-                        To,
-                        Redirect,
-                        Opts
-                    )
+                    Merged
             end;
         {error, Res} ->
             ?event(push, {remote_schedule_result, {res, Res}}, Opts),
@@ -1713,7 +1688,8 @@ http_get_schedule_redirect() ->
                     #{ <<"store-module">> => hb_store_fs, <<"name">> => <<"cache-mainnet">> },
                     #{ <<"store-module">> => hb_store_gateway, <<"opts">> => #{} }
                 ],
-                <<"scheduler-follow-redirects">> => false
+                <<"scheduler-follow-redirects">> => false,
+                <<"http-redirects">> => 0
         },
     {N, _Wallet} = http_init(Opts),
     start(),

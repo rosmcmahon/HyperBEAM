@@ -43,7 +43,7 @@ response_status_to_atom(Status) ->
 
 request(Args, Opts) ->
     Opts1 = hb_opts:mimic_default_types(Opts, existing, Opts),
-    request(Args, hb_opts:get(http_retry, ?DEFAULT_RETRIES, Opts1), Opts1).
+    redirect(Args, 0, Opts1).
 request(Args, RemainingRetries, Opts) ->
     Response = do_request(Args, Opts),
     case Response of
@@ -56,6 +56,34 @@ request(Args, RemainingRetries, Opts) ->
                 false -> Response
             end
     end.
+
+%% @doc Make a request, following a `307' or `308' response to the absolute URL
+%% in its `location' with the same method, headers and body, up to
+%% `http-redirects' times. One more redirect is `{error, 'too-many-redirects'}'.
+%% With `http-redirects' at 0, the redirect is the response.
+redirect(Args, Redirects, Opts) ->
+    Response =
+        request(Args, hb_opts:get(http_retry, ?DEFAULT_RETRIES, Opts), Opts),
+    MaxRedirects = hb_opts:get(http_redirects, ?DEFAULT_REDIRECTS, Opts),
+    Location = location(Response),
+    case uri_string:parse(Location) of
+        URI = #{ scheme := _, host := _ } when Redirects < MaxRedirects ->
+            Path = uri_string:recompose(maps:with([path, query], URI)),
+            redirect(
+                Args#{ peer => Location, path => hb_path:normalize(Path) },
+                Redirects + 1,
+                Opts
+            );
+        #{ scheme := _, host := _ } when MaxRedirects > 0 ->
+            {error, 'too-many-redirects'};
+        _ -> Response
+    end.
+
+%% @doc The `location' of a `307' or `308' response, else `<<>>'.
+location({ok, Status, Headers, _Body}) when Status == 307; Status == 308 ->
+    Lower = [{hb_util:to_lower(Key), Value} || {Key, Value} <- Headers],
+    proplists:get_value(<<"location">>, Lower, <<>>);
+location(_Response) -> <<>>.
 
 do_request(Args, Opts) ->
     case hb_opts:get(http_client, ?DEFAULT_HTTP_CLIENT, Opts) of
