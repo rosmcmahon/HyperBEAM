@@ -324,10 +324,20 @@ committed_keys(Commitment, Opts) ->
 %% @doc Verify a message. By default, all commitments are verified. The
 %% `committers' key in the request can be used to specify that only the 
 %% commitments from specific committers should be verified. Similarly, specific
-%% commitments can be specified using the `ids' key.
+%% commitments can be specified using the `ids' key. Each takes `all', `none',
+%% one address or ID, or a list of them. A message that lacks a committer or
+%% commitment the request names does not verify, nor does `committers=all'
+%% on a message without committers. The request is kept whole: `target' may
+%% name any of its keys as the message to verify, and its private element
+%% goes to the commitment device.
 -spec verify(
     #{ _ => _ },
-    #{ committers => _, ids => _, commitments => _, _ => _ },
+    #{
+        committers => binary() | [binary()],
+        ids => binary() | [binary()],
+        target => binary(),
+        _ => _
+    },
     #{ _ => _ }
 ) -> {ok, boolean()}.
 verify(Self, Req, Opts) ->
@@ -354,7 +364,44 @@ verify(Self, Req, Opts) ->
                 Req#{ <<"ids">> => maps:keys(Unsigned) };
             _ -> Req
         end,
-    IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),
+    case has_named(CommitmentBase, Req, Opts) of
+        false -> {ok, false};
+        true ->
+            verify_ids(
+                commitment_ids_from_request(CommitmentBase, Selection, Opts),
+                Commitments,
+                CommitmentBase,
+                Req,
+                Opts
+            )
+    end.
+
+%% @doc Whether a message has what a verification request names: each
+%% committer and commitment it lists, and a committer if it asks for `all'.
+has_named(Base, Req, Opts) ->
+    {ok, Committers} = committers(Base, #{}, Opts),
+    Commitments = maps:get(<<"commitments">>, Base, #{}),
+    case maps:get(<<"committers">>, Req, <<"none">>) of
+        <<"all">> -> Committers =/= [];
+        <<"none">> -> true;
+        NamedCommitters ->
+            lists:all(
+                fun(Committer) -> lists:member(Committer, Committers) end,
+                lists:flatten([NamedCommitters])
+            )
+    end andalso
+        case maps:get(<<"ids">>, Req, <<"none">>) of
+            <<"all">> -> true;
+            <<"none">> -> true;
+            NamedIDs ->
+                lists:all(
+                    fun(ID) -> maps:is_key(ID, Commitments) end,
+                    lists:flatten([NamedIDs])
+                )
+        end.
+
+%% @doc Verify the given commitments of a message.
+verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
     % The commitment device receives the keys of each commitment and the
     % private element of the request. No other key of the request reaches it.
     ReqPriv = hb_private:from_message(Req),
