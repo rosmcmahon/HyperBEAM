@@ -80,15 +80,7 @@ handle(NodeMsg, RawRequest) ->
         hb_private:set(RawRequest, <<"http-request">>, RawRequest, NodeMsg),
         NodeMsg
     ),
-    ?event(
-        http,
-        {request,
-            hb_cache:ensure_all_loaded(
-                hb_ao:normalize_keys(NormRequest, NodeMsg),
-                NodeMsg
-            )
-        }
-    ),
+    ?event(http, {request, hb_ao:normalize_keys(NormRequest, NodeMsg)}),
     case hb_opts:get(initialized, false, NodeMsg) of
         false ->
             Res =
