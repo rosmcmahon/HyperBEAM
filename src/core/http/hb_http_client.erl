@@ -136,7 +136,7 @@ httpc_req(Args, Opts) ->
             ?event({http_client_outbound, Method, URL, {priv_req, Request}}),
             HTTPCOpts = [{full_result, true}, {body_format, binary}],
             StartTime = os:system_time(native),
-            case httpc:request(Method, Request, [], HTTPCOpts) of
+            case httpc:request(Method, Request, [{autoredirect, false}], HTTPCOpts) of
                 {ok, {{_, Status, _}, RawRespHeaders, RespBody}} ->
                     download_metric(RespBody, Opts),
                     EndTime = os:system_time(native),
