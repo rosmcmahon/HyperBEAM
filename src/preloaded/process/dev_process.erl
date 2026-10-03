@@ -728,6 +728,8 @@ now(RawBase, Req, Opts) ->
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
                     case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
+                        {error, _} = Error ->
+                            Error;
                         true ->
                             LatestMsg = without_snapshot(RawLatestMsg, Opts),
                             ?event(compute_cache,
