@@ -205,12 +205,16 @@ server_address(Opts) ->
 
 %% @doc Return the PID of the bundler server. If the server is not running,
 %% it is started and registered with the name returned by `server_name/1'.
+%% The items it recovers are listed before it starts, so an item that a
+%% request caches once it has started is queued by that request alone.
 ensure_server(Opts) ->
     Name = server_name(Opts),
-    hb_name:singleton(
-        Name,
-        fun() -> init(Opts) end
-    ).
+    case hb_name:lookup(Name) of
+        PID when is_pid(PID) -> PID;
+        undefined ->
+            ItemIDs = dev_bundler_cache:list_item_ids(Opts),
+            hb_name:singleton(Name, fun() -> init(ItemIDs, Opts) end)
+    end.
 
 %% @doc Return the current bundler server state for tests.
 get_state() ->
@@ -228,7 +232,7 @@ get_state(Opts) ->
     end.
 
 %% @doc Initialize the bundler server.
-init(Opts) ->
+init(ItemIDs, Opts) ->
     NumWorkers = hb_opts:get(bundler_workers, ?DEFAULT_NUM_WORKERS, Opts),
     Workers = lists:map(
         fun(_) ->
@@ -249,7 +253,7 @@ init(Opts) ->
         bundles = #{},
         opts = Opts
     },
-    dev_bundler_recovery:recover_unbundled_items(self(), Opts),
+    dev_bundler_recovery:recover_unbundled_items(self(), ItemIDs, Opts),
     dev_bundler_recovery:recover_bundles(self(), Opts),
     server(assign_tasks(InitialState), Opts).
 
