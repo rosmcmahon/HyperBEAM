@@ -253,29 +253,28 @@ do_read(StoreOpts, ID, Opts) ->
 %% the reason. The `StartOffset` is the precise starting byte of the item _header_,
 %% not the data segment. The `Length` covers the full size of the item, including
 %% header. The `ExpectedID` is verified against the deserialized item's ID to
-%% guard against stale offsets (e.g. after a reorg).
+%% guard against stale offsets (e.g. after a reorg). The ID is the hash of the
+%% signature alone, so the signature must verify too. Both checks run on the
+%% bytes read, before the codec unbundles any items that they hold.
 load_item(ExpectedID, StartOffset, Length, Opts) ->
     hb_prometheus:measure_and_report(
         fun() ->
-            case read_chunks(StartOffset, Length, Opts) of
-                {ok, SerializedItem} ->
-                    Item =
-                        ar_bundles:deserialize(SerializedItem),
-                    case hb_util:encode(Item#tx.id) of
-                        ExpectedID ->
-                            {ok, hb_message:convert(
-                                Item,
-                                <<"structured@1.0">>,
-                                <<"ans104@1.0">>,
-                                Opts
-                            )};
-                        ActualID ->
-                            {error,
-                                {id_mismatch,
-                                    ExpectedID, ActualID}}
-                    end;
-                {error, Reason} ->
-                    {error, Reason}
+            maybe
+                {ok, SerializedItem} ?= read_chunks(StartOffset, Length, Opts),
+                Item = ar_bundles:deserialize_item_wrapper(SerializedItem),
+                ActualID = hb_util:encode(Item#tx.id),
+                true ?=
+                    ActualID =:= ExpectedID
+                        orelse {error, {id_mismatch, ExpectedID, ActualID}},
+                true ?=
+                    ar_bundles:verify_item(Item)
+                        orelse {error, unverifiable_item},
+                {ok, hb_message:convert(
+                    Item,
+                    <<"structured@1.0">>,
+                    <<"ans104@1.0">>,
+                    Opts
+                )}
             end
         end,
         hb_store_arweave_chunk_fetch_duration_seconds,
@@ -329,16 +328,17 @@ load_tx(ID, StartOffset, Length, Opts) ->
                         <<"tx@1.0">>,
                         Opts)};
                 _ ->
-                    case read_chunks(StartOffset, Length, Opts) of
-                        {ok, Data} ->
-                            {ok, hb_message:convert(
-                                TXHeader#tx{data = Data},
-                                <<"structured@1.0">>,
-                                <<"tx@1.0">>,
-                                Opts
-                            )};
-                        {error, Reason} ->
-                            {error, Reason}
+                    maybe
+                        {ok, Data} ?= read_chunks(StartOffset, Length, Opts),
+                        TX = TXHeader#tx{data = Data},
+                        % The data must be the data that the signature covers.
+                        true ?= ar_tx:verify(TX) orelse {error, data_mismatch},
+                        {ok, hb_message:convert(
+                            TX,
+                            <<"structured@1.0">>,
+                            <<"tx@1.0">>,
+                            Opts
+                        )}
                     end
             end
         end,

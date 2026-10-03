@@ -1266,22 +1266,24 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
                 end
         end,
     TX = TXHeader#tx{ data = Data },
-    try
-        {
-            ok,
-            hb_message:convert(
-                TX,
-                <<"structured@1.0">>,
-                <<"tx@1.0">>,
-                Opts
-            )
-        }
-    catch
-        _:{necessary_message_not_found, _, _}:_ ->
-            {error, not_found};
-        _:_:_ ->
-            case TX#tx.id =:= hb_util:native_id(ID) andalso ar_tx:verify(TX) of
-                true ->
+    % Return the transaction only if it has the requested ID, its signature
+    % verifies, and any data it carries is the data that the signature covers.
+    case TX#tx.id =:= hb_util:native_id(ID) andalso ar_tx:verify(TX) of
+        true ->
+            try
+                {
+                    ok,
+                    hb_message:convert(
+                        TX,
+                        <<"structured@1.0">>,
+                        <<"tx@1.0">>,
+                        Opts
+                    )
+                }
+            catch
+                _:{necessary_message_not_found, _, _}:_ ->
+                    {error, not_found};
+                _:_:_ ->
                     {
                         error,
                         #{
@@ -1292,10 +1294,10 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
                                     "but not deserializable."
                                 >>
                         }
-                    };
-                false ->
-                    {error, <<"Received invalid transaction.">>}
-            end
+                    }
+            end;
+        false ->
+            {error, <<"Received invalid transaction.">>}
     end.
 
 event_request(Path, Method, Status, Extra) ->
