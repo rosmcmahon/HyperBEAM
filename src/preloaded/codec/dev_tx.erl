@@ -84,8 +84,8 @@ tx_verifies(TX, _Req, _Msg) ->
     {ok, binary() | #{ _ => _ }}.
 from(Binary, _Req, _Opts) when is_binary(Binary) -> {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
-    case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data};
+    case TX#tx.tags of
+        [{<<"ao-type">>, <<"binary">>}] -> {ok, TX#tx.data};
         _ -> do_from(TX, Req, Opts)
     end.
 do_from(RawTX, Req, Opts) ->

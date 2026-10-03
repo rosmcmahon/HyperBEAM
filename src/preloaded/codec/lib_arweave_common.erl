@@ -13,12 +13,13 @@
 
 -define(ANS104_BASE_FIELDS, [<<"anchor">>, <<"target">>]).
 
-%% @doc Convert an ANS-104 item into its message form.
+%% @doc Convert an ANS-104 item into its message form. An item whose only tag
+%% is `ao-type: binary' is a bare binary.
 from(Binary, _Req, _Opts) when is_binary(Binary) ->
     {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
-    case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data};
+    case TX#tx.tags of
+        [{<<"ao-type">>, <<"binary">>}] -> {ok, TX#tx.data};
         _ -> from_item(TX, Req, Opts)
     end.
 
@@ -776,7 +777,9 @@ data(TABM, Req, Opts) ->
             NestedMsgs#{ DataKey => hb_util:ok(to(DataVal, Req, Opts)) }
     end.
 
-%% @doc Calculate data messages for large tag values or nested messages.
+%% @doc Calculate data messages for large tag values or nested messages. A
+%% message's own `ao-type: binary' is carried in the data too, so that only the
+%% item of a bare binary has that tag.
 data_messages(TABM, Opts) when is_map(TABM) ->
     UncommittedTABM =
         hb_maps:without(
@@ -791,6 +794,7 @@ data_messages(TABM, Opts) when is_map(TABM) ->
                 false ->
                     byte_size(Value) > ?MAX_TAG_VALUE_SIZE
                     orelse byte_size(Key) > ?MAX_TAG_NAME_SIZE
+                    orelse {Key, Value} =:= {<<"ao-type">>, <<"binary">>}
             end
         end,
         UncommittedTABM,
