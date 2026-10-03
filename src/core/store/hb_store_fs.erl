@@ -200,11 +200,14 @@ group(Opts = #{ <<"name">> := _DataDir }, #{ <<"group">> := Path }, _NodeOpts) -
     end.
 
 %% @doc Create a symlink, handling the case where the link would point to itself.
+%% A failed link does not stop the others: every link of the request is tried,
+%% and the first error is returned.
 link(Opts, Req, _NodeOpts) when is_map(Req) ->
     maps:fold(
         fun(New, Existing, ok) ->
             link_path(Opts, Existing, New);
-           (_New, _Existing, Error) ->
+           (New, Existing, Error) ->
+            link_path(Opts, Existing, New),
             Error
         end,
         ok,
@@ -222,8 +225,15 @@ link_path(Opts, Existing, New) ->
     case file:make_symlink(add_prefix(Opts, ExistingPath), N = add_prefix(Opts, NewPath)) of
         ok -> ok;
         {error, eexist} ->
-            file:delete(N),
-            R = file:make_symlink(add_prefix(Opts, ExistingPath), N),
+            % Keep an existing link to the same target; replace any other entry.
+            Target = add_prefix(Opts, ExistingPath),
+            TargetName = unicode:characters_to_list(Target),
+            Make = fun(Temp) -> file:make_symlink(Target, Temp) end,
+            R =
+                case file:read_link(N) of
+                    {ok, TargetName} -> ok;
+                    _ -> replace(Opts, N, Make)
+                end,
             ?event(debug_fs,
                 {symlink_recreated,
                     {existing, ExistingPath},
