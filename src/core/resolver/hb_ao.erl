@@ -1206,25 +1206,20 @@ set(RawBase, RawReq, Opts) when is_map(RawReq) ->
             Opts
         ),
     ?event_debug(ao_internal, {set_called, {base, Base}, {req, Req}}, Opts),
-    % Get the next key to set. 
-    case keys(Req, internal_opts(Opts)) of
-        [] -> Base;
-        [Key|_] ->
-            % Get the value to set. Use AO-Core by default, but fall back to
-            % getting via `maps' if it is not found.
-            Val =
-                case get(Key, Req, internal_opts(Opts)) of
-                    not_found -> hb_maps:get(Key, Req, undefined, Opts);
-                    Body -> Body
-                end,
+    % Set each public key of the request to the value that its map holds. The
+    % request is data to set: its device does not resolve its keys or values.
+    lists:foldl(
+        fun(Key, Acc) ->
+            Val = hb_maps:get(Key, Req, undefined, Opts),
             ?event_debug({got_val_to_set, {key, Key}, {val, Val}, {req, Req}}),
-            % Next, set the key and recurse, removing the key from the Req.
-            set(
-                set(Base, Key, Val, internal_opts(Opts)),
-                remove(Req, Key, internal_opts(Opts)),
-                Opts
-            )
-    end.
+            set(Acc, Key, Val, internal_opts(Opts))
+        end,
+        Base,
+        lists:filter(
+            fun(Key) -> not hb_private:is_private(Key) end,
+            hb_maps:keys(hb_message:uncommitted(Req, Opts), Opts)
+        )
+    ).
 set(Base, Key, Value, Opts) ->
     % For an individual key, we run deep_set with the key as the path.
     % This handles both the case that the key is a path as well as the case

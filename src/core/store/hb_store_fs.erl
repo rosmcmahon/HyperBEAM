@@ -90,7 +90,22 @@ write_path(Opts, PathComponents, Value) ->
     Path = add_prefix(Opts, hb_path:to_binary(PathComponents)),
     ?event({writing, Path, byte_size(Value)}),
     filelib:ensure_dir(Path),
-    file:write_file(Path, Value).
+    % Keep a file that holds the value; replace any other entry.
+    Make = fun(Temp) -> file:write_file(Temp, Value) end,
+    case holds_value(Path, Value) of
+        true -> ok;
+        false -> replace(Opts, Path, Make)
+    end.
+
+%% @doc Whether `Path' is a file, not a link, that holds `Value'.
+holds_value(Path, Value) ->
+    case file:read_link_info(Path) of
+        {ok, #file_info{ type = regular, size = Size }} ->
+            Size == byte_size(Value) andalso
+                file:read_file(Path) == {ok, Value};
+        _ ->
+            false
+    end.
 
 %% @doc List contents of a directory in the store, following symlinks as
 %% needed.
@@ -185,11 +200,14 @@ group(Opts = #{ <<"name">> := _DataDir }, #{ <<"group">> := Path }, _NodeOpts) -
     end.
 
 %% @doc Create a symlink, handling the case where the link would point to itself.
+%% A failed link does not stop the others: every link of the request is tried,
+%% and the first error is returned.
 link(Opts, Req, _NodeOpts) when is_map(Req) ->
     maps:fold(
         fun(New, Existing, ok) ->
             link_path(Opts, Existing, New);
-           (_New, _Existing, Error) ->
+           (New, Existing, Error) ->
+            link_path(Opts, Existing, New),
             Error
         end,
         ok,
@@ -207,8 +225,15 @@ link_path(Opts, Existing, New) ->
     case file:make_symlink(add_prefix(Opts, ExistingPath), N = add_prefix(Opts, NewPath)) of
         ok -> ok;
         {error, eexist} ->
-            file:delete(N),
-            R = file:make_symlink(add_prefix(Opts, ExistingPath), N),
+            % Keep an existing link to the same target; replace any other entry.
+            Target = add_prefix(Opts, ExistingPath),
+            TargetName = unicode:characters_to_list(Target),
+            Make = fun(Temp) -> file:make_symlink(Target, Temp) end,
+            R =
+                case file:read_link(N) of
+                    {ok, TargetName} -> ok;
+                    _ -> replace(Opts, N, Make)
+                end,
             ?event(debug_fs,
                 {symlink_recreated,
                     {existing, ExistingPath},
@@ -220,6 +245,25 @@ link_path(Opts, Existing, New) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% @doc Replace the entry at `Path' with the file or link that `Make' makes at
+%% a unique path in the store's `~tmp' directory, by renaming it over the
+%% entry. The rename replaces the entry in one step: a concurrent read finds
+%% the old entry or the new one, a crash leaves one of them whole, and a link
+%% at `Path' is replaced, not written through. Escaped keys never contain `~',
+%% so no key names the directory or a path in it.
+replace(#{ <<"name">> := DataDir }, Path, Make) ->
+    Unique = hb_util:encode(crypto:strong_rand_bytes(16)),
+    Temp = <<DataDir/binary, "/~tmp/", Unique/binary>>,
+    filelib:ensure_dir(Temp),
+    R =
+        maybe
+            ok ?= Make(Temp),
+            file:rename(Temp, Path)
+        end,
+    % Remove the temporary entry if the rename did not move it.
+    file:delete(Temp),
+    R.
 
 %% @doc Add the directory prefix to a path.
 add_prefix(#{ <<"name">> := Prefix }, Path) ->

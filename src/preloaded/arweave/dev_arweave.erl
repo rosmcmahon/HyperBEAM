@@ -132,7 +132,10 @@ post_tx(_Base, Request, Opts, <<"ans104@1.0">>) ->
             <<"body">> => Request
         },
         Opts
-    ).
+    );
+post_tx(_Base, _Request, _Opts, Device) ->
+    ?event(error, {unsupported_commitment_device, Device}),
+    {error, <<"Unsupported commitment device on `POST tx` request.">>}.
 
 post_tx_header(TX, Opts) ->
     JSON = ar_tx:tx_to_json_struct(TX#tx{ data = <<>> }),
@@ -596,7 +599,7 @@ fill_gaps(ChunkInfos, Offset, EndOffset, Opts) ->
 fetch_and_collect(Offsets, Opts) ->
     fetch_and_collect(
         Offsets,
-        fun(Offset) -> decode_chunk(get_chunk(Offset, Opts)) end,
+        fun(Offset) -> decode_chunk(Offset, get_chunk(Offset, Opts)) end,
         Opts
     ).
 fetch_and_collect(Offsets, GETFun, Opts) ->
@@ -627,9 +630,10 @@ pending_relative_chunk_offsets(Offset, Length, DataSize) ->
                 Chunk <- lists:seq(FirstChunk, LastChunk)]
     end.
 
-%% @doc Decode a chunk response into a {Start, End, Binary} tuple.
+%% @doc Decode a chunk response into a {Start, End, Binary} tuple, if the chunk
+%% holds the byte at the offset it was fetched for.
 %% Runs inside the pmap worker so raw JSON is GC'd per-worker.
-decode_chunk({ok, JSON}) ->
+decode_chunk(Offset, {ok, JSON}) ->
     AbsEnd = hb_util:int(maps:get(<<"absolute_end_offset">>, JSON)),
     {AbsStart, _AbsEnd, Chunk} = ChunkTuple = decode_chunk_tuple(JSON, AbsEnd),
     ?event(debug_arweave,
@@ -637,8 +641,11 @@ decode_chunk({ok, JSON}) ->
             {abs_start, AbsStart},
             {abs_end, AbsEnd},
             {size, byte_size(Chunk)}}),
-    {ok, ChunkTuple};
-decode_chunk({error, _} = Err) ->
+    case AbsStart =< Offset andalso Offset =< AbsEnd of
+        true -> {ok, ChunkTuple};
+        false -> {error, 'chunk-not-at-offset'}
+    end;
+decode_chunk(_Offset, {error, _} = Err) ->
     Err.
 
 decode_chunk_tuple(JSON, ChunkEnd) ->
@@ -766,7 +773,7 @@ block(Base, RawRequest, Opts) when is_map(Base) ->
             )
         ) },
     Block =
-        hb_ao:get_first(
+        hb_maps:get_first(
             [
                 {Request, <<"block">>},
                 {Base, <<"block">>}
@@ -1259,22 +1266,24 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
                 end
         end,
     TX = TXHeader#tx{ data = Data },
-    try
-        {
-            ok,
-            hb_message:convert(
-                TX,
-                <<"structured@1.0">>,
-                <<"tx@1.0">>,
-                Opts
-            )
-        }
-    catch
-        _:{necessary_message_not_found, _, _}:_ ->
-            {error, not_found};
-        _:_:_ ->
-            case TX#tx.id =:= hb_util:native_id(ID) andalso ar_tx:verify(TX) of
-                true ->
+    % Return the transaction only if it has the requested ID, its signature
+    % verifies, and any data it carries is the data that the signature covers.
+    case TX#tx.id =:= hb_util:native_id(ID) andalso ar_tx:verify(TX) of
+        true ->
+            try
+                {
+                    ok,
+                    hb_message:convert(
+                        TX,
+                        <<"structured@1.0">>,
+                        <<"tx@1.0">>,
+                        Opts
+                    )
+                }
+            catch
+                _:{necessary_message_not_found, _, _}:_ ->
+                    {error, not_found};
+                _:_:_ ->
                     {
                         error,
                         #{
@@ -1285,10 +1294,10 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
                                     "but not deserializable."
                                 >>
                         }
-                    };
-                false ->
-                    {error, <<"Received invalid transaction.">>}
-            end
+                    }
+            end;
+        false ->
+            {error, <<"Received invalid transaction.">>}
     end.
 
 event_request(Path, Method, Status, Extra) ->

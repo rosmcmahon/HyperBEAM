@@ -55,8 +55,23 @@ start(ProcID, Proc, Opts) ->
                     not_found ->
                         ?event({starting_new_schedule, {proc_id, ProcID}}),
                         {-1, undefined};
-                    {Slot, Base} ->
-                        {Slot, Base}
+                    {Slot, Latest} ->
+                        % The next assignment applies to the state after the
+                        % latest one, as `do_assign/3' sets it.
+                        {
+                            Slot,
+                            next_hashpath(
+                                hb_ao:get_first(
+                                    [
+                                        {Latest, <<"base-hashpath">>},
+                                        {Latest, <<"hash-chain">>}
+                                    ],
+                                    #{ <<"hashpath">> => ignore }
+                                ),
+                                Latest,
+                                #{ hashpath_alg => HashpathAlg, opts => Opts }
+                            )
+                        }
                 end,
             ?event(
                 {scheduler_got_process_info,
@@ -255,6 +270,10 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(starting_message_write),
             ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
+            % The store may hold the write in memory: commit it before the
+            % slot is confirmed. A failed commit raises, and `assign/3' keeps
+            % the previous slot without answering the client.
+            ok = dev_scheduler_cache:flush(Opts),
             maybe_inform_recipient(
                 local_confirmation,
                 ReplyPID,
@@ -264,8 +283,8 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(writes_complete),
             ?event(uploading_message),
-            hb_client_remote:upload(Message, Opts),
-            hb_client_remote:upload(Assignment, Opts),
+            upload(Message, Opts),
+            upload(Assignment, Opts),
             ?event(uploads_complete),
             maybe_inform_recipient(
                 remote_confirmation,
@@ -313,6 +332,23 @@ maybe_inform_recipient(Mode, ReplyPID, Message, Assignment, State) ->
     case maps:get(mode, State) of
         Mode -> ReplyPID ! {scheduled, Message, Assignment};
         _ -> ok
+    end.
+
+%% @doc Upload a message once its assignment is written. The slot is taken by
+%% then, so an exception from the upload is logged and returned as an error,
+%% and the slot counter still moves past the written slot.
+upload(Msg, Opts) ->
+    try hb_client_remote:upload(Msg, Opts)
+    catch
+        Class:Reason:Stack ->
+            ?event(warning,
+                {upload_failed,
+                    {class, Class},
+                    {reason, Reason},
+                    {trace, Stack}
+                }
+            ),
+            {error, Reason}
     end.
 
 %% @doc Find the hashpath of the base state upon which a new assignment should

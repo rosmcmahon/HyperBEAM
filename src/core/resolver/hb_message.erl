@@ -521,7 +521,7 @@ verify(Msg, all, Opts) ->
 verify(Msg, none, Opts) ->
     verify(Msg, <<"none">>, Opts);
 verify(Msg, signers, Opts) ->
-    verify(Msg, hb_message:signers(Msg, Opts), Opts);
+    verify(Msg, #{ <<"committers">> => <<"all">> }, Opts);
 verify(Msg, Committers, Opts) when not is_map(Committers) ->
     verify(
         Msg,

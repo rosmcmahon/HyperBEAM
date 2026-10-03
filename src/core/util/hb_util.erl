@@ -623,10 +623,11 @@ message_to_ordered_pairs({Key, Val, Iter}, Acc) ->
             message_to_ordered_pairs(Next, [{N, CanonicalKey, MaybeValue}|Acc])
     end.
 
-message_to_ordered_key(<<"commitments">>) -> skip;
-message_to_ordered_key(<<"ao-types">>) -> skip;
-message_to_ordered_key(<<"priv", _/binary>>) -> skip;
-message_to_ordered_key(Key) -> int(Key).
+message_to_ordered_key(Key) ->
+    case is_ordered_list_key(Key) of
+        skip -> skip;
+        _ -> int(Key)
+    end.
 
 message_to_ordered_list(Message, [{Next, NextKey, NextVal}|Rest], N, Key, MaybeValue, Opts, Acc)
         when Next == N + 1 ->

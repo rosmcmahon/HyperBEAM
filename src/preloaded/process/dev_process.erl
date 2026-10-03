@@ -171,8 +171,9 @@ snapshot(RawBase, _Req, Opts) ->
 
 %% @doc Before computation begins, a boot phase is required. This phase
 %% allows devices on the execution stack to initialize themselves. We set the
-%% `Initialized' key to `True' to indicate that the process has been
-%% initialized.
+%% private `initialized' key to `true' to indicate that the state holds the
+%% live state of its execution devices. The key is never stored, so a state
+%% read from the cache is not initialized.
 init(Base, Req, Opts) ->
     ?event({init_called, {base, Base}, {req, Req}}),
     {ok, Initialized} =
@@ -184,12 +185,10 @@ init(Base, Req, Opts) ->
         ),
     {
         ok,
-        hb_ao:set(
-            Initialized,
-            #{
-                <<"initialized">> => <<"true">>,
-                <<"at-slot">> => -1
-            },
+        hb_private:set(
+            hb_ao:set(Initialized, #{ <<"at-slot">> => -1 }, Opts),
+            <<"initialized">>,
+            <<"true">>,
             Opts
         )
     }.
@@ -207,7 +206,7 @@ init(Base, Req, Opts) ->
 %%   for the dryrun functionality that allows external clients to test
 %%   message processing without side effects.
 -spec compute(
-    #{ initialized => binary(), 'at-slot' => integer(), _ => _ },
+    #{ 'at-slot' => integer(), _ => _ },
     #{
         compute => integer(),
         slot => integer(),
@@ -763,7 +762,7 @@ ensure_loaded(Base, Req, Opts) ->
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
     ProcID = lib_process:process_id(Base, #{}, Opts),
     ?event({ensure_loaded, {base, Base}, {req, Req}}),
-    case hb_ao:get(<<"initialized">>, Base, Opts) of
+    case hb_private:get(<<"initialized">>, Base, Opts) of
         <<"true">> ->
             ?event(already_initialized),
             {ok, Base};
@@ -816,10 +815,12 @@ ensure_loaded(Base, Req, Opts) ->
                             Opts
                         ),
                     SnapshotReq =
-                        SnapshotMsg#{
-                            <<"process">> => UpdateProcess,
-                            <<"initialized">> => <<"true">>
-                        },
+                        hb_private:set(
+                            SnapshotMsg#{ <<"process">> => UpdateProcess },
+                            <<"initialized">>,
+                            <<"true">>,
+                            Opts
+                        ),
                     LoadedSlot =
                         hb_cache:ensure_all_loaded(MaybeLoadedSlot, Opts),
                     ?event(compute,

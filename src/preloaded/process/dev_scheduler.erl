@@ -1780,7 +1780,7 @@ http_get_schedule_test_parallel_() ->
 				{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 3),
 				Assignments = hb_ao:get(<<"assignments">>, Schedule, Opts),
 				?assertEqual(
-					5, % 4 assignments, +1 for the commitments
+					4, % 4 assignments: a bundle holds no unsigned commitments.
 					hb_maps:size(hb_private:reset(Assignments), Opts)
 				)
 			end}.

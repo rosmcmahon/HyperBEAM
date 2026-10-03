@@ -315,6 +315,7 @@ normalize(RawM1, M2, Opts) ->
                         {ok, M1} = init(RawM1, State, Opts),
                         Res = hb_beamr:deserialize(instance(M1, M2, Opts), State),
                         ?event(snapshot, {wasm_deserialized, {result, Res}}),
+                        ok = Res,
                         M1
                 end;
             _ ->

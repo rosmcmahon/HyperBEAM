@@ -1,6 +1,6 @@
 %%% @doc A module that provides a cache for scheduler assignments and locations.
 -module(dev_scheduler_cache).
--export([write/3, write_spawn/2, read/3]).
+-export([write/3, write_spawn/2, read/3, flush/1]).
 -export([list/2, latest/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -56,6 +56,12 @@ write(ProcID, RawAssignment, RawOpts) ->
             ?event(error, {failed_to_write_assignment, {reason, Reason}}),
             {error, Reason}
     end.
+
+%% @doc Commit the writes that the scheduler store holds in memory, such that
+%% they survive a halt of the node.
+flush(RawOpts) ->
+    Opts = opts(RawOpts),
+    hb_store:flush(hb_opts:get(store, no_viable_store, Opts), Opts).
 
 %% @doc Write the initial assignment message to the cache.
 write_spawn(RawInitMessage, Opts) ->
@@ -144,16 +150,7 @@ latest(ProcID, RawOpts) ->
                 AssignmentNum,
                 Opts
             ),
-            {
-                AssignmentNum,
-                hb_ao:get_first(
-                    [
-                        {Assignment, <<"base-hashpath">>},
-                        {Assignment, <<"hash-chain">>}
-                    ],
-                    #{ <<"hashpath">> => ignore }
-                )
-            }
+            {AssignmentNum, Assignment}
     end.
 
 %%% Tests

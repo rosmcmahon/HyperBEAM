@@ -230,6 +230,8 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         msg[msg_index++] = 2;
         
         int msg_res = erl_drv_output_term(proc->port_term, msg, msg_index);
+        driver_free(msg);
+        driver_free(out_binary);
         DRV_DEBUG("Read response sent: %d", msg_res);
     }
     else if (strcmp(command, "size") == 0) {
@@ -246,6 +248,20 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         msg[msg_index++] = ERL_DRV_TUPLE;
         msg[msg_index++] = 2;
         erl_drv_output_term(proc->port_term, msg, msg_index);
+    }
+    else if (strcmp(command, "grow") == 0) {
+        DRV_DEBUG("Grow received");
+        long pages;
+        ei_decode_long(buff, &index, &pages);
+        if(!wasm_runtime_enlarge_memory(proc->instance->inst_comm_rt, pages)) {
+            DRV_DEBUG("Grow request failed.");
+            send_error(proc, "Grow request failed");
+            return;
+        }
+        ErlDrvTermData* msg = driver_alloc(sizeof(ErlDrvTermData) * 2);
+        msg[0] = ERL_DRV_ATOM;
+        msg[1] = atom_ok;
+        erl_drv_output_term(proc->port_term, msg, 2);
     }
     else {
         DRV_DEBUG("Unknown command: %s", command);

@@ -93,9 +93,21 @@ item(_Base, Req, Opts) ->
     end.
 
 %% @doc Verify the subject by extracting committed fields and checking signatures.
+%% The item is the subject with its signed ANS-104 commitments alone: an item
+%% in a bundle carries its ANS-104 signature and no other, so a subject with
+%% no such commitment is unsigned, and the item's ID is its ANS-104 ID.
 %% Returns {ok, Item} or {error, Reason}.
 verify_message(Req, Opts) ->
-    case hb_message:with_only_committed(Req, Opts) of
+    ANS104 =
+        hb_message:with_commitments(
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"committer">> => '_'
+            },
+            Req,
+            Opts
+        ),
+    case hb_message:with_only_committed(ANS104, Opts) of
         {ok, Item} ->
             case hb_message:signers(Item, Opts) of
                 [] ->
@@ -193,12 +205,16 @@ server_address(Opts) ->
 
 %% @doc Return the PID of the bundler server. If the server is not running,
 %% it is started and registered with the name returned by `server_name/1'.
+%% The items it recovers are listed before it starts, so an item that a
+%% request caches once it has started is queued by that request alone.
 ensure_server(Opts) ->
     Name = server_name(Opts),
-    hb_name:singleton(
-        Name,
-        fun() -> init(Opts) end
-    ).
+    case hb_name:lookup(Name) of
+        PID when is_pid(PID) -> PID;
+        undefined ->
+            ItemIDs = dev_bundler_cache:list_item_ids(Opts),
+            hb_name:singleton(Name, fun() -> init(ItemIDs, Opts) end)
+    end.
 
 %% @doc Return the current bundler server state for tests.
 get_state() ->
@@ -216,7 +232,7 @@ get_state(Opts) ->
     end.
 
 %% @doc Initialize the bundler server.
-init(Opts) ->
+init(ItemIDs, Opts) ->
     NumWorkers = hb_opts:get(bundler_workers, ?DEFAULT_NUM_WORKERS, Opts),
     Workers = lists:map(
         fun(_) ->
@@ -237,7 +253,7 @@ init(Opts) ->
         bundles = #{},
         opts = Opts
     },
-    dev_bundler_recovery:recover_unbundled_items(self(), Opts),
+    dev_bundler_recovery:recover_unbundled_items(self(), ItemIDs, Opts),
     dev_bundler_recovery:recover_bundles(self(), Opts),
     server(assign_tasks(InitialState), Opts).
 
@@ -717,7 +733,9 @@ nested_bundle_test_parallel() ->
     end.
 
 %% @doc End-to-end bundler test for a nested dataitem where the parent
-%% has bundle=false. The chile is posted on its own first.
+%% has bundle=false. The child is posted on its own first: it is signed with
+%% `httpsig@1.0' alone, so the bundler refuses it, and a plain data item
+%% takes its slot.
 nested_unbundled_bundle_child_posted_test_parallel() ->
     run_nested_unbundled_bundle_test(child_posted).
 
@@ -815,7 +833,11 @@ run_nested_unbundled_bundle_test(Variant) ->
     end.
 
 post_first_item(Node, child_posted, Child, ClientOpts) ->
-    post_structured_item(Node, Child, ClientOpts);
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"details">> := <<"unsigned-item">> }},
+        post_structured_item(Node, Child, ClientOpts)
+    ),
+    post_data_item(Node, new_data_item(1, 10), ClientOpts);
 post_first_item(Node, child_not_posted, _Child, ClientOpts) ->
     post_data_item(Node, new_data_item(1, 10), ClientOpts).
 

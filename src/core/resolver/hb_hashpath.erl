@@ -615,6 +615,9 @@ execute(Ctx, Opts) ->
         {ok, Req} ?= load_request(Ctx, Opts),
         true ?= verify_all_commitments(Base, Opts),
         true ?= verify_all_commitments(Req, Opts),
+        % A transition is one key. A request whose path has several parts is
+        % refused, as `resolve/3' would apply them in turn.
+        [_] = hb_path:from_message(request, Req, Opts),
         hb_ao:resolve(
             Base,
             Req,

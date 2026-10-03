@@ -250,12 +250,20 @@ serialize(WASM) when is_pid(WASM) ->
     ?event({finished_serialize, byte_size(Mem)}),
     {ok, Mem}.
 
-%% @doc Deserialize a WASM state from a binary.
+%% @doc Deserialize a WASM state from a binary. The instance's memory is first
+%% grown to the size of the binary, so a state whose memory grew after the
+%% instance started is written in full.
 deserialize(WASM, Bin) when is_pid(WASM) andalso is_binary(Bin) ->
     ?event(starting_deserialize),
-    Res = hb_beamr_io:write(WASM, 0, Bin),
+    {ok, Size} = hb_beamr_io:size(WASM),
+    Pages = max(0, byte_size(Bin) - Size) div 65536,
+    Res =
+        maybe
+            ok ?= hb_beamr_io:grow(WASM, Pages),
+            hb_beamr_io:write(WASM, 0, Bin)
+        end,
     ?event({finished_deserialize, Res}),
-    ok.
+    Res.
 
 %% Tests
 

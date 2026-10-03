@@ -192,7 +192,14 @@ name_from_host(Host, no_host) ->
             end
     end;
 name_from_host(ReqHost, RawNodeHost) ->
-    NodeHostName = maps:get(host, uri_string:parse(RawNodeHost), RawNodeHost),
+    % `node-host' is a URL or a host alone, with or without a port. A value
+    % that does not parse as a URL with a host, such as `127.0.0.1:8734', is
+    % used as it is.
+    NodeHostName =
+        case uri_string:parse(RawNodeHost) of
+            #{ host := ParsedHost } -> ParsedHost;
+            _ -> RawNodeHost
+        end,
     case binary:split(ReqHost, <<".", NodeHostName/binary>>) of
         [Subdomain, <<>>] -> {ok, Subdomain};
         _ when ReqHost =:= NodeHostName ->
