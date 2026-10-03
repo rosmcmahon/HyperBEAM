@@ -214,7 +214,8 @@ init(Base, Req, Opts) ->
         push => _,
         'result-depth' => _,
         async => _,
-        'max-depth' => _
+        'max-depth' => _,
+        'max-age' => infinity | integer()
     },
     #{ _ => _ }
 ) -> {ok, #{ _ => _ }} | {error, _} | {failure, _}.
