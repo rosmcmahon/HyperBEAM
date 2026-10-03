@@ -152,6 +152,7 @@ request(Base, Req, Opts) ->
 load(Msg, _Opts) when is_map(Msg) -> {ok, Msg};
 load(List, _Opts) when is_list(List) -> skip;
 load({as, _, _}, _Opts) -> skip;
+load({resolve, _}, _Opts) -> skip;
 load(ID, Opts) when ?IS_ID(ID) ->
     case hb_cache:read(ID, Opts) of
         {ok, Msg} -> load(Msg, Opts);
