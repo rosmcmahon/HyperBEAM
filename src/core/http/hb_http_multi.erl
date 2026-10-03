@@ -123,13 +123,13 @@ multirequest_opt(Key, Config, Message, Default, Opts) ->
         Opts#{ <<"hashpath">> => ignore }
     ).
 
-%% @doc Check if a response is admissible, according to the configuration. First,
-%% we check the Erlang response status to check for `ok'. If the response is
-%% not `ok', it is not admissible.
-%% 
-%% If the response is `ok', we check the status and the response message against
-%% the configuration.
-is_admissible(ok, Res, Admissible, Statuses, Opts) ->
+%% @doc Check if a response is admissible, according to the configuration. A
+%% reply is admissible if its status is one of the configured statuses and it
+%% satisfies the `admissible' message. With the statuses `All', a reply that
+%% is not `ok' is not admissible. A request that fails without a reply is not
+%% admissible.
+is_admissible(ErlStatus, Res, Admissible, Statuses, Opts)
+        when ErlStatus == ok; is_map(Res), Statuses =/= <<"All">> ->
     ?event(debug_multi,
         {is_admissible,
             {response, Res},
@@ -228,8 +228,8 @@ node_request(Method, Node, Path, Message, Opts) ->
     end.
 
 %% @doc Check if a status is allowed, according to the configuration. Statuses
-%% can be a single integer, a comma-separated list of integers, or the string
-%% `All'.
+%% can be a single integer, a list of integers, a comma-separated list of
+%% integers, or the string `All'. Integers may be given as binaries.
 admissible_status(_, <<"All">>, _Opts) -> true;
 admissible_status(ResponseMsg = #{ <<"status">> := _ }, Statuses, Opts) ->
     admissible_status(hb_http:http_status(ResponseMsg, Opts), Statuses, Opts);
@@ -238,14 +238,9 @@ admissible_status(Status, Statuses, Opts) when is_integer(Statuses) ->
 admissible_status(Status, Statuses, Opts) when is_binary(Status) ->
     admissible_status(binary_to_integer(Status), Statuses, Opts);
 admissible_status(Status, Statuses, Opts) when is_binary(Statuses) ->
-    % Convert the statuses to a list of integers.
-    admissible_status(
-        Status,
-        lists:map(fun binary_to_integer/1, binary:split(Statuses, <<",">>)),
-        Opts
-    );
+    admissible_status(Status, hb_util:binary_to_strings(Statuses), Opts);
 admissible_status(Status, Statuses, _Opts) when is_list(Statuses) ->
-    lists:member(Status, Statuses).
+    lists:member(Status, lists:map(fun hb_util:int/1, Statuses)).
 
 %% @doc If an `admissable` message is set for the request, check if the response
 %% adheres to it. Else, return `true'.
