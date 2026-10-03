@@ -452,8 +452,14 @@ vary_projection_and_coercion_test() ->
 
 vary_required_key_missing_test() ->
     Opts = vary_opts(),
-    ?assertThrow(
-        {required_key_missing, <<"required">>},
+    ?assertEqual(
+        {error, #{
+            <<"status">> => 400,
+            <<"error">> => <<"required-key-missing">>,
+            <<"input">> => <<"base">>,
+            <<"key">> => <<"required">>,
+            <<"resolving">> => <<"~test-device@1.0/vary-projection">>
+        }},
         hb_ao:resolve(
             #{
                 <<"device">> => <<"test-device@1.0">>,

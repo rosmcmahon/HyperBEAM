@@ -131,7 +131,8 @@ content_type(Filename) ->
     end.
 
 %% @doc Apply a simple binary replacement template to a static file. Values are
-%% inserted as HTML text.
+%% inserted as HTML text, and a list of `{Term, Description}' pairs as the
+%% terms and descriptions of a definition list.
 apply_static_template(Body, Template) when is_map(Template) ->
     apply_static_template(Body, maps:to_list(Template));
 apply_static_template(Body, []) ->
@@ -141,11 +142,22 @@ apply_static_template(Body, [{Key, Value} | Rest]) ->
         binary:replace(
             Body,
             <<"{{", Key/binary, "}}">>,
-            escape_html(hb_util:bin(Value)),
+            template_html(Value),
             [global]
         ),
         Rest
     ).
+
+%% @doc The HTML of a template value.
+template_html([{_, _} | _] = Pairs) ->
+    <<
+        <<"<dt>", (template_html(Term))/binary, "</dt>",
+            "<dd>", (template_html(Description))/binary, "</dd>">>
+    ||
+        {Term, Description} <- Pairs
+    >>;
+template_html(Value) ->
+    escape_html(hb_util:bin(Value)).
 
 %% @doc Escape the characters that HTML reads as markup.
 escape_html(Bin) ->
