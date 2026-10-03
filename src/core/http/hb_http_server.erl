@@ -645,8 +645,10 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
 
 %% @doc The status of an error response. A request whose commitments do not
 %% verify or that `hb_singleton' cannot parse is refused as the client's error.
+%% A request that needs a message the node cannot load is not found.
 error_status(throw, {invalid_commitments, _}) -> 400;
 error_status(throw, {invalid_singleton, _, _}) -> 400;
+error_status(throw, {necessary_message_not_found, _, _}) -> 404;
 error_status(_Type, _Details) -> 500.
 
 %% @doc The error type and offender of a request that `hb_singleton' cannot
@@ -868,4 +870,20 @@ restart_server_test() ->
     ?assertEqual(
         {ok, <<"server-2">>},
         hb_http:get(N2, <<"/~meta@1.0/info/test-key">>, #{ <<"protocol">> => http2 })
+    ).
+
+%% @doc A request whose path reads a link to a message the node does not hold
+%% gets 404.
+read_missing_link_test() ->
+    Node = start_node(#{ <<"store">> => hb_test_utils:test_store() }),
+    ?assertMatch(
+        {error, #{ <<"status">> := 404 }},
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/x">>,
+                <<"x+link">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+            },
+            #{}
+        )
     ).
