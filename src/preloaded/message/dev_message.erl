@@ -310,8 +310,7 @@ commit(Self, Req, Opts) ->
             Req#{ <<"type">> => maps:get(<<"type">>, Req, <<"signed">>) },
             CommitOpts
         ),
-    Res = Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) },
-    {ok, hb_private:merge(Res, Committed, Opts)}.
+    {ok, Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) }}.
 
 %% @doc The keys a commitment lists as committed, in their normalized form. A
 %% commitment without a `committed' list commits no keys.
@@ -1387,6 +1386,24 @@ vacuous_signed_commitment_test_() ->
     ||
         Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
     ].
+
+%% @doc Committing to a message keeps its private element as it is: a link in
+%% it is not loaded, even when the node does not hold its message.
+commit_keeps_private_links_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Missing =
+        {link,
+            hb_util:human_id(crypto:strong_rand_bytes(32)),
+            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+        },
+    Priv = #{ <<"request">> => #{ <<"x">> => Missing } },
+    Committed =
+        hb_message:commit(
+            #{ <<"a">> => <<"b">>, <<"priv">> => Priv },
+            Opts,
+            #{ <<"type">> => <<"unsigned">> }
+        ),
+    ?assertEqual(Priv, maps:get(<<"priv">>, Committed)).
 
 set_nested_link_test() ->
     Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)] },
