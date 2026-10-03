@@ -233,8 +233,7 @@ handle_resolve(Req, Msgs, NodeMsg) ->
             {parsed_request_sequence, Msgs}
         }
     ),
-    LoadedMsgs = hb_cache:ensure_all_loaded(Msgs, NodeMsg),
-    case resolve_hook(<<"request">>, Req, LoadedMsgs, NodeMsg) of
+    case resolve_hook(<<"request">>, Req, Msgs, NodeMsg) of
         {ok, []} ->
             {ok,
                 #{
