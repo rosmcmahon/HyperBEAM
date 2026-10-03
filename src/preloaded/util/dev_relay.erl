@@ -70,13 +70,27 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
             ],
             Opts
         ),
-    RelayPeer =
+    % A `peer' named in the request is checked against the host policy. A
+    % `relay-route' is resolved through the node's own routes, so it names a
+    % destination the node's configuration chose and is reached without a
+    % check.
+    RequestPeer =
         hb_ao:get_first(
             [
                 {M1, <<"peer">>},
                 {{as, <<"message@1.0">>, BaseTarget}, <<"peer">>},
                 {RawM2, <<"peer">>}
             ],
+            Opts
+        ),
+    RelayRoute =
+        hb_ao:get_first(
+            [
+                {M1, <<"relay-route">>},
+                {{as, <<"message@1.0">>, BaseTarget}, <<"relay-route">>},
+                {RawM2, <<"relay-route">>}
+            ],
+            not_found,
             Opts
         ),
     RelayMethod =
@@ -161,12 +175,19 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
             <<"http-only-result">> => false,
             <<"http-redirects">> => 0
         },
-    % The relay reaches the `peer' when one is named, otherwise the host in an
-    % absolute `relay-path'. A relative path names no host; the node routes it
-    % through its own routes, failing closed when none match. Refuse the request
-    % when the host it reaches is blocked, or when a named destination has no
-    % resolvable host.
-    case is_blocked_host(relay_destination(RelayPeer, RelayPath), Opts) of
+    % Decide where the request goes and whether the host was chosen by the
+    % node. A `relay-route' the node resolves through its own routes is trusted.
+    % A request `peer' or absolute `relay-path' is checked; a relative
+    % `relay-path' names no host and is routed by `hb_http:request/2', which
+    % fails closed when no route matches.
+    {RelayPeer, Destination} =
+        case RelayRoute of
+            not_found ->
+                {RequestPeer, relay_destination(RequestPeer, RelayPath)};
+            _ ->
+                {route_node(RelayRoute, RelayMethod, Opts), undefined}
+        end,
+    case is_blocked_host(Destination, Opts) of
         true -> {error, blocked_host};
         false ->
             Res =
@@ -197,6 +218,18 @@ relay_destination(not_found, <<"http://", _/binary>> = Path) -> Path;
 relay_destination(not_found, <<"https://", _/binary>> = Path) -> Path;
 relay_destination(not_found, _RelativePath) -> undefined;
 relay_destination(Peer, _RelayPath) -> Peer.
+
+%% @doc The node that the node's own routes resolve `Route' to: the destination
+%% the node's configuration chose for that path. Returns `not_found' when no
+%% route matches, which leaves the request with no peer to contact.
+route_node(Route, Method, Opts) ->
+    case hb_http:message_to_request(
+            #{ <<"path">> => Route, <<"method">> => Method },
+            Opts
+        ) of
+        {ok, _Method, Node, _Path, _Msg, _NodeOpts} -> Node;
+        {error, _} -> not_found
+    end.
 
 %% @doc Ensure that cookies are not forwarded either to or from the relayed
 %% node.
@@ -423,9 +456,6 @@ commit_request_test() ->
         hb_http_server:start_node(#{
             <<"priv-wallet">> => Wallet,
             <<"relay-allow-commit-request">> => true,
-            % The executor runs on an internal host, so the relay must be told
-            % to permit it.
-            <<"relay-block-internal">> => false,
             <<"routes">> =>
                 [
                     #{
