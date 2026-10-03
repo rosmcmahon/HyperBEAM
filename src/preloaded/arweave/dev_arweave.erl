@@ -769,7 +769,7 @@ block(Base, RawRequest, Opts) when is_map(Base) ->
             )
         ) },
     Block =
-        hb_ao:get_first(
+        hb_maps:get_first(
             [
                 {Request, <<"block">>},
                 {Base, <<"block">>}
