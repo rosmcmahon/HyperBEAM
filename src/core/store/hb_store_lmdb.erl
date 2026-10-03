@@ -32,6 +32,8 @@
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
 -define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
                                                 % every 5,000 write operations.
+-define(DEFAULT_FLUSH_EVERY, 1_000).            % Commit buffered writes at
+                                                % least every second.
 -define(MAX_KEY_SIZE, 511).                     % LMDB's key size limit, bytes.
 
 %% @doc Start the LMDB storage system for a given database configuration.
@@ -84,9 +86,38 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
     % Create the LMDB environment with specified size limit
     {ok, Env} = elmdb:env_open(DataDirPath, EnvOpts),
     {ok, DBInstance} = elmdb:db_open(Env, [create]),
-    {ok, #{ <<"env">> => Env, <<"db">> => DBInstance }};
+    Instance = #{ <<"env">> => Env, <<"db">> => DBInstance },
+    start_flusher(Opts, Instance),
+    {ok, Instance};
 start(_Store, _Req, _NodeOpts) ->
     {error, {badarg, <<"StoreOpts must be a map">>}}.
+
+%% @doc Start the store's flusher, one process per store, which commits the
+%% writes that `elmdb' holds in memory every `flush-every' milliseconds, so that
+%% a crash of the node loses at most the writes of the last interval. A
+%% `flush-every' of 0 starts none, and a read-only store has no writes.
+start_flusher(Opts = #{ <<"name">> := DataDir }, Instance) ->
+    FlushEvery =
+        hb_util:int(maps:get(<<"flush-every">>, Opts, ?DEFAULT_FLUSH_EVERY)),
+    case maps:get(<<"read-only">>, Opts, false) orelse FlushEvery == 0 of
+        true -> ok;
+        false ->
+            hb_name:singleton(
+                {?MODULE, DataDir},
+                fun() -> flusher(Instance, FlushEvery) end
+            ),
+            ok
+    end.
+
+%% @doc Commit the store's buffered writes every `FlushEvery' milliseconds,
+%% until the store stops.
+flusher(Instance, FlushEvery) ->
+    receive
+        stop -> ok
+    after FlushEvery ->
+        flush(Instance, #{}, #{}),
+        flusher(Instance, FlushEvery)
+    end.
 
 %% @doc Ensure that the database directory exists.
 ensure_dir(DataDirPath) ->
@@ -661,11 +692,23 @@ ensure_env(Opts) -> maps:merge(Opts, find_env(Opts)).
 
 %% Shutdown LMDB environment and cleanup resources
 stop(#{ <<"store-module">> := ?MODULE, <<"name">> := DataDir }, _Req, _Opts) ->
+    stop_flusher(DataDir),
     % Soft-close by name; refs stay valid and reopen lazily on next access.
     catch elmdb:env_close_by_name(hb_util:list(DataDir)),
     ok;
 stop(_InvalidStoreOpts, _Req, _Opts) ->
     ok.
+
+%% @doc Stop the store's flusher and wait for it to exit, as a flush after the
+%% environment closes would open it again.
+stop_flusher(DataDir) ->
+    case hb_name:lookup({?MODULE, DataDir}) of
+        undefined -> ok;
+        PID ->
+            Ref = erlang:monitor(process, PID),
+            PID ! stop,
+            receive {'DOWN', Ref, process, PID, _} -> ok end
+    end.
 
 %% @doc Commit the writes that `elmdb' holds in memory. `elmdb:put/3' returns
 %% before its write is committed: writes are committed in batches of
