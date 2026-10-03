@@ -132,25 +132,15 @@ id(RawBase, Req, NodeOpts) ->
             ?event_debug(debug_id, regenerating_id),
             calculate_id(hb_maps:without([<<"commitments">>], Base), Req, IDOpts);
         IDs ->
-            % Accumulate the relevant IDs into a single value. This is performed 
-            % by module arithmetic of each of the IDs. The effect of this is that:
-            % 1. New IDs can be added to the combined ID without requiring any
-            %    recalculation of other IDs.
-            % 2. New IDs can be added in any order, and will compare to the same
-            %    value as if they were added in other orders.
-            % 3. Subsequently, combined IDs cannot be used to express ordering of
-            %    the underlying commitments.
-            % This works for single IDs as well as lists of IDs, because the 
-            % accumulation function starts with a buffer of zero encoded as a 
-            % 256-bit binary. Subsequently, a single ID on its own 'accumulates' 
-            % to itself.
+            % A message with one commitment has that commitment's ID. Several
+            % are combined whatever their order: the SHA-256 of their IDs,
+            % sorted and joined by newlines.
             ?event_debug(debug_id, returning_existing_ids),
             {ok,
-                hb_util:human_id(
-                    hb_crypto:accumulate(
-                        lists:map(fun hb_util:native_id/1, IDs)
-                    )
-                )
+                case IDs of
+                    [ID] -> ID;
+                    _ -> hb_util:human_id(hb_crypto:accumulate(IDs))
+                end
             }
     end.
 

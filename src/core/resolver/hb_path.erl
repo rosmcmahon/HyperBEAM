@@ -136,8 +136,6 @@ hashpath_alg(Msg, Opts) ->
     case hb_maps:get(<<"hashpath-alg">>, Msg, <<"sha-256-chain">>, Opts) of
         <<"sha-256-chain">> ->
             fun hb_crypto:sha256_chain/2;
-        <<"accumulate-256">> ->
-            fun hb_crypto:accumulate/2;
         _ ->
             fun hb_crypto:sha256_chain/2
     end.
