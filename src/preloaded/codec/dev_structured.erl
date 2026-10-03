@@ -281,10 +281,11 @@ decode(TABM0, Req, Opts) ->
             #{},
             TABM1
         ),
-    % If the message is a list, we need to convert it back.
+    % If the message is a list, we need to convert it back. A `.' type other
+    % than `list' is the type of the message's own `.' key.
     case maps:get(<<".">>, Types, not_found) of
-        not_found -> {ok, ResMsg};
-        <<"list">> -> {ok, hb_util:message_to_ordered_list(ResMsg, Opts)}
+        <<"list">> -> {ok, hb_util:message_to_ordered_list(ResMsg, Opts)};
+        _ -> {ok, ResMsg}
     end.
 
 %% @doc Generate an `ao-types' structured field from a map of keys and their
