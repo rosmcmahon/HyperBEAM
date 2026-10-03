@@ -466,9 +466,15 @@ normalize(Base, _Req, RawOpts) ->
             {ok, Base}
     end.
 
-%% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message.
+%% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message, removing
+%% the commitments that do not verify. No commitment is added, so a message
+%% that passes through Lua unchanged keeps exactly the commitments it had.
 decode(EncMsg, Opts) ->
-    hb_message:normalize_commitments(do_decode(EncMsg, Opts), Opts, all).
+    hb_message:normalize_commitments(
+        do_decode(EncMsg, Opts),
+        Opts,
+        #{ <<"verify">> => all, <<"add-unsigned">> => false }
+    ).
 do_decode(EncMsg, _Opts) when is_list(EncMsg) andalso length(EncMsg) == 0 ->
     % The value is an empty table, so we assume it is a message rather than
     % a list.
