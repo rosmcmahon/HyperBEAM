@@ -365,11 +365,16 @@ status_code(forbidden, _NodeMsg) -> 403;
 status_code(not_authorized, _NodeMsg) -> 403;
 status_code(_, _NodeMsg) -> 200.
 
-%% @doc Get the HTTP status code from a transaction (if it exists).
+%% @doc Get the HTTP status code from a transaction (if it exists). An atom
+%% that `status_code/2' maps to 200, as it maps every atom it does not name,
+%% gives no code, so the Erlang status of the result gives it.
 message_to_status(#{ <<"body">> := Status }, NodeMsg) when is_atom(Status) ->
-    status_code(Status, NodeMsg);
+    message_to_status(Status, NodeMsg);
 message_to_status(Item, NodeMsg) when is_atom(Item) ->
-    status_code(Item, NodeMsg);
+    case status_code(Item, NodeMsg) of
+        200 -> default;
+        Status -> Status
+    end;
 message_to_status(_Item, _NodeMsg) ->
     default.
 
