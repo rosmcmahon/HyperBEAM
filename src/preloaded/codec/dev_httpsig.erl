@@ -212,6 +212,7 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
                     hb_util:human_id(ar_wallet:to_address(Wallet)),
                 <<"committed">> => ToCommit
             },
+            MsgToSign,
             Req,
             Opts
         ),
@@ -280,6 +281,7 @@ commit(BaseMsg, Req = #{ <<"type">> := <<"hmac-sha256">> }, RawOpts) ->
     UnauthedCommitment =
         maybe_bundle_tag_commitment(
             BaseCommitment,
+            BaseMsg,
             Req,
             Opts
         ),
@@ -316,10 +318,12 @@ commit(BaseMsg, Req = #{ <<"type">> := <<"hmac-sha256">> }, RawOpts) ->
     ?event_debug(debug_commitments, {hmac_generation_complete, Res}),
     Res.
 
-%% @doc Annotate the commitment with the `bundle' key if the request contains
-%% it.
-maybe_bundle_tag_commitment(Commitment, Req, _Opts) ->
-    case hb_util:atom(maps:get(<<"bundle">>, Req, false)) of
+%% @doc Annotate the commitment with the `bundle' key if the message is bundled.
+%% `to_hint/3' gives its bundle state, from the request or the message's
+%% `httpsig@1.0' commitment, as it does for the encoding of the message.
+maybe_bundle_tag_commitment(Commitment, Msg, Req, Opts) ->
+    {ok, HintedReq} = to_hint(Msg, Req, Opts),
+    case hb_util:atom(maps:get(<<"bundle">>, HintedReq, false)) of
         true -> Commitment#{ <<"bundle">> => <<"true">> };
         false -> Commitment
     end.
