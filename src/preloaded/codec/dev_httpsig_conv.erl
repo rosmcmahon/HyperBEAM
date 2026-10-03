@@ -45,6 +45,24 @@
         C == $. orelse C == $^ orelse C == $_ orelse C == $` orelse
         C == $| orelse C == $~)
 ).
+% The headers that HTTP and this codec set themselves: the signatures, the
+% digest and length of the body, and the fields of the connection and its
+% framing, which HTTP servers and clients act on or remove. A key of a message
+% with one of these names is carried in a body part, and a header with one of
+% them is not a key of the message.
+-define(RESERVED_HEADERS, [
+    <<"signature">>,
+    <<"signature-input">>,
+    <<"content-digest">>,
+    <<"content-length">>,
+    <<"connection">>,
+    <<"keep-alive">>,
+    <<"proxy-connection">>,
+    <<"te">>,
+    <<"trailer">>,
+    <<"transfer-encoding">>,
+    <<"upgrade">>
+]).
 
 %% @doc Convert a HTTP Message into a TABM.
 %% HTTP Structured Field is encoded into it's equivalent TABM encoding.
@@ -65,21 +83,12 @@ from(HTTP, _Req, Opts) ->
     % Next, we need to potentially parse the body, get the ordering of the body
     % parts, and add them to the TABM.
     {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
-    % Merge the body keys with the headers, other than the signature headers,
-    % the digest of the body and the length of the HTTP body. A key of the
-    % message that shares one of their names is carried in a body part.
+    % Merge the body keys with the headers, other than the reserved headers. A
+    % key of the message that shares one of their names is carried in a body
+    % part.
     WithBodyKeys =
         maps:merge(
-            hb_maps:without(
-                [
-                    <<"signature">>,
-                    <<"signature-input">>,
-                    <<"content-digest">>,
-                    <<"content-length">>
-                ],
-                Headers,
-                Opts
-            ),
+            hb_maps:without(?RESERVED_HEADERS, Headers, Opts),
             BodyTABM
         ),
     % Reconstruct the commitments from the signature headers.
@@ -439,17 +448,15 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                (Key, Value, AccMap) when Key =:= InlineKey andalso InlineKey =/= not_set ->
                     OldBody = maps:get(<<"body">>, AccMap, #{}),
                     AccMap#{ <<"body">> => OldBody#{ InlineKey => Value } };
-               (Key, Value, AccMap)
-                        when Key =:= <<"signature">>;
-                            Key =:= <<"signature-input">>;
-                            Key =:= <<"content-digest">>;
-                            Key =:= <<"content-length">> ->
-                    % The signatures, the digest of the body and the length of
-                    % the HTTP body are headers of these names, so a key of the
-                    % message that shares one is carried in a body part.
-                    field_to_http(AccMap, {Key, Value}, #{ where => body });
                (Key, Value, AccMap) ->
-                    field_to_http(AccMap, {Key, Value}, #{})
+                    % A key of the message that shares the name of a reserved
+                    % header is carried in a body part.
+                    Where =
+                        case lists:member(Key, ?RESERVED_HEADERS) of
+                            true -> #{ where => body };
+                            false -> #{}
+                        end,
+                    field_to_http(AccMap, {Key, Value}, Where)
             end,
             % Add any inline field denotations to the HTTP message
             case lists:keyfind(inline, 1, FormatOpts) of
@@ -1108,3 +1115,64 @@ nested_content_disposition_roundtrip_test() ->
     Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, #{}),
     Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, #{}),
     ?assertEqual(Msg, Decoded).
+
+%% @doc A message's own keys with the names of reserved headers are served by
+%% ID and posted as they were written, over HTTP/1.1 and HTTP/2.
+reserved_header_keys_test_() ->
+    [
+        {binary_to_list(<<Key/binary, ": ", Value/binary>>), fun() ->
+            NodeOpts =
+                #{
+                    <<"priv-wallet">> => ar_wallet:new(),
+                    <<"store">> => hb_test_utils:test_store()
+                },
+            Node = hb_http_server:start_node(NodeOpts),
+            Msg =
+                hb_message:commit(
+                    #{
+                        <<"path">> => <<"/", Key/binary>>,
+                        <<"note">> => <<"kept">>,
+                        <<"body">> => <<"hello">>,
+                        Key => Value
+                    },
+                    #{ <<"priv-wallet">> => ar_wallet:new() }
+                ),
+            {ok, _} = hb_cache:write(Msg, NodeOpts),
+            Path = <<"/", (hb_message:id(Msg, signed, NodeOpts))/binary>>,
+            lists:foreach(
+                fun(Opts) ->
+                    {ok, Read} = hb_http:get(Node, Path, Opts),
+                    ?assertEqual(
+                        {Value, <<"kept">>},
+                        {
+                            hb_maps:get(Key, Read, not_found, Opts),
+                            hb_maps:get(<<"note">>, Read, not_found, Opts)
+                        }
+                    ),
+                    ?assert(hb_message:verify(Read, all, Opts)),
+                    ?assertEqual({ok, Value}, hb_http:post(Node, Msg, Opts))
+                end,
+                [
+                    #{ <<"store">> => hb_test_utils:test_store() },
+                    #{
+                        <<"store">> => hb_test_utils:test_store(),
+                        <<"http-client">> => gun,
+                        <<"protocol">> => http2
+                    }
+                ]
+            )
+        end}
+    ||
+        {Key, Value} <-
+            [
+                {<<"content-length">>, <<"3">>},
+                {<<"connection">>, <<"foo bar">>},
+                {<<"connection">>, <<"note">>},
+                {<<"keep-alive">>, <<"timeout=5">>},
+                {<<"proxy-connection">>, <<"keep-alive">>},
+                {<<"te">>, <<"gzip">>},
+                {<<"trailer">>, <<"x-note">>},
+                {<<"transfer-encoding">>, <<"gzip">>},
+                {<<"upgrade">>, <<"websocket">>}
+            ]
+    ].
