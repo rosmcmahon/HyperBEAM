@@ -56,12 +56,10 @@ call(M1, RawM2, Opts) ->
             undefined,
             Opts
         ),
-    case is_blocked_host(RelayPath, Opts) of
-        true -> {error, blocked_host};
-        _ -> do_call(RelayPath, BaseTarget, M1, RawM2, Opts)
-    end.
+    do_call(RelayPath, BaseTarget, M1, RawM2, Opts).
 
-%% @doc The target is valid, so we perform the full relay call.
+%% @doc Perform the full relay call, refusing it if the host it would reach is
+%% blocked.
 do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
     RelayDevice =
         hb_ao:get_first(
@@ -154,32 +152,51 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
         hb_opts:get(http_client, ?DEFAULT_HTTP_CLIENT, Opts),
         Opts
     ),
-    % Let `hb_http:request/2' handle finding the peer and dispatching the
-    % request, unless the peer is explicitly given. Redirects are not followed:
-    % `is_blocked_host/2' checks only the first URL.
+    % `hb_http:request/2' finds the peer and dispatches the request, unless the
+    % peer is explicitly given. Redirects are not followed, so the host checked
+    % here is the only host contacted.
     HTTPOpts =
         Opts#{
             <<"http-client">> => Client,
             <<"http-only-result">> => false,
             <<"http-redirects">> => 0
         },
-    Res = case RelayPeer of
-        not_found ->
-            hb_http:request(TargetMod5, HTTPOpts);
-        _ ->
-            ?event(debug_relay, {relaying_to_peer, RelayPeer}),
-            hb_http:request(
-                RelayMethod,
-                RelayPeer,
-                RelayPath,
-                TargetMod5,
-                HTTPOpts
-            )
-    end,
-    case Res of
-        {ok, R} -> {ok, strip_cookies(R, Opts)};
-        Err -> Err
+    % The relay reaches the `peer' when one is named, otherwise the host in an
+    % absolute `relay-path'. A relative path names no host; the node routes it
+    % through its own routes, failing closed when none match. Refuse the request
+    % when the host it reaches is blocked, or when a named destination has no
+    % resolvable host.
+    case is_blocked_host(relay_destination(RelayPeer, RelayPath), Opts) of
+        true -> {error, blocked_host};
+        false ->
+            Res =
+                case RelayPeer of
+                    not_found ->
+                        hb_http:request(TargetMod5, HTTPOpts);
+                    _ ->
+                        ?event(debug_relay, {relaying_to_peer, RelayPeer}),
+                        hb_http:request(
+                            RelayMethod,
+                            RelayPeer,
+                            RelayPath,
+                            TargetMod5,
+                            HTTPOpts
+                        )
+                end,
+            case Res of
+                {ok, R} -> {ok, strip_cookies(R, Opts)};
+                Err -> Err
+            end
     end.
+
+%% @doc The host the relay will contact: the `peer' when one is named,
+%% otherwise an absolute `relay-path'. A relative path names no host, so the
+%% node routes it through its own routes and there is nothing for
+%% `is_blocked_host/2' to vet: return `undefined'.
+relay_destination(not_found, <<"http://", _/binary>> = Path) -> Path;
+relay_destination(not_found, <<"https://", _/binary>> = Path) -> Path;
+relay_destination(not_found, _RelativePath) -> undefined;
+relay_destination(Peer, _RelayPath) -> Peer.
 
 %% @doc Ensure that cookies are not forwarded either to or from the relayed
 %% node.
@@ -191,9 +208,10 @@ strip_cookies(Msg, Opts) ->
         Opts
     ).
 
-%% @doc Returns `true` if the given host is blocked by the relay's allowed
-%% hosts configuration.
-%% 
+%% @doc Returns `true` if the host named by `URI` is blocked by the relay's
+%% allowed hosts configuration, or if `URI' names a host that cannot be
+%% determined. `undefined' names no host to vet and is not blocked.
+%%
 %% The configuration supports:
 %% 1. Blocking internal hosts (e.g. `localhost`, `127.0.0.1`, etc.) if the
 %%    `relay-block-internal` option is set to `true` (default: `true`).
@@ -216,7 +234,6 @@ is_blocked_host(URI, Opts) ->
         end
     else
         skip -> false;
-        {error, invalid_uri} -> false;
         _ -> true
     end.
 
@@ -288,7 +305,11 @@ internal_host_block_test() ->
     ),
     ?assertEqual(false, is_blocked_host(<<"https://1.1.1.1/">>, #{})),
     ?assertEqual(false, is_blocked_host(<<"https://[2606:4700:4700::1111]/">>, #{})),
-    ?assertEqual(false, is_blocked_host(<<"/arweave/info">>, #{})),
+    % `undefined' names no host to vet, so it is not blocked: a relative
+    % `relay-path' is routed by the node, not checked here. A value that names
+    % no resolvable host fails closed.
+    ?assertEqual(false, is_blocked_host(undefined, #{})),
+    ?assert(is_blocked_host(<<"/arweave/info">>, #{})),
     ?assertEqual(
         false,
         is_blocked_host(
@@ -402,6 +423,9 @@ commit_request_test() ->
         hb_http_server:start_node(#{
             <<"priv-wallet">> => Wallet,
             <<"relay-allow-commit-request">> => true,
+            % The executor runs on an internal host, so the relay must be told
+            % to permit it.
+            <<"relay-block-internal">> => false,
             <<"routes">> =>
                 [
                     #{
@@ -435,3 +459,129 @@ commit_request_test() ->
         ),
     ?event({res, Res}),
     ?assertEqual(<<"value">>, Res).
+
+%% @doc Start a node to relay to, returning its location and address. The node
+%% binds to an internal host, so the relay blocks it unless it is permitted.
+start_relay_target() ->
+    Wallet = ar_wallet:new(),
+    Node = hb_http_server:start_node(#{ <<"priv-wallet">> => Wallet }),
+    {Node, hb_util:human_id(ar_wallet:to_address(Wallet))}.
+
+%% @doc Resolve a `relay@1.0/call' with the given request fields and node
+%% options, returning the relay's response without the HTTP-only wrapping.
+relay_call(Fields, Opts) ->
+    hb_ao:resolve(
+        Fields#{ <<"device">> => <<"relay@1.0">> },
+        <<"call">>,
+        Opts#{ <<"http-only-result">> => false }
+    ).
+
+%% @doc A `call' with an internal `peer' is refused by default: the peer names
+%% the host the request will reach.
+relay_peer_internal_blocked_test() ->
+    {Target, _Address} = start_relay_target(),
+    ?assertEqual(
+        {error, blocked_host},
+        relay_call(
+            #{
+                <<"peer">> => Target,
+                <<"relay-path">> => <<"/~meta@1.0/info/address">>
+            },
+            #{}
+        )
+    ).
+
+%% @doc The same internal `peer' is reached once internal hosts are permitted.
+relay_peer_allowed_test() ->
+    {Target, Address} = start_relay_target(),
+    {ok, Res} =
+        relay_call(
+            #{
+                <<"peer">> => Target,
+                <<"relay-path">> => <<"/~meta@1.0/info/address">>
+            },
+            #{ <<"relay-block-internal">> => false }
+        ),
+    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})).
+
+%% @doc A `call' whose `relay-path' is an absolute URL on an internal host is
+%% refused by default.
+relay_absolute_internal_blocked_test() ->
+    {Target, _Address} = start_relay_target(),
+    ?assertEqual(
+        {error, blocked_host},
+        relay_call(
+            #{ <<"relay-path">> => <<Target/binary, "~meta@1.0/info/address">> },
+            #{}
+        )
+    ).
+
+%% @doc The same absolute URL is reached once internal hosts are permitted.
+relay_absolute_allowed_test() ->
+    {Target, Address} = start_relay_target(),
+    {ok, Res} =
+        relay_call(
+            #{ <<"relay-path">> => <<Target/binary, "~meta@1.0/info/address">> },
+            #{ <<"relay-block-internal">> => false }
+        ),
+    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})).
+
+%% @doc A relative `relay-path' names no host: the node routes it through its
+%% own routes. A route to an internal host is the operator's own, so the
+%% request is reached even with internal hosts blocked.
+relay_relative_routed_test() ->
+    {Target, Address} = start_relay_target(),
+    Relay =
+        hb_http_server:start_node(#{
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"/.*">>,
+                        <<"node">> => #{ <<"prefix">> => Target }
+                    }
+                ]
+        }),
+    {ok, Res} =
+        hb_http:get(
+            Relay,
+            <<"/~relay@1.0/call?relay-path=/~meta@1.0/info/address">>,
+            #{ <<"http-only-result">> => false }
+        ),
+    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})).
+
+%% @doc A relative `relay-path' that matches no route reaches no host: the
+%% request is refused rather than relayed.
+relay_relative_unroutable_refused_test() ->
+    Relay =
+        hb_http_server:start_node(#{
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"/only-this">>,
+                        <<"node">> => #{ <<"prefix">> => <<"https://arweave.net">> }
+                    }
+                ]
+        }),
+    Res =
+        hb_http:get(
+            Relay,
+            <<"/~relay@1.0/call?relay-path=/no-matching-route">>,
+            #{ <<"http-only-result">> => false }
+        ),
+    ?assertMatch({failure, _}, Res).
+
+%% @doc A `call' whose `peer' names no resolvable host is refused: the check
+%% fails closed rather than contacting an unknown host.
+relay_undeterminable_host_blocked_test() ->
+    ?assertEqual(
+        {error, blocked_host},
+        relay_call(
+            #{
+                <<"peer">> => <<"http://">>,
+                <<"relay-path">> => <<"/~meta@1.0/info/address">>
+            },
+            #{}
+        )
+    ).
