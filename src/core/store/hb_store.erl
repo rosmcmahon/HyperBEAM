@@ -15,6 +15,8 @@
 %%%     start/3:      Initialize the store.
 %%%     stop/3:       Stop any processes (etc.) that manage the store.
 %%%     reset/3:      Restore the store to its original, empty state.
+%%%     flush/3:      Commit the writes that the store holds in memory, such
+%%%                   that they survive a halt of the node.
 %%%     scope/0:      A tag describing the 'scope' of a stores search: `in_memory',
 %%%                   `local', `remote', `arweave', etc. Used in order to allow
 %%%                   node operators to prioritize their stores for search.
@@ -97,7 +99,8 @@
 -export([
     start/1, start/2, start/3,
     stop/1, stop/2, stop/3,
-    reset/1, reset/2, reset/3
+    reset/1, reset/2, reset/3,
+    flush/2
 ]).
 -export([filter/2, scope/2, sort/2]).
 -export([
@@ -141,7 +144,7 @@ behavior_info(callbacks) ->
 %% @doc Store access policies to function names.
 -define(STORE_ACCESS_POLICIES, #{
     <<"read">> => [read, resolve, list, type, match] ++ ?COMMON_POLICIES,
-    <<"write">> => [write, link, group, reset] ++ ?COMMON_POLICIES,
+    <<"write">> => [write, link, group, reset, flush] ++ ?COMMON_POLICIES,
     <<"admin">> => [reset] ++ ?COMMON_POLICIES
 }).
 
@@ -260,6 +263,24 @@ stop(Store, Opts) ->
     stop(Store, #{}, Opts).
 stop(Stores, Req, Opts) ->
     admin_call(Stores, stop, Req, Opts).
+
+%% @doc Commit the writes that the stores hold in memory, such that they
+%% survive a halt of the node. Stores whose module does not implement
+%% `flush/3' are skipped.
+flush(Store, Opts) when not is_list(Store) ->
+    flush([Store], Opts);
+flush(Stores, Opts) ->
+    admin_call(
+        lists:filter(
+            fun(#{ <<"store-module">> := Mod }) ->
+                erlang:function_exported(Mod, flush, 3)
+            end,
+            Stores
+        ),
+        flush,
+        #{},
+        Opts
+    ).
 
 %% @doc Takes a store object and a filter function or match spec, returning a
 %% new store object with only the modules that match the filter. The filter

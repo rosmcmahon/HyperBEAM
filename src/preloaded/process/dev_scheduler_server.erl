@@ -270,6 +270,10 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(starting_message_write),
             ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
+            % The store may hold the write in memory: commit it before the
+            % slot is confirmed. A failed commit raises, and `assign/3' keeps
+            % the previous slot without answering the client.
+            ok = dev_scheduler_cache:flush(Opts),
             maybe_inform_recipient(
                 local_confirmation,
                 ReplyPID,

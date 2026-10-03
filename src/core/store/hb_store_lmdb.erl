@@ -20,7 +20,7 @@
 -module(hb_store_lmdb).
 
 %% Public API exports
--export([start/3, stop/3, scope/0, scope/1, reset/3]).
+-export([start/3, stop/3, flush/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
 -export([group/3, link/3, type/3, resolve/3]).
 
@@ -666,6 +666,24 @@ stop(#{ <<"store-module">> := ?MODULE, <<"name">> := DataDir }, _Req, _Opts) ->
     ok;
 stop(_InvalidStoreOpts, _Req, _Opts) ->
     ok.
+
+%% @doc Commit the writes that `elmdb' holds in memory. `elmdb:put/3' returns
+%% before its write is committed: writes are committed in batches of
+%% `batch-size', and a halt of the node before then loses them.
+flush(Opts, _Req, _NodeOpts) ->
+    #{ <<"db">> := DBInstance } = find_env(Opts),
+    case elmdb:flush(DBInstance) of
+        ok -> ok;
+        {error, Type, Description} ->
+            ?event(
+                error,
+                {lmdb_error,
+                    {type, Type},
+                    {description, Description}
+                }
+            ),
+            {error, Type}
+    end.
 
 %% @doc Completely delete the database directory and all its contents.
 %%
