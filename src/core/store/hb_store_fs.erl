@@ -90,7 +90,22 @@ write_path(Opts, PathComponents, Value) ->
     Path = add_prefix(Opts, hb_path:to_binary(PathComponents)),
     ?event({writing, Path, byte_size(Value)}),
     filelib:ensure_dir(Path),
-    file:write_file(Path, Value).
+    % Keep a file that holds the value; replace any other entry.
+    Make = fun(Temp) -> file:write_file(Temp, Value) end,
+    case holds_value(Path, Value) of
+        true -> ok;
+        false -> replace(Opts, Path, Make)
+    end.
+
+%% @doc Whether `Path' is a file, not a link, that holds `Value'.
+holds_value(Path, Value) ->
+    case file:read_link_info(Path) of
+        {ok, #file_info{ type = regular, size = Size }} ->
+            Size == byte_size(Value) andalso
+                file:read_file(Path) == {ok, Value};
+        _ ->
+            false
+    end.
 
 %% @doc List contents of a directory in the store, following symlinks as
 %% needed.
@@ -220,6 +235,25 @@ link_path(Opts, Existing, New) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% @doc Replace the entry at `Path' with the file or link that `Make' makes at
+%% a unique path in the store's `~tmp' directory, by renaming it over the
+%% entry. The rename replaces the entry in one step: a concurrent read finds
+%% the old entry or the new one, a crash leaves one of them whole, and a link
+%% at `Path' is replaced, not written through. Escaped keys never contain `~',
+%% so no key names the directory or a path in it.
+replace(#{ <<"name">> := DataDir }, Path, Make) ->
+    Unique = hb_util:encode(crypto:strong_rand_bytes(16)),
+    Temp = <<DataDir/binary, "/~tmp/", Unique/binary>>,
+    filelib:ensure_dir(Temp),
+    R =
+        maybe
+            ok ?= Make(Temp),
+            file:rename(Temp, Path)
+        end,
+    % Remove the temporary entry if the rename did not move it.
+    file:delete(Temp),
+    R.
 
 %% @doc Add the directory prefix to a path.
 add_prefix(#{ <<"name">> := Prefix }, Path) ->
