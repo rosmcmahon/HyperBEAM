@@ -599,7 +599,7 @@ fill_gaps(ChunkInfos, Offset, EndOffset, Opts) ->
 fetch_and_collect(Offsets, Opts) ->
     fetch_and_collect(
         Offsets,
-        fun(Offset) -> decode_chunk(get_chunk(Offset, Opts)) end,
+        fun(Offset) -> decode_chunk(Offset, get_chunk(Offset, Opts)) end,
         Opts
     ).
 fetch_and_collect(Offsets, GETFun, Opts) ->
@@ -630,9 +630,10 @@ pending_relative_chunk_offsets(Offset, Length, DataSize) ->
                 Chunk <- lists:seq(FirstChunk, LastChunk)]
     end.
 
-%% @doc Decode a chunk response into a {Start, End, Binary} tuple.
+%% @doc Decode a chunk response into a {Start, End, Binary} tuple, if the chunk
+%% holds the byte at the offset it was fetched for.
 %% Runs inside the pmap worker so raw JSON is GC'd per-worker.
-decode_chunk({ok, JSON}) ->
+decode_chunk(Offset, {ok, JSON}) ->
     AbsEnd = hb_util:int(maps:get(<<"absolute_end_offset">>, JSON)),
     {AbsStart, _AbsEnd, Chunk} = ChunkTuple = decode_chunk_tuple(JSON, AbsEnd),
     ?event(debug_arweave,
@@ -640,8 +641,11 @@ decode_chunk({ok, JSON}) ->
             {abs_start, AbsStart},
             {abs_end, AbsEnd},
             {size, byte_size(Chunk)}}),
-    {ok, ChunkTuple};
-decode_chunk({error, _} = Err) ->
+    case AbsStart =< Offset andalso Offset =< AbsEnd of
+        true -> {ok, ChunkTuple};
+        false -> {error, 'chunk-not-at-offset'}
+    end;
+decode_chunk(_Offset, {error, _} = Err) ->
     Err.
 
 decode_chunk_tuple(JSON, ChunkEnd) ->
