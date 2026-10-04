@@ -1070,6 +1070,12 @@ denormalized_key_test(Opts) ->
     ?assertEqual(
         {ok, <<"TEST VALUE">>},
         hb_ao:resolve(Msg, <<"test-key">>, Opts)
+    ),
+    % Map device resolves canonical hyphenated binary key without atom conversion.
+    HyphenMsg = #{ device => #{ <<"my-fn">> => fun(_) -> {ok, <<"HYPHEN">>} end } },
+    ?assertEqual(
+        {ok, <<"HYPHEN">>},
+        hb_ao:resolve(HyphenMsg, <<"my-fn">>, Opts)
     ).
 
 list_transform_test(Opts) ->
