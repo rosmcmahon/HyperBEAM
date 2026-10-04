@@ -70,7 +70,7 @@ remote_read(Opts = #{ <<"node">> := Node }, Key) ->
         hb_http:get(
             Node,
             #{ <<"path">> => Path, <<"read">> => Key },
-            Opts
+            Opts#{ <<"http-only-result">> => true }
         ),
     case HTTPRes of
         {ok, Res} ->
@@ -315,10 +315,22 @@ read_test() ->
             }
         ),
     RemoteStore = [
-		#{ <<"store-module">> => hb_store_remote_node, <<"node">> => Node }
+		#{
+			<<"store-module">> => hb_store_remote_node,
+			<<"node">> => Node,
+			<<"http-only-result">> => false
+		}
 	],
     {ok, RetrievedMsg} = hb_cache:read(ID, #{ <<"store">> => RemoteStore }),
-    ?assertMatch(#{ <<"test-key">> := Rand }, hb_cache:ensure_all_loaded(RetrievedMsg)).
+    ?assertMatch(#{ <<"test-key">> := Rand }, hb_cache:ensure_all_loaded(RetrievedMsg)),
+    % The store reads the list regardless of the HTTP result option.
+    ?assertEqual(
+        {ok, []},
+        hb_cache:read(
+            hb_util:ok(hb_cache:write([], #{ <<"store">> => LocalStore })),
+            #{ <<"store">> => RemoteStore }
+        )
+    ).
 
 read_only_ids_test() ->
     LocalStore = hb_test_utils:test_store(),
