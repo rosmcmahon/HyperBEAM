@@ -122,9 +122,9 @@
 %% `{ok | error, NewMessage}.'
 %% The resolver is composed of a series of discrete phases:
 %%      1: Normalization.
-%%      2: Vary inputs; lookup cached results.
+%%      2: Vary inputs.
 %%      3: Validation check.
-%%      4: Persistent-resolver lookup.
+%%      4: Persistent-resolver lookup; lookup cached results.
 %%      5: Execution.
 %%      6: Execution of the `step' hook.
 %%      7: Subresolution.
@@ -433,7 +433,7 @@ resolve_stage(2, Base, Req, Opts = #{ <<"resolve-mode">> := raw }) ->
     % validation, persistence, linking, and worker stages.
     raw(Base, Req, Opts);
 resolve_stage(2, Base, Req, Opts) ->
-    ?event_debug(debug_ao_core, {stage, 2, vary_and_cache_lookup}, Opts),
+    ?event_debug(debug_ao_core, {stage, 2, vary_inputs}, Opts),
     % Vary the inputs by the schema of the function that will execute them
     % before the cache lookup, such that every execution the schema deems
     % equivalent shares one cached result. If the function's schema declares
@@ -442,24 +442,7 @@ resolve_stage(2, Base, Req, Opts) ->
     try vary_loaded(ensure_message_loaded(Base, Opts), Req, Opts) of
         {Func, VariedBase, VariedReq, Overlay} ->
             Original = {Base, Req, Overlay},
-            case hb_cache_control:maybe_lookup(VariedBase, VariedReq, Base, Req, Opts) of
-                {ok, Res} ->
-                    ?event_debug(
-                        debug_ao_core,
-                        {stage, 2, cache_hit, {res, Res}, {opts, Opts}},
-                        Opts
-                    ),
-                    resolve_stage(
-                        10, VariedBase, VariedReq, {ok, Res}, Original,
-                        undefined, Opts
-                    );
-                {continue, NewBase, NewReq} ->
-                    resolve_stage(
-                        3, Func, NewBase, NewReq, Original, Opts
-                    );
-                {error, CacheResp} ->
-                    {error, CacheResp}
-            end
+            resolve_stage(3, Func, VariedBase, VariedReq, Original, Opts)
     catch throw:Reason:Stacktrace ->
         hb_ao_errors:from_throw(Reason, Stacktrace, Base, Req, Opts)
     end.
@@ -488,12 +471,23 @@ resolve_stage(4, Func, Base, Req, Original, Opts) ->
     % group name.
     case hb_persistent:find_or_register(Base, Req, hb_maps:without(?TEMP_OPTS, Opts, Opts)) of
         {leader, ExecName} ->
-            % We are the leader for this resolution. Continue to the next stage.
-            case hb_opts:get(spawn_worker, false, Opts) of
-                true -> ?event(worker_spawns, {will_become, ExecName});
-                _ -> ok
-            end,
-            resolve_stage(5, Func, Base, Req, Original, ExecName, Opts);
+            % Look up the cached result while leading the execution.
+            {OrigBase, OrigReq, _} = Original,
+            case hb_cache_control:maybe_lookup(Base, Req, OrigBase, OrigReq, Opts) of
+                {ok, Res} ->
+                    ?event_debug(
+                        debug_ao_core,
+                        {stage, 4, cache_hit, {res, Res}, {opts, Opts}},
+                        Opts
+                    ),
+                    hb_persistent:unregister_notify(ExecName, Req, {ok, Res}, Opts),
+                    resolve_stage(10, Base, Req, {ok, Res}, Original, undefined, Opts);
+                {error, _} = Error ->
+                    hb_persistent:unregister_notify(ExecName, Req, Error, Opts),
+                    Error;
+                {continue, NewBase, NewReq} ->
+                    resolve_stage(5, Func, NewBase, NewReq, Original, ExecName, Opts)
+            end;
         {wait, Leader} ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then

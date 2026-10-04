@@ -109,7 +109,7 @@ find_or_register(Base, Req, Opts) ->
     find_or_register(group(Base, Req, Opts), Base, Req, Opts).
 find_or_register(ungrouped_exec, _Base, _Req, _Opts) ->
     {leader, ungrouped_exec};
-find_or_register(GroupName, _Base, _Req, Opts) ->
+find_or_register(GroupName, Base, Req, Opts) ->
     case hb_opts:get(await_inprogress, false, Opts) of
         false -> {leader, GroupName};
         _ ->
@@ -122,8 +122,10 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
                     {infinite_recursion, GroupName};
                 _ ->
                     ?event({register_resolver, {group, GroupName}}),
-                    register_groupname(GroupName, Opts),
-                    {leader, GroupName}
+                    case register_groupname(GroupName, Opts) of
+                        ok -> {leader, GroupName};
+                        error -> find_or_register(GroupName, Base, Req, Opts)
+                    end
             end
     end.
 
@@ -470,6 +472,29 @@ deduplicated_execution_test() ->
     ?assertEqual(Res1, Res2),
     % Check the time it took is less than the sum of the two test times.
     ?assert(T1 - T0 < (2*TestTime)).
+
+%% @doc Use a result cached during election.
+cached_before_election_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"attested-store">> => hb_test_utils:test_store(),
+        <<"cache-control">> => [<<"always">>],
+        <<"await-inprogress">> => true
+    },
+    Base = #{ <<"device">> => test_device(#{
+        grouper => fun(M1, M2, NodeOpts) ->
+            hb_cache_control:maybe_store(M1, M2, <<"cached">>, M2, Opts),
+            default_grouper(M1, M2, NodeOpts)
+        end
+    }) },
+    ?assertEqual(
+        {ok, <<"cached">>},
+        hb_ao:resolve(
+            Base,
+            #{ <<"path">> => <<"self">>, <<"wait">> => 0 },
+            Opts
+        )
+    ).
 
 %% @doc Test spawning a default persistent worker.
 persistent_worker_test() ->
