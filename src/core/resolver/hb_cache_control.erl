@@ -38,8 +38,9 @@ maybe_store(Base, Req, Res, OriginalReq, Opts) ->
 %%                        a 504 `Status'.
 %%      `no_cache':       If set, the cached values are never used. Returns
 %%                        `continue' to the caller.
-maybe_lookup(Base, Req, OriginalBase, OriginalReq, Opts) ->
-    case derive_cache_settings([OriginalBase, OriginalReq], Opts) of
+maybe_lookup(Base, Req, _OriginalBase, OriginalReq, Opts) ->
+    % A base's own `cache-control' describes itself, not this lookup.
+    case derive_cache_settings([OriginalReq], Opts) of
         #{ <<"lookup">> := false } ->
             ?event({skip_cache_check, lookup_disabled}),
             {continue, Base, Req};
