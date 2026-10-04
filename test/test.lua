@@ -161,3 +161,10 @@ function inc(base, req, opts)
     base.count = base.count + 1
     return base
 end
+--- @function ao_get_as_missing
+--- @error the library call into the node throws, as the message it reads
+--- is not on this node
+function ao_get_as_missing()
+    return ao.get("data", {"as", "message@1.0",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"})
+end

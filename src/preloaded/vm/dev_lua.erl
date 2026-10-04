@@ -402,12 +402,15 @@ process_response({lua_error, RawError, State}, _Priv, Opts) ->
         <<"trace">> => hb_ao:normalize_keys(StackTrace, Opts)
     }};
 process_response({error, Reason, Trace}, _Priv, _Opts) ->
-    % An Erlang error occurred while calling the Lua function. Return it.
+    % An Erlang exception occurred while the Lua call ran, for example
+    % inside a library call into the node. It depends on this node, so it
+    % is a failure, not a result of the computation: a script's own error
+    % arrives as a `lua_error', and stays an `error'.
     ?event(lua_error, {trace, Trace}),
     TraceBin = iolist_to_binary(hb_format:trace(Trace)),
     ?event(lua_error, {formatted, {string, TraceBin}}),
     ReasonBin = iolist_to_binary(io_lib:format("~p", [Reason])),
-    {error, #{
+    {failure, #{
         <<"status">> => 500,
         <<"body">> =>
             << "Erlang error while running Lua: ", ReasonBin/binary >>,
@@ -663,6 +666,18 @@ error_response_test() ->
     ?assertEqual(
         {error, <<"Very bad, but Lua caught it.">>},
         hb_ao:resolve(Base, <<"error_response">>, #{})
+    ),
+    % An exception inside the library call into the node -- here, reading a
+    % message this node does not have -- depends on this node, so it is a
+    % failure, not a result of the computation.
+    ?assertMatch(
+        {failure,
+            #{
+                <<"status">> := 500,
+                <<"body">> := <<"Erlang error while running Lua: ", _/binary>>
+            }
+        },
+        hb_ao:resolve(Base, <<"ao_get_as_missing">>, #{})
     ).
 
 sandboxed_failure_test() ->
