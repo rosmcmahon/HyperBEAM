@@ -1,19 +1,25 @@
 %%% @doc A battery of test vectors for serving messages between nodes over
 %%% HTTP. Each message is written to the cache of an isolated primary node, then
-%%% read back over three paths -- directly with `hb_http', through a
-%%% `hb_store_remote_node' store, and from a secondary node that downloaded and
-%%% cached it -- with every codec and both `accept-bundle' settings. Each read
-%%% is checked against the message that was written: its values and types, its
-%%% signatures and its IDs.
+%%% read back over six paths: directly with `hb_http', through a
+%%% `hb_store_remote_node' store, through a `~relay@1.0' node, from a node that
+%%% received it by POST, and from a second or third node that downloaded and
+%%% cached it. Each path is read with every codec, both `accept-bundle' settings
+%%% and both `http-only-result' settings, from volatile, LMDB and filesystem
+%%% primaries. Each read is checked against the message that was written: its
+%%% values and types, its signatures and its IDs.
 %%%
-%%% Run a single case with
-%%% `eunit:test(hb_http_test_vectors:run(Name, Path, Transport))'.
+%%% By default, each message is read once with each transport, over a path and
+%%% from a primary store that rotate between cases. Set
+%%% `HB_HTTP_TEST_VECTORS=full' to read every combination. Run a single case
+%%% with `eunit:test(hb_http_test_vectors:run(Name, Path, Transport, Store))'.
 -module(hb_http_test_vectors).
--export([run/3]).
+-export([run/3, run/4]).
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc The messages that the primary node serves. A message given as a
 %% function is built with the primary's options, so that it can be signed.
+%% A message given as a pair is written as its first element and read back as
+%% its second: a message written with explicit types or links.
 messages() ->
     [
         {"basic", #{ <<"hello">> => <<"world">> }},
@@ -22,6 +28,7 @@ messages() ->
         {"empty message", #{}},
         {"empty child", #{ <<"child">> => #{} }},
         {"empty list", #{ <<"items">> => [] }},
+        {"empty root list", []},
         {"typed scalars", typed()},
         {"large integers",
             #{
@@ -77,6 +84,72 @@ messages() ->
             #{ <<"body">> => binary:copy(<<"abcdefgh">>, 2048) }
         },
         {"large header", #{ <<"text">> => binary:copy(<<"x">>, 8192) }},
+        {"megabyte body", #{ <<"body">> => binary:copy(<<"x">>, 1048577) }},
+        {"header boundary",
+            #{
+                <<"at-limit">> => binary:copy(<<"x">>, 4096),
+                <<"over-limit">> => binary:copy(<<"y">>, 4097)
+            }
+        },
+        {"deep lists",
+            #{
+                <<"items">> =>
+                    lists:foldl(
+                        fun(_, Child) -> [Child, [], #{}, <<>>] end,
+                        [typed()],
+                        lists:seq(1, 8)
+                    )
+            }
+        },
+        {"wide lists",
+            #{ <<"items">> => lists:duplicate(32, [typed(), [], #{}, <<>>]) }
+        },
+        {"deep empty values",
+            lists:foldl(
+                fun(_, Child) ->
+                    #{
+                        <<"child">> => Child,
+                        <<"body">> => <<>>,
+                        <<"map">> => #{},
+                        <<"list">> => []
+                    }
+                end,
+                #{},
+                lists:seq(1, 6)
+            )
+        },
+        {"empty commitments", #{ <<"commitments">> => #{}, <<"body">> => <<>> }},
+        {"explicit types",
+            {
+                #{
+                    <<"ao-types">> => <<"answer=\"integer\"">>,
+                    <<"answer">> => <<"42">>
+                },
+                #{ <<"answer">> => 42 }
+            }
+        },
+        {"explicit link",
+            fun(Opts) ->
+                Child = typed(),
+                {ok, ID} = hb_cache:write(Child, Opts),
+                {#{ <<"child+link">> => ID }, #{ <<"child">> => Child }}
+            end
+        },
+        {"ID shaped binaries",
+            fun(Opts) ->
+                #{
+                    <<"id">> => hb_message:id(typed(), all, Opts),
+                    <<"raw-id">> => <<0:256>>
+                }
+            end
+        },
+        {"store markers",
+            #{
+                <<"group">> => <<"group">>,
+                <<"link">> => <<"link:literal">>,
+                <<"raw">> => <<"raw:literal">>
+            }
+        },
         {"reserved data keys",
             #{
                 <<"signature">> => <<"data">>,
@@ -127,6 +200,59 @@ messages() ->
         }
     ] ++
     [
+        {Name ++ Suffix, Wrap(#{ Key => <<"literal">> })}
+    ||
+        {Name, Key} <-
+            [
+                {"upper case key", <<"Upper">>},
+                {"slash key", <<"a/b">>},
+                {"percent key", <<"a%2fb">>},
+                {"dot key", <<".">>},
+                {"double dot key", <<"a..b">>},
+                {"space key", <<"a b">>},
+                {"colon key", <<"a:b">>},
+                {"long key", binary:copy(<<"k">>, 200)},
+                {"long escaped key", binary:copy(<<"A">>, 100)},
+                {"path key", <<"path">>},
+                {"method key", <<"method">>}
+            ],
+        {Suffix, Wrap} <-
+            [
+                {"", fun(Msg) -> Msg end},
+                {" nested", fun(Msg) -> #{ <<"child">> => Msg } end}
+            ]
+    ] ++
+    [
+        {"device key", #{ <<"device">> => <<"message@1.0">>, <<"value">> => 1 }},
+        {"escaped key collision",
+            #{ <<"a/b">> => <<"slash">>, <<"a%2fb">> => <<"percent">> }
+        }
+    ] ++
+    [
+        {"shared child " ++ integer_to_list(N),
+            #{ <<"parent">> => N, <<"left">> => typed(), <<"right">> => typed() }
+        }
+    || N <- lists:seq(1, 3)
+    ] ++
+    [
+        {"signed typed child " ++ hb_util:list(Codec),
+            fun(Opts) ->
+                #{
+                    <<"child">> =>
+                        signed(
+                            #{
+                                <<"items">> => [typed(), [1, false, []]],
+                                <<"body">> => 42
+                            },
+                            bundle(Codec),
+                            Opts
+                        )
+                }
+            end
+        }
+    || Codec <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
+    ] ++
+    [
         {"signed " ++ Name, fun(Opts) -> signed(nested(), Spec, Opts) end}
     ||
         {Name, Spec} <-
@@ -158,18 +284,28 @@ messages() ->
     ].
 
 %% @doc The ways that a client reads a message from the primary node.
-paths() -> [direct, remote, secondary].
+paths() -> [direct, remote, secondary, tertiary, relay, post].
+
+%% @doc The stores that the primary node, and a node that receives a POST, write
+%% messages to.
+stores() -> [hb_store_volatile, hb_store_lmdb, hb_store_fs].
 
 %% @doc The transports: each way of asking for a codec, with every codec that
-%% `hb_codec_test_vectors' tests, and both `accept-bundle' settings. The MIME
-%% `accept' header also covers its precedence below a message's own
-%% `content-type'.
+%% `hb_codec_test_vectors' tests, and both `accept-bundle' and
+%% `http-only-result' settings. The MIME `accept' header also covers its
+%% precedence below a message's own `content-type'.
 transports() ->
     [
         {
             hb_util:list(Mode) ++ "=" ++ hb_util:list(Codec) ++
-                " / accept-bundle=" ++ hb_util:list(Bundle),
-            #{ mode => Mode, codec => Codec, bundle => Bundle }
+                " / accept-bundle=" ++ hb_util:list(Bundle) ++
+                " / http-only-result=" ++ hb_util:list(OnlyResult),
+            #{
+                mode => Mode,
+                codec => Codec,
+                bundle => Bundle,
+                only_result => OnlyResult
+            }
         }
     ||
         Mode <- ['require-codec', 'accept-codec', accept],
@@ -182,16 +318,17 @@ transports() ->
                 <<"structured@1.0">>,
                 <<"tx@1.0">>
             ],
-        Bundle <- [false, true]
+        Bundle <- [false, true],
+        OnlyResult <- [true, false]
     ].
 
 %% @doc The combinations that a codec cannot represent by design, each with
 %% its reason. They are not generated as tests.
 exceptions() ->
     [
-        {[Name || {Name, _} <- messages()], <<"flat@1.0">>, [false, true],
+        {all, <<"flat@1.0">>, [false, true],
             "Flat text does not escape newlines or ': ' in keys and values."},
-        {[Name || {Name, _} <- messages()], <<"structured@1.0">>, [false, true],
+        {all, <<"structured@1.0">>, [false, true],
             "Structured messages have no binary wire format."},
         {
             [
@@ -254,50 +391,67 @@ double(Msg, Spec, Opts) ->
     ?assertEqual(2, length(hb_message:signers(Result, Opts))),
     Result.
 
-suite_test_() -> suite(messages(), paths(), transports()).
+%% @doc The suite for each primary store: the default cases, or every
+%% combination with `HB_HTTP_TEST_VECTORS=full'.
+suite_test_() ->
+    Full = os:getenv("HB_HTTP_TEST_VECTORS") == "full",
+    [suite(messages(), paths(), transports(), Store, Full) || Store <- stores()].
 
-%% @doc Generate one named case of the suite, to reproduce it alone.
+%% @doc Generate one named case of the suite, to reproduce it alone. The primary
+%% store is `hb_store_volatile' unless given.
 run(Name, Path, Transport) ->
+    run(Name, Path, Transport, hb_store_volatile).
+run(Name, Path, Transport, Store) ->
     {Name, _} = Message = lists:keyfind(Name, 1, messages()),
     {Transport, Spec} = Selection = lists:keyfind(Transport, 1, transports()),
     true = lists:member(Path, paths()),
+    true = lists:member(Store, stores()),
     false = excluded(Name, Spec),
-    suite([Message], [Path], [Selection]).
+    suite([Message], [Path], [Selection], Store, true).
 
 %% @doc Generate the tests: one primary node holds every message, and each test
 %% reads one message over one path and transport with fresh client stores.
-suite(Messages, Paths, Transports) ->
+suite(Messages, Paths, Transports, Store, Full) ->
     {setup,
-        fun() -> primary(Messages) end,
+        fun() -> primary(Messages, Store) end,
         fun stop_primary/1,
-        fun({Host, _PrimaryOpts, Prepared}) ->
+        fun({Host, PrimaryOpts, Prepared}) ->
             [{foreach, Setup, Reset, Tests}] =
                 hb_test_utils:suite_with_opts(
                     [
                         {
                             Name,
-                            Name ++ " / " ++ hb_util:list(Path) ++ " / " ++ Desc,
+                            Name ++ " / " ++ hb_util:list(Store) ++ " / " ++
+                                hb_util:list(Path) ++ " / " ++ Desc,
                             fun(ClientOpts) ->
-                                {ok, Expected, ID} = Preparation,
+                                {ok, Source, Expected, ID} = Preparation,
                                 ?assertEqual(
                                     {error, not_found},
                                     hb_cache:read(ID, ClientOpts)
                                 ),
                                 exercise(
                                     Path,
-                                    Host,
-                                    ID,
+                                    {Host, PrimaryOpts},
+                                    {ID, Source},
                                     Expected,
                                     Transport,
-                                    ClientOpts
+                                    ClientOpts#{
+                                        <<"http-only-result">> =>
+                                            maps:get(only_result, Transport)
+                                    }
                                 )
                             end
                         }
                     ||
-                        {Name, Preparation} <- Prepared,
-                        Path <- Paths,
-                        {Desc, Transport} <- Transports,
-                        not excluded(Name, Transport)
+                        {MessageIndex, {Name, Preparation}} <-
+                            lists:enumerate(Prepared),
+                        {PathIndex, Path} <- lists:enumerate(Paths),
+                        {TransportIndex, {Desc, Transport}} <-
+                            lists:enumerate(Transports),
+                        not excluded(Name, Transport),
+                        selected(
+                            Full, MessageIndex, PathIndex, TransportIndex, Store
+                        )
                     ],
                     [
                         #{
@@ -323,21 +477,36 @@ suite(Messages, Paths, Transports) ->
         end
     }.
 
+%% @doc Whether a case is generated. By default, each message is read once with
+%% each transport, and the path and store rotate between cases.
+selected(true, _, _, _, _) -> true;
+selected(false, MessageIndex, PathIndex, TransportIndex, Store) ->
+    PathCount = length(paths()),
+    PathIndex == 1 + (MessageIndex + TransportIndex - 2) rem PathCount
+        andalso Store ==
+            lists:nth(
+                1 + (MessageIndex - 1 + (TransportIndex - 1) div PathCount)
+                    rem length(stores()),
+                stores()
+            ).
+
 excluded(Name, #{ codec := Codec, bundle := Bundle }) ->
     lists:any(
         fun({Names, ExcludedCodec, Bundles, _Reason}) ->
             ExcludedCodec == Codec
-                andalso lists:member(Name, Names)
+                andalso (Names == all orelse lists:member(Name, Names))
                 andalso lists:member(Bundle, Bundles)
         end,
         exceptions()
     ).
 
-%% @doc Options for an isolated node or client: a fresh volatile store, no
-%% hooks or uploads, and an ephemeral port.
+%% @doc Options for an isolated node or client: a fresh store, volatile unless
+%% given, no hooks or uploads, and an ephemeral port.
 options() ->
+    options(hb_store_volatile).
+options(Store) ->
     #{
-        <<"store">> => hb_test_utils:test_store(hb_store_volatile),
+        <<"store">> => hb_test_utils:test_store(Store),
         <<"on">> => #{},
         <<"port">> => 0,
         <<"tls">> => false,
@@ -356,11 +525,12 @@ options() ->
 
 %% @doc Start the primary node and write each message to its cache. A message
 %% that fails to build or write becomes a failing test, not a failed setup.
-primary(Messages) ->
+primary(Messages, Store) ->
     Opts =
-        (options())#{
+        (options(Store))#{
             <<"priv-wallet">> => ar_wallet:new(),
-            <<"priv-second-wallet">> => ar_wallet:new()
+            <<"priv-second-wallet">> => ar_wallet:new(),
+            <<"priv-peer-wallets">> => [ar_wallet:new(), ar_wallet:new()]
         },
     hb_store:start(maps:get(<<"store">>, Opts)),
     Host = hb_http_server:start_node(Opts),
@@ -374,14 +544,19 @@ primary(Messages) ->
 
 prepare(Message, Opts) ->
     try
-        Msg =
+        Built =
             case is_function(Message, 1) of
                 true -> Message(Opts);
                 false -> Message
             end,
+        {Msg, Expected} =
+            case Built of
+                {Source, Canonical} -> {Source, Canonical};
+                _ -> {Built, Built}
+            end,
         ?assertEqual(true, hb_message:deep_verify(Msg, Opts)),
         {ok, _} = hb_cache:write(Msg, Opts),
-        {ok, Msg, hb_message:id(Msg, all, Opts)}
+        {ok, Msg, Expected, hb_message:id(Msg, all, Opts)}
     catch Class:Reason:Stacktrace -> {error, {Class, Reason, Stacktrace}}
     end.
 
@@ -393,15 +568,16 @@ stop_node(Opts) ->
             ar_wallet:to_address(maps:get(<<"priv-wallet">>, Opts))
         )
     ),
+    hb_store:reset(maps:get(<<"store">>, Opts)),
     hb_store:stop(maps:get(<<"store">>, Opts)).
 
 %% @doc Read the message over a path and check it against the message that was
 %% written, then check the codec of the reply on the wire.
-exercise(direct, Host, ID, Expected, Transport, ClientOpts) ->
+exercise(direct, {Host, _}, {ID, _}, Expected, Transport, ClientOpts) ->
     Actual = download(Host, ID, Expected, Transport, ClientOpts),
     validate(Expected, Actual, ClientOpts),
     check_wire(Host, wire_request(ID, Transport), Expected, Transport);
-exercise(remote, Host, ID, Expected, Transport, ClientOpts) ->
+exercise(remote, {Host, _}, {ID, _}, Expected, Transport, ClientOpts) ->
     Store = maps:get(<<"store">>, ClientOpts),
     Remote =
         ClientOpts#{
@@ -433,31 +609,151 @@ exercise(remote, Host, ID, Expected, Transport, ClientOpts) ->
         Expected,
         Transport
     );
-exercise(secondary, Host, ID, Expected, Transport, ClientOpts) ->
-    SecondaryOpts = (options())#{ <<"priv-wallet">> => ar_wallet:new() },
-    SecondaryHost = hb_http_server:start_node(SecondaryOpts),
-    try
-        ?assertEqual({error, not_found}, hb_cache:read(ID, SecondaryOpts)),
-        Downloaded = download(Host, ID, Expected, Transport, SecondaryOpts),
-        validate(Expected, Downloaded, SecondaryOpts),
-        {ok, _} = hb_cache:write(Downloaded, SecondaryOpts),
-        {ok, Cached} = hb_cache:read(ID, SecondaryOpts),
-        validate(
-            Expected,
-            hb_cache:ensure_all_loaded(Cached, SecondaryOpts),
-            SecondaryOpts
+exercise(post, {_, PrimaryOpts}, {ID, Source} = Message, Expected, Transport,
+        ClientOpts) ->
+    #{ <<"store-module">> := Store } = maps:get(<<"store">>, PrimaryOpts),
+    PostOpts =
+        (options(Store))#{
+            <<"on">> =>
+                #{
+                    <<"request">> =>
+                        #{
+                            <<"device">> =>
+                                #{ <<"request">> => fun receive_post/3 }
+                        }
+                }
+        },
+    with_node(
+        PrimaryOpts,
+        PostOpts,
+        fun(PostHost, NodeOpts) ->
+            ?assertEqual({error, not_found}, hb_cache:read(ID, NodeOpts)),
+            % The upload loads the message's links from the primary's store,
+            % and caches into a store of its own, not the client's.
+            UploadStore = maps:get(<<"store">>, options()),
+            UploadOpts =
+                ClientOpts#{
+                    <<"store">> =>
+                        [UploadStore, maps:get(<<"store">>, PrimaryOpts)]
+                },
+            try
+                {ok, Reply} =
+                    hb_http:post(
+                        PostHost,
+                        <<"/">>,
+                        (headers(Transport))#{ <<"body">> => Source },
+                        UploadOpts
+                    ),
+                ?assertEqual(ID, hb_maps:get(<<"id">>, Reply, UploadOpts))
+            after hb_store:stop(UploadStore)
+            end,
+            ?assertEqual({error, not_found}, hb_cache:read(ID, ClientOpts)),
+            exercise(
+                direct,
+                {PostHost, NodeOpts},
+                Message,
+                Expected,
+                Transport,
+                ClientOpts
+            )
+        end
+    );
+exercise(relay, {Host, PrimaryOpts}, {ID, _}, Expected, Transport, ClientOpts) ->
+    with_node(
+        PrimaryOpts,
+        (options())#{
+            <<"relay-block-internal">> => false,
+            <<"relay-allowed-hosts">> => [<<"localhost">>]
+        },
+        fun(RelayHost, _Opts) ->
+            % The relay asks the primary for the transport's codec, and the
+            % client asks the relay for it.
+            Request =
+                (headers(Transport))#{
+                    <<"path">> => <<"/~relay@1.0/call">>,
+                    <<"peer">> => Host,
+                    <<"relay-path">> => <<"/", ID/binary>>,
+                    <<"target">> => <<"proxy-message">>,
+                    <<"proxy-message">> => headers(Transport)
+                },
+            Actual =
+                download(RelayHost, Request, Expected, Transport, ClientOpts),
+            validate(Expected, Actual, ClientOpts),
+            Encoded =
+                hb_message:convert(
+                    Request,
+                    bundle(<<"httpsig@1.0">>),
+                    ClientOpts
+                ),
+            check_wire(
+                RelayHost,
+                #{
+                    path => maps:get(<<"path">>, Request),
+                    headers => maps:remove(<<"body">>, Encoded),
+                    body => maps:get(<<"body">>, Encoded, <<>>)
+                },
+                Expected,
+                Transport
+            )
+        end
+    );
+exercise(Path, {Host, PrimaryOpts}, {ID, _} = Message, Expected, Transport,
+        ClientOpts) when Path == secondary; Path == tertiary ->
+    with_node(
+        PrimaryOpts,
+        options(),
+        fun(SecondaryHost, SecondaryOpts) ->
+            ?assertEqual({error, not_found}, hb_cache:read(ID, SecondaryOpts)),
+            Downloaded = download(Host, ID, Expected, Transport, SecondaryOpts),
+            validate(Expected, Downloaded, SecondaryOpts),
+            {ok, _} = hb_cache:write(Downloaded, SecondaryOpts),
+            {ok, Cached} = hb_cache:read(ID, SecondaryOpts),
+            validate(
+                Expected,
+                hb_cache:ensure_all_loaded(Cached, SecondaryOpts),
+                SecondaryOpts
+            ),
+            % The secondary has only its local store, so the client's read
+            % cannot reach the primary.
+            exercise(
+                case Path of secondary -> direct; tertiary -> secondary end,
+                {SecondaryHost, SecondaryOpts},
+                Message,
+                Expected,
+                Transport,
+                ClientOpts
+            )
+        end
+    ).
+
+%% @doc A request hook for the node that receives a POST: cache the posted
+%% message, then reply with its ID.
+receive_post(_, #{ <<"request">> := #{ <<"method">> := <<"POST">> } = Request },
+        Opts) ->
+    Msg =
+        hb_cache:ensure_all_loaded(
+            hb_maps:get(<<"body">>, Request, Opts),
+            Opts
         ),
-        % The secondary has only its local store, so the client's read cannot
-        % reach the primary.
-        Actual = download(SecondaryHost, ID, Expected, Transport, ClientOpts),
-        validate(Expected, Actual, ClientOpts),
-        check_wire(
-            SecondaryHost,
-            wire_request(ID, Transport),
-            Expected,
-            Transport
-        )
-    after stop_node(SecondaryOpts)
+    ?assertEqual(true, hb_message:deep_verify(Msg, Opts)),
+    {ok, _} = hb_cache:write(Msg, Opts),
+    {ok, #{ <<"body">> => [#{ <<"id">> => hb_message:id(Msg, all, Opts) }] }};
+receive_post(_, Request, _) -> {ok, Request}.
+
+%% @doc Run `Fun' with a fresh node, then stop it and remove its store. The node
+%% takes the first spare wallet of the node that starts it and keeps the rest,
+%% so nodes that run at once have distinct wallets and no case generates keys.
+with_node(PrimaryOpts, Options, Fun) ->
+    [Wallet | Wallets] = maps:get(<<"priv-peer-wallets">>, PrimaryOpts),
+    Opts =
+        Options#{
+            <<"priv-wallet">> => Wallet,
+            <<"priv-peer-wallets">> => Wallets
+        },
+    hb_store:start(maps:get(<<"store">>, Opts)),
+    Host = hb_http_server:start_node(Opts),
+    try Fun(Host, Opts)
+    after stop_node(Opts)
     end.
 
 %% @doc The transport as a query string. A remote store builds its own request
@@ -477,16 +773,33 @@ headers(#{ mode := Mode, codec := Codec, bundle := Bundle }) ->
         <<"accept-bundle">> => hb_util:bin(Bundle)
     }.
 
-download(Host, ID, Expected, Transport, Opts) ->
+%% @doc Read a message from a node, by ID or with a request, and return it
+%% without the keys and commitments that the reply adds.
+download(Host, ID, Expected, Transport, Opts) when is_binary(ID) ->
+    download(
+        Host,
+        (headers(Transport))#{ <<"path">> => <<"/", ID/binary>> },
+        Expected,
+        Transport,
+        Opts
+    );
+download(Host, Request, Expected, Transport, Opts) ->
     {ok, Received} =
         hb_http:get(
             Host,
-            (headers(Transport))#{ <<"path">> => <<"/", ID/binary>> },
-            Opts
+            Request,
+            Opts#{ <<"http-only-result">> => maps:get(only_result, Transport) }
         ),
     Loaded = hb_cache:ensure_all_loaded(Received, Opts),
     ?assertEqual(true, hb_message:deep_verify(Loaded, Opts)),
-    payload(Expected, Loaded, Opts).
+    % A full reply holds a literal or list result under its `ao-result' key.
+    Result =
+        case is_map(Loaded)
+                andalso hb_maps:get(<<"ao-result">>, Loaded, false, Opts) of
+            Key when is_binary(Key) -> hb_maps:get(Key, Loaded, Opts);
+            false -> Loaded
+        end,
+    payload(Expected, Result, Opts).
 
 %% @doc Remove the keys and commitments that the reply adds, keeping any that
 %% the message itself holds.
@@ -525,6 +838,7 @@ response_keys() ->
         <<"hashpath">>,
         <<"date">>,
         <<"server">>,
+        <<"content-length">>,
         <<"access-control-allow-origin">>,
         <<"access-control-allow-methods">>,
         <<"access-control-expose-headers">>
@@ -607,7 +921,10 @@ check_wire(Host, Request, Expected, #{ codec := Codec, mode := Mode }) ->
     try
         {ok, 200, Headers, Body} =
             hb_http_client:request(
-                Request#{ peer => Host, method => <<"GET">>, body => <<>> },
+                maps:merge(
+                    #{ peer => Host, method => <<"GET">>, body => <<>> },
+                    Request
+                ),
                 Opts
             ),
         % A message's own `content-type' takes precedence over a codec that
