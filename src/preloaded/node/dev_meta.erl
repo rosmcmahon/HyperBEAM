@@ -340,13 +340,18 @@ embed_status({ErlStatus, Res}, NodeMsg) ->
 %% 1. The status code from the message.
 %% 2. The HTTP representation of the status code.
 %% 3. The default status code.
+%% Only an `error' or `failure' result takes its status from the message it
+%% carries; the body of a successful result is data, not a status.
 status_code({error, {no_viable_responses, _AllResponses}}, NodeMsg) ->
     status_code(no_viable_responses, NodeMsg);
-status_code({ErlStatus, Msg}, NodeMsg) ->
+status_code({ErlStatus, Msg}, NodeMsg)
+        when ErlStatus == error; ErlStatus == failure ->
     case message_to_status(Msg, NodeMsg) of
         default -> status_code(ErlStatus, NodeMsg);
         RawStatus -> RawStatus
     end;
+status_code({ErlStatus, _Msg}, NodeMsg) ->
+    status_code(ErlStatus, NodeMsg);
 status_code(ok, _NodeMsg) -> 200;
 status_code(error, _NodeMsg) -> 400;
 status_code(created, _NodeMsg) -> 201;

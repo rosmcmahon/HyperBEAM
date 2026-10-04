@@ -1233,7 +1233,12 @@ get_host_test_parallel() ->
 simple_ao_resolve_unsigned_test() ->
     URL = hb_http_server:start_node(),
     TestMsg = #{ <<"path">> => <<"/key1">>, <<"key1">> => <<"Value1">> },
-    ?assertEqual({ok, <<"Value1">>}, post(URL, TestMsg, test_opts())).
+    ?assertEqual({ok, <<"Value1">>}, post(URL, TestMsg, test_opts())),
+    % The atom value of a successful result is its body, not its status.
+    ?assertEqual(
+        {ok, forbidden},
+        post(URL, #{ <<"path">> => <<"/key2">>, <<"key2">> => forbidden }, test_opts())
+    ).
 
 %% @doc An empty body is preserved in signed HTTP requests and responses.
 empty_body_http_test() ->
