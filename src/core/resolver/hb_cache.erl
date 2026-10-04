@@ -354,10 +354,17 @@ link_prepared(_Prepared, Child, _Opts) -> Child.
 %% private keys, and each commitment message, then remove the commitments that
 %% do not verify. If commitments remain and do not commit every key that is not
 %% private, keep only the keys they commit, and again remove the commitments
-%% that do not verify over those keys.
+%% that do not verify over those keys. A key present both as a literal and as
+%% a `+link' is refused: `k+link' is only the link form of `k'.
 prepare_write(Msg, Opts) when is_map(Msg) ->
     Deep = maps:map(
-        fun(<<"commitments">>, Value) ->
+        fun
+            (Key, _Value)
+                    when is_binary(Key), byte_size(Key) >= 5,
+                         binary_part(Key, byte_size(Key) - 5, 5) =:= <<"+link">>,
+                         is_map_key(binary_part(Key, 0, byte_size(Key) - 5), Msg) ->
+                throw({duplicated_key_cache_write, Key});
+           (<<"commitments">>, Value) ->
                 prepare_write(ensure_all_loaded(Value, Opts), Opts);
            (Key, Value) ->
                 case hb_private:is_private(Key) of
@@ -1565,6 +1572,42 @@ test_signed_literal_keys(Store) ->
     ?assertEqual(ID, hb_message:id(Loaded, signed, Opts)),
     ?assert(is_map(hb_message:convert(Loaded, <<"httpsig@1.0">>, Opts))).
 
+%% @doc A key present both as a literal and as a `+link' is refused: `k+link'
+%% is only the link form of `k'. Each form alone still writes and reads back
+%% as before.
+test_literal_link_collision(Store) ->
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store },
+    {ok, OtherID} = write(#{ <<"poison">> => <<"from-link">> }, Opts),
+    ?assertThrow(
+        {duplicated_key_cache_write, <<"k+link">>},
+        write(#{ <<"k">> => <<"literal-value">>, <<"k+link">> => OtherID }, Opts)
+    ),
+    % The refusal follows the write into nested messages.
+    ?assertThrow(
+        {duplicated_key_cache_write, <<"k+link">>},
+        write(#{ <<"parent">> => #{ <<"k">> => <<"v">>, <<"k+link">> => OtherID } }, Opts)
+    ),
+    ?assertThrow(
+        {duplicated_key_cache_write, <<"k+link">>},
+        write(#{ <<"list">> => [#{ <<"k">> => <<"v">>, <<"k+link">> => OtherID }] }, Opts)
+    ),
+    % A literal alone is stored and read back unchanged.
+    {ok, LiteralID} = write(#{ <<"k">> => <<"literal-value">> }, Opts),
+    {ok, LiteralRead} = read(LiteralID, Opts),
+    ?assertEqual(
+        #{ <<"k">> => <<"literal-value">> },
+        ensure_all_loaded(LiteralRead, Opts)
+    ),
+    % A link alone resolves to its target under the literal key.
+    {ok, LinkID} = write(#{ <<"k+link">> => OtherID }, Opts),
+    {ok, LinkRead} = read(LinkID, Opts),
+    ?assertEqual(
+        #{ <<"k">> => #{ <<"poison">> => <<"from-link">> } },
+        ensure_all_loaded(LinkRead, Opts)
+    ),
+    ok.
+
 test_immediate_marker_values(Store) ->
     hb_store:reset(Store),
     Opts = #{ <<"store">> => Store, <<"match-index">> => false },
@@ -1635,6 +1678,7 @@ cache_suite_test_() ->
         {"match typed message", fun test_match_typed_message/1},
         {"raw match read", fun test_raw_match_read/1},
         {"literal keys", fun test_literal_keys/1},
+        {"literal and link key collision", fun test_literal_link_collision/1},
         {"signed literal keys", fun test_signed_literal_keys/1},
         {"immediate marker values", fun test_immediate_marker_values/1},
         {"cache-write hook", fun test_cache_write_hook/1}
