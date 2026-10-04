@@ -562,7 +562,9 @@ read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
             }
     end.
 
-%% @doc Return the list of committed keys from a message.
+%% @doc Return the list of committed keys from a message. With `ids' set to
+%% `any', the keys that any selected commitment covers; otherwise the keys
+%% that every one covers.
 -spec committed(
     #{ _ => _ },
     #{ raw => boolean(), committers => _, ids => _, _ => _ },
@@ -610,15 +612,19 @@ committed(Self, Req, Opts) ->
     % Next, we filter the list of all committed keys to only include those that
     % are present in every committer's list.
     OnlyCommittedKeys =
-        lists:filter(
-            fun(Key) ->
-                lists:all(
-                    fun(CommittedKeys) -> lists:member(Key, CommittedKeys) end,
-                    CommitmentKeys
+        case maps:get(<<"ids">>, Req, <<"none">>) of
+            <<"any">> -> AllCommittedKeys;
+            _ ->
+                lists:filter(
+                    fun(Key) ->
+                        lists:all(
+                            fun(CommittedKeys) -> lists:member(Key, CommittedKeys) end,
+                            CommitmentKeys
+                        )
+                    end,
+                    AllCommittedKeys
                 )
-            end,
-            AllCommittedKeys
-        ),
+        end,
     % Remove any `+link` suffixes from TABM-form committed keys if the `raw` flag
     % is not set. This means that callers to `committed/3' will receive a list of
     % keys that they can match  against the 'normal' representation of the message
@@ -647,7 +653,8 @@ with_relevant_commitments(Base, Req, Opts) ->
 %% message request. The caller may specify a list of committers (by address)
 %% or a list of commitment IDs directly. They may specify both, in which case
 %% the returned list will be the union of the two lists. In each case, they
-%% may specify `all' or `none' for each group. If no specifiers are provided,
+%% may specify `all' or `none' for each group. `any' selects every
+%% commitment, as `all' does. If no specifiers are provided,
 %% the default is `all' for commitments -- also implying `all' for committers.
 commitment_ids_from_request(Base, Req, Opts) ->
     Commitments = maps:get(<<"commitments">>, Base, #{}),
@@ -672,6 +679,7 @@ commitment_ids_from_request(Base, Req, Opts) ->
         case ReqCommitments of
             <<"none">> -> [];
             <<"all">> -> hb_maps:keys(Commitments, Opts);
+            <<"any">> -> hb_maps:keys(Commitments, Opts);
             CommitmentIDs ->
                 if is_list(CommitmentIDs) -> CommitmentIDs;
                 true -> [CommitmentIDs]
@@ -847,11 +855,12 @@ set(Base, NewValuesMsg, Opts) ->
             maps:keys(NewValues)
         ),
     % Calculate if the keys to be set conflict with any committed keys.
+    % A key that any commitment covers is signed.
     {ok, CommittedKeys} =
         committed(
             Base,
             #{
-                <<"committers">> => <<"all">>
+                <<"ids">> => <<"any">>
             },
             Opts
         ),
@@ -1240,7 +1249,32 @@ set_new_key_drops_commitments_test() ->
     ),
     ?assertEqual([], hb_message:signers(Updated, Opts)),
     {ok, Canonical} = hb_message:with_only_committed(Updated, Opts),
-    ?assertEqual(<<"2">>, maps:get(<<"b">>, Canonical)).
+    ?assertEqual(<<"2">>, maps:get(<<"b">>, Canonical)),
+    % Setting or removing a key that only one commitment covers drops both.
+    PartiallySigned =
+        hb_message:commit(
+            hb_message:commit(#{ <<"a">> => <<"1">>, <<"b">> => <<"2">> }, Opts),
+            Opts,
+            #{ <<"committed">> => [<<"a">>] }
+        ),
+    ?assertEqual(
+        [<<"a">>, <<"b">>],
+        lists:sort(
+            hb_message:committed(PartiallySigned, #{ <<"ids">> => <<"any">> }, Opts)
+        )
+    ),
+    {ok, Set} = hb_ao:resolve(
+        PartiallySigned,
+        #{ <<"path">> => <<"set">>, <<"b">> => <<"3">> },
+        Opts
+    ),
+    ?assert(hb_message:verify(Set, all, Opts)),
+    {ok, Removed} = hb_ao:resolve(
+        PartiallySigned,
+        #{ <<"path">> => <<"remove">>, <<"item">> => <<"b">> },
+        Opts
+    ),
+    ?assert(hb_message:verify(Removed, all, Opts)).
 
 unset_with_set_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },
