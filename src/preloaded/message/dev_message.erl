@@ -310,8 +310,7 @@ commit(Self, Req, Opts) ->
             Req#{ <<"type">> => maps:get(<<"type">>, Req, <<"signed">>) },
             CommitOpts
         ),
-    Res = Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) },
-    {ok, hb_private:merge(Res, Committed, Opts)}.
+    {ok, Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) }}.
 
 %% @doc The keys a commitment lists as committed, in their normalized form. A
 %% commitment without a `committed' list commits no keys.
@@ -472,7 +471,17 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
                         {commitment_id, CommitmentID},
                         {res, Res}
                     }),
-                Res
+                % A signed commitment that covers no key of the message does
+                % not verify: its signature base holds no component of it.
+                % The `commitments' and `priv' keys never reach a signature
+                % base, so they cannot be the keys a commitment covers.
+                Unsigned = not maps:is_key(<<"committer">>, Commitment),
+                CoversKeys =
+                    hb_util:list_without(
+                        [<<"commitments">>, <<"priv">>],
+                        committed_keys(Commitment, Opts)
+                    ),
+                Res andalso (Unsigned orelse CoversKeys =/= [])
             end,
             IDsToVerify
         ),
@@ -1344,6 +1353,57 @@ verify_without_committed_test() ->
         hb_message:convert(Flat, <<"structured@1.0">>, <<"flat@1.0">>, Opts),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assertEqual([], hb_message:committed(Decoded, all, Opts)).
+
+%% @doc A signed commitment that covers no key of the message does not verify:
+%% grafting it onto a message with arbitrary content leaves that content
+%% unsigned, however it changes.
+vacuous_signed_commitment_test_() ->
+    [
+        {binary_to_list(Device), fun() ->
+            Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+            Committed = hb_message:commit(#{}, Opts, Device),
+            [{ID, Commitment}] =
+                maps:to_list(maps:get(<<"commitments">>, Committed)),
+            ?assertEqual([], hb_maps:get(<<"committed">>, Commitment)),
+            Grafted =
+                #{
+                    <<"data">> => <<"unsigned content">>,
+                    <<"commitments">> => maps:get(<<"commitments">>, Committed)
+                },
+            ?assertEqual(
+                hb_util:human_id(ID),
+                hb_message:id(Grafted, signed, Opts)
+            ),
+            ?assertNot(hb_message:verify(Grafted, all, Opts)),
+            ?assertNot(
+                hb_message:verify(
+                    Grafted#{ <<"data">> => <<"changed later">> },
+                    all,
+                    Opts
+                )
+            )
+        end}
+    ||
+        Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
+    ].
+
+%% @doc Committing to a message keeps its private element as it is: a link in
+%% it is not loaded, even when the node does not hold its message.
+commit_keeps_private_links_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Missing =
+        {link,
+            hb_util:human_id(crypto:strong_rand_bytes(32)),
+            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+        },
+    Priv = #{ <<"request">> => #{ <<"x">> => Missing } },
+    Committed =
+        hb_message:commit(
+            #{ <<"a">> => <<"b">>, <<"priv">> => Priv },
+            Opts,
+            #{ <<"type">> => <<"unsigned">> }
+        ),
+    ?assertEqual(Priv, maps:get(<<"priv">>, Committed)).
 
 set_nested_link_test() ->
     Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)] },

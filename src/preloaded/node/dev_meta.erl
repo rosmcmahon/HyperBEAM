@@ -80,15 +80,7 @@ handle(NodeMsg, RawRequest) ->
         hb_private:set(RawRequest, <<"http-request">>, RawRequest, NodeMsg),
         NodeMsg
     ),
-    ?event(
-        http,
-        {request,
-            hb_cache:ensure_all_loaded(
-                hb_ao:normalize_keys(NormRequest, NodeMsg),
-                NodeMsg
-            )
-        }
-    ),
+    ?event(http, {request, hb_ao:normalize_keys(NormRequest, NodeMsg)}),
     case hb_opts:get(initialized, false, NodeMsg) of
         false ->
             Res =
@@ -241,8 +233,7 @@ handle_resolve(Req, Msgs, NodeMsg) ->
             {parsed_request_sequence, Msgs}
         }
     ),
-    LoadedMsgs = hb_cache:ensure_all_loaded(Msgs, NodeMsg),
-    case resolve_hook(<<"request">>, Req, LoadedMsgs, NodeMsg) of
+    case resolve_hook(<<"request">>, Req, Msgs, NodeMsg) of
         {ok, []} ->
             {ok,
                 #{
@@ -437,6 +428,30 @@ priv_inaccessible_test() ->
     ?event({res, Res}),
     ?assertEqual(<<"test">>, hb_ao:get(<<"test-config-item">>, Res, #{})),
     ?assertEqual(not_found, hb_ao:get(<<"priv-key">>, Res, #{})).
+
+%% @doc A request that carries a link to a message the node does not hold is
+%% answered when its path does not read the link.
+unread_request_link_test() ->
+    Wallet = ar_wallet:new(),
+    Node =
+        hb_http_server:start_node(
+            #{
+                <<"priv-wallet">> => Wallet,
+                <<"store">> => hb_test_utils:test_store()
+            }
+        ),
+    Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(
+        {ok, hb_util:human_id(ar_wallet:to_address(Wallet))},
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/~meta@1.0/info/address">>,
+                <<"x+link">> => Missing
+            },
+            #{}
+        )
+    ).
 
 %% @doc Test that we can't set the node message if the request is not signed by
 %% the owner of the node.

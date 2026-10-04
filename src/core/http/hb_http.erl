@@ -751,36 +751,15 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                 maps:without([<<"body">>], ErrMsg),
                 maps:get(<<"body">>, ErrMsg, <<>>)
             };
-        {Code, <<"httpsig@1.0">>, false} when Code == 403; Code == 404 ->
-            {Title, Description} =
-                case Code of
-                    403 -> {<<"Access denied.">>,
-                        <<"This request does not have permission to perform this operation.">>};
-                    404 -> {<<"Page cannot be found.">>,
-                        <<"This hashpath cannot be resolved on this node, yet...">>}
-                end,
+        {Code, <<"httpsig@1.0">>, false}
+                when Code == 403; Code == 404;
+                     Code == 400, is_map_key(<<"offender">>, Message);
+                     Code == 400, is_map_key(<<"resolving">>, Message) ->
             {ok, ErrMsg} =
                 hb_http_server:static(
                     <<"hyperbuddy@1.0">>,
                     <<"error.html">>,
-                    #{
-                        <<"status">> => Code,
-                        <<"title">> => Title,
-                        <<"description">> => Description
-                    },
-                    Opts
-                ),
-            {Status,
-                maps:without([<<"body">>], ErrMsg),
-                maps:get(<<"body">>, ErrMsg, <<>>)
-            };
-        {400, <<"httpsig@1.0">>, false}
-                when is_map_key(<<"offender">>, Message) ->
-            {ok, ErrMsg} =
-                hb_http_server:static(
-                    <<"hyperbuddy@1.0">>,
-                    <<"400.html">>,
-                    hb_maps:with([<<"error">>, <<"offender">>], Message, Opts),
+                    hb_ao_errors:page(Code, Message, TABMReq),
                     Opts
                 ),
             {Status,

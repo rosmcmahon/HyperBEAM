@@ -227,23 +227,23 @@ part(Sep, Bin) when not is_list(Sep) ->
 part(Seps, Bin) ->
     hb_util:split_depth_string_aware_single(Seps, Bin).
 
-%% @doc Step 3: Apply types to values and remove specifiers.
+%% @doc Step 3: Apply types to values and remove specifiers. A link is loaded
+%% only when its key has a type.
 apply_types(Msg, Opts) ->
-    hb_maps:fold(
+    maps:fold(
         fun(Key, Val, Acc) ->
             {_, K, V} = maybe_typed(Key, Val, Opts),
             hb_maps:put(K, V, Acc, Opts)
         end,
         #{},
-        Msg,
-        Opts
+        Msg
     ).
 
 %% @doc Step 4: Group headers/query by N-scope.
 %% `N.Key' => applies to Nth step. Otherwise => `global'
 group_scoped(Map, Msgs) ->
     {NScope, Global} =
-        hb_maps:fold(
+        maps:fold(
             fun(KeyBin, Val, {Ns, Gs}) ->
                 case parse_scope(KeyBin) of
                     {OkN, RealKey} ->
@@ -422,7 +422,7 @@ maybe_typed(Key, Value, Opts) ->
     case part([$+, $ ], Key) of
         {no_match, OnlyKey, <<>>} -> {untyped, OnlyKey, Value};
         {_, OnlyKey, Type} ->
-            case {Type, Value} of
+            case {Type, hb_cache:ensure_loaded(Value, Opts)} of
                 {<<"resolve">>, Subpath} ->
                     % If the value needs to be resolved before it is converted,
                     % use the `Codec/1.0' device to resolve it.
@@ -749,6 +749,25 @@ typed_key_test() ->
     ?assertEqual(not_found, hb_maps:get(<<"test-key">>, Base, not_found)),
     ?assertEqual(123, hb_maps:get(<<"test-key">>, Msg2, not_found)),
     ?assertEqual(not_found, hb_maps:get(<<"test-key">>, Res, not_found)).
+
+%% @doc A link held by an untyped key is not loaded, even when the node does
+%% not hold its message. A link held by a typed key is loaded to apply the type.
+linked_key_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    {ok, ID} = hb_cache:write(<<"123">>, Opts),
+    Missing =
+        {link,
+            hb_util:human_id(crypto:strong_rand_bytes(32)),
+            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+        },
+    Req = #{
+        <<"path">> => <<"/a">>,
+        <<"test-key">> => Missing,
+        <<"typed-key+integer">> => {link, ID, #{}}
+    },
+    [_, Msg] = from(Req, Opts),
+    ?assertEqual(Missing, maps:get(<<"test-key">>, Msg)),
+    ?assertEqual(123, maps:get(<<"typed-key">>, Msg)).
 
 subpath_in_key_test() ->
     Req = #{

@@ -466,8 +466,8 @@ resolve_stage(2, Base, Req, Opts) ->
                 {error, CacheResp} ->
                     {error, CacheResp}
             end
-    catch throw:{necessary_message_not_found, _, _} ->
-        {error, #{ <<"status">> => 404 }}
+    catch throw:Reason:Stacktrace ->
+        hb_ao_errors:from_throw(Reason, Stacktrace, Base, Req, Opts)
     end.
 resolve_stage(3, Func, Base, Req, Original, Opts) ->
     ?event_debug(debug_ao_core, {stage, 3, validation_check}, Opts),

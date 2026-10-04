@@ -776,7 +776,7 @@ preprocess(Base, RawReq, Opts) ->
                             }]
                     }}
             end;
-        {ok, _Method, Node, _Path, _MsgWithoutMeta, _ReqOpts} ->
+        {ok, _Method, _Node, _Path, _MsgWithoutMeta, _ReqOpts} ->
             ?event(debug_preprocess, {matched_route, {explicit, Res}}),
             CommitRequest =
                 hb_util:atom(
@@ -834,6 +834,10 @@ preprocess(Base, RawReq, Opts) ->
                     <<"user-message">> => UserReqWithCommit
                 },
             ?event(debug_preprocess, {prepared_relay_req, RelayReq}),
+            % This request matched a route, so rather than name a peer that the
+            % relay would check, give the relay the user's path to route: it
+            % picks the destination from the same routes, a destination the
+            % node's configuration chose.
             {
                 ok,
                 #{
@@ -843,7 +847,7 @@ preprocess(Base, RawReq, Opts) ->
                                 <<"device">> => <<"relay@1.0">>,
                                 <<"relay-device">> => <<"apply@1.0">>,
                                 <<"method">> => <<"POST">>,
-                                <<"peer">> => Node
+                                <<"relay-route">> => UserPath
                             },
                             #{
                                 <<"path">> => <<"call">>,

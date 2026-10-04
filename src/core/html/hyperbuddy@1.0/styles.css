@@ -102,7 +102,11 @@ p {
     color: #000000;
 }
 
-#parse-error {
+#details:empty {
+    display: none;
+}
+
+#details {
     display: grid;
     grid-template-columns: max-content auto;
     align-items: baseline;
@@ -111,11 +115,11 @@ p {
     margin: 0;
 }
 
-#parse-error dt {
+#details dt {
     color: rgb(143, 143, 143);
 }
 
-#parse-error dd {
+#details dd {
     margin: 0;
     font-family: "Roboto Mono", monospace;
     color: #000000;
@@ -159,11 +163,11 @@ p {
         color: #fafafa;
     }
 
-    #parse-error dt {
+    #details dt {
         color: rgb(180, 180, 180);
     }
 
-    #parse-error dd {
+    #details dd {
         color: #fafafa;
     }
 

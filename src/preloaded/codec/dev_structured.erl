@@ -225,7 +225,7 @@ apply_bundle_hint(Msg, Req, Opts) ->
 
 %% @doc Discern the linkify mode from the request and the options.
 linkify_mode(Req, Opts) ->
-    case hb_maps:get(<<"bundle">>, Req, not_found, Opts) of
+    case hb_util:bool(hb_maps:get(<<"bundle">>, Req, not_found, Opts)) of
     	true ->
             % The request is asking for a bundle, so we should _not_ linkify.
             false;
