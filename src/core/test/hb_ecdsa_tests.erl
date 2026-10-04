@@ -511,9 +511,10 @@ full_sign_json_recover_verify_roundtrip_test() ->
     TX = make_signed_ecdsa_tx(Wallet),
     ?assertEqual(true, ar_tx:verify(TX)),
     JSON = ar_tx:tx_to_json_struct(TX),
-    JSONEmptyOwner = JSON#{<<"owner">> => <<>>},
-    ParsedTX = ar_tx:json_struct_to_tx(JSONEmptyOwner),
-    ?assertEqual(true, ar_tx:verify(ParsedTX)).
+    % The JSON round trip of an ECDSA transaction verifies and keeps its ID.
+    ParsedTX = ar_tx:json_struct_to_tx(JSON),
+    ?assertEqual(true, ar_tx:verify(ParsedTX)),
+    ?assertEqual(TX#tx.id, ParsedTX#tx.id).
 
 sig_segment_excludes_owner_for_ecdsa_test() ->
     {{EcdsaKeyType1, _EcdsaPriv1, EcdsaPub1}, _} = ar_wallet:new_ecdsa(),
