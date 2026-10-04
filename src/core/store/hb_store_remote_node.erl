@@ -123,8 +123,8 @@ without_transport_commitment(Msg, Opts) when is_map(Msg) ->
         ),
     hb_message:without_unless_signed(
         [<<"hashpath">>, <<"status">>],
-        hb_message:without_commitments(
-            #{ <<"keyid">> => <<"constant:ao">> },
+        hb_message:with_commitments(
+            #{ <<"committer">> => '_' },
             Committed,
             Opts
         ),
