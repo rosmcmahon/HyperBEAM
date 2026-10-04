@@ -942,6 +942,14 @@ multipart_content_type_test() ->
         <<"nested">> => #{ <<"value">> => 42 }
     },
     Signed = hb_message:commit(Msg, Opts, #{ <<"bundle">> => true }),
+    % The flag as a binary, as it arrives over HTTP, signs the same form.
+    ?assert(
+        hb_message:verify(
+            hb_message:commit(Msg, Opts, #{ <<"bundle">> => <<"true">> }),
+            all,
+            Opts
+        )
+    ),
     ?assert(
         lists:member(<<"content-type">>, hb_message:committed(Signed, all, Opts))
     ),
