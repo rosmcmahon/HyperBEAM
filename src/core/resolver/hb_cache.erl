@@ -289,14 +289,51 @@ generate_binary_path(Bin, Opts) ->
 %% outer message (which does not include its commitments) will be built upon
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
+%% Commitments over different keys are written as separate messages, and the
+%% ID of the one with the most keys is returned.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    write_prepared(prepare_write(RawMsg, Opts), RawMsg, Opts);
+    lists:last(
+        [
+            write_prepared(prepare_write(Msg, Opts), RawMsg, Opts)
+        ||
+            Msg <- split_commitments(RawMsg, Opts)
+        ]
+    );
 write(List, Opts) when is_list(List) ->
     write(hb_message:convert(List, tabm, <<"structured@1.0">>, Opts), Opts);
 write(Bin, Opts) when is_binary(Bin) ->
     do_write_message(Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
 
-%% @doc Write `Msg', the result of `prepare_write/2' on `RawMsg'.
+%% @doc The message once for each set of keys its commitments cover, with only
+%% the commitments over that set, the set with the most keys last; the message
+%% itself when all of its commitments cover the same keys.
+split_commitments(Msg, Opts) ->
+    Groups =
+        maps:groups_from_list(
+            fun({_, Commitment}) ->
+                Committed = hb_maps:get(<<"committed">>, Commitment, [], Opts),
+                Keys =
+                    lists:usort(
+                        hb_util:message_to_ordered_list(
+                            ensure_all_loaded(Committed, Opts),
+                            Opts
+                        )
+                    ),
+                {length(Keys), Keys}
+            end,
+            hb_maps:to_list(hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts)
+        ),
+    case map_size(Groups) of
+        N when N < 2 -> [Msg];
+        _ ->
+            [
+                Msg#{ <<"commitments">> => maps:from_list(Comms) }
+            ||
+                {_, Comms} <- lists:sort(maps:to_list(Groups))
+            ]
+    end.
+
+%% @doc Write a prepared message, with private keys from `RawMsg' for the hook.
 write_prepared(Msg, RawMsg, Opts) ->
     hb_message:paranoid_verify(cache_write, Msg, Opts),
     % Conversion writes the children that it links only in `offload' mode.
@@ -1753,7 +1790,11 @@ projected_commitments_test() ->
     end, [Mixed, #{ <<"child">> => Mixed }, #{ <<"children">> => [Mixed] }]),
     {ok, Kept} = read(hb_message:id(Signed, all, Opts), Opts),
     ?assertEqual(hb_message:signers(Signed, Opts), hb_message:signers(Kept, Opts)),
-    ?assertEqual({error, not_found}, read(FullID, Opts)).
+    % Commitments over different keys are written separately.
+    {ok, Full} = read(FullID, Opts),
+    ?assertEqual(hb_message:uncommitted(Mixed, Opts),
+        hb_message:uncommitted(ensure_all_loaded(Full, Opts), Opts)),
+    ?assert(hb_message:verify(Full, #{ <<"ids">> => [FullID] }, Opts)).
 
 %% @doc Run a specific test with a given store module.
 run_test() ->
