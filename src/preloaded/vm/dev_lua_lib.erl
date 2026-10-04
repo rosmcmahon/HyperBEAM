@@ -154,9 +154,6 @@ resolve([SingletonMsg], ExecState, ExecOpts) ->
     ParsedMsgs = hb_singleton:from(SingletonMsg, ExecOpts),
     ?event({parsed_msgs_to_resolve, ParsedMsgs}),
     resolve({many, ParsedMsgs}, ExecState, ExecOpts);
-resolve([Base, Path], ExecState, ExecOpts) when is_binary(Path) ->
-    PathParts = hb_path:term_to_path_parts(Path, ExecOpts),
-    resolve({many, [Base] ++ PathParts}, ExecState, ExecOpts);
 resolve(Msgs, ExecState, ExecOpts) when is_list(Msgs) ->
     resolve({many, Msgs}, ExecState, ExecOpts);
 resolve({many, Msgs}, ExecState, ExecOpts) ->

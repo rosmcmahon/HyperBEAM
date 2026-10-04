@@ -15,6 +15,44 @@
 run_test() ->
     skip.
 
+%% @doc Each entry point parses binary paths and lists of steps alike.
+request_paths_test_() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store(), <<"hashpath">> => ignore },
+    Base = #{ <<"a">> => #{ <<"b">> => 7 }, <<"k">> => #{ <<"q">> => 4 },
+        <<"k=7">> => 9, <<"a/b">> => 8, <<"(subpath)">> => 5 },
+    {ok, ID} = hb_cache:write(Base, Opts),
+    {ok, ReqID} = hb_cache:write(#{ <<"path">> => <<"a/b">> }, Opts),
+    [
+        {hb_util:list(hb_util:bin(Path)), fun() ->
+            Singleton = case is_binary(Path) of
+                true -> <<ID/binary, "/", Path/binary>>;
+                false -> [ID | Path]
+            end,
+            lists:foreach(fun(Resolve) ->
+                ?assertEqual({ok, Expected}, Resolve())
+            end, [
+                fun() -> hb_ao:resolve(Base, Path, Opts) end,
+                fun() -> hb_ao:resolve(Base, #{ <<"path">> => Path }, Opts) end,
+                fun() -> hb_ao:resolve_many([Base, Path], Opts) end,
+                fun() -> hb_ao:resolve_many([Base, #{ <<"path">> => Path }], Opts) end,
+                fun() -> hb_ao:resolve(Singleton, Opts) end,
+                fun() -> {ok, hb_ao:get(Path, Base, Opts)} end
+            ])
+        end}
+    || {Path, Expected} <- [
+        {<<"a/b">>, 7}, {[<<"a">>, <<"b">>], 7},
+        {<<"k=7/q=4">>, 4}, {[<<"k=7">>, <<"q=4">>], 4},
+        {<<"k%3d7">>, 9}, {[<<"k%3d7">>], 9},
+        {<<"a%2fb">>, 8}, {[<<"a/b">>], 8},
+        {<<"a~message@1.0/b">>, 7}, {[<<"a~message@1.0">>, <<"b">>], 7},
+        {<<"set&x+integer=7/x">>, 7}, {[<<"set&x+integer=7">>, <<"x">>], 7},
+        {<<"(", ReqID/binary, ")">>, 7}, {[<<"(", ReqID/binary, ")">>], 7},
+        {<<"%28subpath%29">>, 5}, {[<<"%28subpath%29">>], 5},
+        {<<"set&x=%28subpath%29/x">>, <<"(subpath)">>},
+        {<<"set&x%3dy/x%3dy">>, true},
+        {[<<"set&x%3dy">>, <<"x%3dy">>], true}
+    ] ].
+
 %% @doc Run each test in the file with each set of options. Start and reset
 %% the store for each test.
 suite_test_() ->

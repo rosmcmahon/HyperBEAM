@@ -133,7 +133,7 @@
 %%     10: Apply overlay and cryptographic linking.
 %%     11: Fork worker.
 %%     12: Recurse or terminate.
-resolve(Path, Opts) when is_binary(Path) ->
+resolve(Path, Opts) when not is_map(Path) ->
     resolve(#{ <<"path">> => Path }, Opts);
 resolve(SingletonMsg, _Opts)
         when is_map(SingletonMsg), not is_map_key(<<"path">>, SingletonMsg) ->
@@ -141,26 +141,8 @@ resolve(SingletonMsg, _Opts)
 resolve(SingletonMsg, Opts) ->
     resolve_many(hb_singleton:from(SingletonMsg, Opts), Opts).
 
-resolve(Base, Path, Opts) when not is_map(Path) ->
-    resolve(Base, #{ <<"path">> => Path }, Opts);
-resolve(_Base, #{ <<"path">> := Path }, _Opts) when Path == <<>>; Path == [] ->
-    % The empty path names no key.
-    {error, not_found};
 resolve(Base, Req, Opts) ->
-    PathParts = hb_path:from_message(request, Req, Opts),
-    ?event(
-        ao_core,
-        {stage, 1, prepare_multimessage_resolution, {path_parts, PathParts}}
-    ),
-    MessagesToExec = [ Req#{ <<"path">> => Path } || Path <- PathParts ],
-    ?event_debug(debug_ao_core,
-        {stage,
-            1,
-            prepare_multimessage_resolution,
-            {messages_to_exec, MessagesToExec}
-        }
-    ),
-    resolve_many([Base | MessagesToExec], Opts).
+    resolve_many([Base, Req], Opts).
 
 %% @doc Resolve a full singleton in `raw' mode: the sequence is normalized
 %% and stepped as normal, but each step applies its device function directly,
@@ -247,6 +229,8 @@ resolve_many(ListMsg, Opts) when is_map(ListMsg) ->
     resolve_many(ListOfMessages, Opts);
 resolve_many({as, DevID, Msg}, Opts) ->
     subresolve(#{}, DevID, Msg, Opts);
+resolve_many([Base = {as, _, _}], Opts) ->
+    resolve_stage(1, Base, #{ <<"path">> => <<"/">> }, Opts);
 resolve_many([{resolve, Subres}], Opts) ->
     resolve_many(Subres, Opts);
 resolve_many(MsgList, Opts) ->
@@ -422,17 +406,28 @@ resolve_stage(1, Base, Req, Opts) when is_list(Base) ->
 resolve_stage(1, Base, NonMapReq, Opts) when not is_map(NonMapReq) ->
     ?event_debug(debug_ao_core, {stage, 1, path_normalize}),
     resolve_stage(1, Base, #{ <<"path">> => NonMapReq }, Opts);
+resolve_stage(1, Base, #{ <<"path">> := <<"/">> }, _Opts) ->
+    % Resolving `/' returns the base message.
+    {ok, Base};
 resolve_stage(1, Base, _Req, _Opts) when not is_map(Base) ->
     % We cannot resolve anything over the given `Base` Erlang data type. Return
     % `not_found`.
     {error, not_found};
 resolve_stage(1, RawBase, RawReq, Opts) ->
-    % Normalize the path to a private key containing the list of remaining
-    % keys to resolve.
+    % Parse the path into a list of requests.
     ?event_debug(debug_ao_core, {stage, 1, normalize}, Opts),
     Base = normalize_keys(RawBase, Opts),
     Req = normalize_keys(RawReq, Opts),
-    resolve_stage(2, Base, Req, Opts);
+    case hb_maps:get(<<"path">>, Req, undefined, Opts) of
+        Empty when Empty == undefined; Empty == <<>>; Empty == [] ->
+            {error, not_found};
+        _ ->
+            case hb_singleton:from_request(Req, Opts) of
+                [Req] -> resolve_stage(2, Base, Req, Opts);
+                Requests ->
+                    resolve_many([Base | Requests], Opts)
+            end
+    end;
 resolve_stage(2, Base, Req, Opts = #{ <<"resolve-mode">> := raw }) ->
     ?event_debug(debug_ao_core, {stage, 2, raw_execution}, Opts),
     % Raw mode: apply the device function directly, skipping the cache,
