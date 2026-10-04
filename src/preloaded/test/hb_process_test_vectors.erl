@@ -510,16 +510,26 @@ aos_state_patch_test_parallel_() ->
 restore_test_parallel_() -> {timeout, 30, fun do_test_restore/0}.
 
 do_test_restore() ->
-    % Init the process and schedule 3 messages:
+    % Init the process and schedule 4 messages:
     % 1. Set variables in Lua.
-    % 2. Return the variable.
-    % Execute the first computation, then the second as a disconnected process.
+    % 2. A message whose data is not the JSON its content-type claims.
+    % 3. Return the variable.
+    % Execute the first computation, then the third as a disconnected process.
     Opts = test_opts(#{
         <<"process-cache-frequency">> => 1
     }),
     Base = aos_process(Opts),
     schedule_aos_call(Base, <<"X = 42">>, Opts),
     schedule_aos_call(Base, <<"X = 1337">>, Opts),
+    schedule_test_message(
+        Base,
+        <<"NOT JSON">>,
+        #{
+            <<"content-type">> => <<"application/json">>,
+            <<"data">> => <<"hello">>
+        },
+        Opts
+    ),
     schedule_aos_call(Base, <<"return X">>, Opts),
     % Compute the first message.
     {ok, _} =
@@ -531,11 +541,19 @@ do_test_restore() ->
     {ok, ResultB} =
         hb_ao:resolve(
             Base,
-            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 3 },
             Opts
         ),
     ?event({result_b, ResultB}),
-    ?assertEqual(<<"1337">>, hb_ao:get(<<"results/data">>, ResultB, Opts)).
+    ?assertEqual(<<"1337">>, hb_ao:get(<<"results/data">>, ResultB, Opts)),
+    % The JSON slot's results hold `type error', and the slot after it goes on.
+    {ok, ResultA} =
+        hb_ao:resolve(
+            Base,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+    ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, ResultA, Opts)).
 
 now_results_test_parallel_() ->
     {timeout, 30, fun() ->
