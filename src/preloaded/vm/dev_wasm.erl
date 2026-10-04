@@ -263,15 +263,24 @@ compute(RawM1, M2, Opts) ->
                             M1,
                             Opts
                         ),
-                    {ok,
-                        hb_ao:set(MsgAfterExecution,
-                            #{
-                                <<"results/", Prefix/binary, "/type">> => ResType,
-                                <<"results/", Prefix/binary, "/output">> => Res
-                            },
-                            Opts
-                        )
-                    }
+                    case ResType of
+                        error ->
+                            % A trapped call leaves the instance usable, so
+                            % the error goes to the process device, which
+                            % stores it as the slot's results and carries
+                            % on with the same instance.
+                            {error, Res};
+                        _ ->
+                            {ok,
+                                hb_ao:set(MsgAfterExecution,
+                                    #{
+                                        <<"results/", Prefix/binary, "/type">> => ResType,
+                                        <<"results/", Prefix/binary, "/output">> => Res
+                                    },
+                                    Opts
+                                )
+                            }
+                    end
             end;
         _ -> {ok, M1}
     end.

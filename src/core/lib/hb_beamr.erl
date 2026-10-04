@@ -335,3 +335,14 @@ benchmark_test() ->
         BenchTime
     ),
     ok.
+
+%% @doc A trapped call leaves the instance usable for the next call: a
+%% process that skips the erroring slot keeps the same instance.
+trap_keeps_instance_usable_test() ->
+    {ok, File} = file:read_file("test/test-64.wasm"),
+    {ok, WASM, _ImportMap, _Exports} = start(File),
+    ?assertMatch(
+        {error, _, #{}},
+        call(WASM, "fac", [1000000000.0], fun stub/3, #{})
+    ),
+    ?assertEqual({ok, [120.0]}, call(WASM, "fac", [5.0])).

@@ -326,7 +326,10 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                             );
                         {error, Error} ->
                             % Forward error details back to the caller.
-                            {error, Error}
+                            {error, Error};
+                        {failure, Failure} ->
+                            % Forward failure details back to the caller.
+                            {failure, Failure}
                     end
             end;
         CurrentSlot when CurrentSlot > TargetSlot ->
@@ -449,11 +452,18 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             maybe_trigger_push(State, Slot, InitReq, Opts),
             {ok, ProcStateWithSnapshot};
         {error, Error} ->
-            % An error occurred while computing the slot. Return the details.
+            % An error occurred while computing the slot. The slot's
+            % message leaves the state as it found it: the error becomes
+            % the slot's results over the inbound state, the slot is
+            % stored as usual, and computing carries on to the next slot
+            % from it.
             ErrMsg =
-                if is_map(Error) -> Error;
-                true -> #{ <<"error">> => Error }
-                end,
+                (if is_map(Error) -> Error;
+                    true -> #{ <<"error">> => Error }
+                end)#{
+                    <<"phase">> => <<"compute">>,
+                    <<"attempted-slot">> => Slot
+                },
             ?event(compute_short,
                 {error_computing_slot,
                     {proc_id, ProcID},
@@ -464,12 +474,36 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {error, ErrMsg}
                 }
             ),
-            {error,
-                ErrMsg#{
-                    <<"phase">> => <<"compute">>,
-                    <<"attempted-slot">> => Slot
-                }
-            }
+            ErrState =
+                hb_ao:set(
+                    State,
+                    #{
+                        <<"device">> => <<"process@1.0">>,
+                        <<"at-slot">> => Slot,
+                        <<"results">> => #{
+                            <<"type">> => <<"error">>,
+                            <<"error">> => ErrMsg
+                        }
+                    },
+                    Opts
+                ),
+            store_result(Slot == TargetSlot, ProcID, Slot, ErrState, InitReq, Opts),
+            {ok, ErrState};
+        {failure, Failure} ->
+            % A failure of this node -- a failed read or fetch -- is not a
+            % result of the computation, so nothing of it is stored. The
+            % process-failure hook sees it, and the failure is answered as
+            % it arrived.
+            hb_hook:on(
+                <<"process-failure">>,
+                #{
+                    <<"process-id">> => ProcID,
+                    <<"slot">> => Slot,
+                    <<"body">> => Failure
+                },
+                Opts
+            ),
+            {failure, Failure}
     end.
 
 %% @doc Prepare the process state message for computing the next slot.

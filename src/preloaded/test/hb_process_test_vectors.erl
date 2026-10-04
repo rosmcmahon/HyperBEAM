@@ -91,6 +91,27 @@ aos_process(Opts, Stack) ->
         Opts#{ <<"priv-wallet">> => Wallet }
     ).
 
+%% @doc Generate a process whose execution device is `lua@5.3a', running
+%% the given Lua script. A slot that runs a script function raising an
+%% uncaught error is the smallest execution returning `{error, _}': the
+%% other executors either always succeed or fail with an exception.
+lua_process(Script, Opts) ->
+    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
+    hb_message:commit(
+        hb_maps:merge(
+            hb_message:uncommitted(base_process(Opts), Opts),
+            #{
+                <<"execution-device">> => <<"lua@5.3a">>,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Script
+                }
+            },
+            Opts
+        ),
+        Opts#{ <<"priv-wallet">> => Wallet }
+    ).
+
 %% @doc Generate a device that has a stack of two `dev_test's for 
 %% execution. This should generate a message state has doubled 
 %% `Already-Seen' elements for each assigned slot.
@@ -524,6 +545,40 @@ now_results_test_parallel_() ->
         schedule_aos_call(Base, <<"return 2+2">>, Opts),
         ?assertEqual({ok, <<"4">>}, hb_ao:resolve(Base, <<"now/results/data">>, Opts))
     end}.
+
+%% @doc A slot whose execution returns an error is skipped: the error
+%% becomes the slot's results over the state before the slot, the slot is
+%% stored, and computing carries on to the next slot from that state.
+error_slot_is_skipped_test_parallel() ->
+    Opts = test_opts(),
+    Base =
+        lua_process(
+            <<
+                """
+                function inc(base)
+                    base.count = (base.count or 0) + 1
+                    return base
+                end
+                function fail(base)
+                    error("The process failed.")
+                end
+                """
+            >>,
+            Opts
+        ),
+    schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+    schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+    schedule_test_message(Base, <<"fail">>, #{ <<"path">> => <<"fail">> }, Opts),
+    schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+    % The later slot computes from the state before the erroring slot.
+    {ok, Res} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts),
+    ?assertEqual(3, hb_ao:get(<<"count">>, Res, Opts)),
+    % The erroring slot is stored with the error as its results.
+    {ok, ErrSlot} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 2 }, Opts),
+    ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, ErrSlot, Opts)),
+    ?assertEqual(2, hb_ao:get(<<"count">>, ErrSlot, Opts)).
 
 prior_results_accessible_test_parallel_() ->
     {timeout, 30, fun() ->
