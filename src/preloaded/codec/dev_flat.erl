@@ -22,13 +22,7 @@ commit(Msg, Req, Opts) ->
 %% @doc Route verification through `httpsig@1.0'.
 -spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 verify(Msg, Req, Opts) ->
-    {ok,
-        hb_message:verify(
-            Msg,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
-            Opts
-        )
-    }.
+    hb_ao:raw(<<"httpsig@1.0">>, <<"verify">>, Msg, Req, Opts).
 
 %% @doc Convert a flat map to a TABM.
 -spec from(binary() | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
