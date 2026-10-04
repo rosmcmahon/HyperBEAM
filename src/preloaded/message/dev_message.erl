@@ -1329,6 +1329,15 @@ test_verify(KeyType) ->
             #{ <<"hashpath">> => ignore }
         )
     ),
+    % A `target' naming a key the request lacks is refused, not answered.
+    ?assertError(
+        {badmatch, {error, not_found}},
+        hb_ao:resolve(
+            Signed,
+            #{ <<"path">> => <<"verify">>, <<"target">> => <<"missing">> },
+            #{ <<"hashpath">> => ignore }
+        )
+    ),
     ?assertEqual({ok, false},
         hb_ao:resolve(
             BadSigned,
