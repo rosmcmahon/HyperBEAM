@@ -190,12 +190,28 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             {path, {string, Path}},
             {body_size, byte_size(Body)}
         }),
+    % Find the codec device from the headers, if set.
+    CodecDev =
+        hb_maps:get(
+            <<"codec-device">>,
+            NormHeaderMap,
+            <<"httpsig@1.0">>,
+            Opts
+        ),
+    {ResponseStatus, Msg} =
+        outbound_result_to_message(
+            CodecDev,
+            Status,
+            NormHeaderMap,
+            Body,
+            Opts
+        ),
     ReturnAOResult =
         hb_opts:get(http_only_result, true, Opts) andalso
-        hb_maps:get(<<"ao-result">>, NormHeaderMap, false, Opts),
+        is_map(Msg) andalso
+        hb_maps:get(<<"ao-result">>, Msg, false, Opts),
     case ReturnAOResult of
         Key when is_binary(Key) ->
-            Msg = http_response_to_httpsig(Status, NormHeaderMap, Body, Opts),
             ?event(
                 debug_http_outbound,
                 {result_is_single_key, {key, Key}, {msg, Msg}},
@@ -225,25 +241,7 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
                     )
             end;
         false ->
-            % Find the codec device from the headers, if set.
-            CodecDev =
-                hb_maps:get(
-                    <<"codec-device">>,
-                    NormHeaderMap,
-                    <<"httpsig@1.0">>,
-                    Opts
-                ),
-            add_peer_stores(
-                outbound_result_to_message(
-                    CodecDev,
-                    Status,
-                    NormHeaderMap,
-                    Body,
-                    Opts
-                ),
-                Peer,
-                Opts
-            )
+            add_peer_stores({ResponseStatus, Msg}, Peer, Opts)
     end.
 
 %% @doc Give every link in a response the stores needed to resolve it: the
