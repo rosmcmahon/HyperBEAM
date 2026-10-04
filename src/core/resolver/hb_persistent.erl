@@ -189,9 +189,14 @@ await(Worker, Base, Req, Opts) ->
     % Register with the process.
     GroupName = group(Base, Req, Opts),
     % set monitor to a worker, so we know if it exits
-    _Ref = erlang:monitor(process, Worker),
+    Ref = erlang:monitor(process, Worker),
     Worker ! {resolve, self(), GroupName, Req, Opts},
-    AwaitFun(Worker, GroupName, Base, Req, Opts).
+    case find_execution(GroupName, Opts) of
+        {ok, Worker} -> AwaitFun(Worker, GroupName, Base, Req, Opts);
+        _ ->
+            erlang:demonitor(Ref, [flush]),
+            {error, leader_died}
+    end.
 
 %% @doc Default await function that waits for a resolution from a worker.
 default_await(Worker, GroupName, Base, Req, Opts) ->
