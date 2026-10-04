@@ -931,7 +931,12 @@ req_to_tabm_singleton(Req, Body, Opts) ->
         >>,
     Headers = cowboy_req:headers(Req),
     {ok, _Path, QueryKeys} = hb_singleton:from_path(FullPath),
-    PrimitiveMsg = maps:merge(Headers, QueryKeys),
+    % The query is parsed once, here. The query parameters override the
+    % request's headers, except for the keys that its signatures cover: a
+    % signature covers its keys' values, so the query never replaces signed
+    % content.
+    SignedKeys = signed_keys(Headers, Opts),
+    PrimitiveMsg = maps:merge(Headers, maps:without(SignedKeys, QueryKeys)),
     Codec =
         case hb_maps:find(<<"codec-device">>, PrimitiveMsg, Opts) of
             {ok, ExplicitCodec} -> ExplicitCodec;
@@ -1017,12 +1022,35 @@ req_to_tabm_singleton(Req, Body, Opts) ->
         _ -> throw({invalid_commitments, Normalized})
     end.
 
+%% @doc Return the message keys that the request's HTTPSig signatures cover,
+%% from its `signature-input' headers. A signature covers its keys' values, so
+%% the query parameters do not replace the signed header values of these keys.
+%% HTTPSig is the only request form that carries signed content in headers:
+%% the other codecs sign the body, which the query parameters do not reach.
+signed_keys(Headers, Opts) ->
+    case hb_maps:find(<<"signature-input">>, Headers, Opts) of
+        {ok, SigInput} ->
+            lists:usort(
+                lists:append(
+                    [
+                        [hb_escape:decode(Key) || {item, {string, Key}, _} <- Fields]
+                    ||
+                        {_Name, {list, Fields, _Params}} <-
+                            hb_structured_fields:parse_dictionary(SigInput)
+                    ]
+                )
+            );
+        error -> []
+    end.
+
 %% @doc Add the method and path to a message, if they are not already present.
 %% Remove browser-added fields that are unhelpful during processing (for example,
 %% `content-length').
 %% The precidence order for finding the path is:
 %% 1. The path in the message
-%% 2. The path in the request URI
+%% 2. The path of the request
+%% The path carries no query string: the request's query parameters are already
+%% merged into the message, so `hb_singleton' does not parse them a second time.
 normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
     ?event(debug_http, {adding_method_and_path_from_request, {explicit, Req}}),
     Method = cowboy_req:method(Req),
@@ -1033,16 +1061,7 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
             hb_maps:get(
                 <<"path">>, 
                 RawHeaders,
-                iolist_to_binary(
-                    cowboy_req:uri(
-                        Req,
-                        #{
-                            host => undefined,
-                            port => undefined,
-                            scheme => undefined
-                        }
-                    )
-                ),
+                cowboy_req:path(Req),
                 Opts
             ),
             Opts
@@ -1214,7 +1233,12 @@ get_host_test_parallel() ->
 simple_ao_resolve_unsigned_test() ->
     URL = hb_http_server:start_node(),
     TestMsg = #{ <<"path">> => <<"/key1">>, <<"key1">> => <<"Value1">> },
-    ?assertEqual({ok, <<"Value1">>}, post(URL, TestMsg, test_opts())).
+    ?assertEqual({ok, <<"Value1">>}, post(URL, TestMsg, test_opts())),
+    % The atom value of a successful result is its body, not its status.
+    ?assertEqual(
+        {ok, forbidden},
+        post(URL, #{ <<"path">> => <<"/key2">>, <<"key2">> => forbidden }, test_opts())
+    ).
 
 %% @doc An empty body is preserved in signed HTTP requests and responses.
 empty_body_http_test() ->
@@ -1831,6 +1855,52 @@ index_request_test() ->
             #{}
         ),
     ?assertEqual(<<"i like dogs!">>, hb_ao:get(<<"body">>, Res, #{})).
+
+%% @doc A query parameter overrides a request header of the same name, so the
+%% keys that a request sets in its path keep working beside headers.
+query_overrides_header_test() ->
+    Node = hb_http_server:start_node(),
+    {ok, Res} =
+        get(
+            Node,
+            #{
+                <<"path">> => <<"/accept?accept=from-query">>,
+                <<"accept">> => <<"from-header">>,
+                <<"accept-bundle">> => false
+            },
+            #{}
+        ),
+    ?assertEqual(<<"from-query">>, Res).
+
+%% @doc A signed request's query parameters do not reach its execution, and a
+%% query key that shares a signed key's name does not replace the signed header
+%% value: a signature covers its keys' values.
+signed_request_query_riders_test() ->
+    Opts = test_opts(),
+    Node = hb_http_server:start_node(),
+    Signed =
+        hb_message:commit(
+            #{ <<"x">> => <<"original">> },
+            Opts,
+            #{ <<"committed">> => [<<"x">>] }
+        ),
+    % A query key that the request does not carry is not added to it, so the
+    % step resolves `y' on a message that does not hold it.
+    ?assertMatch(
+        {error, _},
+        request(<<"GET">>, Node, <<"/y?y=1">>, Signed, Opts)
+    ),
+    % The same key sent as an uncommitted header is dropped likewise.
+    ?assertMatch(
+        {error, _},
+        request(<<"GET">>, Node, <<"/y">>, Signed#{ <<"y">> => <<"7">> }, Opts)
+    ),
+    % A query key that shares a signed key's name does not replace the signed
+    % value, so the signature holds and the committed key resolves.
+    ?assertEqual(
+        {ok, <<"original">>},
+        request(<<"GET">>, Node, <<"/x?x=evil">>, Signed, Opts)
+    ).
 
 %% Test parallel requests
 parallel_request_test() ->

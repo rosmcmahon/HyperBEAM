@@ -56,9 +56,12 @@ item(_Base, Req, Opts) ->
     case verify_message(ItemToProcess, Opts) of
         {ok, Item} ->
             ItemID = hb_message:id(Item, signed, Opts),
+            % Size the item for its bundle before it is written anywhere, so
+            % an item that cannot be bundled is refused with nothing cached
+            % or indexed.
+            BundledSize = bundled_item_size(Item, Opts),
             case cache_item(Item, Opts) of
                 ok ->
-                    BundledSize = bundled_item_size(Item, Opts),
                     {ok, Metering} =
                         hb_device_load:reference(<<"metering@1.0">>, Opts),
                     Metering:consume(<<"arweave-bytes">>, BundledSize, Opts),
@@ -1631,6 +1634,31 @@ invalid_item_test_parallel() ->
             <<"status">> := 400,
             <<"error">> := <<"invalid-item">>,
             <<"details">> := <<"signature-verification-failed">>}}, DirectResult),
+        % An item with two ANS-104 commitments cannot be sized for its bundle
+        % format: the node refuses it, and it must not be in the item index.
+        Signed1 =
+            hb_message:commit(
+                hb_message:uncommitted(StructuredItem),
+                #{ <<"priv-wallet">> => hb:wallet() },
+                #{ <<"commitment-device">> => <<"ans104@1.0">> }
+            ),
+        Signed2 =
+            hb_message:commit(
+                hb_message:uncommitted(Signed1),
+                #{ <<"priv-wallet">> => hb:wallet() },
+                #{ <<"commitment-device">> => <<"ans104@1.0">> }
+            ),
+        Unsigned1 = hb_message:uncommitted(Signed1),
+        TwoSigned =
+            Unsigned1#{
+                <<"commitments">> =>
+                    hb_maps:merge(
+                        hb_maps:get(<<"commitments">>, Signed1),
+                        hb_maps:get(<<"commitments">>, Signed2)
+                    )
+            },
+        ?assertThrow(_, dev_bundler:item(#{}, TwoSigned, TestOpts)),
+        ?assertEqual([], dev_bundler_cache:list_item_ids(TestOpts)),
         ok
     after
         stop_test_servers(ServerHandle, NodeOpts)

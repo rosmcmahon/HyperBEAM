@@ -340,13 +340,18 @@ embed_status({ErlStatus, Res}, NodeMsg) ->
 %% 1. The status code from the message.
 %% 2. The HTTP representation of the status code.
 %% 3. The default status code.
+%% Only an `error' or `failure' result takes its status from the message it
+%% carries; the body of a successful result is data, not a status.
 status_code({error, {no_viable_responses, _AllResponses}}, NodeMsg) ->
     status_code(no_viable_responses, NodeMsg);
-status_code({ErlStatus, Msg}, NodeMsg) ->
+status_code({ErlStatus, Msg}, NodeMsg)
+        when ErlStatus == error; ErlStatus == failure ->
     case message_to_status(Msg, NodeMsg) of
         default -> status_code(ErlStatus, NodeMsg);
         RawStatus -> RawStatus
     end;
+status_code({ErlStatus, _Msg}, NodeMsg) ->
+    status_code(ErlStatus, NodeMsg);
 status_code(ok, _NodeMsg) -> 200;
 status_code(error, _NodeMsg) -> 400;
 status_code(created, _NodeMsg) -> 201;
@@ -360,11 +365,16 @@ status_code(forbidden, _NodeMsg) -> 403;
 status_code(not_authorized, _NodeMsg) -> 403;
 status_code(_, _NodeMsg) -> 200.
 
-%% @doc Get the HTTP status code from a transaction (if it exists).
+%% @doc Get the HTTP status code from a transaction (if it exists). An atom
+%% that `status_code/2' maps to 200, as it maps every atom it does not name,
+%% gives no code, so the Erlang status of the result gives it.
 message_to_status(#{ <<"body">> := Status }, NodeMsg) when is_atom(Status) ->
-    status_code(Status, NodeMsg);
+    message_to_status(Status, NodeMsg);
 message_to_status(Item, NodeMsg) when is_atom(Item) ->
-    status_code(Item, NodeMsg);
+    case status_code(Item, NodeMsg) of
+        200 -> default;
+        Status -> Status
+    end;
 message_to_status(_Item, _NodeMsg) ->
     default.
 

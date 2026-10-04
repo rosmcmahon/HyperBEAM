@@ -380,7 +380,16 @@ results(M1, M2, Opts) ->
                         Opts
                     ),
                     ?event(debug_iface, {results, {processed, ProcessedResults}, {out, Out}}),
-                    {ok, Out}
+                    {ok, Out};
+                % The call did not trap, but the process reports an error.
+                % The reply's `response' is the slot's error result.
+                #{<<"ok">> := false} = Reply ->
+                    {error,
+                        maps:get(
+                            <<"response">>,
+                            Reply,
+                            <<"AOS execution error.">>
+                        )}
             catch
                 _:_ ->
                     ?event(error, {json_error, Str}),

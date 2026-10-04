@@ -1930,7 +1930,20 @@ request_hook_reroute_to_nearest() ->
         end,
         Peers
     ),
-    ?assert(HasValidSigner).
+    ?assert(HasValidSigner),
+    % A signed request holding a map is relayed as it was signed.
+    Signed =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"/a/b/c">>,
+                <<"a">> => #{ <<"b">> => #{ <<"c">> => <<"ok">> } }
+            },
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"ok">>},
+        hb_http:post(Node, Signed, Opts#{ <<"http-only-result">> => true })
+    ).
 
 route_nearest_integer_preserves_opts_test_parallel() ->
     Routes =

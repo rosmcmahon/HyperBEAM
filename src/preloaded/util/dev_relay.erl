@@ -301,8 +301,9 @@ request(_Base, Req, Opts) ->
                     #{ <<"device">> => <<"relay@1.0">> },
                     #{
                         <<"path">> => <<"call">>,
-                        <<"target">> => <<"body">>,
-                        <<"body">> => hb_maps:get(<<"request">>, Req, Opts)
+                        <<"target">> => <<"proxy-message">>,
+                        <<"proxy-message">> =>
+                            hb_util:ok(hb_maps:find(<<"request">>, Req, Opts))
                     }
                 ]
         }

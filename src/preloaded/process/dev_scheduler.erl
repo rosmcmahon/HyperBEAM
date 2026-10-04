@@ -168,11 +168,13 @@ validate_next_slot(Base, [NextAssignment|Assignments], Lookahead, Last, Opts) ->
                             Opts
                         );
                     false ->
-                        Base#{
-                            <<"scheduler@1.0">> => #{
+                        hb_private:set(
+                            Base,
+                            #{ <<"scheduler@1.0">> => #{
                                 <<"lookahead-worker">> => Lookahead
-                            }
-                        }
+                            }},
+                            Opts
+                        )
                 end,
             ?event(debug_next,
                 {next_returning,
@@ -716,11 +718,11 @@ without_hint(Target) ->
 %% that matches.
 find_remote_scheduler(_ProcID, [], _Variant, _Opts) -> {error, not_found};
 find_remote_scheduler(ProcID, [Scheduler | Rest], Variant, Opts) ->
-    case find_remote_scheduler(ProcID, Rest, Variant, Opts) of
-        {error, not_found} ->
-            find_remote_scheduler(ProcID, Scheduler, Variant, Opts);
-        {redirect, Redirect} ->
-            {redirect, Redirect}
+    case find_remote_scheduler(ProcID, Scheduler, Variant, Opts) of
+        {error, _} when Rest =/= [] ->
+            find_remote_scheduler(ProcID, Rest, Variant, Opts);
+        Other ->
+            Other
     end;
 find_remote_scheduler(ProcID, Scheduler, Variant, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,

@@ -971,25 +971,22 @@ commitment_devices(_Msg, _Opts) ->
 %% @doc Implements a standard pattern in which the target for an operation is
 %% found by looking for a `target' key in the request. If the target is `self',
 %% or not present, the operation is performed on the original message. Otherwise,
-%% the target is expected to be a key in the message, and the operation is
-%% performed on the value of that key.
+%% the target names a key of the request, and the operation is performed on the
+%% value of that key. A `target' that names a key the request lacks gives
+%% `{error, not_found}'.
 find_target(Self, Req, Opts) ->
 	GetOpts = Opts#{
         <<"hashpath">> => ignore,
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
     },
-    {ok,
-        case hb_maps:get(<<"target">>, Req, <<"self">>, GetOpts) of
-            <<"self">> -> Self;
-            Key ->
-                hb_maps:get(
-                    Key,
-                    Req,
-                    hb_maps:get(<<"body">>, Req, GetOpts),
-                    GetOpts
-                )
-        end
-    }.
+    case hb_maps:get(<<"target">>, Req, <<"self">>, GetOpts) of
+        <<"self">> -> {ok, Self};
+        Key ->
+            case hb_maps:find(Key, Req, GetOpts) of
+                {ok, Target} -> {ok, Target};
+                error -> {error, not_found}
+            end
+    end.
 
 %% @doc Remove keys from the map that can be regenerated. Optionally takes an
 %% additional list of keys to include in the minimization.

@@ -114,7 +114,15 @@ load_names(Opts) ->
             hb_cache:list(?DEV_CACHE, Opts)
         )),
     ?event(local_name, {found_cache_keys, LocalNames}),
-    update_names(LocalNames, Opts).
+    % The names in the store, which registrations write, take precedence over
+    % the names the node message already holds, such as those in its config.
+    update_names(
+        maps:merge(
+            hb_opts:get(local_names, #{}, Opts#{ <<"only">> => local }),
+            LocalNames
+        ),
+        Opts
+    ).
 
 %% @doc Updates the node message with the new names. Further HTTP requests will
 %% use this new message, removing the need to look up the names from non-volatile

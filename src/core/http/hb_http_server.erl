@@ -406,7 +406,14 @@ listener_protocol_options(ServerID, NodeMsg) ->
         env => #{ dispatch => Dispatcher, node_msg => NodeMsg },
         stream_handlers => [cowboy_stream_h],
         max_connections => infinity,
-        idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg)
+        idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg),
+        % `httpsig@1.0' sends a header for each key of a message whose value
+        % is at most 4096 bytes. Percent-encoding can triple the length of
+        % its name, escaping can double the length of its value, and the
+        % `signature-input' header lists every key of each commitment.
+        max_headers => 1024,
+        max_header_name_length => 4096,
+        max_header_value_length => 16384
     }.
 
 stop_tls(ServerID) ->

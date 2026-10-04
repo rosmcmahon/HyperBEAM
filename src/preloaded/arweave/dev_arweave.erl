@@ -1239,7 +1239,7 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
             {tx, TXHeader}
         }
     ),
-    {ok, Data} =
+    Loaded =
         case hb_maps:get(<<"exclude-data">>, Req, false, Opts) of
             true when TXHeader#tx.format =:= 1 ->
                 {ok, TXHeader#tx.data};
@@ -1259,15 +1259,24 @@ to_tx_message(Type, ID, Path, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts
                                 Opts
                             )
                     end,
+                % A transaction that has data is returned only with that data:
+                % a read that gives no data answers `not_found'.
                 case DataRes of
-                    {ok, RawData} -> {ok, RawData};
-                    {error, not_found} -> {ok, ?DEFAULT_DATA};
-                    Error -> Error    
+                    {ok, RawData} when RawData =/= ?DEFAULT_DATA ->
+                        {ok, RawData};
+                    _ when TXHeader#tx.data_size =:= 0 -> {ok, ?DEFAULT_DATA};
+                    {ok, _} -> {error, not_found};
+                    Error -> Error
                 end
         end,
-    TX = TXHeader#tx{ data = Data },
-    % Return the transaction only if it has the requested ID, its signature
-    % verifies, and any data it carries is the data that the signature covers.
+    case Loaded of
+        {ok, Data} -> verified_tx_message(ID, TXHeader#tx{ data = Data }, Opts);
+        Other -> Other
+    end.
+
+%% @doc Return the transaction only if it has the requested ID, its signature
+%% verifies, and any data it carries is the data that the signature covers.
+verified_tx_message(ID, TX, Opts) ->
     case TX#tx.id =:= hb_util:native_id(ID) andalso ar_tx:verify(TX) of
         true ->
             try

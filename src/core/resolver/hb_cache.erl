@@ -289,14 +289,51 @@ generate_binary_path(Bin, Opts) ->
 %% outer message (which does not include its commitments) will be built upon
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
+%% Commitments over different keys are written as separate messages, and the
+%% ID of the one with the most keys is returned.
 write(RawMsg, Opts) when is_map(RawMsg) ->
-    write_prepared(prepare_write(RawMsg, Opts), RawMsg, Opts);
+    lists:last(
+        [
+            write_prepared(prepare_write(Msg, Opts), RawMsg, Opts)
+        ||
+            Msg <- split_commitments(RawMsg, Opts)
+        ]
+    );
 write(List, Opts) when is_list(List) ->
     write(hb_message:convert(List, tabm, <<"structured@1.0">>, Opts), Opts);
 write(Bin, Opts) when is_binary(Bin) ->
     do_write_message(Bin, hb_opts:get(store, no_viable_store, Opts), Opts).
 
-%% @doc Write `Msg', the result of `prepare_write/2' on `RawMsg'.
+%% @doc The message once for each set of keys its commitments cover, with only
+%% the commitments over that set, the set with the most keys last; the message
+%% itself when all of its commitments cover the same keys.
+split_commitments(Msg, Opts) ->
+    Groups =
+        maps:groups_from_list(
+            fun({_, Commitment}) ->
+                Committed = hb_maps:get(<<"committed">>, Commitment, [], Opts),
+                Keys =
+                    lists:usort(
+                        hb_util:message_to_ordered_list(
+                            ensure_all_loaded(Committed, Opts),
+                            Opts
+                        )
+                    ),
+                {length(Keys), Keys}
+            end,
+            hb_maps:to_list(hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts)
+        ),
+    case map_size(Groups) of
+        N when N < 2 -> [Msg];
+        _ ->
+            [
+                Msg#{ <<"commitments">> => maps:from_list(Comms) }
+            ||
+                {_, Comms} <- lists:sort(maps:to_list(Groups))
+            ]
+    end.
+
+%% @doc Write a prepared message, with private keys from `RawMsg' for the hook.
 write_prepared(Msg, RawMsg, Opts) ->
     hb_message:paranoid_verify(cache_write, Msg, Opts),
     % Conversion writes the children that it links only in `offload' mode.
@@ -354,10 +391,17 @@ link_prepared(_Prepared, Child, _Opts) -> Child.
 %% private keys, and each commitment message, then remove the commitments that
 %% do not verify. If commitments remain and do not commit every key that is not
 %% private, keep only the keys they commit, and again remove the commitments
-%% that do not verify over those keys.
+%% that do not verify over those keys. A key present both as a literal and as
+%% a `+link' is refused: `k+link' is only the link form of `k'.
 prepare_write(Msg, Opts) when is_map(Msg) ->
     Deep = maps:map(
-        fun(<<"commitments">>, Value) ->
+        fun
+            (Key, _Value)
+                    when is_binary(Key), byte_size(Key) >= 5,
+                         binary_part(Key, byte_size(Key) - 5, 5) =:= <<"+link">>,
+                         is_map_key(binary_part(Key, 0, byte_size(Key) - 5), Msg) ->
+                throw({duplicated_key_cache_write, Key});
+           (<<"commitments">>, Value) ->
                 prepare_write(ensure_all_loaded(Value, Opts), Opts);
            (Key, Value) ->
                 case hb_private:is_private(Key) of
@@ -1565,6 +1609,42 @@ test_signed_literal_keys(Store) ->
     ?assertEqual(ID, hb_message:id(Loaded, signed, Opts)),
     ?assert(is_map(hb_message:convert(Loaded, <<"httpsig@1.0">>, Opts))).
 
+%% @doc A key present both as a literal and as a `+link' is refused: `k+link'
+%% is only the link form of `k'. Each form alone still writes and reads back
+%% as before.
+test_literal_link_collision(Store) ->
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store },
+    {ok, OtherID} = write(#{ <<"poison">> => <<"from-link">> }, Opts),
+    ?assertThrow(
+        {duplicated_key_cache_write, <<"k+link">>},
+        write(#{ <<"k">> => <<"literal-value">>, <<"k+link">> => OtherID }, Opts)
+    ),
+    % The refusal follows the write into nested messages.
+    ?assertThrow(
+        {duplicated_key_cache_write, <<"k+link">>},
+        write(#{ <<"parent">> => #{ <<"k">> => <<"v">>, <<"k+link">> => OtherID } }, Opts)
+    ),
+    ?assertThrow(
+        {duplicated_key_cache_write, <<"k+link">>},
+        write(#{ <<"list">> => [#{ <<"k">> => <<"v">>, <<"k+link">> => OtherID }] }, Opts)
+    ),
+    % A literal alone is stored and read back unchanged.
+    {ok, LiteralID} = write(#{ <<"k">> => <<"literal-value">> }, Opts),
+    {ok, LiteralRead} = read(LiteralID, Opts),
+    ?assertEqual(
+        #{ <<"k">> => <<"literal-value">> },
+        ensure_all_loaded(LiteralRead, Opts)
+    ),
+    % A link alone resolves to its target under the literal key.
+    {ok, LinkID} = write(#{ <<"k+link">> => OtherID }, Opts),
+    {ok, LinkRead} = read(LinkID, Opts),
+    ?assertEqual(
+        #{ <<"k">> => #{ <<"poison">> => <<"from-link">> } },
+        ensure_all_loaded(LinkRead, Opts)
+    ),
+    ok.
+
 test_immediate_marker_values(Store) ->
     hb_store:reset(Store),
     Opts = #{ <<"store">> => Store, <<"match-index">> => false },
@@ -1635,6 +1715,7 @@ cache_suite_test_() ->
         {"match typed message", fun test_match_typed_message/1},
         {"raw match read", fun test_raw_match_read/1},
         {"literal keys", fun test_literal_keys/1},
+        {"literal and link key collision", fun test_literal_link_collision/1},
         {"signed literal keys", fun test_signed_literal_keys/1},
         {"immediate marker values", fun test_immediate_marker_values/1},
         {"cache-write hook", fun test_cache_write_hook/1}
@@ -1709,7 +1790,11 @@ projected_commitments_test() ->
     end, [Mixed, #{ <<"child">> => Mixed }, #{ <<"children">> => [Mixed] }]),
     {ok, Kept} = read(hb_message:id(Signed, all, Opts), Opts),
     ?assertEqual(hb_message:signers(Signed, Opts), hb_message:signers(Kept, Opts)),
-    ?assertEqual({error, not_found}, read(FullID, Opts)).
+    % Commitments over different keys are written separately.
+    {ok, Full} = read(FullID, Opts),
+    ?assertEqual(hb_message:uncommitted(Mixed, Opts),
+        hb_message:uncommitted(ensure_all_loaded(Full, Opts), Opts)),
+    ?assert(hb_message:verify(Full, #{ <<"ids">> => [FullID] }, Opts)).
 
 %% @doc Run a specific test with a given store module.
 run_test() ->

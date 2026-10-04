@@ -577,7 +577,8 @@ tx_to_json_struct(
         signature = Sig,
         data_size = DataSize,
         data_root = DataRoot,
-        denomination = Denomination
+        denomination = Denomination,
+        signature_type = SigType
     }) ->
     Fields = [
         {<<"format">>,
@@ -589,7 +590,15 @@ tx_to_json_struct(
             end},
         {<<"id">>, hb_util:encode(ID)},
         {<<"last_tx">>, hb_util:encode(Anchor)},
-        {<<"owner">>, hb_util:encode(Owner)},
+        {<<"owner">>,
+            case SigType of
+                ?ECDSA_KEY_TYPE ->
+                    % The owner of an ECDSA transaction is empty: the key is
+                    % recovered from the signature when the JSON is read.
+                    <<>>;
+                _ ->
+                    hb_util:encode(Owner)
+            end},
         {<<"tags">>,
             lists:map(
                 fun({Name, Value}) ->
