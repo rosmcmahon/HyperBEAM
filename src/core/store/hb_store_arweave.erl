@@ -152,7 +152,7 @@ read_remote_offset(
             #{
                 <<"offset">> := StartOffset,
                 <<"header-length">> := HeaderLength,
-                <<"content-length">> := DataLength
+                <<"data-length">> := DataLength
             }} when is_integer(StartOffset) ->
             CodecName =
                 case HeaderLength of

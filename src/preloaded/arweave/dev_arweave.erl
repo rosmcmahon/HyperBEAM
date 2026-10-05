@@ -269,7 +269,7 @@ head_raw_tx_response(TXID, StartOffset, Length, StructuredTXHeader, Opts) ->
             <<"data-offset">> => pending_root_offset(TXID, StartOffset),
             <<"content-type">> => ContentType,
             <<"header-length">> => 0,
-            <<"content-length">> => Length,
+            <<"data-length">> => Length,
             <<"accept-ranges">> => <<"bytes">>
         }
     }.
@@ -306,7 +306,7 @@ do_head_raw_ans104(TXID, ArweaveOffset, Length, Data, _Opts) ->
                     add_data_offset(ArweaveOffset, HeaderSize),
                 <<"content-type">> => ContentType,
                 <<"header-length">> => HeaderSize,
-                <<"content-length">> => Length - HeaderSize,
+                <<"data-length">> => Length - HeaderSize,
                 <<"accept-ranges">> => <<"bytes">>
             }
         }
@@ -347,7 +347,7 @@ get_raw(Base, Request, Opts) ->
                 <<"raw-id">> := TXID,
                 <<"data-offset">> := ArweaveDataOffset,
                 <<"content-type">> := ContentType,
-                <<"content-length">> := FullContentLength
+                <<"data-length">> := FullContentLength
             }
         } ->
         ?event(debug_raw, {raw_header,
@@ -366,7 +366,6 @@ get_raw(Base, Request, Opts) ->
                     Header#{
                         <<"status">> => 206,
                         <<"content-type">> => ContentType,
-                        <<"content-length">> => RangeLength,
                         <<"content-range">> =>
                             <<
                                 "bytes ",
@@ -1957,7 +1956,7 @@ head_raw_tx_test_parallel() ->
     ),
     ?assertEqual(
         {ok, 774},
-        hb_maps:find(<<"content-length">>, Result, Opts)
+        hb_maps:find(<<"data-length">>, Result, Opts)
     ),
     ?assertEqual(
         {ok, 0},
@@ -1988,7 +1987,7 @@ head_raw_ans104_test_parallel() ->
     ),
     ?assertEqual(
         {ok, 575},
-        hb_maps:find(<<"content-length">>, Result, Opts)
+        hb_maps:find(<<"data-length">>, Result, Opts)
     ).
 
 %% @doc Raw reads must check the full ID of a published-index candidate.
@@ -2018,7 +2017,7 @@ raw_published_index_id_test_parallel() ->
                 hb_ao:resolve(Base, Req#{ <<"raw">> => ID }, Opts),
             ?assertEqual(ID, hb_maps:get(<<"raw-id">>, Result, Opts)),
             ?assertEqual(Length,
-                hb_maps:get(<<"content-length">>, Result, Opts)),
+                hb_maps:get(<<"data-length">>, Result, Opts)),
             ?assertEqual(
                 {error, not_found},
                 hb_ao:resolve(Base, Req#{ <<"raw">> => WrongID }, Opts)
