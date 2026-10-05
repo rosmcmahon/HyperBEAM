@@ -745,7 +745,8 @@ calculate_all_ids(Msg, UncommittedID, Opts) ->
 %% a richly typed map or a direct binary. If `cache-read-mode' is `raw',
 %% composite reads return lazy links without decoding `ao-types'. An ID that
 %% holds an `ao://' path for which `is_commitments_path/1' is true reads as the
-%% result of the path in `raw' mode, against the local stores alone; any other
+%% result of the path, resolved against the local stores alone; in `raw' mode
+%% it reads as the stored path, as resolving it needs `message@1.0'. Any other
 %% `ao://' value at an ID is not found.
 read(Path, Opts) when ?IS_HASHPATH(Path) ->
     hb_hashpath:load(Path, Opts);
