@@ -217,7 +217,9 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
                 {result_is_single_key, {key, Key}, {msg, Msg}},
                 Opts
             ),
-            case {Key, hb_maps:get(Key, Msg, undefined, Opts)} of
+            % The result may be a link to a message that the peer holds.
+            {_, Linked} = add_peer_stores({ResponseStatus, Msg}, Peer, Opts),
+            case {Key, hb_maps:get(Key, Linked, undefined, Opts)} of
                 {<<"body">>, undefined} ->
                     {hb_http_client:response_status_to_atom(Status), <<>>};
                 {_, undefined} ->

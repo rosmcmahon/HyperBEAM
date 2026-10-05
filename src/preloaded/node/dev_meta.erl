@@ -322,7 +322,8 @@ resolve_hook(HookName, InitiatingRequest, Body, NodeMsg) ->
 
 %% @doc Wrap the result of a device call in a status. A result that has a
 %% `status' keeps it as it is: `hb_http:reply/4' takes an integer `status' as
-%% the HTTP status, and any other as the message's own.
+%% the HTTP status, and any other as the message's own. A list is the `body'
+%% of the reply, named by its `ao-result' key.
 embed_status({ErlStatus, Res}, NodeMsg) when is_map(Res) ->
     case hb_maps:is_key(<<"status">>, Res, NodeMsg) of
         false ->
@@ -331,6 +332,11 @@ embed_status({ErlStatus, Res}, NodeMsg) when is_map(Res) ->
         true ->
             {ok, Res}
     end;
+embed_status({ErlStatus, List}, NodeMsg) when is_list(List) ->
+    embed_status(
+        {ErlStatus, #{ <<"ao-result">> => <<"body">>, <<"body">> => List }},
+        NodeMsg
+    );
 embed_status({ErlStatus, Res}, NodeMsg) ->
     HTTPCode = status_code({ErlStatus, Res}, NodeMsg),
     {ok, #{ <<"status">> => HTTPCode, <<"body">> => Res }}.
