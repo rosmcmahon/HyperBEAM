@@ -94,7 +94,7 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
             undefined -> undefined;
             _         -> {string, KeyID}
         end,
-    Params =
+    RawParams =
         lists:filter(
             fun({_Key, undefined}) ->
                 false;
@@ -109,6 +109,14 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
                 {<<"expires">>, Expires},
                 {<<"nonce">>, {string, Nonce}}
             ] ++ IDParam ++ AdditionalParams
+        ),
+    Params =
+        lists:map(
+            fun({Key, {string, Value}}) ->
+                {Key, {string, encode_param(Value)}};
+               (Param) -> Param
+            end,
+            RawParams
         ),
     SFSigInput =
         {list,
@@ -166,44 +174,52 @@ get_additional_params(Commitment) ->
                 )
             )
         ),
-    lists:map(fun(Param) ->
-        ParamValue = maps:get(Param, Commitment),
-        case ParamValue of
-            Val when is_atom(Val) ->
-                {Param, {string, atom_to_binary(Val, utf8)}};
-            Val when is_binary(Val) ->
-                {Param, {string, Val}};
-            Val when is_list(Val) ->
-                {Param, {string, list_to_binary(lists:join(<<", ">>, Val))}};
-            Val when is_map(Val) ->
-                Map = nested_map_to_string(Val),
-                {Param, {string, list_to_binary(lists:join(<<", ">>, Map))} }
-        end
-    end, AdditionalParams).
+    [
+        {Param, {string, maps:get(Param, Commitment)}}
+    ||
+        Param <- AdditionalParams
+    ].
 
-nested_map_to_string(Map) ->
-    lists:map(fun(I) ->
-        case maps:get(I, Map) of
-            Val when is_map(Val) ->
-                Name = encode_tag_name(maps:get(<<"name">>, Val)),
-                Value = hb_util:encode(maps:get(<<"value">>, Val)),
-                <<I/binary, ":", Name/binary, ":", Value/binary>>;
-            Val ->
-                Val
-        end
-    end, maps:keys(Map)).
-
-%% @doc Percent-encode an original tag name that holds `%', `:', `,', `"',
-%% `\' or a byte outside printable ASCII. Other names are sent as they are.
-encode_tag_name(Name) ->
-    case lists:any(fun escaped_tag_byte/1, binary_to_list(Name)) of
-        true -> hb_escape:encode(Name);
-        false -> Name
+%% @doc Lists start with a comma and a colon per element. Maps start with a
+%% colon and contain comma-separated key:value pairs. Nested values are escaped.
+encode_param(Value) ->
+    encode_param(Value, "%").
+encode_param(List, _Delimiters) when is_list(List) ->
+    <<",", (hb_util:bin([
+        <<":", (escape_param(encode_param(Value, "%:,")))/binary>>
+    ||
+        Value <- List
+    ]))/binary>>;
+encode_param(Map, _Delimiters) when is_map(Map) ->
+    <<":", (hb_util:bin(lists:join(<<", ">>, [
+        <<
+            (escape_param(Key))/binary, ":",
+            (escape_param(encode_param(Value, "%:,")))/binary
+        >>
+    ||
+        {Key, Value} <- maps:to_list(Map)
+    ])))/binary>>;
+encode_param(Value, Delimiters) ->
+    case escape_param(hb_util:bin(Value), Delimiters) of
+        <<C, Rest/binary>> when C == $,; C == $: ->
+            <<(hb_escape:encode(<<C>>))/binary, Rest/binary>>;
+        Bin -> Bin
     end.
 
-%% @doc Whether an original tag name byte needs escaping.
-escaped_tag_byte(C) ->
-    lists:member(C, "%:,\"\\") orelse C < 16#20 orelse C > 16#7e.
+%% @doc Percent-encode leading container delimiters in plain values, and all
+%% delimiters in nested values. Percent and bytes outside printable ASCII are
+%% escaped in both forms. Structured fields escape quotes and backslashes.
+escape_param(Bin) ->
+    escape_param(Bin, "%:,").
+escape_param(Bin, Delimiters) ->
+    hb_util:bin([
+        case lists:member(C, Delimiters) orelse C < 16#20 orelse C > 16#7e of
+            true -> hb_escape:encode(<<C>>);
+            false -> C
+        end
+    ||
+        C <- hb_util:list(Bin)
+    ]).
 
 %% @doc Take a message with a `signature' and `signature-input' key pair and
 %% return a map of commitments.
@@ -264,7 +280,7 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
                     Item =
                         case hb_structured_fields:from_bare_item(BareItem) of
                             Res when is_binary(Res) ->
-                                decoding_nested_map_binary(Res);
+                                decode_param(Res);
                             Res ->
                                 Res
                         end,
@@ -328,31 +344,26 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
     % Return the commitment and calculated ID.
     {ok, ID, Commitment5}.
 
-decoding_nested_map_binary(Bin) ->
-    MapBinary =
-        lists:foldl(
-            fun (X, Acc) ->
-                case binary:split(X, <<":">>, [global]) of
-                    [ID, Key, Value] ->
-                        Acc#{
-                            ID => #{ 
-                                <<"name">> => hb_escape:decode(Key),
-                                <<"value">> => hb_util:decode(Value)
-                            }
-                        };
-                    _ ->
-                        X
-                end
+%% @doc Read the container delimiters before unescaping each value. The same
+%% form applies to every parameter and to nested values.
+decode_param(<<",", List/binary>>) ->
+    maybe
+        [<<>> | Values] ?= binary:split(List, <<":">>, [global]),
+        [decode_param(hb_escape:decode(Value)) || Value <- Values]
+    end;
+decode_param(<<":">>) -> #{};
+decode_param(<<":", Map/binary>>) ->
+    maps:from_list(
+        lists:map(
+            fun(Pair) ->
+                [Key, Value] = binary:split(Pair, <<":">>),
+                {hb_escape:decode(Key), decode_param(hb_escape:decode(Value))}
             end,
-            #{},
-            binary:split(Bin, <<", ">>, [global])
-        ),
-    case MapBinary of
-        Res when is_map(Res) ->
-            Res;
-        Res ->
-            Res
-    end.
+            binary:split(Map, <<", ">>, [global])
+        )
+    );
+decode_param(Bin) ->
+    hb_escape:decode(Bin).
 
 %% @doc Normalize a list of AO-Core keys to their equivalents in `httpsig@1.0'
 %% format. This involves:
@@ -599,10 +610,51 @@ escaped_value_test() ->
     Commitments = siginfo_to_commitments(SigInfo, #{}, #{}),
     ?event(debug_test, {siginfo, {explicit, SigInfo}}),
     ?event(debug_test, {commitments, {explicit, Commitments}}),
-    ?assertEqual(#{ ID => Commitment }, Commitments).
+    ?assertEqual(#{ ID => Commitment }, Commitments),
+    lists:foreach(
+        fun({Key, Value}) ->
+            Comm = Commitment#{ Key => Value },
+            ?assertEqual(
+                #{ ID => Comm },
+                siginfo_to_commitments(
+                    commitments_to_siginfo(#{}, #{ ID => Comm }, #{}),
+                    #{},
+                    #{}
+                )
+            )
+        end,
+        [
+            {<<"extra">>, <<"a, b">>},
+            {<<"extra">>, <<"x:y:z">>},
+            {<<"extra">>, <<"v1, 2:k:dg">>},
+            {<<"keyid">>, <<"constant:ao, x">>},
+            {<<"keyid">>, <<"constant:a:b">>},
+            {<<"extra">>, <<",::value">>},
+            {<<"extra">>, <<":,,value">>},
+            {<<"nonce">>, <<"%41, :\"\\", 0, 255>>},
+            {<<"extra">>, <<"value">>},
+            {<<"extra">>, [<<"value">>]},
+            {<<"extra">>, [<<"a, b">>, <<"x:y:z">>, <<"%41">>]},
+            {<<"extra">>, []},
+            {<<"extra">>, [<<>>]},
+            {<<"extra">>, #{}},
+            {<<"extra">>, #{ <<"a:b, %">> => [<<0, 255>>, #{ <<>> => <<>> }] }}
+        ]
+    ),
+    lists:foreach(
+        fun({Value, Encoded}) -> ?assertEqual(Encoded, encode_param(Value)) end,
+        [
+            {<<"constant:ao">>, <<"constant:ao">>},
+            {<<"a, b">>, <<"a, b">>},
+            {<<"x:y:z">>, <<"x:y:z">>},
+            {<<"v1, 2:k:dg">>, <<"v1, 2:k:dg">>},
+            {<<",::value">>, <<"%2c::value">>},
+            {<<":,,value">>, <<"%3a,,value">>}
+        ]
+    ).
 
-%% @doc Original tag names that the `original-tags' string can carry are sent
-%% as they are; other names are percent-encoded and decode to themselves.
+%% @doc Ordinary map values remain readable, and nested values and keys with
+%% delimiters or bytes outside printable ASCII decode to themselves.
 original_tag_names_test() ->
     Tag = fun(Name, Value) -> #{ <<"name">> => Name, <<"value">> => Value } end,
     Tags =
@@ -612,10 +664,6 @@ original_tag_names_test() ->
             <<"3">> => Tag(<<"%41">>, <<"y">>),
             <<"4">> => Tag(<<255>>, <<"z">>)
         },
-    Wire = nested_map_to_string(Tags),
-    Plain = <<"1:Action:", (hb_util:encode(<<"Transfer">>))/binary>>,
-    ?assert(lists:member(Plain, Wire)),
-    ?assertEqual(
-        Tags,
-        decoding_nested_map_binary(iolist_to_binary(lists:join(<<", ">>, Wire)))
-    ).
+    Wire = encode_param(Tags),
+    ?assertNotEqual(nomatch, binary:match(Wire, <<"Action">>)),
+    ?assertEqual(Tags, decode_param(Wire)).
