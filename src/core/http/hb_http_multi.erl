@@ -152,7 +152,7 @@ is_admissible(_, _, _, _, _) -> false.
 serial_multirequest(_Nodes, 0, _Method, _Path, _Message, _Admissible, _Statuses, _Opts) -> {[], []};
 serial_multirequest([], _, _Method, _Path, _Message, _Admissible, _Statuses, _Opts) -> {[], []};
 serial_multirequest([Node|Nodes], Remaining, Method, Path, Message, Admissible, Statuses, Opts) ->
-    {ErlStatus, Res} = hb_http:request(Method, Node, Path, Message, Opts),
+    {ErlStatus, Res} = node_request(Method, Node, Path, Message, Opts),
     case is_admissible(ErlStatus, Res, Admissible, Statuses, Opts) of
         true ->
             ?event(debug_http, {admissible_status, {response, Res}}),
@@ -200,10 +200,7 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
             fun(Node) ->
                 spawn(
                     fun() ->
-                        Res =
-                            try hb_http:request(Method, Node, Path, Message, Opts)
-                            catch C:R -> {error, {worker_crash, C, R}}
-                            end,
+                        Res = node_request(Method, Node, Path, Message, Opts),
                         receive no_reply -> stopping
                         after 0 -> Parent ! {Ref, self(), Res}
                         end
@@ -214,6 +211,21 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
         ),
         NewRemainingNodes
     }.
+
+%% @doc Request a message from one node. A request that raises is a failure,
+%% which is not admissible.
+node_request(Method, Node, Path, Message, Opts) ->
+    try hb_http:request(Method, Node, Path, Message, Opts)
+    catch Class:Exception:Stacktrace ->
+        {failure,
+            #{
+                <<"node">> => Node,
+                <<"class">> => Class,
+                <<"exception">> => Exception,
+                <<"trace">> => Stacktrace
+            }
+        }
+    end.
 
 %% @doc Check if a status is allowed, according to the configuration. Statuses
 %% can be a single integer, a comma-separated list of integers, or the string
