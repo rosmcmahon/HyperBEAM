@@ -89,7 +89,7 @@ request(Config, Method, Path, Message, Opts) ->
             )
         end,
     ?event(debug_http, {multirequest_results, {admissible_results, AdmissibleResults}, {all_responses, AllResponses}}),
-    case AdmissibleResults of
+    case [hb_http:only_result(Res, Opts) || Res <- AdmissibleResults] of
         [] -> {error, {no_viable_responses, AllResponses}};
         Results -> if Responses == 1 -> hd(Results); true -> Results end
     end.
@@ -213,9 +213,11 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
     }.
 
 %% @doc Request a message from one node. A request that raises is a failure,
-%% which is not admissible.
+%% which is not admissible. The reply is whole: the admissibility checks read
+%% its `status', and `request/5' takes the value that it names in `ao-result'.
 node_request(Method, Node, Path, Message, Opts) ->
-    try hb_http:request(Method, Node, Path, Message, Opts)
+    ReplyOpts = Opts#{ <<"http-only-result">> => false },
+    try hb_http:request(Method, Node, Path, Message, ReplyOpts)
     catch Class:Exception:Stacktrace ->
         {failure,
             #{

@@ -7,6 +7,7 @@
 -export([start/0]).
 -export([get/2, get/3, post/3, post/4, request/2, request/4, request/5]).
 -export([message_to_request/2, reply/4, accept_to_codec/2, http_status/2]).
+-export([only_result/2]).
 -export([req_to_tabm_singleton/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -206,6 +207,13 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             Body,
             Opts
         ),
+    % The result may be a link to a message that the peer holds.
+    only_result(add_peer_stores({ResponseStatus, Msg}, Peer, Opts), Opts).
+
+%% @doc Return the value that a reply names in its `ao-result' key, if the
+%% caller asks for the result alone (`http-only-result', the default). Return
+%% any other reply as it is.
+only_result({ResponseStatus, Msg}, Opts) ->
     ReturnAOResult =
         hb_opts:get(http_only_result, true, Opts) andalso
         is_map(Msg) andalso
@@ -217,33 +225,22 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
                 {result_is_single_key, {key, Key}, {msg, Msg}},
                 Opts
             ),
-            % The result may be a link to a message that the peer holds.
-            {_, Linked} = add_peer_stores({ResponseStatus, Msg}, Peer, Opts),
-            case {Key, hb_maps:get(Key, Linked, undefined, Opts)} of
+            case {Key, hb_maps:get(Key, Msg, undefined, Opts)} of
                 {<<"body">>, undefined} ->
-                    {hb_http_client:response_status_to_atom(Status), <<>>};
+                    {ResponseStatus, <<>>};
                 {_, undefined} ->
                     {failure,
                         <<
                             "Result key '",
                             Key/binary,
-                            "' not found in response from '",
-                            Peer/binary,
-                            "' for path '",
-                            Path/binary,
-                            "': ",
-                            Body/binary
+                            "' not found in response."
                         >>
                     };
                 {_, Value} ->
-                    add_peer_stores(
-                        {hb_http_client:response_status_to_atom(Status), Value},
-                        Peer,
-                        Opts
-                    )
+                    {ResponseStatus, Value}
             end;
         false ->
-            add_peer_stores({ResponseStatus, Msg}, Peer, Opts)
+            {ResponseStatus, Msg}
     end.
 
 %% @doc Give every link in a response the stores needed to resolve it: the
