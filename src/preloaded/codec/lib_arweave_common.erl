@@ -3,7 +3,7 @@
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
 -export([verify_committed_keys/5]).
--export([enforce_tag_names/3]).
+-export([enforce_tag_names/3, add_commitment/4]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([signed_children_hint/3]).
@@ -110,6 +110,27 @@ enforce_tag_names(TX, TABM, Opts) ->
         false -> ok;
         {value, {Name, _}} -> throw({invalid_tag_name, Name})
     end.
+
+%% @doc Return `Signed', the message of an item signed from `Msg', with the
+%% commitments of `Msg' and its own. The item replaces an unsigned commitment
+%% of `Msg' by the same device, whose tags and fields it carries.
+add_commitment(Device, Msg, Signed, Opts) ->
+    Kept =
+        hb_message:without_commitments(
+            #{
+                <<"commitment-device">> => Device,
+                <<"type">> => <<"unsigned-sha256">>
+            },
+            Msg,
+            Opts
+        ),
+    Signed#{
+        <<"commitments">> =>
+            maps:merge(
+                maps:get(<<"commitments">>, Kept, #{}),
+                maps:get(<<"commitments">>, Signed)
+            )
+    }.
 
 %% @doc Return a TABM message containing the fields of the given decoded
 %% ANS-104 data item that should be included in the base message.

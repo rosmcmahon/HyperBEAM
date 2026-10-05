@@ -45,7 +45,14 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
             <<"tx@1.0">>,
             Opts
         ),
-    {ok, SignedStructured};
+    {ok,
+        lib_arweave_common:add_commitment(
+            <<"tx@1.0">>,
+            Msg,
+            SignedStructured,
+            Opts
+        )
+    };
 commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
     % Remove the commitments from the message, convert it to an L1 TX, 
     % then back. This forces the message to be normalized and the unsigned ID
