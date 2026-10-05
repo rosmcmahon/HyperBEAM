@@ -117,7 +117,7 @@ request(HookMsg, HookReq, Opts) ->
                 {to_execute, ModReq}
             }
         ),
-        {ok, #{ <<"body">> => ModReq }}
+        {ok, HookReq#{ <<"body">> => ModReq }}
     else
         {reserved_host_label, ReservedName} ->
             ?event({reserved_host_label_rejected, {name, ReservedName}}),
