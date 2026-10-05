@@ -211,20 +211,21 @@ charge(_, RawReq, NodeMsg) ->
     #{ _ => _ }
 ) -> {ok, integer()}.
 balance(_, RawReq, NodeMsg) ->
+    Req =
+        hb_ao:get(
+            <<"request">>,
+            RawReq,
+            RawReq,
+            NodeMsg#{ <<"hashpath">> => ignore }
+        ),
     Target =
-        case
-            hb_ao:get(
-                <<"request">>,
-                RawReq,
-                NodeMsg#{ <<"hashpath">> => ignore }
-            )
-        of
-            not_found ->
-                case hb_message:signers(RawReq, NodeMsg) of
-                    [] -> hb_ao:get(<<"target">>, RawReq, undefined, NodeMsg);
-                    [Signer] -> Signer
+        case hb_ao:get(<<"target">>, RawReq, undefined, NodeMsg) of
+            undefined ->
+                case hb_message:signers(Req, NodeMsg) of
+                    [] -> undefined;
+                    [Signer | _] -> Signer
                 end;
-            Req -> hd(hb_message:signers(Req, NodeMsg))
+            Explicit -> Explicit
         end,
     {ok, get_balance(Target, NodeMsg)}.
 
@@ -245,7 +246,9 @@ ledger(NodeMsg) ->
         <<"balances">> => hb_opts:get(simple_pay_ledger, #{}, NodeMsg)
     }.
 
-%% @doc Get the balance of a user in the ledger.
+%% @doc Get the balance of a user in the ledger. A request with no signer and
+%% no `target' names no user, and has a balance of 0.
+get_balance(undefined, _NodeMsg) -> 0;
 get_balance(Signer, NodeMsg) ->
     lib_volatile_ledger:balance(
         ledger(NodeMsg),
