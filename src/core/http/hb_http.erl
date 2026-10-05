@@ -190,12 +190,28 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             {path, {string, Path}},
             {body_size, byte_size(Body)}
         }),
+    % Find the codec device from the headers, if set.
+    CodecDev =
+        hb_maps:get(
+            <<"codec-device">>,
+            NormHeaderMap,
+            <<"httpsig@1.0">>,
+            Opts
+        ),
+    {ResponseStatus, Msg} =
+        outbound_result_to_message(
+            CodecDev,
+            Status,
+            NormHeaderMap,
+            Body,
+            Opts
+        ),
     ReturnAOResult =
         hb_opts:get(http_only_result, true, Opts) andalso
-        hb_maps:get(<<"ao-result">>, NormHeaderMap, false, Opts),
+        is_map(Msg) andalso
+        hb_maps:get(<<"ao-result">>, Msg, false, Opts),
     case ReturnAOResult of
         Key when is_binary(Key) ->
-            Msg = http_response_to_httpsig(Status, NormHeaderMap, Body, Opts),
             ?event(
                 debug_http_outbound,
                 {result_is_single_key, {key, Key}, {msg, Msg}},
@@ -225,25 +241,7 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
                     )
             end;
         false ->
-            % Find the codec device from the headers, if set.
-            CodecDev =
-                hb_maps:get(
-                    <<"codec-device">>,
-                    NormHeaderMap,
-                    <<"httpsig@1.0">>,
-                    Opts
-                ),
-            add_peer_stores(
-                outbound_result_to_message(
-                    CodecDev,
-                    Status,
-                    NormHeaderMap,
-                    Body,
-                    Opts
-                ),
-                Peer,
-                Opts
-            )
+            add_peer_stores({ResponseStatus, Msg}, Peer, Opts)
     end.
 
 %% @doc Give every link in a response the stores needed to resolve it: the
@@ -315,6 +313,12 @@ outbound_result_to_message(<<"ans104@1.0">>, Status, Headers, Body, Opts) ->
         ),
         outbound_result_to_message(<<"httpsig@1.0">>, Status, Headers, Body, Opts)
     end;
+outbound_result_to_message(<<"tx@1.0">>, Status, _Headers, Body, Opts) ->
+    {ok, TABM} = hb_ao:raw(<<"tx@1.0">>, <<"deserialize">>, Body, #{}, Opts),
+    {
+        hb_http_client:response_status_to_atom(Status),
+        hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts)
+    };
 outbound_result_to_message(<<"httpsig@1.0">>, Status, Headers, Body, Opts) ->
     ?event(debug_http_outbound, {result_is_httpsig, {body, Body}}, Opts),
     {
@@ -824,29 +828,33 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                 )
             };
         _ ->
-            % Other codecs are already in binary format, so we can just convert
-            % the message to the codec.
-            {
-                Status,
-                BaseHdrs,
+            % Codecs that do not convert the message to a binary serialize it.
+            case
                 hb_message:convert(
                     Message,
                     #{ <<"device">> => Codec, <<"bundle">> => AcceptBundle },
                     <<"structured@1.0">>,
                     Opts#{ <<"topic">> => ao_internal }
                 )
-            }
+            of
+                Encoded when is_binary(Encoded) -> {Status, BaseHdrs, Encoded};
+                Encoded ->
+                    {ok, Body} =
+                        hb_ao:raw(Codec, <<"serialize">>, Encoded, #{}, Opts),
+                    {Status, BaseHdrs, Body}
+            end
     end.
 
 %% @doc Calculate the codec name to use for a reply given the original parsed 
 %% singleton TABM request and the response message. The precidence
 %% order for finding the codec is:
-%% 1. If the `content-type' field is present in the response message, we always
+%% 1. The `require-codec' field in the original request.
+%% 2. If the `content-type' field is present in the response message, we
 %%    use `httpsig@1.0', as the device is expected to have already encoded the
 %%    message and the `body' field.
-%% 2. The `accept-codec' field in the original request.
-%% 3. The `accept' field in the original request.
-%% 4. The default codec
+%% 3. The `accept-codec' field in the original request.
+%% 4. The `accept' field in the original request.
+%% 5. The default codec
 %% Options can be specified in mime-type format (`application/*') or in
 %% AO device format (`device@1.0').
 accept_to_codec(OriginalReq, Opts) ->
@@ -861,6 +869,8 @@ accept_to_codec(OriginalReq, Reply = #{ <<"content-type">> := Link }, Opts) when
     );
 accept_to_codec(_OriginalReq, #{ <<"content-type">> := CT }, _Opts) ->
     <<"httpsig@1.0">>;
+accept_to_codec(#{ <<"accept-codec">> := Codec }, _Reply, Opts) ->
+    mime_to_codec(Codec, Opts);
 accept_to_codec(OriginalReq, _, Opts) ->
     Accept = hb_maps:get(<<"accept">>, OriginalReq, <<"*/*">>, Opts),
     ?event(debug_accept,
@@ -1551,6 +1561,24 @@ binary_codec_reply_headers_test() ->
     ?assertEqual(
         Message,
         hb_message:convert(Body, <<"structured@1.0">>, <<"json@1.0">>, Opts)
+    ).
+
+%% @doc Required codecs precede the reply's content type, then preferences.
+accept_codec_precedence_test() ->
+    Opts = test_opts(),
+    Request = #{
+        <<"require-codec">> => <<"json@1.0">>,
+        <<"accept-codec">> => <<"ans104@1.0">>,
+        <<"accept">> => <<"application/tx">>
+    },
+    Reply = #{ <<"content-type">> => <<"text/plain">> },
+    ?assertEqual(<<"json@1.0">>, accept_to_codec(Request, Reply, Opts)),
+    Preferred = maps:remove(<<"require-codec">>, Request),
+    ?assertEqual(<<"httpsig@1.0">>, accept_to_codec(Preferred, Reply, Opts)),
+    ?assertEqual(<<"ans104@1.0">>, accept_to_codec(Preferred, #{}, Opts)),
+    ?assertEqual(
+        <<"tx@1.0">>,
+        accept_to_codec(maps:remove(<<"accept-codec">>, Preferred), #{}, Opts)
     ).
 
 nested_ao_resolve_test() ->
