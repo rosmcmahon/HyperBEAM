@@ -205,7 +205,11 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
                         )
                 end,
             case Res of
-                {ok, R} -> {ok, strip_cookies(R, Opts)};
+                {ok, R} ->
+                    % The reply's links name messages in the peer's stores, and
+                    % a client reads them from this node: load them here.
+                    Loaded = hb_cache:ensure_all_loaded(R, Opts),
+                    {ok, strip_cookies(Loaded, Opts)};
                 Err -> Err
             end
     end.
