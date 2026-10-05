@@ -2,13 +2,18 @@
 %%% records to and from TABMs.
 -module(dev_tx).
 -device_libraries([lib_arweave_common]).
--export([from/3, to/3, to_hint/3, commit/3, verify/3, deserialize/3]).
+-export([from/3, to/3, to_hint/3, commit/3, verify/3]).
+-export([serialize/3, deserialize/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(BASE_FIELDS, [
     <<"anchor">>, <<"format">>, <<"quantity">>, <<"reward">>, <<"target">>,
     <<"data_root">>, <<"data_size">> ]).
+
+%% @doc Serialize a TX record to the JSON that `deserialize' reads.
+serialize(TX, _Req, _Opts) ->
+    {ok, hb_json:encode(ar_tx:tx_to_json_struct(TX))}.
 
 %% @doc Deserialize a JSON-encoded transaction to a TABM.
 deserialize(#{ <<"body">> := Body }, Req, Opts) ->

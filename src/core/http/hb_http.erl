@@ -313,6 +313,12 @@ outbound_result_to_message(<<"ans104@1.0">>, Status, Headers, Body, Opts) ->
         ),
         outbound_result_to_message(<<"httpsig@1.0">>, Status, Headers, Body, Opts)
     end;
+outbound_result_to_message(<<"tx@1.0">>, Status, _Headers, Body, Opts) ->
+    {ok, TABM} = hb_ao:raw(<<"tx@1.0">>, <<"deserialize">>, Body, #{}, Opts),
+    {
+        hb_http_client:response_status_to_atom(Status),
+        hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts)
+    };
 outbound_result_to_message(<<"httpsig@1.0">>, Status, Headers, Body, Opts) ->
     ?event(debug_http_outbound, {result_is_httpsig, {body, Body}}, Opts),
     {
@@ -822,18 +828,21 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                 )
             };
         _ ->
-            % Other codecs are already in binary format, so we can just convert
-            % the message to the codec.
-            {
-                Status,
-                BaseHdrs,
+            % Codecs that do not convert the message to a binary serialize it.
+            case
                 hb_message:convert(
                     Message,
                     #{ <<"device">> => Codec, <<"bundle">> => AcceptBundle },
                     <<"structured@1.0">>,
                     Opts#{ <<"topic">> => ao_internal }
                 )
-            }
+            of
+                Encoded when is_binary(Encoded) -> {Status, BaseHdrs, Encoded};
+                Encoded ->
+                    {ok, Body} =
+                        hb_ao:raw(Codec, <<"serialize">>, Encoded, #{}, Opts),
+                    {Status, BaseHdrs, Body}
+            end
     end.
 
 %% @doc Calculate the codec name to use for a reply given the original parsed 
