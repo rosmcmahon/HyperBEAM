@@ -92,11 +92,17 @@ received(_Path, _Value) -> #{}.
 
 %% @doc The device and key being resolved, as a path: `~test-device@1.0/key'.
 resolving(Base, Req, Opts) ->
-    Key = hb_util:bin(hb_path:hd(Req, Opts)),
-    case device(Base, Opts) of
+    Key = hb_util:bin(key(Req, Opts)),
+    case device(hb_ao:normalize_keys(Base, Opts), Opts) of
         undefined -> Key;
         Device -> <<"~", Device/binary, "/", Key/binary>>
     end.
+
+%% @doc The first key of a request's path. A request that is not a message is
+%% a path; a link, `as' or `resolve' tuple has no key until it is resolved.
+key(Req, Opts) when is_map(Req) -> hb_path:hd(Req, Opts);
+key(Req, _Opts) when is_tuple(Req) -> undefined;
+key(Path, Opts) -> hb_path:hd(#{ <<"path">> => Path }, Opts).
 
 %% @doc The name of the base's device, or `undefined' if it cannot be read.
 device(Base, Opts) when is_map(Base) ->
@@ -105,6 +111,7 @@ device(Base, Opts) when is_map(Base) ->
         _ -> undefined
     catch throw:{necessary_message_not_found, _, _} -> undefined
     end;
+device({as, Device, _}, _Opts) when is_binary(Device) -> Device;
 device(_Base, _Opts) ->
     undefined.
 

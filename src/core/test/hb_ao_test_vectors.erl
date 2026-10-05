@@ -482,7 +482,10 @@ no_trusted_device_signers_skips_gateway_test() ->
 
 resolve_simple_test(Opts) ->
     Res = hb_ao:resolve(#{ <<"a">> => <<"RESULT">> }, <<"a">>, Opts),
-    ?assertEqual({ok, <<"RESULT">>}, Res).
+    ?assertEqual({ok, <<"RESULT">>}, Res),
+    % A key linking to a message the node does not hold reads as the default.
+    Link = {link, hb_util:human_id(<<0:256>>), #{ <<"type">> => <<"link">> }},
+    ?assertEqual(default, hb_ao:get(<<"a">>, #{ <<"a">> => Link }, default, Opts)).
 
 singleton_id_base_test() ->
     Opts = #{
