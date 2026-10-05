@@ -78,45 +78,8 @@ init(M1, _M2, Opts) ->
             Opts
         ),
     ?event({in_prefix, InPrefix}),
-    ImageBin =
-        case hb_ao:get(<<InPrefix/binary, "/image">>, M1, Opts) of
-            not_found ->
-                case hb_ao:get(<<"body">>, M1, Opts) of
-                    not_found ->
-                        throw(
-                            {
-                                wasm_init_error,
-                                <<
-                                    "No viable image found in ",
-                                    InPrefix/binary,
-                                    "/image."
-                                >>,
-                                {base, M1}
-                            }
-                        );
-                    Bin when is_binary(Bin) -> Bin
-                end;
-            ImageID when ?IS_ID(ImageID) ->
-                ?event({getting_wasm_image, ImageID}),
-                {ok, ImageMsg} = hb_cache:read(ImageID, Opts),
-                hb_ao:get(<<"body">>, ImageMsg, Opts);
-            ImageMsg when is_map(ImageMsg) ->
-                ?event(wasm_image_message_directly_provided),
-                hb_ao:get(<<"body">>, ImageMsg, Opts);
-            Image when is_binary(Image) ->
-                ?event(wasm_image_binary_directly_provided),
-                Image
-        end,
-    Mode =
-        case hb_ao:get(<<InPrefix/binary, "/Mode">>, M1, Opts) of
-            not_found -> wasm;
-            <<"WASM">> -> wasm;
-            <<"AOT">> ->
-                case hb_opts:get(wasm_allow_aot, false, Opts) of
-                    true -> aot;
-                    false -> wasm
-                end
-        end,
+    ImageBin = image(M1, InPrefix, Opts),
+    Mode = mode(M1, InPrefix, Opts),
     % Start the WASM executor.
     {ok, Instance, _Imports, _Exports} = hb_beamr:start(ImageBin, Mode),
     % Set the WASM Instance, handler, and standard library invokation function.
@@ -142,6 +105,49 @@ init(M1, _M2, Opts) ->
             Opts
         )
     }.
+
+%% @doc Read the WASM image binary from the input prefix of the message.
+image(M1, InPrefix, Opts) ->
+    case hb_ao:get(<<InPrefix/binary, "/image">>, M1, Opts) of
+        not_found ->
+            case hb_ao:get(<<"body">>, M1, Opts) of
+                not_found ->
+                    throw(
+                        {
+                            wasm_init_error,
+                            <<
+                                "No viable image found in ",
+                                InPrefix/binary,
+                                "/image."
+                            >>,
+                            {base, M1}
+                        }
+                    );
+                Bin when is_binary(Bin) -> Bin
+            end;
+        ImageID when ?IS_ID(ImageID) ->
+            ?event({getting_wasm_image, ImageID}),
+            {ok, ImageMsg} = hb_cache:read(ImageID, Opts),
+            hb_ao:get(<<"body">>, ImageMsg, Opts);
+        ImageMsg when is_map(ImageMsg) ->
+            ?event(wasm_image_message_directly_provided),
+            hb_ao:get(<<"body">>, ImageMsg, Opts);
+        Image when is_binary(Image) ->
+            ?event(wasm_image_binary_directly_provided),
+            Image
+    end.
+
+%% @doc Read the WASM execution mode from the input prefix of the message.
+mode(M1, InPrefix, Opts) ->
+    case hb_ao:get(<<InPrefix/binary, "/Mode">>, M1, Opts) of
+        not_found -> wasm;
+        <<"WASM">> -> wasm;
+        <<"AOT">> ->
+            case hb_opts:get(wasm_allow_aot, false, Opts) of
+                true -> aot;
+                false -> wasm
+            end
+    end.
 
 %% @doc Take a BEAMR import call and resolve it using `hb_ao'.
 default_import_resolver(Base, Req, Opts) ->
@@ -267,8 +273,12 @@ compute(RawM1, M2, Opts) ->
                         error ->
                             % A trapped call leaves the instance usable, so
                             % the error goes to the process device, which
-                            % stores it as the slot's results and carries
-                            % on with the same instance.
+                            % stores it as the slot's results. The trap does
+                            % not unwind the instance's globals, so the
+                            % instance is replaced with a new one of the
+                            % image holding the memory as the trap left it:
+                            % the same steps a restore from a snapshot takes.
+                            ok = reset(M1, M2, Opts),
                             {error, Res};
                         _ ->
                             {ok,
@@ -284,6 +294,30 @@ compute(RawM1, M2, Opts) ->
             end;
         _ -> {ok, M1}
     end.
+
+%% @doc Replace an instance whose call trapped with a new instance of the
+%% image, holding the memory as the trapped call left it. The trapped call
+%% keeps the instance's globals, such as the stack pointer, where the call
+%% stopped, while a restore from a snapshot starts at a new instance, so
+%% the process goes on from the new instance on every node. The worker's
+%% pid is kept, so the state's private element stays valid.
+reset(M1, M2, Opts) ->
+    ?event({resetting_wasm_instance_after_trapped_call, {m1, M1}}),
+    Instance = instance(M1, M2, Opts),
+    {ok, Memory} = hb_beamr:serialize(Instance),
+    InPrefix =
+        hb_ao:get(
+            <<"input-prefix">>,
+            {as, <<"message@1.0">>, M1},
+            <<"">>,
+            Opts
+        ),
+    hb_beamr:reset(
+        Instance,
+        image(M1, InPrefix, Opts),
+        mode(M1, InPrefix, Opts),
+        Memory
+    ).
 
 %% @doc Normalize the message to have an open WASM instance, but no literal
 %% `State' key. Ensure that we do not change the hashpath during this process.

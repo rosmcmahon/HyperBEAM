@@ -489,7 +489,11 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
     {ok, Res}.
 
 %% @doc Execute a function for a single commitment in the context of its
-%% parent message.
+%% parent message. A commitment device whose `verify' is this module's own
+%% `verify' holds no commitment scheme of its own: the device of a commitment
+%% is read from the commitment itself, so dispatching would call this
+%% function with the same commitment again, without end. Such a commitment
+%% does not verify.
 %% Note: Assumes that the `commitments' key has already been removed from the
 %% message if applicable.
 verify_commitment(Base, Commitment, Opts) ->
@@ -501,7 +505,14 @@ verify_commitment(Base, Commitment, Opts) ->
             ?DEFAULT_ATT_DEVICE,
             Opts
         ),
-    hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts).
+    case hb_device:message_to_fun(
+        #{ <<"device">> => AttDev },
+        <<"verify">>,
+        Opts
+    ) of
+        {_, ?MODULE, _} -> {ok, false};
+        _ -> hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts)
+    end.
 
 %% @doc Attach to the message the commitments whose IDs are listed in the
 %% `with-commitments' key of the request. Each commitment is read by its own
@@ -1344,6 +1355,29 @@ test_verify(KeyType) ->
             #{ <<"path">> => <<"verify">> },
             #{ <<"hashpath">> => ignore }
         )
+    ),
+    % A commitment relabelled `json@1.0' is verified by the `httpsig@1.0'
+    % codec its device names -- `true' for an `httpsig@1.0' signature. A
+    % commitment relabelled `message@1.0' or `meta@1.0' names a device
+    % with no commitment scheme of its own and does not verify.
+    [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Signed)),
+    Relabelled =
+        fun(Device) ->
+            Signed#{
+                <<"commitments">> =>
+                    #{ ID => Commitment#{ <<"commitment-device">> => Device } }
+            }
+        end,
+    case maps:get(<<"commitment-device">>, Commitment) of
+        <<"httpsig@1.0">> ->
+            ?assert(hb_message:verify(Relabelled(<<"json@1.0">>), all));
+        _ -> ok
+    end,
+    lists:foreach(
+        fun(Device) ->
+            ?assertNot(hb_message:verify(Relabelled(Device), all))
+        end,
+        [<<"message@1.0">>, <<"meta@1.0">>]
     ).
 
 %% @doc A commitment of no keys verifies after a round trip through

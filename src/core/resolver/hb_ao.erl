@@ -122,9 +122,9 @@
 %% `{ok | error, NewMessage}.'
 %% The resolver is composed of a series of discrete phases:
 %%      1: Normalization.
-%%      2: Vary inputs; lookup cached results.
+%%      2: Vary inputs.
 %%      3: Validation check.
-%%      4: Persistent-resolver lookup.
+%%      4: Persistent-resolver lookup; lookup cached results.
 %%      5: Execution.
 %%      6: Execution of the `step' hook.
 %%      7: Subresolution.
@@ -133,7 +133,7 @@
 %%     10: Apply overlay and cryptographic linking.
 %%     11: Fork worker.
 %%     12: Recurse or terminate.
-resolve(Path, Opts) when is_binary(Path) ->
+resolve(Path, Opts) when not is_map(Path) ->
     resolve(#{ <<"path">> => Path }, Opts);
 resolve(SingletonMsg, _Opts)
         when is_map(SingletonMsg), not is_map_key(<<"path">>, SingletonMsg) ->
@@ -141,26 +141,8 @@ resolve(SingletonMsg, _Opts)
 resolve(SingletonMsg, Opts) ->
     resolve_many(hb_singleton:from(SingletonMsg, Opts), Opts).
 
-resolve(Base, Path, Opts) when not is_map(Path) ->
-    resolve(Base, #{ <<"path">> => Path }, Opts);
-resolve(_Base, #{ <<"path">> := Path }, _Opts) when Path == <<>>; Path == [] ->
-    % The empty path names no key.
-    {error, not_found};
 resolve(Base, Req, Opts) ->
-    PathParts = hb_path:from_message(request, Req, Opts),
-    ?event(
-        ao_core,
-        {stage, 1, prepare_multimessage_resolution, {path_parts, PathParts}}
-    ),
-    MessagesToExec = [ Req#{ <<"path">> => Path } || Path <- PathParts ],
-    ?event_debug(debug_ao_core,
-        {stage,
-            1,
-            prepare_multimessage_resolution,
-            {messages_to_exec, MessagesToExec}
-        }
-    ),
-    resolve_many([Base | MessagesToExec], Opts).
+    resolve_many([Base, Req], Opts).
 
 %% @doc Resolve a full singleton in `raw' mode: the sequence is normalized
 %% and stepped as normal, but each step applies its device function directly,
@@ -247,6 +229,8 @@ resolve_many(ListMsg, Opts) when is_map(ListMsg) ->
     resolve_many(ListOfMessages, Opts);
 resolve_many({as, DevID, Msg}, Opts) ->
     subresolve(#{}, DevID, Msg, Opts);
+resolve_many([Base = {as, _, _}], Opts) ->
+    resolve_stage(1, Base, #{ <<"path">> => <<"/">> }, Opts);
 resolve_many([{resolve, Subres}], Opts) ->
     resolve_many(Subres, Opts);
 resolve_many(MsgList, Opts) ->
@@ -295,9 +279,8 @@ resolve_stage(1, Base, Link, Opts) when ?IS_LINK(Link) ->
     % continue with the resolution.
     ?event_debug(debug_ao_core, {stage, 1, resolve_req_link, {link, Link}}, Opts),
     resolve_stage(1, Base, hb_cache:ensure_loaded(Link, Opts), Opts);
-resolve_stage(1, {as, DevID, Ref}, Req, Opts) when ?IS_ID(Ref) orelse ?IS_LINK(Ref) ->
-    % Normalize `as' requests with a raw ID or link as the path. Links will be
-    % loaded in following stages.
+resolve_stage(1, {as, DevID, Ref}, Req, Opts) when ?IS_ID(Ref) ->
+    % Normalize `as' requests with a raw ID as the path.
     resolve_stage(1, {as, DevID, #{ <<"path">> => Ref }}, Req, Opts);
 resolve_stage(1, {as, DevID, Link}, Req, Opts) when ?IS_LINK(Link) ->
     % If the first message is an `as' with a link, we should load the message and
@@ -422,24 +405,35 @@ resolve_stage(1, Base, Req, Opts) when is_list(Base) ->
 resolve_stage(1, Base, NonMapReq, Opts) when not is_map(NonMapReq) ->
     ?event_debug(debug_ao_core, {stage, 1, path_normalize}),
     resolve_stage(1, Base, #{ <<"path">> => NonMapReq }, Opts);
+resolve_stage(1, Base, #{ <<"path">> := <<"/">> }, _Opts) ->
+    % Resolving `/' returns the base message.
+    {ok, Base};
 resolve_stage(1, Base, _Req, _Opts) when not is_map(Base) ->
     % We cannot resolve anything over the given `Base` Erlang data type. Return
     % `not_found`.
     {error, not_found};
 resolve_stage(1, RawBase, RawReq, Opts) ->
-    % Normalize the path to a private key containing the list of remaining
-    % keys to resolve.
+    % Parse the path into a list of requests.
     ?event_debug(debug_ao_core, {stage, 1, normalize}, Opts),
     Base = normalize_keys(RawBase, Opts),
     Req = normalize_keys(RawReq, Opts),
-    resolve_stage(2, Base, Req, Opts);
+    case hb_maps:get(<<"path">>, Req, undefined, Opts) of
+        Empty when Empty == undefined; Empty == <<>>; Empty == [] ->
+            {error, not_found};
+        _ ->
+            case hb_singleton:from_request(Req, Opts) of
+                [Req] -> resolve_stage(2, Base, Req, Opts);
+                Requests ->
+                    resolve_many([Base | Requests], Opts)
+            end
+    end;
 resolve_stage(2, Base, Req, Opts = #{ <<"resolve-mode">> := raw }) ->
     ?event_debug(debug_ao_core, {stage, 2, raw_execution}, Opts),
     % Raw mode: apply the device function directly, skipping the cache,
     % validation, persistence, linking, and worker stages.
     raw(Base, Req, Opts);
 resolve_stage(2, Base, Req, Opts) ->
-    ?event_debug(debug_ao_core, {stage, 2, vary_and_cache_lookup}, Opts),
+    ?event_debug(debug_ao_core, {stage, 2, vary_inputs}, Opts),
     % Vary the inputs by the schema of the function that will execute them
     % before the cache lookup, such that every execution the schema deems
     % equivalent shares one cached result. If the function's schema declares
@@ -448,24 +442,7 @@ resolve_stage(2, Base, Req, Opts) ->
     try vary_loaded(ensure_message_loaded(Base, Opts), Req, Opts) of
         {Func, VariedBase, VariedReq, Overlay} ->
             Original = {Base, Req, Overlay},
-            case hb_cache_control:maybe_lookup(VariedBase, VariedReq, Base, Req, Opts) of
-                {ok, Res} ->
-                    ?event_debug(
-                        debug_ao_core,
-                        {stage, 2, cache_hit, {res, Res}, {opts, Opts}},
-                        Opts
-                    ),
-                    resolve_stage(
-                        10, VariedBase, VariedReq, {ok, Res}, Original,
-                        undefined, Opts
-                    );
-                {continue, NewBase, NewReq} ->
-                    resolve_stage(
-                        3, Func, NewBase, NewReq, Original, Opts
-                    );
-                {error, CacheResp} ->
-                    {error, CacheResp}
-            end
+            resolve_stage(3, Func, VariedBase, VariedReq, Original, Opts)
     catch throw:Reason:Stacktrace ->
         hb_ao_errors:from_throw(Reason, Stacktrace, Base, Req, Opts)
     end.
@@ -494,12 +471,23 @@ resolve_stage(4, Func, Base, Req, Original, Opts) ->
     % group name.
     case hb_persistent:find_or_register(Base, Req, hb_maps:without(?TEMP_OPTS, Opts, Opts)) of
         {leader, ExecName} ->
-            % We are the leader for this resolution. Continue to the next stage.
-            case hb_opts:get(spawn_worker, false, Opts) of
-                true -> ?event(worker_spawns, {will_become, ExecName});
-                _ -> ok
-            end,
-            resolve_stage(5, Func, Base, Req, Original, ExecName, Opts);
+            % Look up the cached result while leading the execution.
+            {OrigBase, OrigReq, _} = Original,
+            case hb_cache_control:maybe_lookup(Base, Req, OrigBase, OrigReq, Opts) of
+                {ok, Res} ->
+                    ?event_debug(
+                        debug_ao_core,
+                        {stage, 4, cache_hit, {res, Res}, {opts, Opts}},
+                        Opts
+                    ),
+                    hb_persistent:unregister_notify(ExecName, Req, {ok, Res}, Opts),
+                    resolve_stage(10, Base, Req, {ok, Res}, Original, undefined, Opts);
+                {error, _} = Error ->
+                    hb_persistent:unregister_notify(ExecName, Req, Error, Opts),
+                    Error;
+                {continue, NewBase, NewReq} ->
+                    resolve_stage(5, Func, NewBase, NewReq, Original, ExecName, Opts)
+            end;
         {wait, Leader} ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then

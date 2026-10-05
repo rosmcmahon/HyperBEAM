@@ -230,8 +230,8 @@ is_relevant_from_keys(_Base, ID, _Opts) when is_binary(ID) ->
     false;
 is_relevant_from_keys(Base, {as, _, Msg}, Opts) ->
     is_relevant_from_keys(Base, Msg, Opts);
-is_relevant_from_keys(Base, {resolve, Msg}, Opts) ->
-    is_relevant_from_keys(Base, Msg, Opts);
+is_relevant_from_keys(Base, {resolve, Msgs}, Opts) ->
+    lists:any(fun(Msg) -> is_relevant_from_keys(Base, Msg, Opts) end, Msgs);
 is_relevant_from_keys(Base, Request, Opts) ->
     Config = hb_util:deep_get([<<"when">>, <<"keys">>], Base, <<"always">>, Opts),
     ?event(

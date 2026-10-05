@@ -212,8 +212,8 @@ list(Path, Opts) when is_map(Opts) and not is_map_key(<<"store-module">>, Opts) 
 list(Path, Store) ->
     list(Path, Store, #{}).
 list(Path, Store, Opts) ->
-    case hb_store:read(Store, Path, Opts) of
-        {composite, Names} -> lists:map(fun child_name/1, Names);
+    case hb_store:list(Store, Path, Opts) of
+        {ok, Names} -> Names;
         _ -> []
     end.
 
@@ -392,7 +392,8 @@ link_prepared(_Prepared, Child, _Opts) -> Child.
 %% do not verify. If commitments remain and do not commit every key that is not
 %% private, keep only the keys they commit, and again remove the commitments
 %% that do not verify over those keys. A key present both as a literal and as
-%% a `+link' is refused: `k+link' is only the link form of `k'.
+%% a `+link' is refused: `k+link' is only the link form of `k'. A message with
+%% an empty key is refused.
 prepare_write(Msg, Opts) when is_map(Msg) ->
     Deep = maps:map(
         fun
@@ -401,6 +402,9 @@ prepare_write(Msg, Opts) when is_map(Msg) ->
                          binary_part(Key, byte_size(Key) - 5, 5) =:= <<"+link">>,
                          is_map_key(binary_part(Key, 0, byte_size(Key) - 5), Msg) ->
                 throw({duplicated_key_cache_write, Key});
+            % The empty key names no key, and its store path is the parent's own.
+            (Key, _Value) when Key =:= <<>> ->
+                throw({invalid_key, Key});
            (<<"commitments">>, Value) ->
                 prepare_write(ensure_all_loaded(Value, Opts), Opts);
            (Key, Value) ->
@@ -1365,6 +1369,26 @@ test_store_simple_signed_message(Store) ->
     ?assert(MatchResSigned),
     ok.
 
+%% @doc A message with an empty key is refused: the write throws, and the store
+%% holds nothing at the message's ID or at the path of any other key.
+test_empty_key_refused(Store) ->
+    ?event_debug(debug_store_test, {store, Store}),
+    hb_store:reset(Store),
+    Opts = #{ <<"store">> => Store },
+    Msg = #{ <<>> => <<"v">> },
+    ID = hb_message:id(Msg, unsigned, Opts),
+    ?assertThrow({invalid_key, <<>>}, write(Msg, Opts)),
+    ?assertEqual({error, not_found}, read(ID, Opts)),
+    Nested = #{ <<"a">> => #{ <<>> => <<"v">> } },
+    NestedID = hb_message:id(Nested, unsigned, Opts),
+    ?assertThrow({invalid_key, <<>>}, write(Nested, Opts)),
+    ?assertEqual({error, not_found}, read(NestedID, Opts)),
+    Beside = #{ <<"a">> => <<"1">>, <<>> => <<"v">> },
+    BesideID = hb_message:id(Beside, unsigned, Opts),
+    ?assertThrow({invalid_key, <<>>}, write(Beside, Opts)),
+    ?assertEqual({error, not_found}, read(BesideID, Opts)),
+    ?assertEqual({error, not_found}, read(<<BesideID/binary, "/a">>, Opts)).
+
 %% @doc Test deeply nested item storage and retrieval
 test_deeply_nested_complex_message(Store) ->
     ?event_debug(debug_store_test, {store, Store}),
@@ -1708,6 +1732,7 @@ cache_suite_test_() ->
         {"store simple signed message", fun test_store_simple_signed_message/1},
         {"store modified signed message",
             fun test_store_modified_signed_message/1},
+        {"empty key refused", fun test_empty_key_refused/1},
         {"deeply nested complex message", fun test_deeply_nested_complex_message/1},
         {"message with list", fun test_message_with_list/1},
         {"match message", fun test_match_message/1},

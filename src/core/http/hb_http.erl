@@ -513,7 +513,7 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
             ?event(debug_accept, {request_message, {message, Message}}),
             {ok, FilteredMessage} =
                 case hb_message:signers(Message, Opts) of
-                    [] -> WithSelfPort;
+                    [] -> {ok, WithoutPriv};
                     _ ->
                         hb_message:with_only_committed(WithSelfPort, Opts)
                 end,
@@ -717,7 +717,7 @@ encode_reply(Status, TABMReq, Message, Opts) ->
 			Opts
         ),
     AcceptBundle =
-        hb_util:atom(
+        hb_util:bool(
             hb_maps:get(<<"accept-bundle">>, TABMReq, false, Opts)
         ),
     ?event(debug_http,
@@ -809,7 +809,7 @@ encode_reply(Status, TABMReq, Message, Opts) ->
                         #{
                             <<"device">> => <<"ans104@1.0">>,
                             <<"bundle">> =>
-                                hb_util:atom(
+                                hb_util:bool(
                                     hb_ao:get(
                                         <<"accept-bundle">>,
                                         {as, <<"message@1.0">>, TABMReq},

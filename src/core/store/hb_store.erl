@@ -722,7 +722,8 @@ execute_normalizer(Setting, Store, Term, Opts) ->
 
 %% @doc Apply a store function, checking if the store returns a retry request or
 %% errors. If it does, attempt to start the store again and retry, up to the
-%% given maximum number of times.
+%% given maximum number of times. A store that does not export the function
+%% is skipped, not restarted.
 apply_store_function(Mod, Store, Function, Args) ->
     MaxAttempts = maps:get(<<"max-retries">>, Store, ?DEFAULT_RETRIES) + 1,
     apply_store_function(Mod, Store, Function, Args, MaxAttempts).
@@ -750,7 +751,14 @@ apply_store_function(Mod, Store, Function, Args, AttemptsRemaining) ->
                 {stacktrace, {trace, Stacktrace}}
             }
         ),
-        retry(Mod, Store, Function, Args, AttemptsRemaining, {error, not_found})
+        case erlang:function_exported(Mod, Function, length(Args) + 1) of
+            true ->
+                retry(
+                    Mod, Store, Function, Args, AttemptsRemaining,
+                    {error, not_found}
+                );
+            false -> {error, not_found}
+        end
     end.
 
 %% @doc Stop and start the store, then retry.
@@ -968,6 +976,38 @@ generate_test_suite(Suite, Stores) ->
     ).
 
 %%% Tests
+
+%% @doc Listing discovers descendants without an explicit parent row.
+implicit_children_test_() ->
+    generate_test_suite([
+        {"implicit children", fun(Store) ->
+            ok = write(Store, #{ <<"parent/child/value">> => <<"data">> }, #{}),
+            ?assertEqual({ok, [<<"child">>]}, list(Store, <<"parent">>, #{})),
+            ?assertEqual([<<"child">>], hb_cache:list(<<"parent">>, Store)),
+            ?assertEqual(
+                {ok, []},
+                list(
+                    Store,
+                    #{ <<"list">> => <<"parent">>, <<"from">> => <<"z">> },
+                    #{}
+                )
+            ),
+            ?assertEqual({error, not_found}, list(Store, <<"missing">>, #{}))
+        end}
+    ]).
+
+%% @doc An unsupported operation leaves a store's existing data intact.
+unsupported_operation_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    ok = write(Store, #{ <<"key">> => <<"value">> }, #{}),
+    Instance = find(Store),
+    ?assertEqual(
+        {error, not_found},
+        match(Store, #{ <<"key">> => <<"value">> }, #{})
+    ),
+    ?assertEqual(Instance, find(Store)),
+    ?assertEqual({ok, <<"value">>}, read(Store, <<"key">>, #{})),
+    stop(Store).
 
 write_req(Key, Value) ->
     #{ hb_path:to_binary(Key) => Value }.

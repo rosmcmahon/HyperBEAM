@@ -119,7 +119,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
         false -> 
             hb_persistent:default_await(Worker, GroupName, Base, Req, Opts);
         true ->
-            TargetSlot = hb_ao:get(<<"slot">>, Req, any, Opts),
+            TargetSlot = dev_process:target_slot(Req, Opts),
             ?event({awaiting_compute, 
                 {worker, Worker},
                 {group, GroupName},
@@ -127,7 +127,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
             }),
             receive
                 {resolved, _, GroupName, {slot, RecvdSlot}, Res}
-                        when RecvdSlot == TargetSlot orelse TargetSlot == any ->
+                        when RecvdSlot == TargetSlot ->
                     ?event(debug_compute, {notified_of_resolution,
                         {target, TargetSlot},
                         {group, GroupName}
@@ -158,12 +158,15 @@ notify_compute(GroupName, SlotToNotify, Res, Opts) ->
     notify_compute(GroupName, SlotToNotify, Res, Opts, 0).
 notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     ?event({notifying_of_computed_slot, {group, GroupName}, {slot, SlotToNotify}}),
+    % A request names its slot as `dev_process:target_slot/2' reads it: with
+    % `compute', or else with `slot'.
     receive
-        {resolve, Listener, GroupName, #{ <<"slot">> := SlotToNotify }, _ListenerOpts} ->
+        {resolve, Listener, GroupName, #{ <<"compute">> := SlotToNotify }, _ListenerOpts} ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg, _ListenerOpts}
-                when is_map(Msg) andalso not is_map_key(<<"slot">>, Msg) ->
+                when map_get(<<"slot">>, Msg) =:= SlotToNotify
+                    andalso not is_map_key(<<"compute">>, Msg) ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1)
     after 0 ->

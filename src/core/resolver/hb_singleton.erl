@@ -33,7 +33,7 @@
 %%%         - N.Key+res=(/a/b/c) => #{ Key => (resolve /a/b/c), ... }
 %%% </pre>
 -module(hb_singleton).
--export([from/2, from_path/1, to/1]).
+-export([from/2, from_request/2, from_path/1, to/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -135,23 +135,18 @@ type(_Value) -> unknown.
 from(RawMsg, Opts) when is_binary(RawMsg) ->
     from(#{ <<"path">> => RawMsg }, Opts);
 from(RawMsg, Opts) ->
-    RawPath = hb_maps:get(<<"path">>, RawMsg, <<>>),
+    RawPath = hb_maps:get(<<"path">>, RawMsg, <<>>, Opts),
     ?event_debug(parsing, {raw_path, RawPath}),
     {ok, Path, Query} = from_path(RawPath),
     ?event_debug(parsing, {parsed_path, Path, Query}),
     MsgWithoutBasePath =
         hb_maps:merge(
-            hb_maps:remove(<<"path">>, RawMsg),
-            Query
+            hb_maps:remove(<<"path">>, RawMsg, Opts),
+            Query,
+            Opts
         ),
-    % 2. Decode, split, and sanitize path segments. Each yields one step message.
-    RawMsgs =
-        lists:flatten(
-            lists:map(
-                fun(Msg) -> path_messages(Msg, Opts) end,
-                Path
-            )
-        ),
+    % 2. Parse path segments. Each yields one step message.
+    RawMsgs = [parse_part(Part, Opts) || Part <- Path],
     ?event_debug(parsing, {raw_messages, RawMsgs}),
     Msgs = normalize_base(RawMsgs),
     ?event_debug(parsing, {normalized_messages, Msgs}),
@@ -159,21 +154,34 @@ from(RawMsg, Opts) ->
     Typed = apply_types(MsgWithoutBasePath, Opts),
     ?event_debug(parsing, {typed_messages, Typed}),
     % 4. Group keys by N-scope and global scope
-    ScopedModifications = group_scoped(Typed, Msgs),
+    ScopedModifications = group_scoped(Typed, Msgs, Opts),
     ?event_debug(parsing, {scoped_modifications, ScopedModifications}),
     % 5. Generate the list of messages (plus-notation, device, typed keys).
     Result = build_messages(Msgs, ScopedModifications, Opts),
     ?event_debug(parsing, {result, Result}),
     Result.
 
+%% @doc Parse a request's path and apply its fields to each request.
+from_request(Req, Opts) ->
+    Path = hb_maps:get(<<"path">>, Req, undefined, Opts),
+    {ok, Parts, Query} = from_path(Path),
+    Fields = hb_maps:merge(Req, Query, Opts),
+    [
+        case parse_part(RawPart, Opts) of
+            Msg when is_map(Msg) -> hb_maps:merge(Fields, Msg, Opts);
+            Subres = {resolve, _} -> Subres;
+            Part -> Fields#{ <<"path">> => Part }
+        end
+    ||
+        RawPart <- Parts
+    ].
+
 %% @doc Parse the relative reference into path, query, and fragment.
-from_path(RelativeRef) ->
-    %?event_debug(parsing, {raw_relative_ref, RawRelativeRef}),
-    %RelativeRef = hb_escape:decode(RawRelativeRef),
-    Decoded = decode_string(RelativeRef),
-    ?event_debug(parsing, {parsed_relative_ref, Decoded}),
-    {_Sep, Path, QStr} = hb_util:split_depth_string_aware_single("?", Decoded),
-    {ok, path_parts($/, Path), parse_query(QStr)}.
+from_path(Parts) when is_list(Parts) -> {ok, Parts, #{}};
+from_path(RelativeRef) when is_binary(RelativeRef) ->
+    {_Sep, Path, QStr} = hb_util:split_depth_string_aware_single("?", RelativeRef),
+    {ok, path_parts($/, Path), parse_query(QStr)};
+from_path(Other) -> from_path(hb_util:bin(Other)).
 
 %% @doc Parse a query string into a message of its unquoted values, or throw
 %% `invalid_query' naming the query string.
@@ -185,12 +193,6 @@ parse_query(QStr) ->
         )
     catch _:_ -> throw({invalid_singleton, invalid_query, QStr})
     end.
-
-%% @doc Step 2: Decode, split and sanitize the path. Split by `/' but avoid
-%% subpath components, such that their own path parts are not dissociated from
-%% their parent path.
-path_messages(Bin, Opts) when is_binary(Bin) ->
-    lists:map(fun(Part) -> parse_part(Part, Opts) end, path_parts([$/], Bin)).
 
 %% @doc Normalize the base path.
 normalize_base([]) -> [];
@@ -241,23 +243,25 @@ apply_types(Msg, Opts) ->
 
 %% @doc Step 4: Group headers/query by N-scope.
 %% `N.Key' => applies to Nth step. Otherwise => `global'
-group_scoped(Map, Msgs) ->
+group_scoped(Map, Msgs, Opts) ->
     {NScope, Global} =
         maps:fold(
             fun(KeyBin, Val, {Ns, Gs}) ->
                 case parse_scope(KeyBin) of
                     {OkN, RealKey} ->
-                        Curr = hb_maps:get(OkN, Ns, #{}),
-                        Ns2 = hb_maps:put(OkN, hb_maps:put(RealKey, Val, Curr), Ns),
+                        Curr = hb_maps:get(OkN, Ns, #{}, Opts),
+                        Ns2 = hb_maps:put(OkN,
+                            hb_maps:put(RealKey, Val, Curr, Opts), Ns, Opts
+                        ),
                         {Ns2, Gs};
-                    global -> {Ns, hb_maps:put(KeyBin, Val, Gs)}
+                    global -> {Ns, hb_maps:put(KeyBin, Val, Gs, Opts)}
                 end
           end,
           {#{}, #{}},
           Map
         ),
     [
-        hb_maps:merge(Global, hb_maps:get(N, NScope, #{}))
+        hb_maps:merge(Global, hb_maps:get(N, NScope, #{}, Opts), Opts)
     ||
         N <- lists:seq(1, length(Msgs))
     ].
@@ -267,7 +271,8 @@ parse_scope(KeyBin) ->
     case binary:split(KeyBin, <<".">>, [global]) of
         [Front, Remainder] ->
             case catch erlang:binary_to_integer(Front) of
-                NInt when is_integer(NInt), NInt >= 0 -> {NInt + 1, Remainder};
+                NInt when is_integer(NInt), NInt >= 0, Remainder =/= <<>> ->
+                    {NInt + 1, Remainder};
                 _ -> throw({invalid_singleton, invalid_scope, KeyBin})
             end;
         _ -> global
@@ -332,7 +337,7 @@ do_build(I, [Msg | Rest], ScopedKeys, Opts) ->
 %% 2. Part subpath resolutions
 %% 3. Inlined key-value pairs
 %% 4. Device specifier
-parse_part(Part, Opts) ->
+parse_part(Part, Opts) when is_binary(Part) ->
     case maybe_subpath(Part, Opts) of
         {resolve, Subpath} -> {resolve, Subpath};
         Part ->
@@ -340,15 +345,18 @@ parse_part(Part, Opts) ->
                 {no_match, PartKey, <<>>} when ?IS_ID(PartKey) ->
                     PartKey;
                 {no_match, PartKey, <<>>} ->
-                    #{ <<"path">> => PartKey };
+                    #{ <<"path">> =>
+                        binary:replace(PartKey, <<"/">>, <<"%2f">>, [global]) };
                 {Sep, PartKey, PartModBin} ->
                     parse_part_mods(
                         << Sep:8/integer, PartModBin/binary >>,
-                        #{ <<"path">> => PartKey },
+                        #{ <<"path">> =>
+                            binary:replace(PartKey, <<"/">>, <<"%2f">>, [global]) },
                         Opts
                     )
             end
-    end.
+    end;
+parse_part(Part, _Opts) -> Part.
 
 %% @doc Parse part modifiers:
 %% 1. `~Device' => `{as, Device, Msg}'
@@ -361,7 +369,7 @@ parse_part_mods(<<"~", PartMods/binary>>, Msg, Opts) ->
     % Calculate the inlined keys
     MsgWithInlines = parse_part_mods(<<"&", InlinedMsgBin/binary >>, Msg, Opts),
     % Apply the device specifier
-    {as, maybe_subpath(DeviceBin, Opts), MsgWithInlines};
+    {as, decode_string(maybe_subpath(DeviceBin, Opts)), MsgWithInlines};
 parse_part_mods(<< "&", InlinedMsgBin/binary >>, Msg, Opts) ->
     InlinedKeys = path_parts($&, InlinedMsgBin),
     MsgWithInlined =
@@ -369,7 +377,7 @@ parse_part_mods(<< "&", InlinedMsgBin/binary >>, Msg, Opts) ->
             fun(InlinedKey, Acc) ->
                 {Key, Val} = parse_inlined_key_val(InlinedKey, Opts),
                 ?event_debug({inlined_key, {explicit, Key}, {explicit, Val}}),
-                hb_maps:put(Key, Val, Acc)
+                hb_maps:put(Key, Val, Acc, Opts)
             end,
             Msg,
             InlinedKeys
@@ -388,14 +396,15 @@ parse_part_mods(_, Msg, _Opts) -> Msg.
 %% value is not provided, it is assumed to be a boolean `true'.
 parse_inlined_key_val(Bin, Opts) ->
     case part([$=, $&], Bin) of
-        {no_match, K, <<>>} -> {K, true};
+        {no_match, K, <<>>} -> {decode_string(K), true};
         {$=, K, RawV} ->
-            V = hb_util:unquote(RawV),
-            {_, Key, Val} = maybe_typed(K, maybe_subpath(V, Opts), Opts),
-            {Key, Val}
+            V = hb_util:unquote(decode_string(maybe_subpath(RawV, Opts))),
+            {_, Key, Val} = maybe_typed(K, V, Opts),
+            {decode_string(Key), Val}
     end.
 
 %% @doc Attempt Cowboy URL decode, then sanitize the result.
+decode_string(Value) when not is_binary(Value) -> Value;
 decode_string(B) ->
     case catch uri_string:unquote(B) of
         DecodedBin when is_binary(DecodedBin) -> DecodedBin;
@@ -420,6 +429,8 @@ maybe_subpath(Other, _Opts) -> Other.
 %% interpret as ` ' characters.
 maybe_typed(Key, Value, Opts) ->
     case part([$+, $ ], Key) of
+        % A key with no name, untyped (`<<>>') or typed (`+Type').
+        {_, <<>>, _} -> throw({invalid_singleton, invalid_key, Key});
         {no_match, OnlyKey, <<>>} -> {untyped, OnlyKey, Value};
         {_, OnlyKey, Type} ->
             case {Type, hb_cache:ensure_loaded(Value, Opts)} of
@@ -755,13 +766,14 @@ typed_key_test() ->
 linked_key_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
     {ok, ID} = hb_cache:write(<<"123">>, Opts),
+    {ok, PathID} = hb_cache:write(<<"/a">>, Opts),
     Missing =
         {link,
             hb_util:human_id(crypto:strong_rand_bytes(32)),
             #{ <<"type">> => <<"link">>, <<"lazy">> => false }
         },
     Req = #{
-        <<"path">> => <<"/a">>,
+        <<"path">> => {link, PathID, #{}},
         <<"test-key">> => Missing,
         <<"typed-key+integer">> => {link, ID, #{}}
     },
@@ -855,7 +867,7 @@ inlined_quoted_key_test() ->
     ?assertEqual(not_found, hb_maps:get(<<"k2">>, Msg2, not_found)),
     ReqB = #{
         <<"method">> => <<"POST">>,
-        <<"path">> => <<"/~profile@1.0/eval=%22~meta@1.0/info%22">>
+        <<"path">> => <<"/~profile@1.0/eval=%22~meta@1.0%2finfo%22">>
     },
     MsgsB = from(ReqB, #{}),
     [_, Msg2b] = MsgsB,
@@ -938,5 +950,5 @@ path_parts_test() ->
     ),
     ok.
 
-path_messages_space_edge_case_test() ->
-    path_messages(<<"42jky7O3rzKkMOfHBXgK-304YjulzEYqHc9qyjT3efA~manifest@1.0/[object Object]">>, #{}).
+parse_part_space_edge_case_test() ->
+    parse_part(<<"42jky7O3rzKkMOfHBXgK-304YjulzEYqHc9qyjT3efA~manifest@1.0/[object Object]">>, #{}).

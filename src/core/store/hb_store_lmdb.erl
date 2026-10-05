@@ -459,7 +459,18 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
         {ok, _ResolvedPath, _Value} ->
             {error, not_found};
         not_found ->
-            {error, not_found}
+            % A path with no row of its own lists the keys written below it.
+            % An empty page with `from' may have started past the last key.
+            case list_children(EnvOpts, PathBin, Req) of
+                {ok, []} when is_map_key(<<"from">>, Req) ->
+                    case list_children(EnvOpts, PathBin, #{ <<"limit">> => 1 }) of
+                        {ok, []} -> {error, not_found};
+                        {ok, _} -> {ok, []};
+                        Error -> Error
+                    end;
+                {ok, []} -> {error, not_found};
+                Result -> Result
+            end
     end.
 
 %% @doc The children of a group through the NIF's cursor: every one, or

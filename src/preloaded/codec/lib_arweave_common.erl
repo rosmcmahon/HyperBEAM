@@ -207,6 +207,11 @@ data(Item, Req, Tags, FromFun, Opts) ->
     DataKey = maps:get(<<"ao-data-key">>, Tags, <<"data">>),
     case {DataKey, Item#tx.data} of
         {_, ?DEFAULT_DATA} -> #{};
+        {DataKey, Empty} when Empty =:= #{}, Item#tx.manifest =:= undefined ->
+            % A list bundle of no items is kept as its bytes: as a message of
+            % no keys, it would encode as an item with no data.
+            {undefined, Bundle} = ar_bundles:serialize_bundle(list, [], false),
+            #{ DataKey => Bundle };
         {DataKey, Map} when is_map(Map) ->
             % If the data is a map, we need to recursively turn its children
             % into messages from their tx representations.

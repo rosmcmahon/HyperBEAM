@@ -26,10 +26,7 @@ hd(Req, Opts) ->
     %?event_debug({key_from_path, Req, Opts}),
     case pop_request(Req, Opts) of
         undefined -> undefined;
-        {Head, _} ->
-            % `term_to_path' returns the full path, so we need to take the
-            % `hd' of our `Head'.
-            erlang:hd(term_to_path_parts(Head, Opts))
+        {Head, _} -> hb_escape:decode(hb_ao:normalize_key(Head))
     end.
 
 %% @doc Return the message without its first path element. Note that this
@@ -194,6 +191,7 @@ verify_hashpath([Base, Req, Res|Rest], Opts) ->
 from_message(Type, Link, Opts) when ?IS_LINK(Link) ->
     from_message(Type, hb_cache:ensure_loaded(Link, Opts), Opts);
 from_message(hashpath, Msg, Opts) -> hashpath(Msg, Opts);
+from_message(request, #{ <<"path">> := Path }, _Opts) when is_list(Path) -> Path;
 from_message(request, #{ path := Path }, Opts) -> term_to_path_parts(Path, Opts);
 from_message(request, #{ <<"path">> := Path }, Opts) -> term_to_path_parts(Path, Opts);
 from_message(request, #{ <<"Path">> := Path }, Opts) -> term_to_path_parts(Path, Opts);
