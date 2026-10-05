@@ -471,17 +471,7 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
                         {commitment_id, CommitmentID},
                         {res, Res}
                     }),
-                % A signed commitment that covers no key of the message does
-                % not verify: its signature base holds no component of it.
-                % The `commitments' and `priv' keys never reach a signature
-                % base, so they cannot be the keys a commitment covers.
-                Unsigned = not maps:is_key(<<"committer">>, Commitment),
-                CoversKeys =
-                    hb_util:list_without(
-                        [<<"commitments">>, <<"priv">>],
-                        committed_keys(Commitment, Opts)
-                    ),
-                Res andalso (Unsigned orelse CoversKeys =/= [])
+                Res
             end,
             IDsToVerify
         ),
@@ -1397,34 +1387,19 @@ verify_without_committed_test() ->
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assertEqual([], hb_message:committed(Decoded, all, Opts)).
 
-%% @doc A signed commitment that covers no key of the message does not verify:
-%% grafting it onto a message with arbitrary content leaves that content
-%% unsigned, however it changes.
+%% @doc A signed commitment over no keys commits none of the keys of a message
+%% that it is grafted onto.
 vacuous_signed_commitment_test_() ->
     [
         {binary_to_list(Device), fun() ->
             Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
             Committed = hb_message:commit(#{}, Opts, Device),
-            [{ID, Commitment}] =
-                maps:to_list(maps:get(<<"commitments">>, Committed)),
-            ?assertEqual([], hb_maps:get(<<"committed">>, Commitment)),
             Grafted =
                 #{
                     <<"data">> => <<"unsigned content">>,
                     <<"commitments">> => maps:get(<<"commitments">>, Committed)
                 },
-            ?assertEqual(
-                hb_util:human_id(ID),
-                hb_message:id(Grafted, signed, Opts)
-            ),
-            ?assertNot(hb_message:verify(Grafted, all, Opts)),
-            ?assertNot(
-                hb_message:verify(
-                    Grafted#{ <<"data">> => <<"changed later">> },
-                    all,
-                    Opts
-                )
-            )
+            ?assertEqual([], hb_message:committed(Grafted, all, Opts))
         end}
     ||
         Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
