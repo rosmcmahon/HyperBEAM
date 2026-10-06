@@ -2016,15 +2016,16 @@ raw_published_index_id_test_parallel() ->
             {ok, Result} =
                 hb_ao:resolve(Base, Req#{ <<"raw">> => ID }, Opts),
             ?assertEqual(ID, hb_maps:get(<<"raw-id">>, Result, Opts)),
+            ?assertEqual(2827, hb_maps:get(<<"data-length">>, Result, Opts)),
             ?assertEqual(Length,
-                hb_maps:get(<<"data-length">>, Result, Opts)),
+                byte_size(hb_maps:get(<<"body">>, Result, <<>>, Opts))),
             ?assertEqual(
                 {error, not_found},
                 hb_ao:resolve(Base, Req#{ <<"raw">> => WrongID }, Opts)
             )
         end,
         [
-            {#{ <<"method">> => <<"HEAD">> }, 2827},
+            {#{ <<"method">> => <<"HEAD">> }, 0},
             {#{ <<"method">> => <<"GET">> }, 2827},
             {#{
                 <<"method">> => <<"GET">>,
