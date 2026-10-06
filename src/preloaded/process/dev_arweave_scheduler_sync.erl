@@ -758,7 +758,7 @@ targets(TX) ->
             Value
         ||
             {Key, Value} <- TX#tx.tags,
-            hb_util:to_lower(hb_ao:normalize_key(Key)) =:= <<"assign-to">>
+            hb_util_string:lowercase(Key) =:= <<"assign-to">>
         ],
     Assigned =
         case AssignValues of
@@ -1034,6 +1034,22 @@ targets_test() ->
     ?assertEqual([], transaction_targets(TX#tx{ data_size = 1 })),
     ?assertEqual({ok, A}, canonical_process_id(A)),
     ?assertEqual(error, canonical_process_id(<<"not-a-process">>)).
+
+binary_tag_names_test() ->
+    Native = crypto:strong_rand_bytes(32),
+    NativeAddress = hb_util:human_id(Native),
+    Assigned = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    lists:foreach(
+        fun(Key) ->
+            TX = #tx{
+                target = Native,
+                tags = [{Key, Assigned}, {<<"AsSiGn-To">>, Assigned}]
+            },
+            ?assertEqual(lists:usort([NativeAddress, Assigned]), targets(TX))
+        end,
+        [<<224, 17>>, <<"assign-to", 0>>, <<"a", 16#C5, 16#BF, "sign-to">> |
+            [<<Byte>> || Byte <- lists:seq(0, 255)]]
+    ).
 
 ordinate_test() ->
     ?assertEqual(<<"1966084-23">>, ordinate(1966084, 23)),
