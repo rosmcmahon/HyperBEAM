@@ -1145,24 +1145,10 @@ to_message(Path = <<"/unconfirmed_tx/", ID/binary>>, <<"GET">>, Result, LogExtra
     to_tx_message(pending, ID, Path, Result, LogExtra, Req, Opts);
 to_message(Path = <<"/tx/", TXID/binary>>, <<"GET">>, Result, LogExtra, Req, Opts) ->
     to_tx_message(tx, TXID, Path, Result, LogExtra, Req, Opts);
-to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, _Req, _Opts) ->
-    event_request(Path, <<"GET">>, 200, LogExtra),
-    {ok, Body};
 to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, Response}, LogExtra, _Req, Opts) ->
-    ContentLength = hb_maps:get(
-        <<"Content-Length">>,
-        Response,
-        hb_maps:get(<<"content-length">>, Response, -1, Opts),
-        Opts
-    ),
-    case hb_util:int(ContentLength) of
-        0 ->
-            event_request(Path, <<"GET">>, 200, LogExtra),
-            {ok, <<>>};
-        _ ->
-            event_request(Path, <<"GET">>, server_error, LogExtra),
-            {error, server_error}
-    end;
+    % A reply without a body carries empty data.
+    event_request(Path, <<"GET">>, 200, LogExtra),
+    {ok, hb_maps:get(<<"body">>, Response, <<>>, Opts)};
 to_message(Path = <<"/block/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
     Decoded =
@@ -1634,7 +1620,7 @@ empty_raw_response_test() ->
         to_message(
             <<"/raw/empty">>,
             <<"GET">>,
-            {ok, #{ <<"Content-Length">> => <<"0">> }},
+            {ok, #{ <<"status">> => 200 }},
             [],
             #{},
             #{}
