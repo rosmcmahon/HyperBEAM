@@ -80,15 +80,7 @@ handle(NodeMsg, RawRequest) ->
         hb_private:set(RawRequest, <<"http-request">>, RawRequest, NodeMsg),
         NodeMsg
     ),
-    ?event(
-        http,
-        {request,
-            hb_cache:ensure_all_loaded(
-                hb_ao:normalize_keys(NormRequest, NodeMsg),
-                NodeMsg
-            )
-        }
-    ),
+    ?event(http, {request, hb_ao:normalize_keys(NormRequest, NodeMsg)}),
     case hb_opts:get(initialized, false, NodeMsg) of
         false ->
             Res =
@@ -241,8 +233,7 @@ handle_resolve(Req, Msgs, NodeMsg) ->
             {parsed_request_sequence, Msgs}
         }
     ),
-    LoadedMsgs = hb_cache:ensure_all_loaded(Msgs, NodeMsg),
-    case resolve_hook(<<"request">>, Req, LoadedMsgs, NodeMsg) of
+    case resolve_hook(<<"request">>, Req, Msgs, NodeMsg) of
         {ok, []} ->
             {ok,
                 #{
@@ -329,9 +320,11 @@ resolve_hook(HookName, InitiatingRequest, Body, NodeMsg) ->
             {error, Other}
     end.
 
-%% @doc Wrap the result of a device call in a status.
+%% @doc Wrap the result of a device call in a status. A result that has a
+%% `status' keeps it as it is: `hb_http:reply/4' takes an integer `status' as
+%% the HTTP status, and any other as the message's own.
 embed_status({ErlStatus, Res}, NodeMsg) when is_map(Res) ->
-    case lists:member(<<"status">>, hb_message:committed(Res, all, NodeMsg)) of
+    case hb_maps:is_key(<<"status">>, Res, NodeMsg) of
         false ->
             HTTPCode = status_code({ErlStatus, Res}, NodeMsg),
             {ok, Res#{ <<"status">> => HTTPCode }};
@@ -347,13 +340,18 @@ embed_status({ErlStatus, Res}, NodeMsg) ->
 %% 1. The status code from the message.
 %% 2. The HTTP representation of the status code.
 %% 3. The default status code.
+%% Only an `error' or `failure' result takes its status from the message it
+%% carries; the body of a successful result is data, not a status.
 status_code({error, {no_viable_responses, _AllResponses}}, NodeMsg) ->
     status_code(no_viable_responses, NodeMsg);
-status_code({ErlStatus, Msg}, NodeMsg) ->
+status_code({ErlStatus, Msg}, NodeMsg)
+        when ErlStatus == error; ErlStatus == failure ->
     case message_to_status(Msg, NodeMsg) of
         default -> status_code(ErlStatus, NodeMsg);
         RawStatus -> RawStatus
     end;
+status_code({ErlStatus, _Msg}, NodeMsg) ->
+    status_code(ErlStatus, NodeMsg);
 status_code(ok, _NodeMsg) -> 200;
 status_code(error, _NodeMsg) -> 400;
 status_code(created, _NodeMsg) -> 201;
@@ -367,49 +365,29 @@ status_code(forbidden, _NodeMsg) -> 403;
 status_code(not_authorized, _NodeMsg) -> 403;
 status_code(_, _NodeMsg) -> 200.
 
-%% @doc Get the HTTP status code from a transaction (if it exists).
+%% @doc Get the HTTP status code from a transaction (if it exists). An atom
+%% that `status_code/2' maps to 200, as it maps every atom it does not name,
+%% gives no code, so the Erlang status of the result gives it.
 message_to_status(#{ <<"body">> := Status }, NodeMsg) when is_atom(Status) ->
-    status_code(Status, NodeMsg);
-message_to_status(Item, NodeMsg) when is_map(Item) ->
-    % Note: We use `hb_maps' directly here, such that we do not cause
-    % additional AO-Core calls for every request. This is particularly important
-    % if a remote server is being used for all AO-Core requests by a node.
-    case hb_maps:find(<<"status">>, Item, NodeMsg) of
-        {ok, RawStatus} when is_integer(RawStatus) -> RawStatus;
-        {ok, RawStatus} when is_atom(RawStatus) ->
-            status_code(RawStatus, NodeMsg);
-        {ok, RawStatus} ->
-            % If we can convert the status to an integer, do so.
-            try binary_to_integer(RawStatus)
-            catch
-                error:badarg ->
-                    % We can't convert the status to an integer, but we may be
-                    % able to convert it to an existing atom status code.
-                    try
-                        status_code(
-                            binary_to_existing_atom(RawStatus, latin1),
-                            NodeMsg
-                        )
-                    catch
-                        error:badarg ->
-                            % We can't convert the status to an integer or atom,
-                            % so we return the default status code.
-                            default
-                    end
-            end;
-        _ -> default
-    end;
+    message_to_status(Status, NodeMsg);
 message_to_status(Item, NodeMsg) when is_atom(Item) ->
-    status_code(Item, NodeMsg);
+    case status_code(Item, NodeMsg) of
+        200 -> default;
+        Status -> Status
+    end;
 message_to_status(_Item, _NodeMsg) ->
     default.
 
 %% @doc Sign the result of a device call if the node is configured to do so.
+%% A result that carries a `hashpath' key, such as another node's reply that
+%% this node relays, is returned as it is: signing it would replace its
+%% unsigned commitment and the `hashpath' that the other node committed.
 maybe_sign({Status, Res}, NodeMsg) ->
     {Status, maybe_sign(Res, NodeMsg)};
 maybe_sign(Res, NodeMsg) ->
     ?event({maybe_sign, Res}),
-    case hb_opts:get(force_signed, false, NodeMsg) of
+    case hb_opts:get(force_signed, false, NodeMsg) andalso
+            not hb_maps:is_key(<<"hashpath">>, Res, NodeMsg) of
         true ->
             case hb_private:get(<<"hashpath">>, Res, not_found, NodeMsg) of
                 not_found ->
@@ -460,6 +438,30 @@ priv_inaccessible_test() ->
     ?event({res, Res}),
     ?assertEqual(<<"test">>, hb_ao:get(<<"test-config-item">>, Res, #{})),
     ?assertEqual(not_found, hb_ao:get(<<"priv-key">>, Res, #{})).
+
+%% @doc A request that carries a link to a message the node does not hold is
+%% answered when its path does not read the link.
+unread_request_link_test() ->
+    Wallet = ar_wallet:new(),
+    Node =
+        hb_http_server:start_node(
+            #{
+                <<"priv-wallet">> => Wallet,
+                <<"store">> => hb_test_utils:test_store()
+            }
+        ),
+    Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(
+        {ok, hb_util:human_id(ar_wallet:to_address(Wallet))},
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/~meta@1.0/info/address">>,
+                <<"x+link">> => Missing
+            },
+            #{}
+        )
+    ).
 
 %% @doc Test that we can't set the node message if the request is not signed by
 %% the owner of the node.

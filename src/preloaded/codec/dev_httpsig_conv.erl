@@ -302,14 +302,17 @@ from_body_part(InlinedKey, Part, Opts) ->
                         % There is no body to the message, so we return
                         % just the headers.
                         RestHeaders;
-                    {0, _, _} ->
+                    {0, <<>>, _} ->
                         % There are no headers besides content-disposition,
                         % so we return the body as is.
                         RawBody;
                     {_, _, _} ->
                         % There are other headers, so we need to parse
-                        % the body as a TABM.
-                        {_, RawBodyKey} = inline_key(Headers),
+                        % the body as a TABM. Its key is chosen from the
+                        % part with its body, so a `data' header in the
+                        % part does not take it.
+                        {_, RawBodyKey} =
+                            inline_key(Headers#{ <<"body">> => RawBody }),
                         RestHeaders#{ RawBodyKey => RawBody }
                 end,
             {PartName, ParsedPart}
@@ -391,7 +394,10 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
     Stripped =
         encode_keys(
-            hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts)
+            without_unsigned_commitments(
+                hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts),
+                Opts
+            )
         ),
     {InlineFieldHdrs, InlineKey} = inline_key(Stripped),
     Intermediate =
@@ -478,9 +484,16 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                 % Otherwise, we need to encode the body map as the
                 % multipart body of the HTTP message
                 ?event_debug({encoding_multipart, {bodymap, {explicit, GroupedBodyMap}}}),
+                % The message's own `content-type' header moves into a part.
+                % Part bodies are not escaped, so the part holds the value as
+                % given.
                 Parts =
                     maps:merge(
-                        maps:with([<<"content-type">>], Enc0), GroupedBodyMap
+                        maps:map(
+                            fun(_, Value) -> hb_escape:decode_header(Value) end,
+                            maps:with([<<"content-type">>], Enc0)
+                        ),
+                        GroupedBodyMap
                     ),
                 PartList = hb_util:to_sorted_list(
                     hb_maps:map(
@@ -557,6 +570,35 @@ encode_keys(Msg) when is_map(Msg) ->
         )
     );
 encode_keys(Value) -> Value.
+
+%% @doc Remove the unsigned commitments (those with no `committer') of a
+%% message and of each message nested in it. A nested message is read from a
+%% store with the commitments that the ID linking it names: its signed
+%% commitments, or the unsigned commitment stored under its unsigned ID if it
+%% has none, whether or not it held that commitment when written. A signature
+%% over a bundled message covers its nested messages with their signed
+%% commitments alone, so it verifies after a write and a read.
+without_unsigned_commitments(Msg, Opts) when is_map(Msg) ->
+    maps:filtermap(
+        fun(<<"commitments">>, Commitments) ->
+                Signed =
+                    hb_maps:filter(
+                        fun(_ID, Commitment) ->
+                            hb_maps:is_key(<<"committer">>, Commitment, Opts)
+                        end,
+                        Commitments,
+                        Opts
+                    ),
+                case map_size(Signed) of
+                    0 -> false;
+                    _ -> {true, Signed}
+                end;
+           (_Key, Value) ->
+                {true, without_unsigned_commitments(Value, Opts)}
+        end,
+        Msg
+    );
+without_unsigned_commitments(Value, _Opts) -> Value.
 
 %% @doc Percent-encode a key as a header name. A header name is a token of the
 %% `tchar' bytes of RFC 9110, and HTTP lowercases it. A key keeps `a-z', `0-9'
@@ -807,7 +849,8 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_map(Value) ->
 field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     NormalizedName = hb_ao:normalize_key(Name),
     % The default location where the value is encoded within the HTTP
-    % message depends on its size.
+    % message depends on its size, and on whether it starts or ends with a
+    % space or tab.
     % 
     % So we check whether the size of the value is within the threshold
     % to encode as a header, and otherwise default to encoding in the body.
@@ -816,7 +859,11 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     % value -- this is only a default location if not specified in Opts 
     DefaultWhere =
         case {maps:get(where, Opts, headers), byte_size(Value)} of
-            {headers, Fits} when Fits =< ?MAX_HEADER_LENGTH -> headers;
+            {headers, Fits} when Fits =< ?MAX_HEADER_LENGTH ->
+                case edge_whitespace(Value) of
+                    true -> body;
+                    false -> headers
+                end;
             _ -> body
         end,
     case maps:get(where, Opts, DefaultWhere) of
@@ -826,6 +873,13 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
             OldBody = hb_maps:get(<<"body">>, Httpsig, #{}, Opts),
             Httpsig#{ <<"body">> => OldBody#{ NormalizedName => Value } }
     end.
+
+%% @doc Whether a value starts or ends with a space or tab. HTTP strips them
+%% from a header value, so such a value is not sent as one.
+edge_whitespace(<<>>) -> false;
+edge_whitespace(Value) ->
+    lists:member(binary:first(Value), " \t")
+        orelse lists:member(binary:last(Value), " \t").
 
 %% @doc Multipart headers preserve literal backslashes and line breaks.
 multipart_header_bytes_roundtrip_test() ->
@@ -895,6 +949,14 @@ multipart_content_type_test() ->
         <<"nested">> => #{ <<"value">> => 42 }
     },
     Signed = hb_message:commit(Msg, Opts, #{ <<"bundle">> => true }),
+    % The flag as a binary, as it arrives over HTTP, signs the same form.
+    ?assert(
+        hb_message:verify(
+            hb_message:commit(Msg, Opts, #{ <<"bundle">> => <<"true">> }),
+            all,
+            Opts
+        )
+    ),
     ?assert(
         lists:member(<<"content-type">>, hb_message:committed(Signed, all, Opts))
     ),

@@ -115,9 +115,13 @@ handle(_Base, RawReq, Opts) ->
             Name when is_binary(Name) -> Name;
             _ -> undefined
         end,
+    % The `graphql' library takes the variables as Erlang terms without links.
     Vars = 
         hb_message:uncommitted_deep(
-            hb_maps:get(<<"variables">>, Req, #{}, Opts),
+            hb_cache:ensure_all_loaded(
+                hb_maps:get(<<"variables">>, Req, #{}, Opts),
+                Opts
+            ),
             Opts
         ),
     ?event(
@@ -265,9 +269,9 @@ message_query(Obj, <<"message">>, #{<<"keys">> := Keys}, Opts) ->
             {ok, Msg} = hb_cache:read(ID, Opts),
             ?event({graphql_cache_read, Msg}),
             {ok, Msg};
-        not_found ->
+        {error, not_found} ->
             ?event(graphql_cache_match_not_found),
-            {ok, #{<<"id">> => <<"not-found">>, <<"keys">> => #{}}}
+            {ok, null}
     end;
 message_query(Msg, <<"keys">>, _Args, Opts) ->
     OnlyKeys =

@@ -41,13 +41,7 @@ commit(Msg, Req, Opts) ->
 %% @doc Route verification through `httpsig@1.0'.
 -spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 verify(Msg, Req, Opts) ->
-    {ok,
-        hb_message:verify(
-            Msg,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
-            Opts
-        )
-    }.
+    hb_ao:raw(<<"httpsig@1.0">>, <<"verify">>, Msg, Req, Opts).
 
 %% @doc Convert a rich message into a 'Type-Annotated-Binary-Message' (TABM).
 -spec from(
@@ -225,7 +219,7 @@ apply_bundle_hint(Msg, Req, Opts) ->
 
 %% @doc Discern the linkify mode from the request and the options.
 linkify_mode(Req, Opts) ->
-    case hb_maps:get(<<"bundle">>, Req, not_found, Opts) of
+    case hb_util:bool(hb_maps:get(<<"bundle">>, Req, not_found, Opts)) of
     	true ->
             % The request is asking for a bundle, so we should _not_ linkify.
             false;
@@ -287,10 +281,11 @@ decode(TABM0, Req, Opts) ->
             #{},
             TABM1
         ),
-    % If the message is a list, we need to convert it back.
+    % If the message is a list, we need to convert it back. A `.' type other
+    % than `list' is the type of the message's own `.' key.
     case maps:get(<<".">>, Types, not_found) of
-        not_found -> {ok, ResMsg};
-        <<"list">> -> {ok, hb_util:message_to_ordered_list(ResMsg, Opts)}
+        <<"list">> -> {ok, hb_util:message_to_ordered_list(ResMsg, Opts)};
+        _ -> {ok, ResMsg}
     end.
 
 %% @doc Generate an `ao-types' structured field from a map of keys and their

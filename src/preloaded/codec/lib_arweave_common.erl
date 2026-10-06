@@ -7,18 +7,19 @@
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([signed_children_hint/3]).
--export([to/3, to/6, siginfo/4, fields_to_tx/4]).
+-export([to/3, to/6, siginfo/4, fields_to_tx/4, decode/1]).
 -export([bundle_header/2, bundle_header/3]).
 -include("include/hb.hrl").
 
 -define(ANS104_BASE_FIELDS, [<<"anchor">>, <<"target">>]).
 
-%% @doc Convert an ANS-104 item into its message form.
+%% @doc Convert an ANS-104 item into its message form. An item whose only tag
+%% is `ao-type: binary' is a bare binary.
 from(Binary, _Req, _Opts) when is_binary(Binary) ->
     {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
-    case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        {<<"ao-type">>, <<"binary">>} -> {ok, TX#tx.data};
+    case TX#tx.tags of
+        [{<<"ao-type">>, <<"binary">>}] -> {ok, TX#tx.data};
         _ -> from_item(TX, Req, Opts)
     end.
 
@@ -206,6 +207,11 @@ data(Item, Req, Tags, FromFun, Opts) ->
     DataKey = maps:get(<<"ao-data-key">>, Tags, <<"data">>),
     case {DataKey, Item#tx.data} of
         {_, ?DEFAULT_DATA} -> #{};
+        {DataKey, Empty} when Empty =:= #{}, Item#tx.manifest =:= undefined ->
+            % A list bundle of no items is kept as its bytes: as a message of
+            % no keys, it would encode as an item with no data.
+            {undefined, Bundle} = ar_bundles:serialize_bundle(list, [], false),
+            #{ DataKey => Bundle };
         {DataKey, Map} when is_map(Map) ->
             % If the data is a map, we need to recursively turn its children
             % into messages from their tx representations.
@@ -333,8 +339,12 @@ verify_identity(Item, TABM) ->
     end.
 
 %% @doc Check that a commitment's committed keys are the keys of the item
-%% encoded from the message: its data keys, tags and fields, as decoding the
-%% item gives them. Nested items are not decoded, as only their keys are needed.
+%% encoded from the message, and that the message gives those keys the types the
+%% item does. The keys are the item's data keys, tags and fields, as decoding
+%% the item gives them; nested items are not decoded, as only their keys are
+%% needed. The item carries the signed types in its `ao-types' tag: an untyped
+%% signed value is a binary, so a message that lists it as another type does not
+%% verify.
 verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
     [Commitment] = maps:values(maps:get(<<"commitments">>, TABM)),
     TX = ar_bundles:deserialize(Item),
@@ -343,7 +353,13 @@ verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
     Data = data(TX, #{}, Tags, fun(_, _, _) -> {ok, <<>>} end, Opts),
     CommittedKeys = hb_maps:get(<<"committed">>, Commitment, #{}, Opts),
     lists:sort(committed(FieldKeys, TX, Fields, Tags, Data, Opts)) =:=
-        lists:sort(hb_util:message_to_ordered_list(CommittedKeys)).
+        lists:sort(hb_util:message_to_ordered_list(CommittedKeys)) andalso
+        holds_types(
+            maps:get(<<"ao-types">>, Tags, <<>>),
+            Commitment,
+            TABM,
+            Opts
+        ).
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
@@ -720,7 +736,7 @@ fields_to_tx(TX, Prefix, Map, Opts) ->
     Anchor =
         case hb_maps:find(<<Prefix/binary, "anchor">>, Map, Opts) of
             {ok, EncodedAnchor} ->
-                case hb_util:safe_decode(EncodedAnchor) of
+                case decode(EncodedAnchor) of
                     {ok, DecodedAnchor} when ?IS_ID(DecodedAnchor) ->
                         DecodedAnchor;
                     _ -> ?DEFAULT_ANCHOR
@@ -730,7 +746,7 @@ fields_to_tx(TX, Prefix, Map, Opts) ->
     Target =
         case hb_maps:find(<<Prefix/binary, "target">>, Map, Opts) of
             {ok, EncodedTarget} ->
-                case hb_util:safe_decode(EncodedTarget) of
+                case decode(EncodedTarget) of
                     {ok, DecodedTarget} when ?IS_ID(DecodedTarget) ->
                         DecodedTarget;
                     _ -> ?DEFAULT_TARGET
@@ -742,6 +758,16 @@ fields_to_tx(TX, Prefix, Map, Opts) ->
         anchor = Anchor,
         target = Target
     }.
+
+%% @doc Decode the base64url string of a field. A string other than the
+%% encoding of the bytes it decodes to, such as one with other padding bits, is
+%% refused: a signature over the bytes covers that encoding alone.
+decode(Encoded) ->
+    maybe
+        {ok, Decoded} ?= hb_util:safe_decode(Encoded),
+        true ?= hb_util:encode(Decoded) =:= Encoded orelse {error, invalid},
+        {ok, Decoded}
+    end.
 
 %% @doc Calculate the data field for a message.
 data(TABM, Req, Opts) ->
@@ -766,7 +792,9 @@ data(TABM, Req, Opts) ->
             NestedMsgs#{ DataKey => hb_util:ok(to(DataVal, Req, Opts)) }
     end.
 
-%% @doc Calculate data messages for large tag values or nested messages.
+%% @doc Calculate data messages for large tag values or nested messages. A
+%% message's own `ao-type: binary' is carried in the data too, so that only the
+%% item of a bare binary has that tag.
 data_messages(TABM, Opts) when is_map(TABM) ->
     UncommittedTABM =
         hb_maps:without(
@@ -781,6 +809,7 @@ data_messages(TABM, Opts) when is_map(TABM) ->
                 false ->
                     byte_size(Value) > ?MAX_TAG_VALUE_SIZE
                     orelse byte_size(Key) > ?MAX_TAG_NAME_SIZE
+                    orelse {Key, Value} =:= {<<"ao-type">>, <<"binary">>}
             end
         end,
         UncommittedTABM,

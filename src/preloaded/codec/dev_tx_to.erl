@@ -21,13 +21,13 @@ target_field(Prefix, Map, Opts) ->
     decoded_field(Prefix, <<"target">>, Map, ?DEFAULT_TARGET, fun decode_id/1, Opts).
 
 anchor_field(Prefix, Map, Opts) ->
-    decoded_field(Prefix, <<"anchor">>, Map, ?DEFAULT_ANCHOR, fun hb_util:safe_decode/1, Opts).
+    decoded_field(Prefix, <<"anchor">>, Map, ?DEFAULT_ANCHOR, fun lib_arweave_common:decode/1, Opts).
 
 quantity_field(Prefix, Map, Opts) ->
-    decoded_field(Prefix, <<"quantity">>, Map, ?DEFAULT_QUANTITY, fun hb_util:safe_int/1, Opts).
+    decoded_field(Prefix, <<"quantity">>, Map, ?DEFAULT_QUANTITY, fun decode_int/1, Opts).
 
 reward_field(Prefix, Map, Opts) ->
-    decoded_field(Prefix, <<"reward">>, Map, ?DEFAULT_REWARD, fun hb_util:safe_int/1, Opts).
+    decoded_field(Prefix, <<"reward">>, Map, ?DEFAULT_REWARD, fun decode_int/1, Opts).
 
 data_root_field(Prefix, Map, Opts) ->
     case hb_maps:get(<<"data">>, Map, ?DEFAULT_DATA, Opts) of
@@ -52,7 +52,7 @@ data_size_field(Prefix, Map, Opts) ->
                 <<"data_size">>,
                 Map,
                 ?DEFAULT_DATA_SIZE,
-                fun hb_util:safe_int/1,
+                fun decode_int/1,
                 Opts
             );
         _ ->
@@ -91,9 +91,19 @@ decode_format(<<"1">>) -> {ok, 1};
 decode_format(_) -> {ok, 2}.
 
 decode_id(Encoded) ->
-    case hb_util:safe_decode(Encoded) of
+    case lib_arweave_common:decode(Encoded) of
         {ok, ID} when ?IS_ID(ID) -> {ok, ID};
         _ -> error
+    end.
+
+%% @doc Decode the decimal string of an integer field. A string other than the
+%% integer's decimal form, such as one with leading zeros or a `+' sign, is
+%% refused: a signature over the integer covers that form alone.
+decode_int(Encoded) ->
+    maybe
+        {ok, Int} ?= hb_util:safe_int(Encoded),
+        true ?= hb_util:bin(Int) =:= Encoded orelse {error, invalid},
+        {ok, Int}
     end.
 
 exclude_quantity_tag(TX, TABM, Opts) ->

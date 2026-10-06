@@ -299,7 +299,10 @@ path_read(Path, Meta, Opts) ->
 %% @doc Classify the marker row of a path's scan, which sorts ahead of the
 %% path's descendants: a link chases its target, a group answers with its
 %% immediate children, any other value answers itself, and a path with
-%% descendants but no marker is a group without a marker.
+%% descendants but no marker is a group without a marker. A content-addressed
+%% `data/' row answers itself, whatever its bytes.
+path_result(<<"data/", _/binary>> = Path, [{Path, Value} | _], _Meta, _Opts) ->
+    {ok, Value};
 path_result(Path, [{Path, <<"link:", Link/binary>>} | _], Meta, Opts)
         when byte_size(Link) > 0 ->
     path_read(Link, Meta, Opts);

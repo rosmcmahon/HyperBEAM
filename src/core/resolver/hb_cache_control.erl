@@ -38,8 +38,9 @@ maybe_store(Base, Req, Res, OriginalReq, Opts) ->
 %%                        a 504 `Status'.
 %%      `no_cache':       If set, the cached values are never used. Returns
 %%                        `continue' to the caller.
-maybe_lookup(Base, Req, OriginalBase, OriginalReq, Opts) ->
-    case derive_cache_settings([OriginalBase, OriginalReq], Opts) of
+maybe_lookup(Base, Req, _OriginalBase, OriginalReq, Opts) ->
+    % A base's own `cache-control' describes itself, not this lookup.
+    case derive_cache_settings([OriginalReq], Opts) of
         #{ <<"lookup">> := false } ->
             ?event({skip_cache_check, lookup_disabled}),
             {continue, Base, Req};
@@ -99,14 +100,8 @@ perform_cache_write(Base, Req, Res, Opts) when is_map(Res); is_binary(Res) ->
                 true -> hb_message:id(Res, all, Opts);
                 false -> Path
             end,
-            % An accumulated signature ID must reload with the same identity.
-            case ResultID == Path orelse
-                    hb_message:id(hb_util:ok(hb_cache:read(ResultID, Opts)), all, Opts)
-                        == ResultID of
-                true -> hb_store:link(hb_opts:get(attested_store, [], Opts),
-                    #{ <<BaseID/binary, "/", ReqID/binary>> => ResultID }, Opts);
-                false -> skip_caching
-            end;
+            hb_store:link(hb_opts:get(attested_store, [], Opts),
+                #{ <<BaseID/binary, "/", ReqID/binary>> => ResultID }, Opts);
         false ->
             ?event(caching, {skip_caching, uncacheable_computation}),
             skip_caching
@@ -216,10 +211,23 @@ cache_source_to_cache_settings(Msg, Opts) ->
 
 %% @doc Convert a cache control list as received via HTTP headers into a 
 %% normalized map of simply whether we should store and/or lookup the result.
+%% A header separates its directives with commas. Directives are ASCII tokens,
+%% compared without regard to case. A value that cannot be read as a list (its
+%% bytes are not UTF-8) names no directive.
+specifiers_to_cache_settings(CCSpecifier) when is_binary(CCSpecifier) ->
+    specifiers_to_cache_settings(
+        try hb_util:binary_to_strings(CCSpecifier)
+        catch error:{cannot_parse_list, _} -> []
+        end
+    );
 specifiers_to_cache_settings(CCSpecifier) when not is_list(CCSpecifier) ->
     specifiers_to_cache_settings([CCSpecifier]);
 specifiers_to_cache_settings(RawCCList) ->
-    CCList = lists:map(fun hb_ao:normalize_key/1, RawCCList),
+    CCList =
+        lists:map(
+            fun(CC) -> hb_util_string:lowercase(hb_ao:normalize_key(CC)) end,
+            RawCCList
+        ),
     #{
         <<"store">> =>
             case lists:member(<<"always">>, CCList) of
@@ -643,7 +651,7 @@ linked_signed_child(Count) ->
     ?assertMatch({error, #{ <<"status">> := 504 }}, hb_ao:resolve(Extended, Req,
         Opts#{ <<"cache-control">> => [<<"only-if-cached">>] })).
 
-%% @doc A signed result cannot be linked unless its all-ID reloads faithfully.
+%% @doc A result with two signatures is linked, and reloads with both of them.
 multiple_signed_result_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store(),
         <<"attested-store">> => hb_test_utils:test_store(),
@@ -656,7 +664,11 @@ multiple_signed_result_test() ->
         hb_message:commit(Acc, Opts#{ <<"priv-wallet">> => ar_wallet:new() })
     end, #{ <<"a">> => 1, <<"b">> => 2 }, [1, 2]),
     maybe_store(Base, Req, Res, Req, Opts),
-    ?assertEqual(miss, hb_cache:read_resolved(Base, Req, Opts)).
+    {hit, {ok, Hit}} = hb_cache:read_resolved(Base, Req, Opts),
+    ?assertEqual(
+        hb_message:id(Res, all, Opts),
+        hb_message:id(hb_cache:ensure_all_loaded(Hit, Opts), all, Opts)
+    ).
 
 %% @doc A device's fresh partial unsigned result must retain every returned
 %% field on the next cache hit, even when its commitment was not an input's.

@@ -34,10 +34,13 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
-%%% Keys that should typically be excluded from searches.
+%%% Keys that should typically be excluded from searches: the request's
+%%% `commitments', the device's parameters, and the keys that the node's
+%%% HTTP server sets on every request.
 -define(
     DEFAULT_EXCLUDES,
-    [<<"path">>, <<"commitments">>, <<"return">>, <<"exclude">>, <<"only">>]
+    [<<"path">>, <<"commitments">>, <<"return">>, <<"exclude">>, <<"only">>,
+        <<"method">>, <<"accept">>, <<"accept-bundle">>, <<"host">>]
 ).
 
 info(_Opts) ->
@@ -209,9 +212,11 @@ match(UserSpec, _Base, Req, Opts) ->
                     ?event({matched, {paths, Matches}}),
                     {ok, length(Matches) > 0}
             end;
-        not_found when ReturnType == <<"boolean">> ->
+        {error, not_found} when ReturnType == <<"boolean">> ->
             {ok, false};
-        not_found ->
+        {error, not_found} when ReturnType == <<"count">> ->
+            {ok, 0};
+        {error, not_found} ->
             {error, not_found}
     end.
 

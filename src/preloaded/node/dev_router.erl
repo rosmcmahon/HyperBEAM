@@ -776,7 +776,7 @@ preprocess(Base, RawReq, Opts) ->
                             }]
                     }}
             end;
-        {ok, _Method, Node, _Path, _MsgWithoutMeta, _ReqOpts} ->
+        {ok, _Method, _Node, _Path, _MsgWithoutMeta, _ReqOpts} ->
             ?event(debug_preprocess, {matched_route, {explicit, Res}}),
             CommitRequest =
                 hb_util:atom(
@@ -834,6 +834,10 @@ preprocess(Base, RawReq, Opts) ->
                     <<"user-message">> => UserReqWithCommit
                 },
             ?event(debug_preprocess, {prepared_relay_req, RelayReq}),
+            % This request matched a route, so rather than name a peer that the
+            % relay would check, give the relay the user's path to route: it
+            % picks the destination from the same routes, a destination the
+            % node's configuration chose.
             {
                 ok,
                 #{
@@ -843,7 +847,7 @@ preprocess(Base, RawReq, Opts) ->
                                 <<"device">> => <<"relay@1.0">>,
                                 <<"relay-device">> => <<"apply@1.0">>,
                                 <<"method">> => <<"POST">>,
-                                <<"peer">> => Node
+                                <<"relay-route">> => UserPath
                             },
                             #{
                                 <<"path">> => <<"call">>,
@@ -1926,7 +1930,20 @@ request_hook_reroute_to_nearest() ->
         end,
         Peers
     ),
-    ?assert(HasValidSigner).
+    ?assert(HasValidSigner),
+    % A signed request holding a map is relayed as it was signed.
+    Signed =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"/a/b/c">>,
+                <<"a">> => #{ <<"b">> => #{ <<"c">> => <<"ok">> } }
+            },
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"ok">>},
+        hb_http:post(Node, Signed, Opts#{ <<"http-only-result">> => true })
+    ).
 
 route_nearest_integer_preserves_opts_test_parallel() ->
     Routes =

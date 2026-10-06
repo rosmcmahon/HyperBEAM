@@ -376,11 +376,14 @@ write_foreign(Base, RawReq, Opts) ->
             end,
             SignerChecks
         ),
+        % The record is linked under every signer, so it must be newer than
+        % the known record of each.
         CanWrite =
-            lists:any(
-                fun({_Signer, IsLatest}) -> IsLatest end,
-                SignerChecks
-            ),
+            Signers =/= []
+                andalso lists:all(
+                    fun({_Signer, IsLatest}) -> IsLatest end,
+                    SignerChecks
+                ),
         case CanWrite of
             true ->
                 case dev_location_cache:write(MaybeLocation, Opts) of

@@ -137,7 +137,7 @@ is_admissible(ok, Res, Admissible, Statuses, Opts) ->
             {statuses, Statuses}
         }
     ),
-    AdmissibleStatus = admissible_status(Res, Statuses),
+    AdmissibleStatus = admissible_status(Res, Statuses, Opts),
     ?event(debug_multi, {admissible_status, {result, AdmissibleStatus}}),
     AdmissibleResponse = admissible_response(Res, Admissible, Opts),
     ?event(debug_multi, {admissible_response, {result, AdmissibleResponse}}),
@@ -218,20 +218,21 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
 %% @doc Check if a status is allowed, according to the configuration. Statuses
 %% can be a single integer, a comma-separated list of integers, or the string
 %% `All'.
-admissible_status(_, <<"All">>) -> true;
-admissible_status(_ResponseMsg = #{ <<"status">> := Status }, Statuses) ->
-    admissible_status(Status, Statuses);
-admissible_status(Status, Statuses) when is_integer(Statuses) ->
-    admissible_status(Status, [Statuses]);
-admissible_status(Status, Statuses) when is_binary(Status) ->
-    admissible_status(binary_to_integer(Status), Statuses);
-admissible_status(Status, Statuses) when is_binary(Statuses) ->
+admissible_status(_, <<"All">>, _Opts) -> true;
+admissible_status(ResponseMsg = #{ <<"status">> := _ }, Statuses, Opts) ->
+    admissible_status(hb_http:http_status(ResponseMsg, Opts), Statuses, Opts);
+admissible_status(Status, Statuses, Opts) when is_integer(Statuses) ->
+    admissible_status(Status, [Statuses], Opts);
+admissible_status(Status, Statuses, Opts) when is_binary(Status) ->
+    admissible_status(binary_to_integer(Status), Statuses, Opts);
+admissible_status(Status, Statuses, Opts) when is_binary(Statuses) ->
     % Convert the statuses to a list of integers.
     admissible_status(
         Status,
-        lists:map(fun binary_to_integer/1, binary:split(Statuses, <<",">>))
+        lists:map(fun binary_to_integer/1, binary:split(Statuses, <<",">>)),
+        Opts
     );
-admissible_status(Status, Statuses) when is_list(Statuses) ->
+admissible_status(Status, Statuses, _Opts) when is_list(Statuses) ->
     lists:member(Status, Statuses).
 
 %% @doc If an `admissable` message is set for the request, check if the response

@@ -73,12 +73,15 @@ refreshed_path(ProcID) ->
     path(ProcID, <<"latest">>, #{}).
 
 %% @doc Return whether the latest cached process output is fresh enough for
-%% `/now' to serve from cache under the effective `max-age'.
+%% `/now' to serve from cache under the effective `max-age'. A `max-age' that
+%% is neither `infinity' nor an integer gives a 400 error.
 fresh(ProcID, Req, RawOpts) ->
     Opts = lib_process:scoped_opts(RawOpts),
     case effective_max_age(Req, Opts) of
         infinity ->
             true;
+        {error, _} = Error ->
+            Error;
         _MaxAge ->
             case latest_slot(ProcID, Opts) of
                 {ok, Slot} -> fresh(ProcID, Slot, Req, Opts);
@@ -90,6 +93,8 @@ fresh(ProcID, Slot, Req, RawOpts) ->
     case effective_max_age(Req, Opts) of
         infinity ->
             true;
+        {error, _} = Error ->
+            Error;
         MaxAge ->
             case read_refreshed_at(ProcID, Opts) of
                 {ok, Slot, RefreshedAt} -> clock(Opts) =< RefreshedAt + MaxAge;
@@ -136,7 +141,17 @@ max_age_from_request(_Req, _Opts) ->
 
 normalize_max_age(infinity) -> infinity;
 normalize_max_age(<<"infinity">>) -> infinity;
-normalize_max_age(RawMaxAge) -> hb_util:int(RawMaxAge).
+normalize_max_age(RawMaxAge) ->
+    case hb_util:safe_int(RawMaxAge) of
+        {ok, MaxAge} -> MaxAge;
+        {error, _} ->
+            {error,
+                #{
+                    <<"status">> => 400,
+                    <<"body">> => <<"Invalid max-age.">>
+                }
+            }
+    end.
 
 %% @doc Return the current clock time. Allows the option to override the clock
 %% time with a custom value for test use.

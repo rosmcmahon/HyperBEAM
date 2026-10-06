@@ -171,8 +171,9 @@ snapshot(RawBase, _Req, Opts) ->
 
 %% @doc Before computation begins, a boot phase is required. This phase
 %% allows devices on the execution stack to initialize themselves. We set the
-%% `Initialized' key to `True' to indicate that the process has been
-%% initialized.
+%% private `initialized' key to `true' to indicate that the state holds the
+%% live state of its execution devices. The key is never stored, so a state
+%% read from the cache is not initialized.
 init(Base, Req, Opts) ->
     ?event({init_called, {base, Base}, {req, Req}}),
     {ok, Initialized} =
@@ -184,12 +185,10 @@ init(Base, Req, Opts) ->
         ),
     {
         ok,
-        hb_ao:set(
-            Initialized,
-            #{
-                <<"initialized">> => <<"true">>,
-                <<"at-slot">> => -1
-            },
+        hb_private:set(
+            hb_ao:set(Initialized, #{ <<"at-slot">> => -1 }, Opts),
+            <<"initialized">>,
+            <<"true">>,
             Opts
         )
     }.
@@ -207,7 +206,7 @@ init(Base, Req, Opts) ->
 %%   for the dryrun functionality that allows external clients to test
 %%   message processing without side effects.
 -spec compute(
-    #{ initialized => binary(), 'at-slot' => integer(), _ => _ },
+    #{ 'at-slot' => integer(), _ => _ },
     #{
         compute => integer(),
         slot => integer(),
@@ -215,7 +214,8 @@ init(Base, Req, Opts) ->
         push => _,
         'result-depth' => _,
         async => _,
-        'max-depth' => _
+        'max-depth' => _,
+        'max-age' => infinity | integer()
     },
     #{ _ => _ }
 ) -> {ok, #{ _ => _ }} | {error, _} | {failure, _}.
@@ -327,7 +327,10 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                             );
                         {error, Error} ->
                             % Forward error details back to the caller.
-                            {error, Error}
+                            {error, Error};
+                        {failure, Failure} ->
+                            % Forward failure details back to the caller.
+                            {failure, Failure}
                     end
             end;
         CurrentSlot when CurrentSlot > TargetSlot ->
@@ -450,11 +453,18 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             maybe_trigger_push(State, Slot, InitReq, Opts),
             {ok, ProcStateWithSnapshot};
         {error, Error} ->
-            % An error occurred while computing the slot. Return the details.
+            % An error occurred while computing the slot. The slot's
+            % message leaves the state as it found it: the error becomes
+            % the slot's results over the inbound state, the slot is
+            % stored as usual, and computing carries on to the next slot
+            % from it.
             ErrMsg =
-                if is_map(Error) -> Error;
-                true -> #{ <<"error">> => Error }
-                end,
+                (if is_map(Error) -> Error;
+                    true -> #{ <<"error">> => Error }
+                end)#{
+                    <<"phase">> => <<"compute">>,
+                    <<"attempted-slot">> => Slot
+                },
             ?event(compute_short,
                 {error_computing_slot,
                     {proc_id, ProcID},
@@ -465,12 +475,36 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {error, ErrMsg}
                 }
             ),
-            {error,
-                ErrMsg#{
-                    <<"phase">> => <<"compute">>,
-                    <<"attempted-slot">> => Slot
-                }
-            }
+            ErrState =
+                hb_ao:set(
+                    State,
+                    #{
+                        <<"device">> => <<"process@1.0">>,
+                        <<"at-slot">> => Slot,
+                        <<"results">> => #{
+                            <<"type">> => <<"error">>,
+                            <<"error">> => ErrMsg
+                        }
+                    },
+                    Opts
+                ),
+            store_result(Slot == TargetSlot, ProcID, Slot, ErrState, InitReq, Opts),
+            {ok, ErrState};
+        {failure, Failure} ->
+            % A failure of this node -- a failed read or fetch -- is not a
+            % result of the computation, so nothing of it is stored. The
+            % process-failure hook sees it, and the failure is answered as
+            % it arrived.
+            hb_hook:on(
+                <<"process-failure">>,
+                #{
+                    <<"process-id">> => ProcID,
+                    <<"slot">> => Slot,
+                    <<"body">> => Failure
+                },
+                Opts
+            ),
+            {failure, Failure}
     end.
 
 %% @doc Prepare the process state message for computing the next slot.
@@ -695,6 +729,8 @@ now(RawBase, Req, Opts) ->
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
                     case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
+                        {error, _} = Error ->
+                            Error;
                         true ->
                             LatestMsg = without_snapshot(RawLatestMsg, Opts),
                             ?event(compute_cache,
@@ -763,7 +799,7 @@ ensure_loaded(Base, Req, Opts) ->
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
     ProcID = lib_process:process_id(Base, #{}, Opts),
     ?event({ensure_loaded, {base, Base}, {req, Req}}),
-    case hb_ao:get(<<"initialized">>, Base, Opts) of
+    case hb_private:get(<<"initialized">>, Base, Opts) of
         <<"true">> ->
             ?event(already_initialized),
             {ok, Base};
@@ -816,10 +852,12 @@ ensure_loaded(Base, Req, Opts) ->
                             Opts
                         ),
                     SnapshotReq =
-                        SnapshotMsg#{
-                            <<"process">> => UpdateProcess,
-                            <<"initialized">> => <<"true">>
-                        },
+                        hb_private:set(
+                            SnapshotMsg#{ <<"process">> => UpdateProcess },
+                            <<"initialized">>,
+                            <<"true">>,
+                            Opts
+                        ),
                     LoadedSlot =
                         hb_cache:ensure_all_loaded(MaybeLoadedSlot, Opts),
                     ?event(compute,

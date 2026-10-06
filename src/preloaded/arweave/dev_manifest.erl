@@ -61,9 +61,13 @@ route(<<"index">>, M1, M2, Opts) ->
                 not_found ->
                     ?event({manifest_path_not_found, <<"index/path">>}),
                     {error, not_found};
+                % No manifest path can be named `index': this clause owns that key.
+                <<"index">> ->
+                    ?event({manifest_path_not_found, <<"index/path">>}),
+                    {error, not_found};
                 _ ->
                     ?event({manifest_path, Path}),
-                    route(Path, M1, M2, Opts)
+                    route(Path, M1, M2, Opts#{ <<"manifest-404">> => error })
             end;
         {error, not_found} ->
             ?event(manifest_not_parsed),
@@ -317,6 +321,27 @@ manifest_default_fallback_test_parallel() ->
     ?assertMatch(
         {ok, #{ <<"body">> := <<"Page 1">> }},
         hb_http:get(Node, << ManifestID/binary, "/invalid_path" >>, Opts)
+    ),
+    % A manifest whose index path is missing is not found: no second fallback.
+    {ok, DanglingID} =
+        hb_cache:write(
+            #{
+                <<"device">> => <<"manifest@1.0">>,
+                <<"body">> =>
+                    hb_json:encode(#{
+                        <<"index">> => #{ <<"path">> => <<"gone">> },
+                        <<"paths">> => #{}
+                    })
+            },
+            Opts
+        ),
+    Self = self(),
+    spawn(fun() ->
+        Self ! {res, hb_http:get(Node, << DanglingID/binary, "/invalid_path" >>, Opts)}
+    end),
+    ?assertMatch(
+        {error, not_found},
+        receive {res, R} -> R after 5000 -> timeout end
     ),
     ok.
 

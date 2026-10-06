@@ -20,7 +20,7 @@
 -module(hb_store_lmdb).
 
 %% Public API exports
--export([start/3, stop/3, scope/0, scope/1, reset/3]).
+-export([start/3, stop/3, flush/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
 -export([group/3, link/3, type/3, resolve/3]).
 
@@ -32,6 +32,8 @@
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
 -define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
                                                 % every 5,000 write operations.
+-define(DEFAULT_FLUSH_EVERY, 1_000).            % Commit buffered writes at
+                                                % least every second.
 -define(MAX_KEY_SIZE, 511).                     % LMDB's key size limit, bytes.
 
 %% @doc Start the LMDB storage system for a given database configuration.
@@ -84,9 +86,38 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
     % Create the LMDB environment with specified size limit
     {ok, Env} = elmdb:env_open(DataDirPath, EnvOpts),
     {ok, DBInstance} = elmdb:db_open(Env, [create]),
-    {ok, #{ <<"env">> => Env, <<"db">> => DBInstance }};
+    Instance = #{ <<"env">> => Env, <<"db">> => DBInstance },
+    start_flusher(Opts, Instance),
+    {ok, Instance};
 start(_Store, _Req, _NodeOpts) ->
     {error, {badarg, <<"StoreOpts must be a map">>}}.
+
+%% @doc Start the store's flusher, one process per store, which commits the
+%% writes that `elmdb' holds in memory every `flush-every' milliseconds, so that
+%% a crash of the node loses at most the writes of the last interval. A
+%% `flush-every' of 0 starts none, and a read-only store has no writes.
+start_flusher(Opts = #{ <<"name">> := DataDir }, Instance) ->
+    FlushEvery =
+        hb_util:int(maps:get(<<"flush-every">>, Opts, ?DEFAULT_FLUSH_EVERY)),
+    case maps:get(<<"read-only">>, Opts, false) orelse FlushEvery == 0 of
+        true -> ok;
+        false ->
+            hb_name:singleton(
+                {?MODULE, DataDir},
+                fun() -> flusher(Instance, FlushEvery) end
+            ),
+            ok
+    end.
+
+%% @doc Commit the store's buffered writes every `FlushEvery' milliseconds,
+%% until the store stops.
+flusher(Instance, FlushEvery) ->
+    receive
+        stop -> ok
+    after FlushEvery ->
+        flush(Instance, #{}, #{}),
+        flusher(Instance, FlushEvery)
+    end.
 
 %% @doc Ensure that the database directory exists.
 ensure_dir(DataDirPath) ->
@@ -155,8 +186,8 @@ write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
 write(Opts, PathParts, Value) when is_list(PathParts) ->
     write(Opts, hb_store_utils:to_path(PathParts), Value);
 write(_Opts, Path, _Value) when byte_size(Path) > ?MAX_KEY_SIZE ->
-    % elmdb accepts a longer key, fails to flush it, and then fails every
-    % later operation on the database.
+    % elmdb accepts a longer key, fails to flush it, and then refuses every
+    % later write to the database.
     {error, 'key-too-long'};
 write(Opts, Path, Value) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
@@ -171,7 +202,12 @@ write(Opts, Path, Value) ->
                     {description, Description}
                 }
             ),
-            retry
+            case Type of
+                % The database failed to commit earlier writes and refuses
+                % more. A restart would accept this one without committing it.
+                transaction_error -> {error, Type};
+                _ -> retry
+            end
     end.
 
 %% @doc Read a value from the database by key, with automatic link resolution.
@@ -423,7 +459,18 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
         {ok, _ResolvedPath, _Value} ->
             {error, not_found};
         not_found ->
-            {error, not_found}
+            % A path with no row of its own lists the keys written below it.
+            % An empty page with `from' may have started past the last key.
+            case list_children(EnvOpts, PathBin, Req) of
+                {ok, []} when is_map_key(<<"from">>, Req) ->
+                    case list_children(EnvOpts, PathBin, #{ <<"limit">> => 1 }) of
+                        {ok, []} -> {error, not_found};
+                        {ok, _} -> {ok, []};
+                        Error -> Error
+                    end;
+                {ok, []} -> {error, not_found};
+                Result -> Result
+            end
     end.
 
 %% @doc The children of a group through the NIF's cursor: every one, or
@@ -460,10 +507,13 @@ read_prefix_rows(Opts, Path) ->
 %% Classify the first (marker) row of a bare-prefix scan. `read_prefix' returns
 %% keys in lexicographic order, so the row whose key equals `Path' — when it
 %% exists — always sorts ahead of the `Path/...' descendants and lands first.
+%% A content-addressed `data/' row is a simple value, whatever its bytes.
 %% A `link:' marker chases its target, a `group' marker becomes a composite of
 %% its immediate children, and any other marker is a simple value. When no
 %% marker row is present the path is an implicit group: its descendants (if any)
 %% still resolve to a composite, otherwise the read is a miss.
+prefix_read_result(_Opts, <<"data/", _/binary>> = Path, [{Path, Value} | _]) ->
+    {ok, Value};
 prefix_read_result(Opts, Path, [{Path, <<"link:", Link/binary>>} | _])
         when byte_size(Link) > 0 ->
     read_result(Opts, Link);
@@ -653,11 +703,41 @@ ensure_env(Opts) -> maps:merge(Opts, find_env(Opts)).
 
 %% Shutdown LMDB environment and cleanup resources
 stop(#{ <<"store-module">> := ?MODULE, <<"name">> := DataDir }, _Req, _Opts) ->
+    stop_flusher(DataDir),
     % Soft-close by name; refs stay valid and reopen lazily on next access.
     catch elmdb:env_close_by_name(hb_util:list(DataDir)),
     ok;
 stop(_InvalidStoreOpts, _Req, _Opts) ->
     ok.
+
+%% @doc Stop the store's flusher and wait for it to exit, as a flush after the
+%% environment closes would open it again.
+stop_flusher(DataDir) ->
+    case hb_name:lookup({?MODULE, DataDir}) of
+        undefined -> ok;
+        PID ->
+            Ref = erlang:monitor(process, PID),
+            PID ! stop,
+            receive {'DOWN', Ref, process, PID, _} -> ok end
+    end.
+
+%% @doc Commit the writes that `elmdb' holds in memory. `elmdb:put/3' returns
+%% before its write is committed: writes are committed in batches of
+%% `batch-size', and a halt of the node before then loses them.
+flush(Opts, _Req, _NodeOpts) ->
+    #{ <<"db">> := DBInstance } = find_env(Opts),
+    case elmdb:flush(DBInstance) of
+        ok -> ok;
+        {error, Type, Description} ->
+            ?event(
+                error,
+                {lmdb_error,
+                    {type, Type},
+                    {description, Description}
+                }
+            ),
+            {error, Type}
+    end.
 
 %% @doc Completely delete the database directory and all its contents.
 %%

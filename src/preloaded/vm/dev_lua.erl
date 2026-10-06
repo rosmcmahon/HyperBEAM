@@ -370,13 +370,26 @@ process_response({ok, [Status, MsgResult], NewState}, Priv, Opts) ->
     case decode(MsgResult, Opts) of
         Msg when is_map(Msg) ->
             ?event(lua, {response, {status, Status}, {msg, Msg}}),
+            % Each call encodes its arguments and results as new tables in
+            % the state. Luerl frees the tables that Lua no longer reaches
+            % only when it collects garbage, so collect after each call.
             {hb_util:atom(Status), Msg#{
                 <<"priv">> => Priv#{
-                    <<"state">> => NewState
+                    <<"state">> => luerl:gc(NewState)
                 }
             }};
         NonMsgRes -> {hb_util:atom(Status), NonMsgRes}
     end;
+process_response({ok, Results, _NewState}, _Priv, _Opts) ->
+    % A Lua function returns a result, or a status and a result. Any other
+    % number of values is an error of the script.
+    {error,
+        <<
+            "Lua function returned ",
+            (hb_util:bin(length(Results)))/binary,
+            " values: it must return a result, or a status and a result."
+        >>
+    };
 process_response({lua_error, RawError, State}, _Priv, Opts) ->
     % An error occurred while calling the Lua function. Parse the stack trace
     % and return it.
@@ -446,16 +459,24 @@ normalize(Base, _Req, RawOpts) ->
                     ExternalizedState = binary_to_term(State),
                     InternalizedState = luerl:internalize(ExternalizedState),
                     ?event(snapshot, loaded_state_from_snapshot),
-                    {ok, hb_private:set(Base, <<"state">>, InternalizedState, Opts)}
+                    {ok, LibState} =
+                        dev_lua_lib:reinstall(Base, InternalizedState, Opts),
+                    {ok, hb_private:set(Base, <<"state">>, LibState, Opts)}
             end;
         _ ->
             ?event(snapshot, state_already_initialized),
             {ok, Base}
     end.
 
-%% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message.
+%% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message, removing
+%% the commitments that do not verify. No commitment is added, so a message
+%% that passes through Lua unchanged keeps exactly the commitments it had.
 decode(EncMsg, Opts) ->
-    hb_message:normalize_commitments(do_decode(EncMsg, Opts), Opts, all).
+    hb_message:normalize_commitments(
+        do_decode(EncMsg, Opts),
+        Opts,
+        #{ <<"verify">> => all, <<"add-unsigned">> => false }
+    ).
 do_decode(EncMsg, _Opts) when is_list(EncMsg) andalso length(EncMsg) == 0 ->
     % The value is an empty table, so we assume it is a message rather than
     % a list.

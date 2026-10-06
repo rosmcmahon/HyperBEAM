@@ -15,6 +15,8 @@
 %%%     start/3:      Initialize the store.
 %%%     stop/3:       Stop any processes (etc.) that manage the store.
 %%%     reset/3:      Restore the store to its original, empty state.
+%%%     flush/3:      Commit the writes that the store holds in memory, such
+%%%                   that they survive a halt of the node.
 %%%     scope/0:      A tag describing the 'scope' of a stores search: `in_memory',
 %%%                   `local', `remote', `arweave', etc. Used in order to allow
 %%%                   node operators to prioritize their stores for search.
@@ -97,7 +99,8 @@
 -export([
     start/1, start/2, start/3,
     stop/1, stop/2, stop/3,
-    reset/1, reset/2, reset/3
+    reset/1, reset/2, reset/3,
+    flush/2
 ]).
 -export([filter/2, scope/2, sort/2]).
 -export([
@@ -141,7 +144,7 @@ behavior_info(callbacks) ->
 %% @doc Store access policies to function names.
 -define(STORE_ACCESS_POLICIES, #{
     <<"read">> => [read, resolve, list, type, match] ++ ?COMMON_POLICIES,
-    <<"write">> => [write, link, group, reset] ++ ?COMMON_POLICIES,
+    <<"write">> => [write, link, group, reset, flush] ++ ?COMMON_POLICIES,
     <<"admin">> => [reset] ++ ?COMMON_POLICIES
 }).
 
@@ -260,6 +263,24 @@ stop(Store, Opts) ->
     stop(Store, #{}, Opts).
 stop(Stores, Req, Opts) ->
     admin_call(Stores, stop, Req, Opts).
+
+%% @doc Commit the writes that the stores hold in memory, such that they
+%% survive a halt of the node. Stores whose module does not implement
+%% `flush/3' are skipped.
+flush(Store, Opts) when not is_list(Store) ->
+    flush([Store], Opts);
+flush(Stores, Opts) ->
+    admin_call(
+        lists:filter(
+            fun(#{ <<"store-module">> := Mod }) ->
+                erlang:function_exported(Mod, flush, 3)
+            end,
+            Stores
+        ),
+        flush,
+        #{},
+        Opts
+    ).
 
 %% @doc Takes a store object and a filter function or match spec, returning a
 %% new store object with only the modules that match the filter. The filter
@@ -701,7 +722,8 @@ execute_normalizer(Setting, Store, Term, Opts) ->
 
 %% @doc Apply a store function, checking if the store returns a retry request or
 %% errors. If it does, attempt to start the store again and retry, up to the
-%% given maximum number of times.
+%% given maximum number of times. A store that does not export the function
+%% is skipped, not restarted.
 apply_store_function(Mod, Store, Function, Args) ->
     MaxAttempts = maps:get(<<"max-retries">>, Store, ?DEFAULT_RETRIES) + 1,
     apply_store_function(Mod, Store, Function, Args, MaxAttempts).
@@ -729,7 +751,14 @@ apply_store_function(Mod, Store, Function, Args, AttemptsRemaining) ->
                 {stacktrace, {trace, Stacktrace}}
             }
         ),
-        retry(Mod, Store, Function, Args, AttemptsRemaining, {error, not_found})
+        case erlang:function_exported(Mod, Function, length(Args) + 1) of
+            true ->
+                retry(
+                    Mod, Store, Function, Args, AttemptsRemaining,
+                    {error, not_found}
+                );
+            false -> {error, not_found}
+        end
     end.
 
 %% @doc Stop and start the store, then retry.
@@ -947,6 +976,38 @@ generate_test_suite(Suite, Stores) ->
     ).
 
 %%% Tests
+
+%% @doc Listing discovers descendants without an explicit parent row.
+implicit_children_test_() ->
+    generate_test_suite([
+        {"implicit children", fun(Store) ->
+            ok = write(Store, #{ <<"parent/child/value">> => <<"data">> }, #{}),
+            ?assertEqual({ok, [<<"child">>]}, list(Store, <<"parent">>, #{})),
+            ?assertEqual([<<"child">>], hb_cache:list(<<"parent">>, Store)),
+            ?assertEqual(
+                {ok, []},
+                list(
+                    Store,
+                    #{ <<"list">> => <<"parent">>, <<"from">> => <<"z">> },
+                    #{}
+                )
+            ),
+            ?assertEqual({error, not_found}, list(Store, <<"missing">>, #{}))
+        end}
+    ]).
+
+%% @doc An unsupported operation leaves a store's existing data intact.
+unsupported_operation_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    ok = write(Store, #{ <<"key">> => <<"value">> }, #{}),
+    Instance = find(Store),
+    ?assertEqual(
+        {error, not_found},
+        match(Store, #{ <<"key">> => <<"value">> }, #{})
+    ),
+    ?assertEqual(Instance, find(Store)),
+    ?assertEqual({ok, <<"value">>}, read(Store, <<"key">>, #{})),
+    stop(Store).
 
 write_req(Key, Value) ->
     #{ hb_path:to_binary(Key) => Value }.

@@ -168,11 +168,13 @@ validate_next_slot(Base, [NextAssignment|Assignments], Lookahead, Last, Opts) ->
                             Opts
                         );
                     false ->
-                        Base#{
-                            <<"scheduler@1.0">> => #{
+                        hb_private:set(
+                            Base,
+                            #{ <<"scheduler@1.0">> => #{
                                 <<"lookahead-worker">> => Lookahead
-                            }
-                        }
+                            }},
+                            Opts
+                        )
                 end,
             ?event(debug_next,
                 {next_returning,
@@ -716,11 +718,11 @@ without_hint(Target) ->
 %% that matches.
 find_remote_scheduler(_ProcID, [], _Variant, _Opts) -> {error, not_found};
 find_remote_scheduler(ProcID, [Scheduler | Rest], Variant, Opts) ->
-    case find_remote_scheduler(ProcID, Rest, Variant, Opts) of
-        {error, not_found} ->
-            find_remote_scheduler(ProcID, Scheduler, Variant, Opts);
-        {redirect, Redirect} ->
-            {redirect, Redirect}
+    case find_remote_scheduler(ProcID, Scheduler, Variant, Opts) of
+        {error, _} when Rest =/= [] ->
+            find_remote_scheduler(ProcID, Rest, Variant, Opts);
+        Other ->
+            Other
     end;
 find_remote_scheduler(ProcID, Scheduler, Variant, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,
@@ -822,18 +824,6 @@ remote_slot(<<"ao.TN.1">>, ProcID, Node, Opts) ->
                         <<"block-hash">> => hb_util:encode(<<0:256>>),
                         <<"cache-control">> => <<"no-store">>
                     }};
-                307 ->
-                    ?event({generating_new_redirect, {redirect, Res}}),
-                    % Maintain the same variant, but generate the redirect using
-                    % the new location.
-                    NewRedirect =
-                        generate_redirect(
-                            ProcID,
-                            Res#{ <<"variant">> => <<"ao.TN.1">> },
-                            Opts
-                        ),
-                    ?event({recursing_on_new_redirect, {redirect, NewRedirect}}),
-                    remote_slot(ProcID, NewRedirect, Opts);
                 _ ->
                     {error, Res}
             end;
@@ -1065,20 +1055,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                             {from_remote_cache, length(RemoteAssignments)}
                         }
                     ),
-                    Merged;
-                307 ->
-                    % NOTE: Shouldn't this be using the `Res' location key to
-                    % regenerate the redirect and recurse on that, instead of
-                    % just using the same redirect?
-                    ?event({recursing_on_same_redirect, {redirect, Redirect}}),
-                    do_get_remote_schedule(
-                        ProcID,
-                        LocalAssignments,
-                        From,
-                        To,
-                        Redirect,
-                        Opts
-                    )
+                    Merged
             end;
         {error, Res} ->
             ?event(push, {remote_schedule_result, {res, Res}}, Opts),
@@ -1713,7 +1690,8 @@ http_get_schedule_redirect() ->
                     #{ <<"store-module">> => hb_store_fs, <<"name">> => <<"cache-mainnet">> },
                     #{ <<"store-module">> => hb_store_gateway, <<"opts">> => #{} }
                 ],
-                <<"scheduler-follow-redirects">> => false
+                <<"scheduler-follow-redirects">> => false,
+                <<"http-redirects">> => 0
         },
     {N, _Wallet} = http_init(Opts),
     start(),
@@ -1780,7 +1758,7 @@ http_get_schedule_test_parallel_() ->
 				{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 3),
 				Assignments = hb_ao:get(<<"assignments">>, Schedule, Opts),
 				?assertEqual(
-					5, % 4 assignments, +1 for the commitments
+					4, % 4 assignments: a bundle holds no unsigned commitments.
 					hb_maps:size(hb_private:reset(Assignments), Opts)
 				)
 			end}.

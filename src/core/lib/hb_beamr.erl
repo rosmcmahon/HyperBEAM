@@ -44,6 +44,14 @@
 %%%         Where:
 %%%             Port is the port to the LID.
 %%%             Mem is a binary output of a previous `serialize/1' call.
+%%%     reset(WASM, WasmBinary, Mode, Mem) -> ok
+%%%         Where:
+%%%             WASM is the pid of the WASM worker.
+%%%             WasmBinary is the WASM binary of the instance.
+%%%             Mode is the type of the WASM module (`wasm' or `aot').
+%%%             Mem is a binary output of a previous `serialize/1' call.
+%%%         Loads a new instance of the image under the worker's pid, with
+%%%         its memory taken from `Mem': the state a restore gives.
 %%% </pre>
 %%% 
 %%% BEAMR was designed for use in the HyperBEAM project, but is suitable for
@@ -53,7 +61,7 @@
 %%% Control API:
 -export([start/1, start/2, call/3, call/4, call/5, call/6, stop/1, wasm_send/2]).
 %%% Utility API:
--export([serialize/1, deserialize/2, stub/3]).
+-export([serialize/1, deserialize/2, reset/4, stub/3]).
 
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -113,6 +121,26 @@ worker(Port, Listener) ->
                     ok
             end,
             ok;
+        {become, From, WasmBinary, Mode} ->
+            % Load a new instance of the image in a new port, then serve it
+            % under this worker's pid. The new instance's globals start at
+            % their initial values; the caller writes the old memory in via
+            % `deserialize/2' afterwards.
+            NewPort = open_port({spawn, "hb_beamr"}, []),
+            NewPort ! {self(), {command, term_to_binary({init, WasmBinary, Mode})}},
+            receive
+                {execution_result, _, _} ->
+                    case erlang:port_info(Port, id) of
+                        undefined -> ok;
+                        _ -> port_close(Port)
+                    end,
+                    From ! {become, ok},
+                    worker(NewPort, Listener);
+                {error, Error} ->
+                    port_close(NewPort),
+                    From ! {become, {error, Error}},
+                    worker(Port, Listener)
+            end;
         {wasm_send, NewListener, Message} ->
             ?event({wasm_send, {listener, NewListener}, {message, Message}}),
             Port ! {self(), Message},
@@ -250,12 +278,42 @@ serialize(WASM) when is_pid(WASM) ->
     ?event({finished_serialize, byte_size(Mem)}),
     {ok, Mem}.
 
-%% @doc Deserialize a WASM state from a binary.
+%% @doc Deserialize a WASM state from a binary. The instance's memory is first
+%% grown to the size of the binary, so a state whose memory grew after the
+%% instance started is written in full.
 deserialize(WASM, Bin) when is_pid(WASM) andalso is_binary(Bin) ->
     ?event(starting_deserialize),
-    Res = hb_beamr_io:write(WASM, 0, Bin),
+    {ok, Size} = hb_beamr_io:size(WASM),
+    Pages = max(0, byte_size(Bin) - Size) div 65536,
+    Res =
+        maybe
+            ok ?= hb_beamr_io:grow(WASM, Pages),
+            hb_beamr_io:write(WASM, 0, Bin)
+        end,
     ?event({finished_deserialize, Res}),
-    ok.
+    Res.
+
+%% @doc Replace the WASM instance of a worker with a new instance of the
+%% image, holding the given memory: the state a restore from a snapshot
+%% gives. The worker keeps its pid, so every holder of the instance
+%% continues with a live, freshly initialized instance, with its globals at
+%% their start values.
+reset(WASM, WasmBinary, Mode, Memory)
+        when is_pid(WASM)
+        andalso is_binary(WasmBinary)
+        andalso is_binary(Memory)
+        andalso (Mode =:= wasm orelse Mode =:= aot) ->
+    ?event({resetting_wasm_instance, WASM}),
+    WASM ! {become, self(), WasmBinary, Mode},
+    receive
+        {become, ok} ->
+            Res = deserialize(WASM, Memory),
+            ?event({finished_reset, Res}),
+            Res;
+        {become, {error, Error}} ->
+            ?event({reset_failed, Error}),
+            {error, Error}
+    end.
 
 %% Tests
 
@@ -327,3 +385,18 @@ benchmark_test() ->
         BenchTime
     ),
     ok.
+
+%% @doc A trapped call leaves the instance usable for the next call: a
+%% process that skips the erroring slot keeps the same instance.
+trap_keeps_instance_usable_test() ->
+    {ok, File} = file:read_file("test/test-64.wasm"),
+    {ok, WASM, _ImportMap, _Exports} = start(File),
+    ?assertMatch(
+        {error, _, #{}},
+        call(WASM, "fac", [1000000000.0], fun stub/3, #{})
+    ),
+    ?assertEqual({ok, [120.0]}, call(WASM, "fac", [5.0])),
+    % A reset instance goes on from a fresh instance of the image.
+    {ok, Mem} = serialize(WASM),
+    ok = reset(WASM, File, wasm, Mem),
+    ?assertEqual({ok, [120.0]}, call(WASM, "fac", [5.0])).

@@ -615,6 +615,9 @@ execute(Ctx, Opts) ->
         {ok, Req} ?= load_request(Ctx, Opts),
         true ?= verify_all_commitments(Base, Opts),
         true ?= verify_all_commitments(Req, Opts),
+        % A transition is one key. A request whose path has several parts is
+        % refused, as `resolve/3' would apply them in turn.
+        [_] = hb_path:from_message(request, Req, Opts),
         hb_ao:resolve(
             Base,
             Req,
@@ -988,9 +991,10 @@ literal_key_receipt_test() ->
     lists:foreach(
         fun(Key) ->
             Base = #{ Key => #{ <<"value">> => 7 } },
-            {ok, Result} = hb_ao:resolve(Base, #{ <<"path">> => Key }, Opts),
+            Path = hb_escape:encode(Key),
+            {ok, Result} = hb_ao:resolve(Base, #{ <<"path">> => Path }, Opts),
             HP = hb_path:hashpath(Result, Opts),
-            ?assertEqual(Key, maps:get(<<"request-id">>, context(HP, Opts))),
+            ?assertEqual(Path, maps:get(<<"request-id">>, context(HP, Opts))),
             ?assert(verify_all(HP, Opts)),
             {ok, Loaded} = load(HP, Opts),
             ?assertEqual(7, hb_maps:get(<<"value">>, Loaded, undefined, Opts))

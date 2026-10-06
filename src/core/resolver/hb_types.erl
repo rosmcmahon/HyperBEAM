@@ -46,8 +46,11 @@
 %%% projection cannot detach an execution from its device or key. Scalar
 %%% types coerce through the `hb_util' converters; lists, tuples, unions,
 %%% ranges and literals apply recursively. A value that cannot be coerced to
-%%% its type throws `{invalid_type, Schema, Value}'; a required key that is
-%%% absent throws `{required_key_missing, Key}'.
+%%% its type throws `{invalid_type, Path, Schema, Value}'; a required key that
+%%% is absent throws `{required_key_missing, Path}'. `Path' names the key from
+%%% the input that holds it: `base/deep/slot' or `request/slot'. A linked
+%%% value that cannot be loaded throws `necessary_message_not_found' with its
+%%% path in the same form.
 %%%
 %%% A result spec may declare `#{ '...' := base }' (or `request'): the
 %%% result is then a patch that `hb_ao' lays over the <em>unvaried</em>
@@ -89,16 +92,25 @@ vary([Schema | Rest], AddKey, Base, Req, Opts) ->
     try
         {BaseSchema, ReqSchema, ReturnSchema} =
             execution_schemas(Schema, AddKey),
-        {VariedBase, _} = apply_schema(implicit_base(BaseSchema), Base, Opts),
+        {VariedBase, _} =
+            at(
+                <<"base">>,
+                fun() -> apply_schema(implicit_base(BaseSchema), Base, Opts) end
+            ),
         {VariedReq, _} =
-            apply_schema(
-                implicit_request(ReqSchema),
-                request_with_key(Req, AddKey),
-                Opts
+            at(
+                <<"request">>,
+                fun() ->
+                    apply_schema(
+                        implicit_request(ReqSchema),
+                        request_with_key(Req, AddKey),
+                        Opts
+                    )
+                end
             ),
         {ok, VariedBase, VariedReq, overlay(ReturnSchema)}
     catch
-        throw:{invalid_type, _, _} when Rest =/= [] ->
+        throw:{invalid_type, _, _, _} when Rest =/= [] ->
             vary(Rest, AddKey, Base, Req, Opts);
         throw:{required_key_missing, _} when Rest =/= [] ->
             vary(Rest, AddKey, Base, Req, Opts)
@@ -468,7 +480,7 @@ apply_schema(
 ) ->
     case apply_union(Members, Value, Opts) of
         {ok, Result} -> Result;
-        error -> throw({invalid_type, Schema, Value})
+        error -> throw({invalid_type, <<>>, Schema, Value})
     end;
 apply_schema(#{ <<"kind">> := Kind }, Value, _Opts)
         when Kind =:= <<"remote">>;
@@ -483,8 +495,8 @@ apply_schema(#{ <<"kind">> := <<"wildcard">> }, Value, _Opts) ->
 apply_schema(Schema = #{ <<"kind">> := <<"message">> }, Value, Opts)
         when not is_map(Value) ->
     case coerce_type(Schema, Value, Opts) of
-        error -> throw({invalid_type, Schema, Value});
-        Value -> throw({invalid_type, Schema, Value});
+        error -> throw({invalid_type, <<>>, Schema, Value});
+        Value -> throw({invalid_type, <<>>, Schema, Value});
         Coerced ->
             {Varied, _Changed} = apply_schema(Schema, Coerced, Opts),
             {Varied, true}
@@ -529,7 +541,7 @@ apply_schema(
                 List
             );
         _ ->
-            throw({invalid_type, Schema, Value})
+            throw({invalid_type, <<>>, Schema, Value})
     end;
 apply_schema(
     Schema = #{ <<"kind">> := <<"tuple">>, <<"items">> := Items },
@@ -556,7 +568,7 @@ apply_schema(
                 ),
             {list_to_tuple(Varied), Changed};
         false ->
-            throw({invalid_type, Schema, Value})
+            throw({invalid_type, <<>>, Schema, Value})
     end;
 apply_schema(Type, Value, Opts) ->
     % A scalar, literal or range: keep a value of the type, else coerce it.
@@ -567,7 +579,7 @@ apply_schema(Type, Value, Opts) ->
             Coerced = coerce_type(Type, Value, Opts),
             case Coerced =/= error andalso check_type(Type, Coerced) of
                 true -> {Coerced, true};
-                false -> throw({invalid_type, Type, Value})
+                false -> throw({invalid_type, <<>>, Type, Value})
             end
     end.
 
@@ -591,11 +603,29 @@ apply_key(Key, Field, Message, {Acc, Changed} = State, Opts) ->
     #{ <<"presence">> := Presence, <<"type">> := Type } = Field,
     case maps:find(Key, Message) of
         {ok, Value} ->
-            {Coerced, ChildChanged} = apply_schema(Type, Value, Opts),
+            {Coerced, ChildChanged} =
+                at(Key, fun() -> apply_schema(Type, Value, Opts) end),
             {Acc#{ Key => Coerced }, Changed orelse ChildChanged};
         error when Presence =:= required -> throw({required_key_missing, Key});
         error -> State
     end.
+
+%% @doc Apply `Fun', adding `Key' to the front of the path of a value that
+%% does not fit its schema or cannot be loaded.
+at(Key, Fun) ->
+    try Fun()
+    catch
+        throw:{required_key_missing, Path} ->
+            throw({required_key_missing, key_path(Key, Path)});
+        throw:{invalid_type, Path, Type, Value} ->
+            throw({invalid_type, key_path(Key, Path), Type, Value});
+        throw:{necessary_message_not_found, Path, Missing} ->
+            throw({necessary_message_not_found, key_path(Key, Path), Missing})
+    end.
+
+%% @doc Join a key and the path below it: `deep' and `slot' give `deep/slot'.
+key_path(Key, <<>>) -> hb_util:bin(Key);
+key_path(Key, Path) -> <<(hb_util:bin(Key))/binary, "/", Path/binary>>.
 
 %% @doc Vary a value by the first of the members it can be coerced to.
 apply_union([], _Value, _Opts) ->
@@ -603,7 +633,7 @@ apply_union([], _Value, _Opts) ->
 apply_union([Member | Rest], Value, Opts) ->
     try {ok, apply_schema(Member, Value, Opts)}
     catch
-        throw:{invalid_type, _, _} ->
+        throw:{invalid_type, _, _, _} ->
             apply_union(Rest, Value, Opts);
         throw:{required_key_missing, _} ->
             apply_union(Rest, Value, Opts)

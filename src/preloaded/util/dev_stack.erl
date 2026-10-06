@@ -346,6 +346,11 @@ resolve_fold(Base, Request, DevNum, Opts) ->
 				{error, Info} ->
 					?event({result, error, {dev, DevNum}, Info}),
 					maybe_error(Base, Request, DevNum, Info, Opts);
+				% A failure of the node running the stack is not a result of
+				% the computation, so it is passed on as it arrived.
+				{failure, Failure} ->
+					?event({result, failure, {dev, DevNum}, Failure}),
+					{failure, Failure};
 				Unexpected ->
 					?event({result, unexpected, {dev, DevNum}, Unexpected}),
 					maybe_error(
@@ -396,9 +401,10 @@ increment_pass(Message, Opts) ->
     ).
 
 maybe_error(Base, Request, DevNum, Info, Opts) ->
-    case hb_opts:get(error_strategy, throw, Opts) of
+    case hb_opts:get(error_strategy, stop, Opts) of
         stop ->
-			{error, {stack_call_failed, Base, Request, DevNum, Info}};
+			% The caller gets the device's error alone.
+			{error, Info};
         throw ->
 			erlang:raise(
                 error,

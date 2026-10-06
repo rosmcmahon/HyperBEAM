@@ -97,6 +97,13 @@ struct wasm_func_t {
     WASMFunctionInstanceCommon *func_comm_rt; // Function instance data
 };
 
+// Structure representing a WASM instance
+struct wasm_instance_t {
+    wasm_store_t *store;             // WASM store
+    wasm_extern_vec_t *exports;      // Exports of the instance
+    struct wasm_host_info host_info; // Host-specific information
+    WASMModuleInstanceCommon *inst_comm_rt; // Module instance data
+};
 
 
 #endif // HB_CORE_H

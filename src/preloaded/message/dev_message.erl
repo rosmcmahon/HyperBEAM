@@ -11,6 +11,7 @@
 %%% Commitment-specific keys:
 -export([id/1, id/2, id/3]).
 -export([commit/3, committed/3, committers/1, committers/2, committers/3, verify/3]).
+-export([with_commitments/3]).
 %%% Non-protocol enforced keys:
 -export([index/3]).
 -include_lib("eunit/include/eunit.hrl").
@@ -131,25 +132,15 @@ id(RawBase, Req, NodeOpts) ->
             ?event_debug(debug_id, regenerating_id),
             calculate_id(hb_maps:without([<<"commitments">>], Base), Req, IDOpts);
         IDs ->
-            % Accumulate the relevant IDs into a single value. This is performed 
-            % by module arithmetic of each of the IDs. The effect of this is that:
-            % 1. New IDs can be added to the combined ID without requiring any
-            %    recalculation of other IDs.
-            % 2. New IDs can be added in any order, and will compare to the same
-            %    value as if they were added in other orders.
-            % 3. Subsequently, combined IDs cannot be used to express ordering of
-            %    the underlying commitments.
-            % This works for single IDs as well as lists of IDs, because the 
-            % accumulation function starts with a buffer of zero encoded as a 
-            % 256-bit binary. Subsequently, a single ID on its own 'accumulates' 
-            % to itself.
+            % A message with one commitment has that commitment's ID. Several
+            % are combined whatever their order: the SHA-256 of their IDs,
+            % sorted and joined by newlines.
             ?event_debug(debug_id, returning_existing_ids),
             {ok,
-                hb_util:human_id(
-                    hb_crypto:accumulate(
-                        lists:map(fun hb_util:native_id/1, IDs)
-                    )
-                )
+                case IDs of
+                    [ID] -> ID;
+                    _ -> hb_util:human_id(hb_crypto:accumulate(IDs))
+                end
             }
     end.
 
@@ -319,8 +310,7 @@ commit(Self, Req, Opts) ->
             Req#{ <<"type">> => maps:get(<<"type">>, Req, <<"signed">>) },
             CommitOpts
         ),
-    Res = Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) },
-    {ok, hb_private:merge(Res, Committed, Opts)}.
+    {ok, Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) }}.
 
 %% @doc The keys a commitment lists as committed, in their normalized form. A
 %% commitment without a `committed' list commits no keys.
@@ -333,10 +323,20 @@ committed_keys(Commitment, Opts) ->
 %% @doc Verify a message. By default, all commitments are verified. The
 %% `committers' key in the request can be used to specify that only the 
 %% commitments from specific committers should be verified. Similarly, specific
-%% commitments can be specified using the `ids' key.
+%% commitments can be specified using the `ids' key. Each takes `all', `none',
+%% one address or ID, or a list of them. A message that lacks a committer or
+%% commitment the request names does not verify, nor does `committers=all'
+%% on a message without committers. The request is kept whole: `target' may
+%% name any of its keys as the message to verify, and its private element
+%% goes to the commitment device.
 -spec verify(
     #{ _ => _ },
-    #{ committers => _, ids => _, commitments => _, _ => _ },
+    #{
+        committers => binary() | [binary()],
+        ids => binary() | [binary()],
+        target => binary(),
+        _ => _
+    },
     #{ _ => _ }
 ) -> {ok, boolean()}.
 verify(Self, Req, Opts) ->
@@ -363,7 +363,44 @@ verify(Self, Req, Opts) ->
                 Req#{ <<"ids">> => maps:keys(Unsigned) };
             _ -> Req
         end,
-    IDsToVerify = commitment_ids_from_request(CommitmentBase, Selection, Opts),
+    case has_named(CommitmentBase, Req, Opts) of
+        false -> {ok, false};
+        true ->
+            verify_ids(
+                commitment_ids_from_request(CommitmentBase, Selection, Opts),
+                Commitments,
+                CommitmentBase,
+                Req,
+                Opts
+            )
+    end.
+
+%% @doc Whether a message has what a verification request names: each
+%% committer and commitment it lists, and a committer if it asks for `all'.
+has_named(Base, Req, Opts) ->
+    {ok, Committers} = committers(Base, #{}, Opts),
+    Commitments = maps:get(<<"commitments">>, Base, #{}),
+    case maps:get(<<"committers">>, Req, <<"none">>) of
+        <<"all">> -> Committers =/= [];
+        <<"none">> -> true;
+        NamedCommitters ->
+            lists:all(
+                fun(Committer) -> lists:member(Committer, Committers) end,
+                lists:flatten([NamedCommitters])
+            )
+    end andalso
+        case maps:get(<<"ids">>, Req, <<"none">>) of
+            <<"all">> -> true;
+            <<"none">> -> true;
+            NamedIDs ->
+                lists:all(
+                    fun(ID) -> maps:is_key(ID, Commitments) end,
+                    lists:flatten([NamedIDs])
+                )
+        end.
+
+%% @doc Verify the given commitments of a message.
+verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
     % The commitment device receives the keys of each commitment and the
     % private element of the request. No other key of the request reaches it.
     ReqPriv = hb_private:from_message(Req),
@@ -434,7 +471,17 @@ verify(Self, Req, Opts) ->
                         {commitment_id, CommitmentID},
                         {res, Res}
                     }),
-                Res
+                % A signed commitment that covers no key of the message does
+                % not verify: its signature base holds no component of it.
+                % The `commitments' and `priv' keys never reach a signature
+                % base, so they cannot be the keys a commitment covers.
+                Unsigned = not maps:is_key(<<"committer">>, Commitment),
+                CoversKeys =
+                    hb_util:list_without(
+                        [<<"commitments">>, <<"priv">>],
+                        committed_keys(Commitment, Opts)
+                    ),
+                Res andalso (Unsigned orelse CoversKeys =/= [])
             end,
             IDsToVerify
         ),
@@ -442,7 +489,11 @@ verify(Self, Req, Opts) ->
     {ok, Res}.
 
 %% @doc Execute a function for a single commitment in the context of its
-%% parent message.
+%% parent message. A commitment device whose `verify' is this module's own
+%% `verify' holds no commitment scheme of its own: the device of a commitment
+%% is read from the commitment itself, so dispatching would call this
+%% function with the same commitment again, without end. Such a commitment
+%% does not verify.
 %% Note: Assumes that the `commitments' key has already been removed from the
 %% message if applicable.
 verify_commitment(Base, Commitment, Opts) ->
@@ -454,7 +505,72 @@ verify_commitment(Base, Commitment, Opts) ->
             ?DEFAULT_ATT_DEVICE,
             Opts
         ),
-    hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts).
+    case hb_device:message_to_fun(
+        #{ <<"device">> => AttDev },
+        <<"verify">>,
+        Opts
+    ) of
+        {_, ?MODULE, _} -> {ok, false};
+        _ -> hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts)
+    end.
+
+%% @doc Attach to the message the commitments whose IDs are listed in the
+%% `with-commitments' key of the request. Each commitment is read by its own
+%% ID, and the message read must have the base's unsigned ID: a commitment
+%% that is not found, or that is over another message, is refused. On the
+%% empty message, the commitments are attached to the message that the first
+%% of them is over.
+with_commitments(Base, Req, Opts) ->
+    Loaded = ensure_commitments_loaded(Base, Opts),
+    read_commitments(
+        hb_util:binary_to_strings(
+            hb_maps:get(<<"with-commitments">>, Req, <<>>, Opts)
+        ),
+        Loaded,
+        hb_message:id(Loaded, none, Opts),
+        Opts
+    ).
+
+%% @doc Read each commitment by its ID and attach it to the message. The
+%% message read by the ID must have the given unsigned ID. The empty message is
+%% replaced by the first message read.
+read_commitments([], Msg, _UnsignedID, _Opts) -> {ok, Msg};
+read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Read = #{ <<"commitments">> := #{ ID := Commitment } }} ->
+            case hb_message:id(Read, none, Opts) of
+                UnsignedID ->
+                    read_commitments(
+                        IDs,
+                        Msg#{
+                            <<"commitments">> =>
+                                (maps:get(<<"commitments">>, Msg, #{}))#{
+                                    ID => Commitment
+                                }
+                        },
+                        UnsignedID,
+                        Opts
+                    );
+                ReadID when ?IS_EMPTY_MESSAGE(Msg) ->
+                    read_commitments(IDs, Read, ReadID, Opts);
+                _ ->
+                    {error,
+                        #{
+                            <<"status">> => 400,
+                            <<"body">> =>
+                                <<"Commitment ", ID/binary,
+                                    " is not over this message.">>
+                        }
+                    }
+            end;
+        _ ->
+            {error,
+                #{
+                    <<"status">> => 404,
+                    <<"body">> => <<"Commitment ", ID/binary, " not found.">>
+                }
+            }
+    end.
 
 %% @doc Return the list of committed keys from a message.
 -spec committed(
@@ -1224,12 +1340,44 @@ test_verify(KeyType) ->
             #{ <<"hashpath">> => ignore }
         )
     ),
+    % A `target' naming a key the request lacks is refused, not answered.
+    ?assertError(
+        {badmatch, {error, not_found}},
+        hb_ao:resolve(
+            Signed,
+            #{ <<"path">> => <<"verify">>, <<"target">> => <<"missing">> },
+            #{ <<"hashpath">> => ignore }
+        )
+    ),
     ?assertEqual({ok, false},
         hb_ao:resolve(
             BadSigned,
             #{ <<"path">> => <<"verify">> },
             #{ <<"hashpath">> => ignore }
         )
+    ),
+    % A commitment relabelled `json@1.0' is verified by the `httpsig@1.0'
+    % codec its device names -- `true' for an `httpsig@1.0' signature. A
+    % commitment relabelled `message@1.0' or `meta@1.0' names a device
+    % with no commitment scheme of its own and does not verify.
+    [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Signed)),
+    Relabelled =
+        fun(Device) ->
+            Signed#{
+                <<"commitments">> =>
+                    #{ ID => Commitment#{ <<"commitment-device">> => Device } }
+            }
+        end,
+    case maps:get(<<"commitment-device">>, Commitment) of
+        <<"httpsig@1.0">> ->
+            ?assert(hb_message:verify(Relabelled(<<"json@1.0">>), all));
+        _ -> ok
+    end,
+    lists:foreach(
+        fun(Device) ->
+            ?assertNot(hb_message:verify(Relabelled(Device), all))
+        end,
+        [<<"message@1.0">>, <<"meta@1.0">>]
     ).
 
 %% @doc A commitment of no keys verifies after a round trip through
@@ -1248,6 +1396,57 @@ verify_without_committed_test() ->
         hb_message:convert(Flat, <<"structured@1.0">>, <<"flat@1.0">>, Opts),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assertEqual([], hb_message:committed(Decoded, all, Opts)).
+
+%% @doc A signed commitment that covers no key of the message does not verify:
+%% grafting it onto a message with arbitrary content leaves that content
+%% unsigned, however it changes.
+vacuous_signed_commitment_test_() ->
+    [
+        {binary_to_list(Device), fun() ->
+            Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+            Committed = hb_message:commit(#{}, Opts, Device),
+            [{ID, Commitment}] =
+                maps:to_list(maps:get(<<"commitments">>, Committed)),
+            ?assertEqual([], hb_maps:get(<<"committed">>, Commitment)),
+            Grafted =
+                #{
+                    <<"data">> => <<"unsigned content">>,
+                    <<"commitments">> => maps:get(<<"commitments">>, Committed)
+                },
+            ?assertEqual(
+                hb_util:human_id(ID),
+                hb_message:id(Grafted, signed, Opts)
+            ),
+            ?assertNot(hb_message:verify(Grafted, all, Opts)),
+            ?assertNot(
+                hb_message:verify(
+                    Grafted#{ <<"data">> => <<"changed later">> },
+                    all,
+                    Opts
+                )
+            )
+        end}
+    ||
+        Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]
+    ].
+
+%% @doc Committing to a message keeps its private element as it is: a link in
+%% it is not loaded, even when the node does not hold its message.
+commit_keeps_private_links_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Missing =
+        {link,
+            hb_util:human_id(crypto:strong_rand_bytes(32)),
+            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+        },
+    Priv = #{ <<"request">> => #{ <<"x">> => Missing } },
+    Committed =
+        hb_message:commit(
+            #{ <<"a">> => <<"b">>, <<"priv">> => Priv },
+            Opts,
+            #{ <<"type">> => <<"unsigned">> }
+        ),
+    ?assertEqual(Priv, maps:get(<<"priv">>, Committed)).
 
 set_nested_link_test() ->
     Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)] },

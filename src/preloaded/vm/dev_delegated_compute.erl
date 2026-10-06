@@ -160,6 +160,8 @@ do_relay(Method, Path, Body, Headers, Opts) ->
             <<"application/json">>,
             Opts
         ),
+    % The compute peer is set by the node operator, so permit it as an internal
+    % host for this call.
     hb_ao:resolve(
         #{
             <<"device">> => <<"relay@1.0">>,
@@ -177,7 +179,7 @@ do_relay(Method, Path, Body, Headers, Opts) ->
                     <<"content-type">> => ContentType
                 }
         },
-        Opts
+        Opts#{ <<"relay-block-internal">> => false }
     ).
 
 %% @doc Extract the JSON response from the delegated compute response.
@@ -258,9 +260,12 @@ snapshot(Msg, Req, Opts) ->
                 <<"content-type">> => <<"application/json">>,
                 <<"body">> => <<"{}">>
             },
+            % The compute peer is set by the node operator, so permit it as an
+            % internal host for this call.
             Opts#{
                 <<"hashpath">> => ignore,
-                <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
+                <<"cache-control">> => [<<"no-store">>, <<"no-cache">>],
+                <<"relay-block-internal">> => false
             }
         ),
     ?event({snapshotting_result, Res}),

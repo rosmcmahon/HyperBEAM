@@ -22,13 +22,7 @@ commit(Msg, Req, Opts) ->
 %% @doc Route verification through `httpsig@1.0'.
 -spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 verify(Msg, Req, Opts) ->
-    {ok,
-        hb_message:verify(
-            Msg,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
-            Opts
-        )
-    }.
+    hb_ao:raw(<<"httpsig@1.0">>, <<"verify">>, Msg, Req, Opts).
 
 %% @doc Convert a flat map to a TABM.
 -spec from(binary() | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
@@ -68,7 +62,9 @@ from(Map, Req, Opts) when is_map(Map) ->
 to(Bin, _, _Opts) when is_binary(Bin) -> {ok, Bin};
 to(List, Req, Opts) when is_list(List) ->
     to(
-        hb_util:list_to_numbered_message(List),
+        (hb_util:list_to_numbered_message(List))#{
+            <<"ao-types">> => <<".=\"list\"">>
+        },
         Req,
         Opts
     );
@@ -152,7 +148,16 @@ nested_conversion_test() ->
     Unflattened = hb_util:ok(dev_flat:from(Flat, #{}, #{})),
     Flattened = hb_util:ok(dev_flat:to(Nested, #{}, #{})),
     ?assert(hb_message:match(Nested, Unflattened)),
-    ?assert(hb_message:match(Flat, Flattened)).
+    ?assert(hb_message:match(Flat, Flattened)),
+    % Native TABM lists round-trip through flat encoding.
+    ?assertEqual([<<"description">>],
+        hb_message:convert(
+            hb_message:convert([<<"description">>], <<"flat@1.0">>, tabm, #{}),
+            <<"structured@1.0">>,
+            <<"flat@1.0">>,
+            #{}
+        )
+    ).
 
 multiple_paths_test() ->
     Flat = #{

@@ -57,6 +57,9 @@ read(_M1, M2, Opts) ->
                             <<"content-type">> => <<"application/aos-2">>
                         }
 					};
+                _ when is_list(Res) ->
+                    % The reply's `ao-result' is the list, as it was written.
+                    {ok, #{ <<"ao-result">> => <<"body">>, <<"body">> => Res }};
                 _ ->
                     {ok, Res}
             end;
@@ -199,7 +202,9 @@ setup_test_env() ->
             #{
                 <<"store-module">> => hb_store_remote_node,
                 <<"node">> => Node,
-                <<"priv-wallet">> => Wallet
+                <<"priv-wallet">> => Wallet,
+                % The tests read back the `data/' path of a binary they write.
+                <<"trusted">> => true
             }
 	    ]
     },

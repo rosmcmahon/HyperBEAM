@@ -131,7 +131,8 @@ content_type(Filename) ->
     end.
 
 %% @doc Apply a simple binary replacement template to a static file. Values are
-%% inserted as HTML text.
+%% inserted as HTML text, and a list of `{Term, Description}' pairs as the
+%% terms and descriptions of a definition list.
 apply_static_template(Body, Template) when is_map(Template) ->
     apply_static_template(Body, maps:to_list(Template));
 apply_static_template(Body, []) ->
@@ -141,11 +142,22 @@ apply_static_template(Body, [{Key, Value} | Rest]) ->
         binary:replace(
             Body,
             <<"{{", Key/binary, "}}">>,
-            escape_html(hb_util:bin(Value)),
+            template_html(Value),
             [global]
         ),
         Rest
     ).
+
+%% @doc The HTML of a template value.
+template_html([{_, _} | _] = Pairs) ->
+    <<
+        <<"<dt>", (template_html(Term))/binary, "</dt>",
+            "<dd>", (template_html(Description))/binary, "</dd>">>
+    ||
+        {Term, Description} <- Pairs
+    >>;
+template_html(Value) ->
+    escape_html(hb_util:bin(Value)).
 
 %% @doc Escape the characters that HTML reads as markup.
 escape_html(Bin) ->
@@ -394,7 +406,14 @@ listener_protocol_options(ServerID, NodeMsg) ->
         env => #{ dispatch => Dispatcher, node_msg => NodeMsg },
         stream_handlers => [cowboy_stream_h],
         max_connections => infinity,
-        idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg)
+        idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg),
+        % `httpsig@1.0' sends a header for each key of a message whose value
+        % is at most 4096 bytes. Percent-encoding can triple the length of
+        % its name, escaping can double the length of its value, and the
+        % `signature-input' header lists every key of each commitment.
+        max_headers => 1024,
+        max_header_name_length => 4096,
+        max_header_value_length => 16384
     }.
 
 stop_tls(ServerID) ->
@@ -633,8 +652,10 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
 
 %% @doc The status of an error response. A request whose commitments do not
 %% verify or that `hb_singleton' cannot parse is refused as the client's error.
+%% A request that needs a message the node cannot load is not found.
 error_status(throw, {invalid_commitments, _}) -> 400;
 error_status(throw, {invalid_singleton, _, _}) -> 400;
+error_status(throw, {necessary_message_not_found, _, _}) -> 404;
 error_status(_Type, _Details) -> 500.
 
 %% @doc The error type and offender of a request that `hb_singleton' cannot
@@ -856,4 +877,20 @@ restart_server_test() ->
     ?assertEqual(
         {ok, <<"server-2">>},
         hb_http:get(N2, <<"/~meta@1.0/info/test-key">>, #{ <<"protocol">> => http2 })
+    ).
+
+%% @doc A request whose path reads a link to a message the node does not hold
+%% gets 404.
+read_missing_link_test() ->
+    Node = start_node(#{ <<"store">> => hb_test_utils:test_store() }),
+    ?assertMatch(
+        {error, #{ <<"status">> := 404 }},
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/x">>,
+                <<"x+link">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+            },
+            #{}
+        )
     ).
