@@ -1088,6 +1088,15 @@ test_multi_process_push() ->
             Opts
         ),
     ?event(push, {push_result, PushResult}),
+    % The pushed message holds the AOS `Tags' as keys, not as a `tags' list.
+    ?assertEqual(
+        not_found,
+        hb_ao:get(
+            <<"tags">>,
+            hb_util:deep_get(<<"1/id">>, PushResult, Opts),
+            Opts
+        )
+    ),
     ?assertEqual(
         {ok, <<"GOT PONG">>},
         hb_ao:resolve(Sender, <<"now/results/data">>, Opts)

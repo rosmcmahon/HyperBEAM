@@ -143,7 +143,7 @@ move(Mode, Base, Req, Opts) ->
                                     PatchAcc#{
                                         Key =>
                                             hb_maps:without(
-                                                [<<"commitments">>, <<"Tags">>],
+                                                [<<"commitments">>],
                                                 Msg,
                                                 Opts
                                             )

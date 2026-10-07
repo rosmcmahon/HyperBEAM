@@ -478,7 +478,7 @@ preprocess_results(Msg, Opts) ->
     Tags = tags_to_map(Msg, Opts),
     FilteredMsg =
         hb_maps:without(
-            [<<"from-process">>, <<"from-image">>, <<"anchor">>, <<"tags">>],
+            [<<"from-process">>, <<"from-image">>, <<"anchor">>, <<"Tags">>],
             Msg,
             Opts
         ),
