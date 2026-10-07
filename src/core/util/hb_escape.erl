@@ -10,7 +10,7 @@
 %%%
 %%% Path components have separate escaping for literal `/` and `%` characters.
 -module(hb_escape).
--export([encode/1, decode/1, encode_keys/2, decode_keys/2]).
+-export([encode/1, decode/1]).
 -export([encode_path_component/1, decode_path_component/1]).
 -export([encode_header/1, decode_header/1]).
 -export([encode_quotes/1, decode_quotes/1]).
@@ -88,26 +88,6 @@ encode_ampersand(String) when is_binary(String) ->
 encode_ampersand([]) -> [];
 encode_ampersand([$& | Rest]) -> [$&, $a, $m, $p, $; | encode_ampersand(Rest)];
 encode_ampersand([C | Rest]) -> [C | encode_ampersand(Rest)].
-
-%% @doc Return a message with all of its keys decoded.
-decode_keys(Msg, Opts) when is_map(Msg) ->
-    hb_maps:from_list(
-        lists:map(
-            fun({Key, Value}) -> {decode(Key), Value} end,
-            hb_maps:to_list(Msg, Opts)
-        )
-    );
-decode_keys(Other, _Opts) -> Other.
-
-%% @doc URI encode keys in the base layer of a message. Does not recurse.
-encode_keys(Msg, Opts) when is_map(Msg) ->
-    hb_maps:from_list(
-        lists:map(
-            fun({Key, Value}) -> {encode(Key), Value} end,
-            hb_maps:to_list(Msg, Opts)
-        )
-    );
-encode_keys(Other, _Opts) -> Other.
 
 %% @doc Escape a binary as a URI-encoded string.
 uri_safe(<<>>) -> true;
