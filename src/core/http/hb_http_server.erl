@@ -557,8 +557,7 @@ cors_reply(Req, _ServerID) ->
 
 %% @doc Handle all non-CORS preflight requests as AO-Core requests. Execution 
 %% starts by parsing the HTTP request into HyerBEAM's message format, then
-%% passing the message directly to `meta@1.0' which handles calling AO-Core in
-%% the appropriate way.
+%% resolving it with `resolve_request/3'.
 handle_request(RawReq, Body, ServerID) ->
     % Insert the start time into the request so that it can be used by the
     % `hb_http' module to calculate the duration of the request.
@@ -566,8 +565,6 @@ handle_request(RawReq, Body, ServerID) ->
     Req = RawReq#{ start_time => StartTime },
     NodeMsg = get_opts(#{ <<"http-server">> => ServerID }),
     put(server_id, ServerID),
-    % The request is of normal AO-Core form, so we parse it and invoke
-    % the meta@1.0 device to handle it.
     ?event(http,
         {
             http_inbound,
@@ -586,18 +583,13 @@ handle_request(RawReq, Body, ServerID) ->
                         {accept_codec, CommitmentCodec}},
                     #{}
                 ),
-                % Invoke the meta@1.0 device to handle the request.
-                Meta =
-                    hb_device:message_to_device(
-                        #{ <<"device">> => <<"meta@1.0">> },
-                        NodeMsg
-                    ),
                 Res =
-                    Meta:handle(
+                    resolve_request(
+                        Req,
+                        ReqSingleton,
                         NodeMsg#{
                             <<"commitment-device">> => CommitmentCodec
-                        },
-                        ReqSingleton
+                        }
                     ),
                 hb_http:reply(Req, ReqSingleton, Res, NodeMsg)
             catch
@@ -620,6 +612,94 @@ handle_request(RawReq, Body, ServerID) ->
             ParseStacktrace,
             NodeMsg
         )
+    end.
+
+%% @doc Resolve a singleton request: parse it, apply the node's `request' hook
+%% to its messages, resolve them, and apply the `response' hook to the result.
+%% A node that is not initialized resolves only `/~meta@1.0/info', and an
+%% empty sequence of messages redirects to the node's default request.
+resolve_request(Req, Singleton, NodeMsg) ->
+    maybe
+        true ?=
+            hb_opts:get(initialized, false, NodeMsg) =/= false orelse
+                cowboy_req:path(Req) == <<"/~meta@1.0/info">> orelse
+                {error, <<"Node must be initialized before use.">>},
+        Msgs =
+            hb_singleton:from(
+                hb_private:set(Singleton, <<"http-request">>, Singleton, NodeMsg),
+                NodeMsg
+            ),
+        {ok, PreProcessedMsgs} ?=
+            resolve_hook(<<"request">>, Singleton, Msgs, NodeMsg),
+        true ?=
+            PreProcessedMsgs =/= [] orelse
+                {ok,
+                    #{
+                        <<"status">> => 307,
+                        <<"body">> => <<"Redirecting to default request.">>,
+                        <<"location">> => hb_opts:get(
+                            default_request,
+                            <<"/~hyperbuddy@1.0/index">>,
+                            NodeMsg
+                        )
+                    }
+                },
+        % Resolve the request message without the node's key material, and
+        % with `http_extra_opts' overriding the node defaults.
+        HTTPOpts =
+            maps:without(
+                ?NODE_KEY_OPTS,
+                hb_maps:merge(
+                    get_opts(NodeMsg),
+                    hb_opts:get(http_extra_opts, #{}, NodeMsg),
+                    NodeMsg
+                )
+            ),
+        {ErlStatus, Res} =
+            hb_ao:resolve_many(
+                PreProcessedMsgs,
+                HTTPOpts#{ <<"force-message">> => true }
+            ),
+        % The result keeps its Erlang status unless the `response' hook returns
+        % an error.
+        {ok, Body} ?=
+            resolve_hook(<<"response">>, Singleton, Res, get_opts(NodeMsg)),
+        {ErlStatus, Body}
+    end.
+
+%% @doc Execute a hook from the node message upon the user's request. The
+%% invocation of the hook provides a request of the following form:
+%% <pre>
+%%      /path => request | response
+%%      /request => the original request singleton
+%%      /body => parsed sequence of messages to process | the execution result
+%% </pre>
+resolve_hook(HookName, InitiatingRequest, Body, NodeMsg) ->
+    HookReq =
+        #{
+            <<"request">> => InitiatingRequest,
+            <<"body">> => Body
+        },
+    ?event(hook, {resolve_hook, HookName, HookReq}),
+    case hb_hook:on(HookName, HookReq, NodeMsg) of
+        {ok, #{ <<"body">> := ResponseBody }} ->
+            ?event(hook,
+                {resolve_hook_success,
+                    {name, HookName},
+                    {response_body, ResponseBody}
+                }
+            ),
+            {ok, ResponseBody};
+        {error, _} = Error ->
+            ?event(hook,
+                {resolve_hook_error,
+                    {name, HookName},
+                    {error, Error}
+                }
+            ),
+            Error;
+        Other ->
+            {error, Other}
     end.
 
 %% @doc Return an error response to the client: a message the node cannot
@@ -647,7 +727,12 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     FormattedErrorMsg =
         ErrorMsg#{
             <<"stacktrace">> => hb_util:bin(hb_format:remove_trailing_noise(StacktraceStr)),
-            <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_trailing_noise(DetailsStr)), ErrorDetailsMaxSize)
+            <<"details">> =>
+                hb_format:truncate(
+                    hb_util:bin(
+                        hb_format:remove_trailing_noise(DetailsStr)),
+                        ErrorDetailsMaxSize
+                )
         },
     hb_http:reply(
         Req,

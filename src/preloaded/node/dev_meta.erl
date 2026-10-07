@@ -1,14 +1,9 @@
-%%% @doc The hyperbeam meta device, which is the default entry point
-%%% for all messages processed by the machine. This device executes a
-%%% AO-Core singleton request, after first applying the node's
-%%% pre-processor, if set. The pre-processor can halt the request by
-%%% returning an error, or return a modified version if it deems necessary --
-%%% the result of the pre-processor is used as the request for the AO-Core
-%%% resolver. Additionally, a post-processor can be set, which is executed after
-%%% the AO-Core resolver has returned a result.
+%%% @doc The hyperbeam meta device, which gets and sets the node message
+%%% (`info'), gives the version and build of the node (`build'), and checks
+%%% whether a request is signed by the node operator (`is-operator').
 -module(dev_meta).
 -device_libraries([lib_meta]).
--export([info/1, info/3, build/3, handle/2, adopt_node_message/2]).
+-export([info/1, info/3, build/3, adopt_node_message/2]).
 -export([is_operator/3]).
 -export([is_operator/2]).
 -include("include/hb.hrl").
@@ -70,34 +65,6 @@ build_info() ->
                 _ -> #{}
             end
     end.
-
-%% @doc Normalize and route messages downstream based on their path. Messages
-%% with a `Meta' key are routed to the `handle_meta/2' function, while all
-%% other messages are routed to the `handle_resolve/2' function.
-handle(NodeMsg, RawRequest) ->
-    ?event({singleton_tabm_request, RawRequest}),
-    NormRequest = hb_singleton:from(
-        hb_private:set(RawRequest, <<"http-request">>, RawRequest, NodeMsg),
-        NodeMsg
-    ),
-    ?event(http, {request, hb_ao:normalize_keys(NormRequest, NodeMsg)}),
-    case hb_opts:get(initialized, false, NodeMsg) of
-        false -> handle_initialize(NormRequest, NodeMsg);
-        _ -> handle_resolve(RawRequest, NormRequest, NodeMsg)
-    end.
-
-handle_initialize([Base = #{ <<"device">> := Dev}, Req = #{ <<"path">> := Path }|_], NodeMsg) ->
-    ?event({got, {device, Dev}, {path, Path}}),
-    case {Dev, Path} of
-        {<<"meta@1.0">>, <<"info">>} -> info(Base, Req, NodeMsg);
-        _ -> {error, <<"Node must be initialized before use.">>}
-    end;
-handle_initialize([{as, <<"meta@1.0">>, _}|Rest], NodeMsg) ->
-    handle_initialize([#{ <<"device">> => <<"meta@1.0">>}|Rest], NodeMsg);
-handle_initialize([_|Rest], NodeMsg) ->
-    handle_initialize(Rest, NodeMsg);
-handle_initialize([], _NodeMsg) ->
-    {error, <<"Node must be initialized before use.">>}.
 
 %% @doc Get/set the node message. If the request is a `POST', we check that the
 %% request is signed by the owner of the node. If not, we return the node message
@@ -207,104 +174,6 @@ adopt_node_message(Request, NodeMsg) ->
 
 is_permanent(NodeMsg) ->
     hb_ao:get(<<"initialized">>, NodeMsg, not_found, NodeMsg) =:= <<"permanent">>.
-
-%% @doc Handle an AO-Core request, which is a list of messages. We apply
-%% the node's pre-processor to the request first, and then resolve the request
-%% using the node's AO-Core implementation if its response was `ok'.
-%% After execution, we run the node's `response' hook on the result of
-%% the request before returning the result it grants back to the user.
-handle_resolve(Req, Msgs, NodeMsg) ->
-    % Apply the pre-processor to the request.
-    ?event(http_request,
-        {resolve_hook,
-            {raw_request, Req},
-            {parsed_request_sequence, Msgs}
-        }
-    ),
-    case resolve_hook(<<"request">>, Req, Msgs, NodeMsg) of
-        {ok, []} ->
-            {ok,
-                #{
-                    <<"status">> => 307,
-                    <<"body">> => <<"Redirecting to default request.">>,
-                    <<"location">> => hb_opts:get(
-                        default_request,
-                        <<"/~hyperbuddy@1.0/index">>,
-                        NodeMsg
-                    )
-                }
-            };
-        {ok, PreProcessedMsg} ->
-            ?event(http_request, {request_after_preprocessing, PreProcessedMsg}),
-            AfterPreprocOpts = hb_http_server:get_opts(NodeMsg),
-            % Resolve the request message without the node's key material, and
-            % with `http_extra_opts' overriding the node defaults.
-            HTTPOpts =
-                maps:without(
-                    ?NODE_KEY_OPTS,
-                    hb_maps:merge(
-                        AfterPreprocOpts,
-                        hb_opts:get(http_extra_opts, #{}, NodeMsg),
-                        NodeMsg
-                    )
-                ),
-            {ErlStatus, Res} =
-                hb_ao:resolve_many(
-                    PreProcessedMsg,
-                    HTTPOpts#{ <<"force-message">> => true }
-                ),
-            AfterResolveOpts = hb_http_server:get_opts(NodeMsg),
-            % Apply the post-processor to the result. The result keeps its
-            % Erlang status unless the post-processor returns an error.
-            Output =
-                case resolve_hook(<<"response">>, Req, Res, AfterResolveOpts) of
-                    {ok, Body} -> {ErlStatus, Body};
-                    Error -> Error
-                end,
-            ?event(http_request,
-                {http_request,
-                    {request, Req},
-                    {result, Output}
-                }
-            ),
-            Output;
-        Res -> Res
-    end.
-
-%% @doc Execute a hook from the node message upon the user's request. The
-%% invocation of the hook provides a request of the following form:
-%% <pre>
-%%      /path => request | response
-%%      /request => the original request singleton
-%%      /body => parsed sequence of messages to process | the execution result
-%% </pre>
-resolve_hook(HookName, InitiatingRequest, Body, NodeMsg) ->
-    HookReq =
-        #{
-            <<"request">> => InitiatingRequest,
-            <<"body">> => Body
-        },
-    ?event(hook, {resolve_hook, HookName, HookReq}),
-    case hb_hook:on(HookName, HookReq, NodeMsg) of
-        {ok, #{ <<"body">> := ResponseBody }} ->
-            ?event(hook,
-                {resolve_hook_success,
-                    {name, HookName},
-                    {response_body, ResponseBody}
-                }
-            ),
-            {ok, ResponseBody};
-        {error, _} = Error ->
-            ?event(hook,
-                {resolve_hook_error,
-                    {name, HookName},
-                    {error, Error}
-                }
-            ),
-            Error;
-        Other ->
-            {error, Other}
-    end.
 
 %%% Tests
 

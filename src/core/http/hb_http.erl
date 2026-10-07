@@ -215,7 +215,10 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             false -> Msg
         end,
     % The result may be a link to a message that the peer holds.
-    only_result(add_peer_stores({ResponseStatus, WithStatus}, Peer, Opts), Opts).
+    only_result(
+        add_peer_stores({ResponseStatus, WithStatus}, Peer, Opts),
+        Opts
+    ).
 
 %% @doc Return the value that a reply names in its `ao-result' key, if the
 %% caller asks for the result alone (`http-only-result', the default). Return
@@ -1332,7 +1335,8 @@ simple_ao_resolve_signed_test() ->
         ),
     ?assertEqual(<<"Value1">>, Res).
 
-%% @doc Test that forced response signing preserves signers and commits hashpath.
+%% @doc Test that forced response signing preserves signers and commits the
+%% hashpath.
 maybe_sign_hashpath_only_test() ->
     OldWallet = ar_wallet:new(),
     NewWallet = ar_wallet:new(),
@@ -1369,10 +1373,15 @@ maybe_sign_hashpath_only_test() ->
     ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
     ?assert(hb_message:verify(Signed, all, Opts)).
 
-%% @doc Test that forced response signing leaves replies without hashpaths alone.
+%% @doc Test that forced response signing leaves replies without hashpaths
+%% alone.
 maybe_sign_without_hashpath_test() ->
     Res = #{ <<"body">> => <<"test">> },
-    Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => ar_wallet:new() },
+    Opts =
+        #{
+            <<"force-signed">> => true,
+            <<"priv-wallet">> => ar_wallet:new()
+        },
     ?assertEqual(Res, maybe_sign(Res, Opts)),
     Signed = hb_message:commit(Res, Opts),
     ?assertNotEqual([], hb_message:signers(Signed, Opts)),
