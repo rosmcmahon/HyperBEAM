@@ -87,7 +87,8 @@ get(TrieNode, Req, Opts) ->
     case hb_maps:find(<<"key">>, Req, Opts) of
         error -> {error, <<"'key' parameter is required for trie lookup.">>};
         {ok, Key} ->
-            case retrieve(TrieNode, Key, Opts) of
+            % A key is stored lowercase, as keys are in `structured@1.0' form.
+            case retrieve(TrieNode, hb_util:lowercase_key(Key), Opts) of
                 {error, not_found} -> {error, not_found};
                 Value -> {ok, Value}
             end
