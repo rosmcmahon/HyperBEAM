@@ -82,16 +82,7 @@ handle(NodeMsg, RawRequest) ->
     ),
     ?event(http, {request, hb_ao:normalize_keys(NormRequest, NodeMsg)}),
     case hb_opts:get(initialized, false, NodeMsg) of
-        false ->
-            Res =
-                embed_status(
-                    hb_ao:force_message(
-                        handle_initialize(NormRequest, NodeMsg),
-                        NodeMsg
-                    ),
-                    NodeMsg
-                ),
-            Res;
+        false -> handle_initialize(NormRequest, NodeMsg);
         _ -> handle_resolve(RawRequest, NormRequest, NodeMsg)
     end.
 
@@ -113,26 +104,26 @@ handle_initialize([], _NodeMsg) ->
 %% as-is, aside all keys that are private (according to `hb_private').
 -spec info(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 info(_, Request, NodeMsg) ->
-    {ok, Res} = case hb_ao:get(<<"method">>, Request, NodeMsg) of
+    {ErlStatus, Res} = case hb_ao:get(<<"method">>, Request, NodeMsg) of
         <<"POST">> ->
             case is_permanent(NodeMsg) of
                 true ->
-                    embed_status(
-                        {error,
-                            <<"The node message of this machine is already "
-                                "permanent. It cannot be changed.">>
-                        },
-                        NodeMsg
-                    );
+                    {error,
+                        #{
+                            <<"body">> =>
+                                <<"The node message of this machine is already "
+                                    "permanent. It cannot be changed.">>
+                        }
+                    };
                 false ->
                     update_node_message(Request, NodeMsg)
             end;
         _ ->
             ?event({get_config_req, Request, NodeMsg}),
             DynamicKeys = add_dynamic_keys(NodeMsg),
-            embed_status({ok, filter_node_msg(DynamicKeys, NodeMsg)}, NodeMsg)
+            {ok, filter_node_msg(DynamicKeys, NodeMsg)}
     end,
-    {ok, Res#{ <<"cache-control">> => [<<"no-store">>] }}.
+    {ErlStatus, Res#{ <<"cache-control">> => [<<"no-store">>] }}.
 
 %% @doc Remove items from the node message that are not encodable into a
 %% message.
@@ -176,32 +167,29 @@ add_identity_addresses(NodeMsg) ->
 %% @doc Apply only the admin's signed node-message fields to the configuration.
 update_node_message(Request, NodeMsg) ->
     case lib_meta:is_authorized(<<"node-message">>, admin, Request, NodeMsg) of
-        {error, not_authorized} = Error ->
+        {error, not_authorized} ->
             ?event({set_node_message_fail, Request}),
-            embed_status(Error, NodeMsg);
+            {error, #{ <<"body">> => not_authorized }};
         {ok, Authorized} ->
             case adopt_node_message(Authorized, NodeMsg) of
                 {ok, NewNodeMsg} ->
                     NewH = hb_opts:get(node_history, [], NewNodeMsg),
-                    embed_status(
-                        {ok,
-                            #{
-                                <<"body">> =>
-                                    iolist_to_binary(
-                                        io_lib:format(
-                                            "Node message updated. History: ~p"
-                                                "updates.",
-                                            [length(NewH)]
-                                        )
-                                    ),
-                                <<"history-length">> => length(NewH)
-                            }
-                        },
-                        NodeMsg
-                    );
+                    {ok,
+                        #{
+                            <<"body">> =>
+                                iolist_to_binary(
+                                    io_lib:format(
+                                        "Node message updated. History: ~p"
+                                            "updates.",
+                                        [length(NewH)]
+                                    )
+                                ),
+                            <<"history-length">> => length(NewH)
+                        }
+                    };
                 {error, Reason} ->
                     ?event({set_node_message_fail, Request, Reason}),
-                    embed_status({error, Reason}, NodeMsg)
+                    {error, #{ <<"body">> => Reason }}
             end
     end.
 
@@ -260,26 +248,19 @@ handle_resolve(Req, Msgs, NodeMsg) ->
                         NodeMsg
                     )
                 ),
-            Res =
+            {ErlStatus, Res} =
                 hb_ao:resolve_many(
                     PreProcessedMsg,
                     HTTPOpts#{ <<"force-message">> => true }
                 ),
-            {ok, StatusEmbeddedRes} = embed_status(Res, NodeMsg),
             AfterResolveOpts = hb_http_server:get_opts(NodeMsg),
-            % Apply the post-processor to the result.
-            Output = maybe_sign(
-                embed_status(
-                    resolve_hook(
-                        <<"response">>,
-                        Req,
-                        StatusEmbeddedRes,
-                        AfterResolveOpts
-                    ),
-                    NodeMsg
-                ),
-                NodeMsg
-            ),
+            % Apply the post-processor to the result. The result keeps its
+            % Erlang status unless the post-processor returns an error.
+            Output =
+                case resolve_hook(<<"response">>, Req, Res, AfterResolveOpts) of
+                    {ok, Body} -> {ErlStatus, Body};
+                    Error -> Error
+                end,
             ?event(http_request,
                 {http_request,
                     {request, Req},
@@ -287,7 +268,7 @@ handle_resolve(Req, Msgs, NodeMsg) ->
                 }
             ),
             Output;
-        Res -> embed_status(hb_ao:force_message(Res, NodeMsg), NodeMsg)
+        Res -> Res
     end.
 
 %% @doc Execute a hook from the node message upon the user's request. The
@@ -323,106 +304,6 @@ resolve_hook(HookName, InitiatingRequest, Body, NodeMsg) ->
             Error;
         Other ->
             {error, Other}
-    end.
-
-%% @doc Wrap the result of a device call in a status. A result that has a
-%% `status' keeps it as it is: `hb_http:reply/4' takes an integer `status' as
-%% the HTTP status, and any other as the message's own. A list is the `body'
-%% of the reply, named by its `ao-result' key.
-embed_status({ErlStatus, Res}, NodeMsg) when is_map(Res) ->
-    case hb_maps:is_key(<<"status">>, Res, NodeMsg) of
-        false ->
-            HTTPCode = status_code({ErlStatus, Res}, NodeMsg),
-            {ok, Res#{ <<"status">> => HTTPCode }};
-        true ->
-            {ok, Res}
-    end;
-embed_status({ErlStatus, List}, NodeMsg) when is_list(List) ->
-    embed_status(
-        {ErlStatus, #{ <<"ao-result">> => <<"body">>, <<"body">> => List }},
-        NodeMsg
-    );
-embed_status({ErlStatus, Res}, NodeMsg) ->
-    HTTPCode = status_code({ErlStatus, Res}, NodeMsg),
-    {ok, #{ <<"status">> => HTTPCode, <<"body">> => Res }}.
-
-%% @doc Calculate the appropriate HTTP status code for an AO-Core result.
-%% The order of precedence is:
-%% 1. The status code from the message.
-%% 2. The HTTP representation of the status code.
-%% 3. The default status code.
-%% Only an `error' or `failure' result takes its status from the message it
-%% carries; the body of a successful result is data, not a status.
-status_code({error, {no_viable_responses, _AllResponses}}, NodeMsg) ->
-    status_code(no_viable_responses, NodeMsg);
-status_code({ErlStatus, Msg}, NodeMsg)
-        when ErlStatus == error; ErlStatus == failure ->
-    case message_to_status(Msg, NodeMsg) of
-        default -> status_code(ErlStatus, NodeMsg);
-        RawStatus -> RawStatus
-    end;
-status_code({ErlStatus, _Msg}, NodeMsg) ->
-    status_code(ErlStatus, NodeMsg);
-status_code(ok, _NodeMsg) -> 200;
-status_code(error, _NodeMsg) -> 400;
-status_code(created, _NodeMsg) -> 201;
-status_code(not_found, _NodeMsg) -> 404;
-status_code(client_error, _NodeMsg) -> 400;
-status_code(no_viable_responses, _NodeMsg) -> 400;
-status_code(failure, _NodeMsg) -> 500;
-status_code(unavailable, _NodeMsg) -> 503;
-status_code(unauthorized, _NodeMsg) -> 401;
-status_code(forbidden, _NodeMsg) -> 403;
-status_code(not_authorized, _NodeMsg) -> 403;
-status_code(_, _NodeMsg) -> 200.
-
-%% @doc Get the HTTP status code from a transaction (if it exists). An atom
-%% that `status_code/2' maps to 200, as it maps every atom it does not name,
-%% gives no code, so the Erlang status of the result gives it.
-message_to_status(#{ <<"body">> := Status }, NodeMsg) when is_atom(Status) ->
-    message_to_status(Status, NodeMsg);
-message_to_status(Item, NodeMsg) when is_atom(Item) ->
-    case status_code(Item, NodeMsg) of
-        200 -> default;
-        Status -> Status
-    end;
-message_to_status(_Item, _NodeMsg) ->
-    default.
-
-%% @doc Sign the result of a device call if the node is configured to do so.
-%% A result that carries a `hashpath' key, such as another node's reply that
-%% this node relays, is returned as it is: signing it would replace its
-%% unsigned commitment and the `hashpath' that the other node committed.
-maybe_sign({Status, Res}, NodeMsg) ->
-    {Status, maybe_sign(Res, NodeMsg)};
-maybe_sign(Res, NodeMsg) ->
-    ?event({maybe_sign, Res}),
-    case hb_opts:get(force_signed, false, NodeMsg) andalso
-            not hb_maps:is_key(<<"hashpath">>, Res, NodeMsg) of
-        true ->
-            case hb_private:get(<<"hashpath">>, Res, not_found, NodeMsg) of
-                not_found ->
-                    Res;
-                Hashpath ->
-                    WithUnsigned =
-                        hb_message:commit(
-                            Res,
-                            NodeMsg,
-                            #{
-                                <<"device">> => <<"httpsig@1.0">>,
-                                <<"type">> => <<"unsigned">>
-                            }
-                        ),
-                    hb_message:commit(
-                        WithUnsigned#{ <<"hashpath">> => Hashpath },
-                        NodeMsg,
-                        #{
-                            <<"device">> => <<"httpsig@1.0">>,
-                            <<"committed">> => [<<"hashpath">>]
-                        }
-                    )
-            end;
-        false -> Res
     end.
 
 %%% Tests
@@ -851,70 +732,6 @@ modify_request_test() ->
         }),
     {ok, Res} = hb_http:get(Node, <<"/added">>, #{}),
     ?assertEqual(<<"value">>, Res).
-
-%% @doc Test that forced response signing preserves signers and commits hashpath.
-maybe_sign_hashpath_only_test() ->
-    OldWallet = ar_wallet:new(),
-    NewWallet = ar_wallet:new(),
-    Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
-    OldOpts =
-        #{
-            <<"commitment-device">> => <<"httpsig@1.0">>,
-            <<"priv-wallet">> => OldWallet
-        },
-    Opts =
-        #{
-            <<"force-signed">> => true,
-            <<"priv-wallet">> => NewWallet
-        },
-    OldSigner = hb_util:human_id(ar_wallet:to_address(OldWallet)),
-    NewSigner = hb_util:human_id(ar_wallet:to_address(NewWallet)),
-    AlreadySigned =
-        (hb_message:commit(
-            #{ <<"body">> => <<"test">> },
-            OldOpts,
-            #{ <<"committed">> => [<<"body">>] }
-        ))#{
-            <<"priv">> => #{ <<"hashpath">> => Hashpath }
-        },
-    Signed = maybe_sign(AlreadySigned, Opts),
-    ?assertEqual(Hashpath, maps:get(<<"hashpath">>, Signed)),
-    ?assertEqual(
-        lists:sort([OldSigner, NewSigner]),
-        lists:sort(hb_message:signers(Signed, Opts))
-    ),
-    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"body">>])),
-    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
-    ?assert(hb_message:verify(Signed, all, Opts)).
-
-%% @doc Test that forced response signing leaves replies without hashpaths alone.
-maybe_sign_without_hashpath_test() ->
-    Res = #{ <<"body">> => <<"test">> },
-    Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => ar_wallet:new() },
-    ?assertEqual(Res, maybe_sign(Res, Opts)),
-    Signed = hb_message:commit(Res, Opts),
-    ?assertNotEqual([], hb_message:signers(Signed, Opts)),
-    ?assertEqual(Signed, maybe_sign(Signed, Opts)).
-
-%% @doc Test that unsigned responses get hashpath transport commitments.
-maybe_sign_unsigned_hashpath_test() ->
-    Wallet = ar_wallet:new(),
-    Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
-    Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => Wallet },
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
-    Signed =
-        maybe_sign(
-            #{
-                <<"body">> => <<"test">>,
-                <<"status">> => 200,
-                <<"priv">> => #{ <<"hashpath">> => Hashpath }
-            },
-            Opts
-        ),
-    ?assertEqual(Hashpath, maps:get(<<"hashpath">>, Signed)),
-    ?assertEqual([Signer], hb_message:signers(Signed, Opts)),
-    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
-    ?assert(hb_message:verify(Signed, all, Opts)).
 
 %% @doc Test that version information is available and returned correctly.
 buildinfo_test() ->

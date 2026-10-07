@@ -6,7 +6,7 @@
 -module(hb_http).
 -export([start/0]).
 -export([get/2, get/3, post/3, post/4, request/2, request/4, request/5]).
--export([message_to_request/2, reply/4, accept_to_codec/2, http_status/2]).
+-export([message_to_request/2, reply/4, accept_to_codec/2, status_code/2]).
 -export([only_result/2]).
 -export([req_to_tabm_singleton/3]).
 -include("include/hb.hrl").
@@ -207,8 +207,15 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             Body,
             Opts
         ),
+    % A reply in any codec keeps the `status' that it carries, and gets the
+    % HTTP status as its `status' if it carries none.
+    WithStatus =
+        case is_map(Msg) of
+            true -> maps:merge(#{ <<"status">> => hb_util:int(Status) }, Msg);
+            false -> Msg
+        end,
     % The result may be a link to a message that the peer holds.
-    only_result(add_peer_stores({ResponseStatus, Msg}, Peer, Opts), Opts).
+    only_result(add_peer_stores({ResponseStatus, WithStatus}, Peer, Opts), Opts).
 
 %% @doc Return the value that a reply names in its `ao-result' key, if the
 %% caller asks for the result alone (`http-only-result', the default). Return
@@ -322,7 +329,7 @@ outbound_result_to_message(<<"httpsig@1.0">>, Status, Headers, Body, Opts) ->
     ?event(debug_http_outbound, {result_is_httpsig, {body, Body}}, Opts),
     {
         hb_http_client:response_status_to_atom(Status),
-        http_response_to_httpsig(Status, Headers, Body, Opts)
+        http_response_to_httpsig(Headers, Body, Opts)
     };
 outbound_result_to_message(Codec, Status, Headers, Body, Opts) ->
     ?event(debug, {headers, Headers}),
@@ -336,10 +343,8 @@ outbound_result_to_message(Codec, Status, Headers, Body, Opts) ->
         )
     }.
 
-%% @doc Convert a HTTP response to a httpsig message. The message keeps the
-%% `status' that the reply carries, and gets the HTTP status as its `status'
-%% if the reply carries none.
-http_response_to_httpsig(Status, HeaderMap, Body, Opts) ->
+%% @doc Convert a HTTP response to a httpsig message.
+http_response_to_httpsig(HeaderMap, Body, Opts) ->
     BodyMap = case byte_size(Body) of
         0 when not is_map_key(<<"content-digest">>, HeaderMap) -> #{};
         _ -> #{ <<"body">> => Body }
@@ -350,23 +355,43 @@ http_response_to_httpsig(Status, HeaderMap, Body, Opts) ->
             BodyMap,
 			Opts
         ),
-    maps:merge(
-        #{ <<"status">> => hb_util:int(Status) },
-        hb_message:convert(
-            ConvertFrom,
-            #{ <<"device">> => <<"structured@1.0">>, <<"bundle">> => true },
-            <<"httpsig@1.0">>,
-            Opts
-        )
+    hb_message:convert(
+        ConvertFrom,
+        #{ <<"device">> => <<"structured@1.0">>, <<"bundle">> => true },
+        <<"httpsig@1.0">>,
+        Opts
     ).
 
-%% @doc The HTTP status of a message: its `status' if that is an integer from
-%% 100 to 599, else 200. Any other `status' is the message's own.
-http_status(Msg, Opts) ->
-    case hb_maps:get(<<"status">>, Msg, 200, Opts) of
-        Status when is_integer(Status), Status >= 100, Status =< 599 -> Status;
-        _ -> 200
-    end.
+%% @doc The HTTP status of a result: its message's `status' if that is an
+%% integer from 100 to 599 or the binary encoding of one. Otherwise an `error'
+%% or `failure' whose `body' is an atom with a code of its own takes that code,
+%% and any other result the code of its Erlang status.
+status_code({ErlStatus, Msg}, Opts) ->
+    ParsedStatus =
+        hb_util:safe_int(hb_maps:get(<<"status">>, Msg, undefined, Opts)),
+    case {ParsedStatus, Msg} of
+        {{ok, Status}, _} when Status >= 100, Status =< 599 ->
+            Status;
+        {_, #{ <<"body">> := Error }} when is_atom(Error), ErlStatus == error;
+                is_atom(Error), ErlStatus == failure ->
+            case status_code(Error, Opts) of
+                200 -> status_code(ErlStatus, Opts);
+                Status -> Status
+            end;
+        _ -> status_code(ErlStatus, Opts)
+    end;
+status_code(ok, _Opts) -> 200;
+status_code(error, _Opts) -> 400;
+status_code(created, _Opts) -> 201;
+status_code(not_found, _Opts) -> 404;
+status_code(client_error, _Opts) -> 400;
+status_code(no_viable_responses, _Opts) -> 400;
+status_code(failure, _Opts) -> 500;
+status_code(unavailable, _Opts) -> 503;
+status_code(unauthorized, _Opts) -> 401;
+status_code(forbidden, _Opts) -> 403;
+status_code(not_authorized, _Opts) -> 403;
+status_code(_, _Opts) -> 200.
 
 %% @doc Given a message, return the information needed to make the request.
 message_to_request(M, Opts) ->
@@ -555,11 +580,16 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
             }
     end.
 
-%% @doc Reply to the client's HTTP request with a message.
-reply(Req, TABMReq, Message, Opts) ->
-    reply(Req, TABMReq, http_status(Message, Opts), Message, Opts).
-reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
+%% @doc Reply to the client's HTTP request with the result of resolving it. The
+%% HTTP status comes from the result and is not added to the message, which is
+%% sent with the node's signature on its hashpath (`maybe_sign/2'). A list is
+%% the `body' of the reply, which its `ao-result' key selects.
+reply(InitReq, TABMReq, {ErlStatus, List}, Opts) when is_list(List) ->
+    Msg = #{ <<"ao-result">> => <<"body">>, <<"body">> => List },
+    reply(InitReq, TABMReq, {ErlStatus, Msg}, Opts);
+reply(InitReq, TABMReq, Result, Opts) ->
     ReplyStartTime = os:system_time(millisecond),
+    {ErlStatus, RawMessage} = hb_ao:force_message(Result, Opts),
     KeyNormMessage = hb_ao:normalize_keys(RawMessage, Opts),
     {ok, Req, Message} =
         try reply_handle_cookies(InitReq, KeyNormMessage, Opts)
@@ -569,9 +599,9 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
         end,
     {Status, HeadersBeforeCors, EncodedBody} =
         encode_reply(
-            RawStatus,
+            status_code({ErlStatus, Message}, Opts),
             TABMReq,
-            Message,
+            maybe_sign(Message, Opts),
             Opts
         ),
     % Get the CORS request headers from the message, if they exist.
@@ -632,6 +662,30 @@ reply(InitReq, TABMReq, RawStatus, RawMessage, Opts) ->
         }
     ),
     {ok, PostStreamReq, no_state}.
+
+%% @doc Sign the hashpath of a result if the node signs its replies and the
+%% message that is sent is the result of the hashpath. A message that carries a
+%% `hashpath' key, such as another node's reply that this node relays, is sent
+%% as it is.
+maybe_sign(Msg, Opts) ->
+    case hb_private:from_message(Msg) of
+        #{ <<"hashpath">> := Hashpath, <<"hashpath-result">> := ID } ->
+            case hb_opts:get(force_signed, false, Opts) andalso
+                    not hb_maps:is_key(<<"hashpath">>, Msg, Opts) andalso
+                    hb_message:id(Msg, all, Opts) == ID of
+                true ->
+                    hb_message:commit(
+                        Msg#{ <<"hashpath">> => Hashpath },
+                        Opts,
+                        #{
+                            <<"device">> => <<"httpsig@1.0">>,
+                            <<"committed">> => [<<"hashpath">>]
+                        }
+                    );
+                false -> Msg
+            end;
+        _ -> Msg
+    end.
 
 %% @doc Handle replying with cookies if the message contains them. Returns the
 %% new Cowboy `Req` object, and the message without the cookie keys that no
@@ -1277,6 +1331,73 @@ simple_ao_resolve_signed_test() ->
             test_opts()
         ),
     ?assertEqual(<<"Value1">>, Res).
+
+%% @doc Test that forced response signing preserves signers and commits hashpath.
+maybe_sign_hashpath_only_test() ->
+    OldWallet = ar_wallet:new(),
+    NewWallet = ar_wallet:new(),
+    Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
+    OldOpts =
+        #{
+            <<"commitment-device">> => <<"httpsig@1.0">>,
+            <<"priv-wallet">> => OldWallet
+        },
+    Opts =
+        #{
+            <<"force-signed">> => true,
+            <<"priv-wallet">> => NewWallet
+        },
+    OldSigner = hb_util:human_id(ar_wallet:to_address(OldWallet)),
+    NewSigner = hb_util:human_id(ar_wallet:to_address(NewWallet)),
+    AlreadySigned =
+        hb_hashpath:attach(
+            hb_message:commit(
+                #{ <<"body">> => <<"test">> },
+                OldOpts,
+                #{ <<"committed">> => [<<"body">>] }
+            ),
+            Hashpath,
+            Opts
+        ),
+    Signed = maybe_sign(AlreadySigned, Opts),
+    ?assertEqual(Hashpath, maps:get(<<"hashpath">>, Signed)),
+    ?assertEqual(
+        lists:sort([OldSigner, NewSigner]),
+        lists:sort(hb_message:signers(Signed, Opts))
+    ),
+    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"body">>])),
+    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
+    ?assert(hb_message:verify(Signed, all, Opts)).
+
+%% @doc Test that forced response signing leaves replies without hashpaths alone.
+maybe_sign_without_hashpath_test() ->
+    Res = #{ <<"body">> => <<"test">> },
+    Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => ar_wallet:new() },
+    ?assertEqual(Res, maybe_sign(Res, Opts)),
+    Signed = hb_message:commit(Res, Opts),
+    ?assertNotEqual([], hb_message:signers(Signed, Opts)),
+    ?assertEqual(Signed, maybe_sign(Signed, Opts)).
+
+%% @doc Test that unsigned responses get hashpath transport commitments.
+maybe_sign_unsigned_hashpath_test() ->
+    Wallet = ar_wallet:new(),
+    Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
+    Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => Wallet },
+    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Result =
+        hb_hashpath:attach(
+            #{ <<"body">> => <<"test">>, <<"status">> => 200 },
+            Hashpath,
+            Opts
+        ),
+    Signed = maybe_sign(Result, Opts),
+    ?assertEqual(Hashpath, maps:get(<<"hashpath">>, Signed)),
+    ?assertEqual([Signer], hb_message:signers(Signed, Opts)),
+    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
+    ?assert(hb_message:verify(Signed, all, Opts)),
+    % A message changed after its hashpath was attached is not signed.
+    Changed = Result#{ <<"body">> => <<"changed">> },
+    ?assertEqual(Changed, maybe_sign(Changed, Opts)).
 
 %% @doc Every ingress codec verifies commitments and applies the node's
 %% signature policy before executing the request.

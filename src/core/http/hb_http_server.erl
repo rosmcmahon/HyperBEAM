@@ -592,7 +592,7 @@ handle_request(RawReq, Body, ServerID) ->
                         #{ <<"device">> => <<"meta@1.0">> },
                         NodeMsg
                     ),
-                {ok, Res} =
+                Res =
                     Meta:handle(
                         NodeMsg#{
                             <<"commitment-device">> => CommitmentCodec
@@ -629,7 +629,6 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
     StacktraceStr = hb_util:bin(hb_format:trace(Stacktrace)),
     ErrorMsg =
         (parse_error(Details))#{
-            <<"status">> => error_status(Type, Details),
             <<"type">> => hb_util:bin(hb_format:message(Type)),
             <<"details">> => DetailsStr,
             <<"stacktrace">> => StacktraceStr
@@ -650,15 +649,20 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
             <<"stacktrace">> => hb_util:bin(hb_format:remove_trailing_noise(StacktraceStr)),
             <<"details">> => hb_format:truncate(hb_util:bin(hb_format:remove_trailing_noise(DetailsStr)), ErrorDetailsMaxSize)
         },
-    hb_http:reply(Req, Singleton, FormattedErrorMsg, NodeMsg).
+    hb_http:reply(
+        Req,
+        Singleton,
+        {error_status(Type, Details), FormattedErrorMsg},
+        NodeMsg
+    ).
 
 %% @doc The status of an error response. A request whose commitments do not
 %% verify or that `hb_singleton' cannot parse is refused as the client's error.
 %% A request that needs a message the node cannot load is not found.
-error_status(throw, {invalid_commitments, _}) -> 400;
-error_status(throw, {invalid_singleton, _, _}) -> 400;
-error_status(throw, {necessary_message_not_found, _, _}) -> 404;
-error_status(_Type, _Details) -> 500.
+error_status(throw, {invalid_commitments, _}) -> error;
+error_status(throw, {invalid_singleton, _, _}) -> error;
+error_status(throw, {necessary_message_not_found, _, _}) -> not_found;
+error_status(_Type, _Details) -> failure.
 
 %% @doc The error type and offender of a request that `hb_singleton' cannot
 %% parse, for the reply to name them.

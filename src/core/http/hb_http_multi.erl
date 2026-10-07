@@ -234,7 +234,7 @@ node_request(Method, Node, Path, Message, Opts) ->
 %% integers, or the string `All'. Integers may be given as binaries.
 admissible_status(_, <<"All">>, _Opts) -> true;
 admissible_status(ResponseMsg = #{ <<"status">> := _ }, Statuses, Opts) ->
-    admissible_status(hb_http:http_status(ResponseMsg, Opts), Statuses, Opts);
+    admissible_status(hb_http:status_code({ok, ResponseMsg}, Opts), Statuses, Opts);
 admissible_status(Status, Statuses, Opts) when is_integer(Statuses) ->
     admissible_status(Status, [Statuses], Opts);
 admissible_status(Status, Statuses, Opts) when is_binary(Status) ->
