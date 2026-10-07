@@ -6,7 +6,6 @@
  *
  *   lowercase/1      `A'..`Z' -> `a'..`z'                 (to_lower)
  *   key_chars/1      `A'..`Z' -> `a'..`z', and `-' -> `_' (key_to_atom)
- *   canon_chars/1    `A'..`Z' -> `a'..`z', and `_' -> `-' (hb_opts canonical_key)
  *   dash_chars/1     `_' -> `-'                           (atom_to_dashed_binary)
  *   normalize_path/1 collapse `//' runs, trim leading/trailing `/' (hb_path)
  *
@@ -53,15 +52,6 @@ key_byte(unsigned char c)
         return (unsigned char)(c + ('a' - 'A'));
     }
     return (c == '-') ? (unsigned char)'_' : c;
-}
-
-static inline unsigned char
-canon_byte(unsigned char c)
-{
-    if (c >= 'A' && c <= 'Z') {
-        return (unsigned char)(c + ('a' - 'A'));
-    }
-    return (c == '_') ? (unsigned char)'-' : c;
 }
 
 static inline unsigned char
@@ -129,13 +119,6 @@ key_chars(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     (void)argc;
     ASCII_TRANSFORM_BODY(key_byte)
-}
-
-static ERL_NIF_TERM
-canon_chars(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    (void)argc;
-    ASCII_TRANSFORM_BODY(canon_byte)
 }
 
 /* `dash_chars' is exact for all bytes (`_'<->`-' swap, never folds), so it has
@@ -247,7 +230,6 @@ upgrade(ErlNifEnv* env, void** priv, void** old_priv, ERL_NIF_TERM info)
 static ErlNifFunc funcs[] = {
     {"lowercase", 1, lowercase, 0},
     {"key_chars", 1, key_chars, 0},
-    {"canon_chars", 1, canon_chars, 0},
     {"dash_chars", 1, dash_chars, 0},
     {"normalize_path", 1, normalize_path, 0}
 };

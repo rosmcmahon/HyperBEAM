@@ -169,7 +169,7 @@ preloaded_store_from_env(Path) ->
 lua_tests_from_env(tests) -> tests;
 lua_tests_from_env(Spec) -> hb_util:bin(Spec).
 
-%% @doc Convert an opts key to lower-case binary dash form.
+%% @doc Convert an opts key to binary dash form.
 canonical_key(Key) when is_atom(Key) ->
     canonical_key(atom_to_binary(Key, utf8));
 canonical_key(Key) when is_list(Key) ->
@@ -177,13 +177,7 @@ canonical_key(Key) when is_list(Key) ->
         true -> canonical_key(list_to_binary(Key));
         false -> Key
     end;
-canonical_key(Key) when is_binary(Key) ->
-    case hb_util_string:canon_chars(Key) of
-        non_ascii ->
-            hb_util:to_lower(binary:replace(Key, <<"_">>, <<"-">>, [global]));
-        Chars ->
-            Chars
-    end;
+canonical_key(Key) when is_binary(Key) -> hb_util_string:dash_chars(Key);
 canonical_key(Key) -> Key.
 
 %% @doc The node's resolved global configuration: the static `default_message/0'
