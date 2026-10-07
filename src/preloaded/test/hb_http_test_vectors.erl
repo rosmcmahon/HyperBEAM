@@ -19,7 +19,8 @@
 %% @doc The messages that the primary node serves. A message given as a
 %% function is built with the primary's options, so that it can be signed.
 %% A message given as a pair is written as its first element and read back as
-%% its second: a message written with explicit types or links.
+%% its second: a message written with explicit types or links, or with keys
+%% that `structured@1.0' reads in lowercase.
 messages() ->
     [
         {"basic", #{ <<"hello">> => <<"world">> }},
@@ -200,7 +201,13 @@ messages() ->
         }
     ] ++
     [
-        {Name ++ Suffix, Wrap(#{ Key => <<"literal">> })}
+        {
+            Name ++ Suffix,
+            {
+                Wrap(#{ Key => <<"literal">> }),
+                Wrap(#{ hb_util:lowercase_key(Key) => <<"literal">> })
+            }
+        }
     ||
         {Name, Key} <-
             [

@@ -497,10 +497,10 @@ preprocess_results(Msg, Opts) ->
         )
     ).
 
-%% @doc Convert a message with tags into a map of their key-value pairs.
+%% @doc Convert a message with tags into a map of their key-value pairs. AOS
+%% JSON holds the tags under `Tags'.
 tags_to_map(Msg, Opts) ->
-    NormMsg = hb_util:lower_case_keys(hb_ao:normalize_keys(Msg, Opts), Opts),
-    RawTags = hb_maps:get(<<"tags">>, NormMsg, [], Opts),
+    RawTags = hb_maps:get(<<"Tags">>, Msg, [], Opts),
     TagList =
         [
             {hb_maps:get(<<"name">>, Tag, Opts), hb_maps:get(<<"value">>, Tag, Opts)}

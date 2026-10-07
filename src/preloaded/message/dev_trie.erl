@@ -13,6 +13,11 @@
 %%% N-bit chunk comparison -- e.g., a 2-bit comparison yields paths
 %%% `{00, 11, 01, 10}`, which is why each node in a radix-4 trie can have at-most
 %%% 4 children!)
+%%%
+%%% A key is stored lowercase, as keys are in `structured@1.0' form. A capital
+%%% that an ID keeps is written as `^' and its lowercase letter, and `^' itself
+%%% as `^^', so no edge label holds a capital and IDs that differ only in case
+%%% stay apart.
 -module(dev_trie).
 -export([info/0, keys/2, keys/3, set/3, get/3, get_key/4]).
 -include_lib("eunit/include/eunit.hrl").
@@ -42,7 +47,7 @@ info() ->
 keys(Trie, _Req, Opts) ->
     keys(Trie, Opts).
 keys(Trie, Opts) ->
-    collect_keys(Trie, <<>>, Opts, []).
+    lists:map(fun decode_key/1, collect_keys(Trie, <<>>, Opts, [])).
 
 collect_keys(TrieNode, Prefix, Opts, Acc) ->
     EdgeLabels = edges(TrieNode, Opts),
@@ -87,7 +92,7 @@ get(TrieNode, Req, Opts) ->
     case hb_maps:find(<<"key">>, Req, Opts) of
         error -> {error, <<"'key' parameter is required for trie lookup.">>};
         {ok, Key} ->
-            case retrieve(TrieNode, Key, Opts) of
+            case retrieve(TrieNode, encode_key(Key), Opts) of
                 {error, not_found} -> {error, not_found};
                 Value -> {ok, Value}
             end
@@ -111,8 +116,22 @@ do_set(Trie, [], Opts) ->
     {ok, _} = hb_cache:write(CommittedTrie, Opts),
     CommittedTrie;
 do_set(Trie, [{Key, Val} | KeyVals], Opts) ->
-    NewTrie = insert(Trie, Key, Val, Opts),
+    NewTrie = insert(Trie, encode_key(Key), Val, Opts),
     do_set(NewTrie, KeyVals, Opts).
+
+%% @doc The stored form of a key.
+encode_key(Key) ->
+    << <<(encode_byte(C))/binary>> || <<C>> <= hb_util:lowercase_key(Key) >>.
+
+encode_byte(C) when C >= $A, C =< $Z -> <<$^, (C bor 32)>>;
+encode_byte($^) -> <<"^^">>;
+encode_byte(C) -> <<C>>.
+
+%% @doc The key that has the given stored form.
+decode_key(<<"^^", Rest/binary>>) -> <<$^, (decode_key(Rest))/binary>>;
+decode_key(<<$^, C, Rest/binary>>) -> <<(C - 32), (decode_key(Rest))/binary>>;
+decode_key(<<C, Rest/binary>>) -> <<C, (decode_key(Rest))/binary>>;
+decode_key(<<>>) -> <<>>.
 
 insert(TrieNode, Key, Val, Opts) ->
     insert(TrieNode, Key, Val, Opts, 0).
@@ -480,6 +499,8 @@ basic_retrievability_test() ->
     {ok, Path} = hb_cache:write(Trie, Opts),
     ?event(debug_trie, {basic_retrievability_test, {trie, Trie}}),
     ?assertEqual(31337, hb_ao:get(<<"car">>, Trie, Opts)),
+    % A key is read as `structured@1.0' reads keys: in lowercase.
+    ?assertEqual(31337, hb_ao:get(<<"Car">>, Trie, Opts)),
     ?assertEqual(90210, hb_ao:get(<<"card">>, Trie, Opts)),
     ?assertEqual(666, hb_ao:get(<<"cardano">>, Trie, Opts)),
     ?assertEqual(8675309, hb_ao:get(<<"carmex">>, Trie, Opts)),
@@ -537,7 +558,9 @@ reserved_edge_labels_test_() ->
             lists:foldl(
                 fun({Key, Value}, {Trie, Expected}) ->
                     New = hb_ao:set(Trie, #{Key => Value}, Opts),
-                    NextExpected = Expected#{Key => Value},
+                    % `set' reads a key as `structured@1.0' does: in lowercase.
+                    NextExpected =
+                        Expected#{hb_util:lowercase_key(Key) => Value},
                     {ok, ID} = hb_cache:write(New, Opts),
                     {ok, Loaded} = hb_cache:read(ID, Opts),
                     lists:foreach(

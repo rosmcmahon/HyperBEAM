@@ -1123,15 +1123,14 @@ normalize_commitments_depth_and_fast_test() ->
     ?assertEqual(#{ <<"children">> => [#{ <<"a">> => 2 }],
         <<"plain">> => #{ <<"x">> => 1 } }, hb_private:reset(Deep)),
     ?assert(deep_verify(normalize_commitments(Nested, Opts, all), Opts)),
-    % `commit' runs `to' first: a TABM is committed as the message it decodes to.
+    % `id' and `commit' run `to' first, so they are over lowercase keys.
+    ?assertEqual(
+        id(#{ <<"a">> => 1 }, all, Opts),
+        id(#{ <<"A">> => 1 }, all, Opts)
+    ),
     ?assertEqual(
         #{ <<"a">> => 1 },
-        uncommitted(
-            commit(
-                #{ <<"a">> => <<"1">>, <<"ao-types">> => <<"a=\"integer\"">> },
-                Opts
-            )
-        )
+        uncommitted(commit(#{ <<"A">> => 1 }, Opts))
     ).
 
 %% @doc Commitments should never generally be unloaded, but `hb_message` chooses

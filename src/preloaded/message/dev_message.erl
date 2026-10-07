@@ -1062,28 +1062,17 @@ keys(Msg, Opts) ->
     }.
 
 %% @doc Return the value associated with the key as it exists in the message's
-%% underlying Erlang map. First check the public keys, then check case-
-%% insensitively if the key is a binary.
+%% underlying Erlang map, if the key is public. The key is lowercased once, as
+%% the keys of a message in `structured@1.0' form are, then matched exactly.
 get(Key, Msg, Opts) -> get(Key, Msg, #{ <<"path">> => <<"get">> }, Opts).
 get(Key, Msg, _Req, Opts) ->
     case hb_private:is_private(Key) of
         true -> {error, not_found};
         false ->
-            case hb_maps:find(Key, Msg, Opts) of
-                error -> case_insensitive_get(Key, Msg, Opts);
+            case hb_maps:find(hb_util:lowercase_key(Key), Msg, Opts) of
+                error -> {error, not_found};
                 {ok, Value} -> {ok, Value}
             end
-    end.
-
-%% @doc Key matching should be case insensitive, following RFC-9110, so we 
-%% implement a case-insensitive key lookup rather than delegating to
-%% `hb_maps:get/2'. Encode the key to a binary if it is not already.
-case_insensitive_get(Key, Msg, Opts) ->
-    NormKey = hb_util:to_lower(hb_util:bin(Key)),
-    NormMsg = hb_ao:normalize_keys(Msg, Opts),
-    case hb_maps:find(NormKey, NormMsg, Opts) of
-        error -> {error, not_found};
-        {ok, Value} -> {ok, Value}
     end.
 
 %%% Tests
@@ -1124,12 +1113,6 @@ is_private_mod_test() ->
 
 keys_from_device_test() ->
     ?assertEqual({ok, [<<"a">>]}, hb_ao:resolve(#{ <<"a">> => 1 }, keys, #{})).
-
-case_insensitive_get_test() ->
-	?assertEqual({ok, 1}, case_insensitive_get(<<"a">>, #{ <<"a">> => 1 }, #{})),
-%	?assertEqual({ok, 1}, case_insensitive_get(<<"a">>, #{ <<"A">> => 1 }, #{})),
-	?assertEqual({ok, 1}, case_insensitive_get(<<"A">>, #{ <<"a">> => 1 }, #{})).
-	%?assertEqual({ok, 1}, case_insensitive_get(<<"A">>, #{ <<"A">> => 1 }, #{})).
 
 private_keys_are_filtered_test() ->
     ?assertEqual(

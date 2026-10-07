@@ -1927,6 +1927,11 @@ signed_request_query_riders_test() ->
     ?assertEqual(
         {ok, <<"original">>},
         request(<<"GET">>, Node, <<"/x?x=evil">>, Signed, Opts)
+    ),
+    % A query key is lowercase, so one that differs only in case is dropped too.
+    ?assertEqual(
+        {ok, <<"original">>},
+        request(<<"GET">>, Node, <<"/x?X=evil">>, Signed, Opts)
     ).
 
 %% Test parallel requests

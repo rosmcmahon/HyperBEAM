@@ -183,13 +183,19 @@ from_path(RelativeRef) when is_binary(RelativeRef) ->
     {ok, path_parts($/, Path), parse_query(QStr)};
 from_path(Other) -> from_path(hb_util:bin(Other)).
 
-%% @doc Parse a query string into a message of its unquoted values, or throw
-%% `invalid_query' naming the query string.
+%% @doc Parse a query string into a message of its unquoted values, with the
+%% keys in lowercase, or throw `invalid_query' naming the query string.
 parse_query(QStr) ->
     try
         maps:map(
             fun(_, Val) -> hb_util:unquote(Val) end,
-            hb_maps:from_list(cowboy_req:parse_qs(#{ qs => QStr }))
+            hb_maps:from_list(
+                [
+                    {hb_util:lowercase_key(Key), Val}
+                ||
+                    {Key, Val} <- cowboy_req:parse_qs(#{ qs => QStr })
+                ]
+            )
         )
     catch _:_ -> throw({invalid_singleton, invalid_query, QStr})
     end.

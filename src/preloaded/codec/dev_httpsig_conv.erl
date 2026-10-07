@@ -254,7 +254,8 @@ from_body_part(InlinedKey, Part, Opts) ->
                (RawHeader) -> 
                     case binary:split(RawHeader, [<<": ">>]) of
                         [Name, Value] ->
-                            {true, {Name, hb_escape:decode_header(Value)}};
+                            Key = hb_util:lowercase_key(Name),
+                            {true, {Key, hb_escape:decode_header(Value)}};
                         _ ->
                             % skip lines that aren't properly formatted headers
                             false
@@ -1114,7 +1115,24 @@ nested_content_disposition_roundtrip_test() ->
     Codec = #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true },
     Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, #{}),
     Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, #{}),
-    ?assertEqual(Msg, Decoded).
+    ?assertEqual(Msg, Decoded),
+    % Part header names are case-insensitive, as HTTP header names are.
+    Capitalised =
+        binary:replace(
+            maps:get(<<"body">>, Encoded),
+            <<"content-disposition: ">>,
+            <<"Content-Disposition: ">>,
+            [global]
+        ),
+    ?assertEqual(
+        Msg,
+        hb_message:convert(
+            Encoded#{ <<"body">> => Capitalised },
+            <<"structured@1.0">>,
+            Codec,
+            #{}
+        )
+    ).
 
 %% @doc A message's own keys with the names of reserved headers are served by
 %% ID and posted as they were written, over HTTP/1.1 and HTTP/2.

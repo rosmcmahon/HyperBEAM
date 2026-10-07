@@ -89,6 +89,8 @@ test_suite() ->
             fun resolve_path_element_test/1},
         {resolve_binary_key, "resolve binary key",
             fun resolve_binary_key_test/1},
+        {resolve_capitalised_key, "resolve capitalised key",
+            fun resolve_capitalised_key_test/1},
         {key_to_binary, "key to binary",
             fun key_to_binary_test/1},
         {key_from_id_device_with_args, "key from id device with args",
@@ -222,6 +224,7 @@ test_opts() ->
                 set_new_messages,
                 resolve_from_multiple_keys,
                 resolve_path_element,
+                resolve_capitalised_key,
                 device_with_default_handler_function,
                 device_with_handler_function,
                 error_strategy,
@@ -251,6 +254,7 @@ test_opts() ->
             skip => [
                 % Skip tests that assert behaviors of the management stages
                 % that raw mode explicitly skips.
+                resolve_capitalised_key,
                 error_strategy,
                 step_hook,
                 paranoid_input_verification,
@@ -541,10 +545,6 @@ resolve_path_element_test(Opts) ->
     ?assertEqual(
         {ok, [<<"test_path">>]},
         hb_ao:resolve(#{ <<"path">> => [<<"test_path">>] }, <<"path">>, Opts)
-    ),
-    ?assertEqual(
-        {ok, [<<"a">>]},
-        hb_ao:resolve(#{ <<"Path">> => [<<"a">>] }, <<"Path">>, Opts)
     ).
 
 key_to_binary_test(Opts) ->
@@ -556,6 +556,15 @@ resolve_binary_key_test(Opts) ->
     ?assertEqual(
         {ok, <<"RESULT">>},
         hb_ao:resolve(#{ a => <<"RESULT">> }, <<"a">>, Opts)
+    ).
+
+%% @doc The vary step gives a device the keys of its inputs in lowercase, so a
+%% key that is read with capitals finds the message's key, and a `Device' key is
+%% in lowercase before the device is chosen. Raw mode does not vary.
+resolve_capitalised_key_test(Opts) ->
+    ?assertEqual(
+        {ok, [<<"a">>]},
+        hb_ao:resolve(#{ <<"Path">> => [<<"a">>] }, <<"Path">>, Opts)
     ),
     ?assertEqual(
         {ok, <<"1">>},
@@ -564,6 +573,17 @@ resolve_binary_key_test(Opts) ->
                 <<"Test-Header">> => <<"1">>
             },
             <<"Test-Header">>,
+            Opts
+        )
+    ),
+    ?assertEqual(
+        {ok, <<"a=\"integer\"">>},
+        hb_ao:resolve(
+            #{ <<"Device">> => <<"structured@1.0">> },
+            #{
+                <<"path">> => <<"encode-types">>,
+                <<"body">> => #{ <<"a">> => <<"integer">> }
+            },
             Opts
         )
     ).

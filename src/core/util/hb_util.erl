@@ -27,7 +27,7 @@
 -export([unquote/1, split_escaped_single/2]).
 -export([check_size/2, check_value/2, check_type/2, ok_or_throw/3]).
 -export([all_atoms/0, binary_is_atom/1]).
--export([lower_case_keys/2]).
+-export([lowercase_key/1]).
 -export([base58_encode/1, atom_to_dashed_binary/1]).
 -include("include/hb.hrl").
 
@@ -208,6 +208,26 @@ to_lower(Str) when is_binary(Str) ->
     end;
 to_lower(Str) ->
     string:lowercase(Str).
+
+%% @doc Lowercase a key as `structured@1.0' does. Unlike `to_lower/1', only
+%% the ASCII capitals A-Z change: every other byte is kept, so every node gives
+%% the same key. A key of the length of an ID, with or without `+link', keeps
+%% its case, as ledgers key balances by address. A key that is not a binary is
+%% kept.
+lowercase_key(Key) when is_binary(Key) ->
+    case hb_link:remove_link_specifier(Key) of
+        ID when ?IS_ID(ID) -> Key;
+        _ ->
+            case hb_util_string:lowercase(Key) of
+                non_ascii -> << <<(lowercase_byte(C))>> || <<C>> <= Key >>;
+                Lowered -> Lowered
+            end
+    end;
+lowercase_key(Key) -> Key.
+
+%% @doc Lowercase an ASCII capital; keep any other byte.
+lowercase_byte(C) when C >= $A, C =< $Z -> C bor 32;
+lowercase_byte(C) -> C.
 
 %% @doc Build a committer address from a shared secret.
 secret_key_to_committer(Key) ->
@@ -938,25 +958,6 @@ atom_from_int(Int) ->
 %% @doc Check if a given binary is already an atom.
 binary_is_atom(X) ->
     lists:member(X, lists:map(fun hb_util:bin/1, all_atoms())).
-
-%% @doc Convert all keys in a message or map to lowercase.
-%% Note: Recursively forces load of _all_ keys in the map recursively for 
-%% conversion.
-lower_case_keys(Map, Opts) ->
-    hb_maps:fold(
-        fun(K, V, Acc) ->
-            maps:put(
-                to_lower(K),
-                if is_map(V) -> lower_case_keys(V, Opts);
-                true -> V
-                end,
-                Acc
-            )
-        end,
-        #{},
-        Map,
-        Opts
-    ).
 
 %% @doc Base58 encode.
 base58_encode(<<0, Rest/binary>>) ->

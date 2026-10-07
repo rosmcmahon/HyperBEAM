@@ -250,7 +250,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                 <<"message">> => Msg
                             }
                     end,
-                    hb_util:lower_case_keys(
+                    hb_cache:ensure_all_loaded(
                         hb_ao:normalize_keys(hb_private:reset(Outbox)),
                         Opts
                     ),

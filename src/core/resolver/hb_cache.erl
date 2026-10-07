@@ -1117,13 +1117,14 @@ structured_decode_types(Types, Opts) ->
 %% message and return it if it exists.
 %% 3. If the message has an explicit device, we attempt to read the hashpath to
 %% see if it has already been computed.
+%% A key is read as `message@1.0' reads it: lowercased once, then exactly.
 read_resolved(BaseMsg, Key, Opts) when is_binary(Key) ->
     read_resolved(BaseMsg, #{ <<"path">> => Key }, Opts);
 read_resolved({link, ID, LinkOpts}, Req, Opts) ->
     read_resolved(ID, Req, maps:merge(LinkOpts, Opts));
 read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsgID) ->
     Store = hb_opts:get(store, no_viable_store, Opts),
-    NormKey = hb_ao:normalize_key(Key, Opts),
+    NormKey = hb_util:lowercase_key(hb_ao:normalize_key(Key, Opts)),
     case hb_device:is_direct_key_access(BaseMsgID, Req, Opts, Store) of
         unknown -> miss;
         false ->
@@ -1158,7 +1159,7 @@ read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsg
 read_resolved(BaseMsg, Req = #{ <<"path">> := Key }, Opts) when is_map(BaseMsg) ->
     % The base message is loaded, so we determine if it has an explicit device
     % and perform a direct lookup if it does not.
-    NormKey = hb_ao:normalize_key(Key, Opts),
+    NormKey = hb_util:lowercase_key(hb_ao:normalize_key(Key, Opts)),
     case hb_device:is_direct_key_access(BaseMsg, Req, Opts) of
         false -> read_computation(BaseMsg, Req, Opts);
         true ->
