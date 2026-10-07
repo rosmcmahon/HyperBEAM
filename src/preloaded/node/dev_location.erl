@@ -321,15 +321,7 @@ write_foreign(Base, RawReq, Opts) ->
     MaybeLocation = find_target(Base, RawReq, Opts),
     maybe
         Signers = hb_message:signers(MaybeLocation, Opts),
-        LocationType =
-            hb_ao:get_first(
-                [
-                    {MaybeLocation, <<"type">>},
-                    {MaybeLocation, <<"Type">>}
-                ],
-                not_found,
-                Opts
-            ),
+        LocationType = hb_ao:get(<<"type">>, MaybeLocation, not_found, Opts),
         NormalizedType =
             case LocationType of
                 not_found -> not_found;
