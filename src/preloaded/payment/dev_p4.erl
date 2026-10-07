@@ -482,7 +482,20 @@ non_chargable_route_test() ->
     BadSignedReq3 = hb_message:commit(Req3, #{ <<"priv-wallet">> => Wallet }),
     Res3 = hb_http:get(Node, BadSignedReq3, #{}),
     ?event({res3, Res3}),
-    ?assertMatch({error, _}, Res3).
+    ?assertMatch({error, _}, Res3),
+    % A wallet that signs twice is one signer, and its balance is too low.
+    ?assertMatch(
+        {error, #{ <<"status">> := 402 }},
+        hb_http:get(
+            Node,
+            hb_message:commit(
+                BadSignedReq3,
+                #{ <<"priv-wallet">> => Wallet },
+                #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true }
+            ),
+            #{}
+        )
+    ).
 
 %% @doc Ensure that Lua scripts can be used as pricing and ledger devices. Our
 %% scripts come in two components:

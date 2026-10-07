@@ -228,7 +228,8 @@ id_device(#{ <<"commitments">> := Commitments }, Opts) ->
 id_device(_, _) ->
     {ok, ?DEFAULT_ID_DEVICE}.
 
-%% @doc Return the committers of a message that are present in the given request.
+%% @doc Return the committers of a message. A committer is listed once, however
+%% many commitments it made.
 committers(Base) -> committers(Base, #{}).
 committers(Base, Req) -> committers(Base, Req, #{}).
 -spec committers(
@@ -237,7 +238,7 @@ committers(Base, Req) -> committers(Base, Req, #{}).
     #{ _ => _ }
 ) -> {ok, [_]}.
 committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
-    {ok,
+    Committers =
         hb_maps:values(
             hb_maps:filtermap(
                 fun(_ID, Commitment) ->
@@ -250,8 +251,8 @@ committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
                 NodeOpts
             ),
             NodeOpts
-        )
-    };
+        ),
+    {ok, hb_util:unique(Committers)};
 committers(_, _, _) ->
     {ok, []}.
 

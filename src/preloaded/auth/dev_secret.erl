@@ -955,6 +955,58 @@ export_wallet_test() ->
     AccessControl = maps:get(<<"access-control">>, ExportResponse),
     ?assertEqual(WalletAddress, maps:get(<<"wallet-address">>, AccessControl)).
 
+%% @doc Ensure that a secret needing two controllers is not exported for a
+%% request that one controller signed twice. A wallet that signs twice is one
+%% signer, so it does not meet the threshold.
+export_requires_distinct_controllers_test() ->
+    A = ar_wallet:new(),
+    B = ar_wallet:new(),
+    Node = hb_http_server:start_node(#{ <<"priv-wallet">> => ar_wallet:new() }),
+    {ok, #{ <<"body">> := KeyID }} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/~secret@1.0/generate">>,
+                <<"persist">> => <<"in-memory">>,
+                <<"controllers">> =>
+                    [
+                        hb_util:human_id(ar_wallet:to_address(A)),
+                        hb_util:human_id(ar_wallet:to_address(B))
+                    ],
+                <<"required-controllers">> => 2
+            },
+            #{}
+        ),
+    ExportBody = #{ <<"device">> => <<"secret@1.0">>, <<"keyids">> => [KeyID] },
+    Export =
+        fun(Signed) ->
+            hb_http:get(
+                Node,
+                Signed#{ <<"path">> => <<"/~secret@1.0/export">> },
+                #{}
+            )
+        end,
+    % Signed by both controllers, the secret is exported.
+    {ok, _} =
+        Export(
+            hb_message:commit(
+                hb_message:commit(ExportBody, #{ <<"priv-wallet">> => A }),
+                #{ <<"priv-wallet">> => B }
+            )
+        ),
+    % A request signed twice by one controller has two commitments, but only
+    % one signer, so the secret is not exported.
+    ?assertMatch(
+        {error, _},
+        Export(
+            hb_message:commit(
+                hb_message:commit(ExportBody, #{ <<"priv-wallet">> => A }),
+                #{ <<"priv-wallet">> => A },
+                #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true }
+            )
+        )
+    ).
+
 export_non_volatile_wallet_test() ->
         Node = hb_http_server:start_node(#{
             <<"priv-wallet">> => ar_wallet:new()
