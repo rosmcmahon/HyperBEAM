@@ -2,12 +2,12 @@
 %%% from the message as it is found in the message's underlying Erlang map. 
 %%% Private keys (`priv[.*]') are not included.
 %%% Reserved keys are: `id', `commitments', `committers', `keys', `path', 
-%%% `set', `remove', `get', and `verify'. Their function comments describe the 
+%%% `set', `remove', and `verify'. Their function comments describe the 
 %%% behaviour of the device when these keys are set.
 -module(dev_message).
 %%% Base AO-Core reserved keys:
 -export([info/0, keys/1, keys/2]).
--export([set/3, set_path/3, remove/3, get/3, get/4]).
+-export([set/3, set_path/3, remove/3, get/4]).
 %%% Commitment-specific keys:
 -export([id/1, id/2, id/3]).
 -export([commit/3, committed/3, committers/1, committers/2, committers/3, verify/3]).
@@ -1064,7 +1064,6 @@ keys(Msg, Opts) ->
 %% @doc Return the value associated with the key as it exists in the message's
 %% underlying Erlang map, if the key is public. The key is lowercased once, as
 %% the keys of a message in `structured@1.0' form are, then matched exactly.
-get(Key, Msg, Opts) -> get(Key, Msg, #{ <<"path">> => <<"get">> }, Opts).
 get(Key, Msg, _Req, Opts) ->
     case hb_private:is_private(Key) of
         true -> {error, not_found};
@@ -1140,7 +1139,9 @@ key_from_device_test() ->
         {ok, not_found},
         hb_ao:resolve(ID, <<"a">>, #{})
     ),
-    ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})).
+    ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})),
+    % A key named `get' is read like any other.
+    ?assertEqual({ok, 2}, hb_ao:resolve(#{ <<"get">> => 2 }, <<"get">>, #{})).
 
 remove_test() ->
 	Msg = #{ <<"key1">> => <<"Value1">>, <<"key2">> => <<"Value2">> },
