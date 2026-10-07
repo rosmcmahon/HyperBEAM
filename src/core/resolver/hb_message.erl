@@ -232,8 +232,12 @@ id(Msg) -> id(Msg, uncommitted).
 id(Msg, Opts) when is_map(Opts) -> id(Msg, uncommitted, Opts);
 id(Msg, Committers) -> id(Msg, Committers, #{}).
 id(Msg, Spec, Opts) when is_map(Spec) ->
+    % hb_ao:raw does not vary for us but ~message@1.0/commit|id expects a
+    % ~structured@1.0 form, so we force an idempotent 'to' call to ensure it
+    {ok, Structured} =
+        hb_ao:raw(<<"structured@1.0">>, <<"to">>, Msg, #{}, Opts),
     {ok, ID} =
-        hb_ao:raw(<<"message@1.0">>, <<"id">>, Msg, Spec, Opts),
+        hb_ao:raw(<<"message@1.0">>, <<"id">>, Structured, Spec, Opts),
     hb_util:human_id(ID);
 id(Msg, RawCommitters, Opts) ->
     CommSpec =
@@ -246,9 +250,7 @@ id(Msg, RawCommitters, Opts) ->
             List when is_list(List) -> #{ <<"committers">> => List }
         end,
     ?event_debug({getting_id, {msg, Msg}, {spec, CommSpec}}),
-    {ok, ID} =
-        hb_ao:raw(<<"message@1.0">>, <<"id">>, Msg, CommSpec, Opts),
-    hb_util:human_id(ID).
+    id(Msg, CommSpec, Opts).
 
 %% @doc Normalize loaded messages bottom-up. `verify' selects the commitments
 %% to check: `all', `signed', `unsigned', `passive' (trust existing commitments),
@@ -336,8 +338,11 @@ normalize_message(Msg, Opts, Settings) ->
         true ->
             Unsigned = commit(uncommitted(Normalized, Opts), Opts,
                 #{ <<"type">> => <<"unsigned">> }),
-            Normalized#{ <<"commitments">> => hb_maps:merge(
-                hb_maps:get(<<"commitments">>, Unsigned, Opts), Kept, Opts) };
+            Unsigned#{ <<"commitments">> => hb_maps:merge(
+                hb_maps:get(<<"commitments">>, Unsigned, #{}, Opts),
+                Kept,
+                Opts
+            ) };
         false -> Normalized
     end.
 
@@ -454,11 +459,15 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
 commit(Msg, Opts, Spec) ->
+    % hb_ao:raw does not vary for us but ~message@1.0/commit|id expects a
+    % ~structured@1.0 form, so we force an idempotent 'to' call to ensure it
+    {ok, Structured} =
+        hb_ao:raw(<<"structured@1.0">>, <<"to">>, Msg, #{}, Opts),
     {ok, Signed} =
         hb_ao:raw(
             <<"message@1.0">>,
             <<"commit">>,
-            Msg,
+            Structured,
             Spec#{
                 <<"commitment-device">> =>
                     case hb_maps:get(<<"commitment-device">>, Spec, none, Opts) of
@@ -1113,7 +1122,17 @@ normalize_commitments_depth_and_fast_test() ->
         #{ <<"verify">> => all, <<"add-unsigned">> => false }),
     ?assertEqual(#{ <<"children">> => [#{ <<"a">> => 2 }],
         <<"plain">> => #{ <<"x">> => 1 } }, hb_private:reset(Deep)),
-    ?assert(deep_verify(normalize_commitments(Nested, Opts, all), Opts)).
+    ?assert(deep_verify(normalize_commitments(Nested, Opts, all), Opts)),
+    % `commit' runs `to' first: a TABM is committed as the message it decodes to.
+    ?assertEqual(
+        #{ <<"a">> => 1 },
+        uncommitted(
+            commit(
+                #{ <<"a">> => <<"1">>, <<"ao-types">> => <<"a=\"integer\"">> },
+                Opts
+            )
+        )
+    ).
 
 %% @doc Commitments should never generally be unloaded, but `hb_message` chooses
 %% to be tolerant of issues here regardless.

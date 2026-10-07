@@ -244,12 +244,9 @@ to(TABM, Req, Opts) ->
 
 %% @doc Decode types recursively, leaving malformed inputs to the codec boundary.
 decode(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
-decode(TABM0, Req, Opts) when is_list(TABM0) ->
-    % If we receive a list, we convert it to a message and run `to/3' on it. 
-    % Finally, we convert the result back to a list.
-    {ok, TABM1} = decode(hb_util:list_to_numbered_message(TABM0), Req, Opts),
-    {ok, hb_util:numbered_keys_to_list(TABM1, Opts)};
-decode(TABM0, Req, Opts) ->
+decode(List, Req, Opts) when is_list(List) ->
+    {ok, [ hb_util:ok(decode(Value, Req, Opts)) || Value <- List ]};
+decode(TABM0, Req, Opts) when is_map(TABM0) ->
     Types = decode_ao_types(TABM0, Opts),
     % Decode all links to their HyperBEAM-native, resolvable form.
     TABM1 = hb_link:decode_all_links(TABM0),
@@ -286,7 +283,8 @@ decode(TABM0, Req, Opts) ->
     case maps:get(<<".">>, Types, not_found) of
         <<"list">> -> {ok, hb_util:message_to_ordered_list(ResMsg, Opts)};
         _ -> {ok, ResMsg}
-    end.
+    end;
+decode(Literal, _Req, _Opts) -> {ok, Literal}.
 
 %% @doc Generate an `ao-types' structured field from a map of keys and their
 %% types.

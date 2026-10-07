@@ -436,8 +436,12 @@ resolve_stage(2, Base, Req, Opts = #{ <<"resolve-mode">> := raw }) ->
     % Raw mode: apply the device function directly, skipping the cache,
     % validation, persistence, linking, and worker stages.
     raw(Base, Req, Opts);
-resolve_stage(2, Base, Req, Opts) ->
+resolve_stage(2, RawBase, RawReq, Opts) ->
     ?event_debug(debug_ao_core, {stage, 2, vary_inputs}, Opts),
+    % Devices receive their inputs in `structured@1.0' form: `to' decodes the
+    % base and the request here.
+    {ok, Base} = raw(<<"structured@1.0">>, <<"to">>, RawBase, #{}, Opts),
+    {ok, Req} = raw(<<"structured@1.0">>, <<"to">>, RawReq, #{}, Opts),
     % Vary the inputs by the schema of the function that will execute them
     % before the cache lookup, such that every execution the schema deems
     % equivalent shares one cached result. If the function's schema declares
