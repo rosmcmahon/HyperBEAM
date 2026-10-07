@@ -134,7 +134,10 @@ trusted_device_id_matches(Pkg, Opts, SpecIDs, ImplID) ->
     Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
     IDOpts = Opts#{
         <<"trusted-device-signers">> => [Other],
-        <<"trusted-devices">> => #{ SpecID => ImplID }
+        % No preloaded store holds the implementation, and a config file gives
+        % the key lowercase.
+        <<"preloaded-store">> => undefined,
+        <<"trusted-devices">> => #{ hb_util:lowercase_key(SpecID) => ImplID }
     },
     {ok, Mod} = hb_device_load:reference(SpecID, IDOpts),
     ?assertEqual(maps:get(module_name, Pkg), Mod).

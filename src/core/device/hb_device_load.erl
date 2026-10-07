@@ -139,9 +139,17 @@ from_forge_bootstrap(Ref, Opts) ->
     end.
 
 %% @doc Operator-pinned map from device name or spec ID to implementation ID.
+%% Its keys and the reference are compared lowercase, as a config file loads
+%% the keys.
 from_trusted_devices(Ref, Opts) ->
-    case hb_opts:get(trusted_devices, #{}, Opts) of
-        #{ Ref := ID } when ?IS_ID(ID) -> load_archive(ID, Opts);
+    Trusted =
+        maps:fold(
+            fun(Key, ID, Acc) -> Acc#{ hb_util:lowercase_key(Key) => ID } end,
+            #{},
+            hb_opts:get(trusted_devices, #{}, Opts)
+        ),
+    case maps:find(hb_util:lowercase_key(Ref), Trusted) of
+        {ok, ID} when ?IS_ID(ID) -> load_archive(ID, Opts);
         _ -> {error, not_found}
     end.
 
