@@ -275,6 +275,17 @@ decode(TABM0, Req, Opts) when is_map(TABM0) ->
                     {ok, Type} ->
                         Acc#{ RawKey => hb_util:decode(Type, BinValue) }
                 end;
+            (<<"commitments">>, Commitments, Acc) when is_map(Commitments) ->
+                % The keys of `commitments' are IDs: only its values are decoded.
+                Acc#{
+                    <<"commitments">> =>
+                        maps:map(
+                            fun(_ID, Commitment) ->
+                                hb_util:ok(decode(Commitment, Req, Opts))
+                            end,
+                            Commitments
+                        )
+                };
             (RawKey, ChildTABM, Acc) when is_map(ChildTABM) or is_list(ChildTABM) ->
                 % Decode the child TABM, unless the key is private
                 case hb_private:is_private(RawKey) of
@@ -528,7 +539,8 @@ malformed_types_return_error_test() ->
     )).
 
 %% @doc Keys are lowercased, a link key holds a link, keys that become one key
-%% hold a list, and an ID and a private key keep their case.
+%% hold a list, and a private key and the IDs that key `commitments' keep their
+%% case.
 lowercase_keys_test() ->
     ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ?assertEqual(
@@ -537,7 +549,8 @@ lowercase_keys_test() ->
             <<"child">> =>
                 {link, ID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
             <<"action">> => [<<"a">>, <<"b">>],
-            ID => <<"balance">>,
+            hb_util:lowercase_key(ID) => <<"balance">>,
+            <<"commitments">> => #{ ID => #{ <<"keyid">> => <<"k">> } },
             <<"Priv-Key">> => #{ <<"Inner">> => 1 }
         }},
         hb_ao:raw(
@@ -549,6 +562,7 @@ lowercase_keys_test() ->
                 <<"Action">> => <<"a">>,
                 <<"action">> => <<"b">>,
                 ID => <<"balance">>,
+                <<"commitments">> => #{ ID => #{ <<"Keyid">> => <<"k">> } },
                 <<"Priv-Key">> => #{ <<"Inner">> => 1 }
             },
             #{}, #{}

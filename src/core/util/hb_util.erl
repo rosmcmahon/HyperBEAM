@@ -211,17 +211,11 @@ to_lower(Str) ->
 
 %% @doc Lowercase a key as `structured@1.0' does. Unlike `to_lower/1', only
 %% the ASCII capitals A-Z change: every other byte is kept, so every node gives
-%% the same key. A key of the length of an ID, with or without `+link', keeps
-%% its case, as ledgers key balances by address. A key that is not a binary is
-%% kept.
+%% the same key. A key that is not a binary is kept.
 lowercase_key(Key) when is_binary(Key) ->
-    case hb_link:remove_link_specifier(Key) of
-        ID when ?IS_ID(ID) -> Key;
-        _ ->
-            case hb_util_string:lowercase(Key) of
-                non_ascii -> << <<(lowercase_byte(C))>> || <<C>> <= Key >>;
-                Lowered -> Lowered
-            end
+    case hb_util_string:lowercase(Key) of
+        non_ascii -> << <<(lowercase_byte(C))>> || <<C>> <= Key >>;
+        Lowered -> Lowered
     end;
 lowercase_key(Key) -> Key.
 

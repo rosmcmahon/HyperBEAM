@@ -165,8 +165,7 @@ tags(Item, Opts) ->
     ),
     ao_types(Tags, Opts).
 
-%% @doc Normalize a tag name as `structured@1.0' normalizes a key: IDs and
-%% their link forms keep their bytes.
+%% @doc Normalize a tag name as `structured@1.0' normalizes a key.
 normalize_key(Key) -> hb_util:lowercase_key(hb_ao:normalize_key(Key)).
 
 %% @doc Ensure the encoded keys in the `ao-types' field are lowercased and
