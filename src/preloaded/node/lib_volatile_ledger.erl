@@ -21,6 +21,9 @@
 %%%     min:      The lowest balance that a debit leaves.
 %%%               Default: none.
 %%% ```
+%%%
+%%% An account is a key of `balances', so the ledger holds and reads each
+%%% account lowercase, as keys are in `structured@1.0' form.
 -module(lib_volatile_ledger).
 -export([debit/4, balance/3]).
 -include("include/hb.hrl").
@@ -28,11 +31,11 @@
 %% @doc Debit `Amount' from `Account' and return its new balance. A negative
 %% amount credits the account.
 debit(Ledger, Account, Amount, Opts) when is_number(Amount) ->
-    call(Ledger, {debit, Account, Amount}, Opts).
+    call(Ledger, {debit, hb_util:lowercase_key(Account), Amount}, Opts).
 
 %% @doc Return the balance of `Account'.
 balance(Ledger, Account, Opts) ->
-    call(Ledger, {balance, Account}, Opts).
+    call(Ledger, {balance, hb_util:lowercase_key(Account)}, Opts).
 
 %% @doc Send a request to the ledger's process and wait for its reply, for as
 %% long as the process is alive.
@@ -67,7 +70,14 @@ start_server(ServerID, Ledger, Opts) ->
     ?event(volatile_ledger, {started_ledger, {server_id, ServerID}}),
     server_loop(
         #{
-            balances => hb_maps:get(<<"balances">>, Ledger, #{}, Opts),
+            balances =>
+                maps:fold(
+                    fun(Account, Balance, Balances) ->
+                        Balances#{ hb_util:lowercase_key(Account) => Balance }
+                    end,
+                    #{},
+                    hb_maps:get(<<"balances">>, Ledger, #{}, Opts)
+                ),
             default => hb_maps:get(<<"default">>, Ledger, 0, Opts),
             recharge => hb_maps:get(<<"recharge">>, Ledger, 0, Opts),
             max => hb_maps:get(<<"max">>, Ledger, infinity, Opts),

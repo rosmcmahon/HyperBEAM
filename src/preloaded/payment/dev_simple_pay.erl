@@ -323,7 +323,9 @@ test_opts(Ledger) ->
 get_balance_and_top_up_test() ->
     ClientWallet = ar_wallet:new(),
     ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
-    {HostAddress, HostWallet, Opts} = test_opts(#{ ClientAddress => 100 }),
+    % The ledger keys the client lowercase, as a config file loads it.
+    {HostAddress, HostWallet, Opts} =
+        test_opts(#{ hb_util:lowercase_key(ClientAddress) => 100 }),
     Node = hb_http_server:start_node(Opts),
     ?event({host_address, HostAddress}),
     ?event({client_address, ClientAddress}),
