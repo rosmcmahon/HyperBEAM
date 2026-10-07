@@ -1,12 +1,12 @@
-%%% @doc Functions for escaping and unescaping mixed case values, for use in HTTP
-%%% headers. Both percent-encoding and escaping of double-quoted strings
-%%% (`"' => `\"') are supported.
+%%% @doc Functions for escaping and unescaping values for use in HTTP headers,
+%%% store keys and path components. Both percent-encoding and escaping of
+%%% double-quoted strings (`"' => `\"') are supported.
 %%%
-%%% This is necessary for encodings of AO-Core messages for transmission in
-%%% HTTP/2 and HTTP/3, because uppercase header keys are explicitly disallowed.
-%%% While most map keys in HyperBEAM are normalized to lowercase, IDs are not.
-%%% Subsequently, we encode all header keys to lowercase %-encoded URI-style
-%%% strings because transmission.
+%%% `encode/1' writes each byte other than `a-z', `0-9', `.', `-', `_', `/', `?'
+%%% and `&' as `%' and two lowercase hex digits, capitals included. The keys of
+%%% a message in `structured@1.0' form are lowercase, but an ID keeps its
+%%% capitals, and a file system that ignores case would give two IDs that
+%%% differ only in case one file.
 %%%
 %%% Path components have separate escaping for literal `/` and `%` characters.
 -module(hb_escape).

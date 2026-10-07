@@ -11,10 +11,9 @@
  *
  * UTF-8 safety: `lowercase' and `key_chars' fold ASCII only and do NOT
  * validate UTF-8, whereas `string:lowercase' folds full Unicode and *throws*
- * on invalid UTF-8 (a contract `ar_tx' tag parsing relies on to reject
- * non-string tags). To stay both fast and exact, those two functions return
+ * on invalid UTF-8. To stay both fast and exact, those two functions return
  * the atom `non_ascii' the moment they see a byte >= 0x80, and the Erlang
- * caller falls back to the original `string:lowercase'-based expression. Pure
+ * caller chooses how to lowercase such a binary. Pure
  * ASCII -- the overwhelming common case for HB keys -- takes the fast path and
  * is provably identical to `string:lowercase' (only `A'..`Z' has an ASCII case
  * mapping, and ASCII is always valid UTF-8, so it never throws). `dash_chars'
