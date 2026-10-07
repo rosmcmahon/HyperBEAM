@@ -1,10 +1,12 @@
 %%% @doc `shepherd-feed@1.0' reports the weave items a node takes in to a
 %%% Shepherd content-moderation server. Each report is a JSON object whose
 %%% `items' are GraphQL-shaped transaction nodes (`id', `data/size',
-%%% `data/type', `tags' and `owner/address'), POSTed to the node option
-%%% `shepherd-feed-url' with `shepherd-feed-token' as a bearer token. Every
-%%% field is read from an item the node has verified: the owner is the
-%%% committer of the item's signed `ans104@1.0' or `tx@1.0' commitment.
+%%% `data/type', `tags', `owner/address' and `owner/key'), POSTed to the node
+%%% option `shepherd-feed-url' with `shepherd-feed-token' as a bearer token.
+%%% Every field is read from an item the node has verified, from its signed
+%%% `ans104@1.0' or `tx@1.0' commitment: `owner/address' is the committer,
+%%% which is native to the signer's chain for Ethereum and Solana signers, as
+%%% in GraphQL, and `owner/key' is the signer's base64url public key.
 %%% `data/type' is omitted when the item has no UTF-8 `content-type', and tags
 %%% that are not UTF-8 are omitted.
 %%%
@@ -163,6 +165,7 @@ gql_node(ID, TABM, Opts) ->
     maybe
         true ?= lists:member(Device, ?DEVICES),
         {ok, Owner} ?= hb_maps:find(<<"committer">>, Commitment, Opts),
+        {ok, KeyID} ?= hb_maps:find(<<"keyid">>, Commitment, Opts),
         Size = integer_to_binary(data_size(TABM, Commitment, Opts)),
         Type = text(hb_maps:get(<<"content-type">>, TABM, not_found, Opts)),
         #{
@@ -173,7 +176,11 @@ gql_node(ID, TABM, Opts) ->
                     _ -> #{ <<"size">> => Size, <<"type">> => Type }
                 end,
             <<"tags">> => tags(TABM, Commitment, Opts),
-            <<"owner">> => #{ <<"address">> => Owner }
+            <<"owner">> =>
+                #{
+                    <<"address">> => Owner,
+                    <<"key">> => hb_util:remove_scheme_prefix(KeyID)
+                }
         }
     else
         _ -> skip
@@ -441,6 +448,7 @@ item_fields(Item) ->
         size => hb_maps:get(<<"size">>, Data, undefined, #{}),
         type => hb_maps:get(<<"type">>, Data, undefined, #{}),
         owner => hb_maps:get(<<"address">>, Owner, undefined, #{}),
+        key => hb_maps:get(<<"key">>, Owner, undefined, #{}),
         tags =>
             [
                 {
@@ -458,8 +466,8 @@ node_hooks(Wallet) ->
         #{ <<"http-server">> => hb_util:human_id(ar_wallet:to_address(Wallet)) }
     ).
 
-%% @doc An item uploaded to the bundler is reported with its metadata, and the
-%% node keeps its default request hooks.
+%% @doc Items uploaded to the bundler by RSA and Ethereum signers are reported
+%% with their metadata, and the node keeps its default request hooks.
 upload_test() ->
     Receiver = start_receiver(),
     {ServerHandle, NodeOpts} =
@@ -492,42 +500,71 @@ upload_test() ->
             hb_hook:find(<<"request">>, hb_opts:default_message_with_env()),
             hb_hook:find(<<"request">>, node_hooks(NodeWallet))
         ),
-        Wallet = ar_wallet:new(),
-        Item =
-            ar_bundles:sign_item(
-                #tx{
-                    data = <<"not really a png">>,
-                    tags = [{<<"Content-Type">>, <<"image/png">>}]
-                },
-                Wallet
-            ),
-        ?assertMatch(
-            {ok, _},
-            hb_http:post(
-                Node,
-                #{
-                    <<"path">> => <<"/~bundler@1.0/tx">>,
-                    <<"bundler-subject">> => <<"body">>,
-                    <<"body">> =>
-                        hb_message:convert(
-                            Item,
-                            <<"structured@1.0">>,
-                            <<"ans104@1.0">>,
-                            #{}
-                        )
-                },
-                #{}
-            )
+        RSAWallet = ar_wallet:new(),
+        Items =
+            [RSAItem, EthereumItem] =
+                [
+                    ar_bundles:sign_item(
+                        #tx{
+                            data = <<"not really a png">>,
+                            tags = [{<<"Content-Type">>, <<"image/png">>}]
+                        },
+                        Wallet
+                    )
+                ||
+                    Wallet <- [RSAWallet, ar_wallet:new(ethereum)]
+                ],
+        lists:foreach(
+            fun(Item) ->
+                ?assertMatch(
+                    {ok, _},
+                    hb_http:post(
+                        Node,
+                        #{
+                            <<"path">> => <<"/~bundler@1.0/tx">>,
+                            <<"bundler-subject">> => <<"body">>,
+                            <<"body">> =>
+                                hb_message:convert(
+                                    Item,
+                                    <<"structured@1.0">>,
+                                    <<"ans104@1.0">>,
+                                    #{}
+                                )
+                        },
+                        #{}
+                    )
+                )
+            end,
+            Items
         ),
+        % An Ethereum signer's address is its native `0x' address, as in
+        % GraphQL; its public key is reported alongside it.
+        EthereumAddress =
+            hb_util:human_id(
+                ar_wallet:to_address(
+                    EthereumItem#tx.owner,
+                    EthereumItem#tx.signature_type
+                )
+            ),
+        ?assertMatch(<<"0x", _/binary>>, EthereumAddress),
         ?assertEqual(
             {
                 <<"Bearer test-token">>,
                 [
                     #{
-                        id => hb_util:encode(Item#tx.id),
+                        id => hb_util:encode(RSAItem#tx.id),
                         size => <<"16">>,
                         type => <<"image/png">>,
-                        owner => hb_util:human_id(ar_wallet:to_address(Wallet)),
+                        owner => hb_util:human_id(ar_wallet:to_address(RSAWallet)),
+                        key => hb_util:encode(RSAItem#tx.owner),
+                        tags => [{<<"Content-Type">>, <<"image/png">>}]
+                    },
+                    #{
+                        id => hb_util:encode(EthereumItem#tx.id),
+                        size => <<"16">>,
+                        type => <<"image/png">>,
+                        owner => EthereumAddress,
+                        key => hb_util:encode(EthereumItem#tx.owner),
                         tags => [{<<"Content-Type">>, <<"image/png">>}]
                     }
                 ]
