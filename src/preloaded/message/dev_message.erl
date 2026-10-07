@@ -809,13 +809,6 @@ set(Base, NewValuesMsg, Opts) ->
 			end,
 			NewValuesKeys
 		),
-	% Find keys in the message that are already set (case-insensitive), and 
-	% note them for removal.
-	_ConflictingKeys =
-		lists:filter(
-			fun(Key) -> lists:member(Key, KeysToSet) end,
-			hb_maps:keys(Base, Opts)
-		),
     UnsetKeys =
         lists:filter(
             fun(Key) ->
@@ -830,7 +823,6 @@ set(Base, NewValuesMsg, Opts) ->
     BaseValues = hb_maps:without(UnsetKeys, Base, Opts),
     ?event_debug(debug_message_set,
         {performing_set,
-            {conflicting_keys, _ConflictingKeys},
             {keys_to_unset, UnsetKeys},
             {new_values, NewValuesMsg},
             {original_message, Base}
