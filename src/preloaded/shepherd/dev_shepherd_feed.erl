@@ -16,7 +16,8 @@
 %%%              from the cache that the bundler writes them to before it
 %%%              responds.
 %%%     copycat: `cache-write' hook. Items written at a weave offset, as
-%%%              copycat writes them. Only with `shepherd-feed-copycat=true'.
+%%%              copycat writes them. A node that runs no copycat reports
+%%%              none.
 %%% '''
 %%% Both pass items to a batching process per node and feed URL, and return
 %%% the hook request unchanged. Their failures are logged and dropped: a failed
@@ -59,19 +60,14 @@ install(_Base, Req = #{ <<"body">> := NodeMsg }, Opts) ->
     Defaults =
         hb_maps:get(<<"on">>, hb_opts:default_message_with_env(), #{}, Opts),
     On = hb_maps:merge(Defaults, hb_maps:get(<<"on">>, NodeMsg, #{}, Opts), Opts),
-    Copycat =
-        hb_util:bool(
-            hb_maps:get(<<"shepherd-feed-copycat">>, NodeMsg, false, Opts)
-        ),
     Sources =
         case hb_maps:is_key(<<"shepherd-feed-url">>, NodeMsg, Opts) of
             false -> [];
-            true when Copycat ->
+            true ->
                 [
                     {<<"response">>, <<"upload">>},
                     {<<"cache-write">>, <<"copycat">>}
-                ];
-            true -> [{<<"response">>, <<"upload">>}]
+                ]
         end,
     WithSources = lists:foldl(fun add_source/2, On, Sources),
     {ok, Req#{ <<"body">> => NodeMsg#{ <<"on">> => WithSources } }}.
@@ -466,8 +462,9 @@ node_hooks(Wallet) ->
         #{ <<"http-server">> => hb_util:human_id(ar_wallet:to_address(Wallet)) }
     ).
 
-%% @doc Items uploaded to the bundler by RSA and Ethereum signers are reported
-%% with their metadata, and the node keeps its default request hooks.
+%% @doc `install' adds both sources and keeps the node's default request
+%% hooks, and items uploaded to the bundler by RSA and Ethereum signers are
+%% reported with their metadata.
 upload_test() ->
     Receiver = start_receiver(),
     {ServerHandle, NodeOpts} =
@@ -496,9 +493,24 @@ upload_test() ->
                     <<"shepherd-feed-token">> => <<"test-token">>
                 }
             ),
+        Hooks = node_hooks(NodeWallet),
         ?assertEqual(
             hb_hook:find(<<"request">>, hb_opts:default_message_with_env()),
-            hb_hook:find(<<"request">>, node_hooks(NodeWallet))
+            hb_hook:find(<<"request">>, Hooks)
+        ),
+        lists:foreach(
+            fun({Hook, Path}) ->
+                ?assert(
+                    lists:member(
+                        #{
+                            <<"device">> => <<"shepherd-feed@1.0">>,
+                            <<"path">> => Path
+                        },
+                        hb_hook:find(Hook, Hooks)
+                    )
+                )
+            end,
+            [{<<"response">>, <<"upload">>}, {<<"cache-write">>, <<"copycat">>}]
         ),
         RSAWallet = ar_wallet:new(),
         Items =
@@ -602,7 +614,7 @@ install_without_url_test() ->
         [<<"request">>, <<"response">>, <<"cache-write">>]
     ).
 
-%% @doc With `shepherd-feed-copycat', an item written at a weave offset is
+%% @doc Through the `copycat' source, an item written at a weave offset is
 %% reported and an item written without one is not.
 copycat_test() ->
     Receiver = start_receiver(),
