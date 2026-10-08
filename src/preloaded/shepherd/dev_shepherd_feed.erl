@@ -59,7 +59,8 @@
 install(_Base, Req = #{ <<"body">> := NodeMsg }, Opts) ->
     Defaults =
         hb_maps:get(<<"on">>, hb_opts:default_message_with_env(), #{}, Opts),
-    On = hb_maps:merge(Defaults, hb_maps:get(<<"on">>, NodeMsg, #{}, Opts), Opts),
+    Configured = hb_maps:get(<<"on">>, NodeMsg, #{}, Opts),
+    On = hb_maps:merge(Defaults, Configured, Opts),
     Sources =
         case hb_maps:is_key(<<"shepherd-feed-url">>, NodeMsg, Opts) of
             false -> [];
@@ -135,7 +136,7 @@ copycat(_Base, Req, Opts) ->
 report(ID, TABM, Opts) ->
     case gql_node(ID, TABM, Opts) of
         skip -> ok;
-        Node -> cast({node, hb_json:encode(Node)}, Opts)
+        Node -> cast({node, Node}, Opts)
     end.
 
 %% @doc Run a source, logging rather than raising its failure.
@@ -269,22 +270,22 @@ batcher(Opts) ->
             )
     end.
 
-%% @doc Collect encoded nodes into a page, in reverse order.
+%% @doc Collect nodes into a page, in reverse order.
 collect(URL, Opts, Page, Count, Bytes) ->
     receive
         {upload, ID} ->
             case upload_node(ID, Opts) of
                 skip -> collect(URL, Opts, Page, Count, Bytes);
-                JSON -> add(JSON, URL, Opts, Page, Count, Bytes)
+                Node -> add(Node, URL, Opts, Page, Count, Bytes)
             end;
-        {node, JSON} ->
-            add(JSON, URL, Opts, Page, Count, Bytes);
+        {node, Node} ->
+            add(Node, URL, Opts, Page, Count, Bytes);
         flush ->
             send(URL, Page, Opts),
             collect(URL, Opts, [], 0, 0)
     end.
 
-%% @doc Read an uploaded item from the cache and encode its node.
+%% @doc Read an uploaded item from the cache and build its node.
 upload_node(ID, Opts) ->
     try
         {ok, Item} = hb_cache:read(ID, Opts),
@@ -295,10 +296,7 @@ upload_node(ID, Opts) ->
                 <<"structured@1.0">>,
                 Opts
             ),
-        case gql_node(ID, TABM, Opts) of
-            skip -> skip;
-            Node -> hb_json:encode(Node)
-        end
+        gql_node(ID, TABM, Opts)
     catch Class:Reason ->
         ?event(warning,
             {shepherd_feed_upload_unread,
@@ -310,76 +308,58 @@ upload_node(ID, Opts) ->
         skip
     end.
 
-%% @doc Add an encoded node to the page, first sending the page if the node
-%% would take it past `PAGE_BYTES', and sending it once it is full.
-add(JSON, URL, Opts, Page, Count, Bytes)
-        when Count > 0, Bytes + byte_size(JSON) + 1 > ?PAGE_BYTES ->
-    send(URL, Page, Opts),
-    add(JSON, URL, Opts, [], 0, 0);
-add(JSON, URL, Opts, Page, Count, Bytes) ->
-    case Count of
-        0 -> erlang:send_after(?FLUSH_MS, self(), flush);
-        _ -> ok
-    end,
-    case Count + 1 of
-        ?PAGE_ITEMS ->
-            send(URL, [JSON | Page], Opts),
-            collect(URL, Opts, [], 0, 0);
-        NewCount ->
-            NewBytes = Bytes + byte_size(JSON) + 1,
-            collect(URL, Opts, [JSON | Page], NewCount, NewBytes)
+%% @doc Add a node to the page, first sending the page if the node's JSON would
+%% take it past `PAGE_BYTES', and sending it once it is full.
+add(Node, URL, Opts, Page, Count, Bytes) ->
+    Size = byte_size(hb_json:encode(Node)) + 1,
+    case Count > 0 andalso Bytes + Size > ?PAGE_BYTES of
+        true ->
+            send(URL, Page, Opts),
+            add(Node, URL, Opts, [], 0, 0);
+        false ->
+            case Count of
+                0 -> erlang:send_after(?FLUSH_MS, self(), flush);
+                _ -> ok
+            end,
+            case Count + 1 of
+                ?PAGE_ITEMS ->
+                    send(URL, [Node | Page], Opts),
+                    collect(URL, Opts, [], 0, 0);
+                NewCount ->
+                    collect(URL, Opts, [Node | Page], NewCount, Bytes + Size)
+            end
     end.
 
-%% @doc POST a page to the feed URL with the node's HTTP client, so that its
-%% TLS and retry settings apply.
+%% @doc POST a page to the feed URL as JSON, as a request to an explicit URL,
+%% so that the node's HTTP client and its TLS and retry settings apply. The
+%% bearer token is sent only when one is set: an `authorization' value that
+%% cannot be a header would turn the request into a multipart body.
 send(_URL, [], _Opts) ->
     ok;
 send(URL, Page, Opts) ->
-    try
-        URI = uri_string:parse(URL),
-        Token = hb_util:bin(hb_opts:get(<<"shepherd-feed-token">>, <<>>, Opts)),
-        Res =
-            hb_http_client:request(
-                #{
-                    peer =>
-                        uri_string:recompose(
-                            (maps:with([scheme, host, port], URI))#{
-                                path => <<>>
-                            }
-                        ),
-                    path =>
-                        case maps:get(path, URI, <<>>) of
-                            <<>> -> <<"/">>;
-                            Path -> Path
-                        end,
-                    method => <<"POST">>,
-                    headers =>
-                        #{
-                            <<"content-type">> => <<"application/json">>,
-                            <<"authorization">> => <<"Bearer ", Token/binary>>
-                        },
-                    body =>
-                        iolist_to_binary(
-                            [
-                                <<"{\"items\":[">>,
-                                lists:join($,, lists:reverse(Page)),
-                                <<"]}">>
-                            ]
-                        )
-                },
-                Opts
-            ),
-        case Res of
-            {ok, Status, _Headers, _Body} when Status >= 200, Status < 300 ->
-                ok;
-            Other ->
-                ?event(warning,
-                    {shepherd_feed_report_dropped,
-                        {items, length(Page)},
-                        {response, Other}
-                    }
-                )
-        end
+    Authorization =
+        case hb_util:bin(hb_opts:get(<<"shepherd-feed-token">>, <<>>, Opts)) of
+            <<>> -> #{};
+            Token -> #{ <<"authorization">> => <<"Bearer ", Token/binary>> }
+        end,
+    Report =
+        Authorization#{
+            <<"method">> => <<"POST">>,
+            <<"path">> => URL,
+            <<"content-type">> => <<"application/json">>,
+            <<"body">> =>
+                hb_json:encode(#{ <<"items">> => lists:reverse(Page) })
+        },
+    try hb_http:request(Report, Opts) of
+        {ok, _Res} ->
+            ok;
+        Other ->
+            ?event(warning,
+                {shepherd_feed_report_dropped,
+                    {items, length(Page)},
+                    {response, Other}
+                }
+            )
     catch Class:Reason ->
         ?event(warning,
             {shepherd_feed_report_failed,
@@ -406,11 +386,15 @@ start_receiver() ->
                             <<"device">> =>
                                 #{
                                     <<"request">> =>
-                                        fun(_, Req, _) ->
-                                            Self !
-                                                {received,
-                                                    maps:get(<<"request">>, Req)
-                                                },
+                                        fun(_, Req, Opts) ->
+                                            Request =
+                                                hb_maps:get(
+                                                    <<"request">>,
+                                                    Req,
+                                                    #{},
+                                                    Opts
+                                                ),
+                                            Self ! {received, Request},
                                             {ok, Req}
                                         end
                                 }
@@ -559,6 +543,7 @@ upload_test() ->
                 )
             ),
         ?assertMatch(<<"0x", _/binary>>, EthereumAddress),
+        RSAAddress = hb_util:human_id(ar_wallet:to_address(RSAWallet)),
         ?assertEqual(
             {
                 <<"Bearer test-token">>,
@@ -567,7 +552,7 @@ upload_test() ->
                         id => hb_util:encode(RSAItem#tx.id),
                         size => <<"16">>,
                         type => <<"image/png">>,
-                        owner => hb_util:human_id(ar_wallet:to_address(RSAWallet)),
+                        owner => RSAAddress,
                         key => hb_util:encode(RSAItem#tx.owner),
                         tags => [{<<"Content-Type">>, <<"image/png">>}]
                     },
@@ -634,8 +619,12 @@ copycat_test() ->
                 },
             <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>
         },
-    Unplaced = hb_message:commit(#{ <<"a">> => <<"1">> }, Opts, <<"ans104@1.0">>),
-    Placed = hb_message:commit(#{ <<"a">> => <<"2">> }, Opts, <<"ans104@1.0">>),
+    [Unplaced, Placed] =
+        [
+            hb_message:commit(#{ <<"a">> => Value }, Opts, <<"ans104@1.0">>)
+        ||
+            Value <- [<<"1">>, <<"2">>]
+        ],
     {ok, _} = hb_cache:write(Unplaced, Opts),
     {ok, _} =
         hb_cache:write(hb_private:set(Placed, <<"offset">>, 1000, Opts), Opts),
