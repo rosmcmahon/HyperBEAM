@@ -183,7 +183,7 @@ query(Obj, <<"transaction">>, Args, Opts) ->
 query(Obj, <<"transactions">>, RawArgs, Opts) ->
     Args = maps:map(
         fun(<<"tags">>, Tags) when is_list(Tags) ->
-            [Tag#{ <<"name">> := hb_util:to_lower(Name) }
+            [Tag#{ <<"name">> := hb_util:lowercase_key(Name) }
                 || Tag = #{ <<"name">> := Name } <- Tags];
            (_, Value) -> Value
         end,
