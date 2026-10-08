@@ -89,7 +89,7 @@ export class AddonComponent extends pulumi.ComponentResource {
                 `HB_MAX_CACHE_GB=${maxCacheGB}`,
             ],
             entrypoints: ['/opt/hb/shepherd-start.sh', '/opt/hb/bin/hb', 'foreground'],
-            ports: [{ internal: 8734, external: 8734, ip: '127.0.0.1' }],
+            ports: [{ internal: 8734, external: 8734 }],
             ulimits: [{ name: 'nofile', soft: 65536, hard: 65536 }],
             logDriver: lokiLogDriver,
             logOpts: lokiLogOpts,
