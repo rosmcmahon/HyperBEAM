@@ -269,7 +269,7 @@ head_raw_tx_response(TXID, StartOffset, Length, StructuredTXHeader, Opts) ->
             <<"data-offset">> => pending_root_offset(TXID, StartOffset),
             <<"content-type">> => ContentType,
             <<"header-length">> => 0,
-            <<"content-length">> => Length,
+            <<"data-length">> => Length,
             <<"accept-ranges">> => <<"bytes">>
         }
     }.
@@ -306,7 +306,7 @@ do_head_raw_ans104(TXID, ArweaveOffset, Length, Data, _Opts) ->
                     add_data_offset(ArweaveOffset, HeaderSize),
                 <<"content-type">> => ContentType,
                 <<"header-length">> => HeaderSize,
-                <<"content-length">> => Length - HeaderSize,
+                <<"data-length">> => Length - HeaderSize,
                 <<"accept-ranges">> => <<"bytes">>
             }
         }
@@ -347,7 +347,7 @@ get_raw(Base, Request, Opts) ->
                 <<"raw-id">> := TXID,
                 <<"data-offset">> := ArweaveDataOffset,
                 <<"content-type">> := ContentType,
-                <<"content-length">> := FullContentLength
+                <<"data-length">> := FullContentLength
             }
         } ->
         ?event(debug_raw, {raw_header,
@@ -366,7 +366,6 @@ get_raw(Base, Request, Opts) ->
                     Header#{
                         <<"status">> => 206,
                         <<"content-type">> => ContentType,
-                        <<"content-length">> => RangeLength,
                         <<"content-range">> =>
                             <<
                                 "bytes ",
@@ -970,6 +969,18 @@ dash_keys(Msg) when is_map(Msg) ->
     );
 dash_keys(Value) -> Value.
 
+%% @doc Whether a peer's block is the block its path asked for, or an error:
+%% `/block/height/<n>' asks for `height' `n', `/block/hash/<id>' for
+%% `indep-hash' `id', and `/block/current' for any block.
+requested_block(<<"height/", Height/binary>>, Block, Opts) ->
+    hb_maps:get(<<"height">>, Block, not_found, Opts) =:= hb_util:int(Height)
+        orelse {error, 'invalid-block-height'};
+requested_block(<<"hash/", ID/binary>>, Block, Opts) ->
+    hb_maps:get(<<"indep-hash">>, Block, not_found, Opts) =:= ID
+        orelse {error, 'invalid-indep-hash'};
+requested_block(<<"current">>, _Block, _Opts) ->
+    true.
+
 %% @doc Return whether the request only permits cached values.
 only_if_cached(Req, Opts) ->
     lists:member(
@@ -1146,25 +1157,11 @@ to_message(Path = <<"/unconfirmed_tx/", ID/binary>>, <<"GET">>, Result, LogExtra
     to_tx_message(pending, ID, Path, Result, LogExtra, Req, Opts);
 to_message(Path = <<"/tx/", TXID/binary>>, <<"GET">>, Result, LogExtra, Req, Opts) ->
     to_tx_message(tx, TXID, Path, Result, LogExtra, Req, Opts);
-to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, _Req, _Opts) ->
-    event_request(Path, <<"GET">>, 200, LogExtra),
-    {ok, Body};
 to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, Response}, LogExtra, _Req, Opts) ->
-    ContentLength = hb_maps:get(
-        <<"Content-Length">>,
-        Response,
-        hb_maps:get(<<"content-length">>, Response, -1, Opts),
-        Opts
-    ),
-    case hb_util:int(ContentLength) of
-        0 ->
-            event_request(Path, <<"GET">>, 200, LogExtra),
-            {ok, <<>>};
-        _ ->
-            event_request(Path, <<"GET">>, server_error, LogExtra),
-            {error, server_error}
-    end;
-to_message(Path = <<"/block/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
+    % A reply without a body carries empty data.
+    event_request(Path, <<"GET">>, 200, LogExtra),
+    {ok, hb_maps:get(<<"body">>, Response, <<>>, Opts)};
+to_message(Path = <<"/block/", Ref/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
     Decoded =
         hb_message:convert(
@@ -1179,22 +1176,25 @@ to_message(Path = <<"/block/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body
             Opts
         ),
     Block = block_proofs(block_keys(Decoded), Req, Opts),
-    CacheRes =
-        case hb_opts:get(arweave_index_blocks, true, Opts) of
-            true -> dev_arweave_block_cache:write(Block, Opts);
-            false -> skipped
-        end,
-    ?event(
-        debug_arweave_index,
-        {
-            if CacheRes == skipped -> skipped_caching_arweave_block;
-            true -> cached_arweave_block
+    maybe
+        true ?= requested_block(Ref, Block, Opts),
+        CacheRes =
+            case hb_opts:get(arweave_index_blocks, true, Opts) of
+                true -> dev_arweave_block_cache:write(Block, Opts);
+                false -> skipped
             end,
-            {path, Path},
-            {result, CacheRes}
-        }
-    ),
-    {ok, Block};
+        ?event(
+            debug_arweave_index,
+            {
+                if CacheRes == skipped -> skipped_caching_arweave_block;
+                true -> cached_arweave_block
+                end,
+                {path, Path},
+                {result, CacheRes}
+            }
+        ),
+        {ok, Block}
+    end;
 to_message(Path = <<"/price/", _/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, _Req, _Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
     {ok, hb_util:int(Body)};
@@ -1635,7 +1635,7 @@ empty_raw_response_test() ->
         to_message(
             <<"/raw/empty">>,
             <<"GET">>,
-            {ok, #{ <<"Content-Length">> => <<"0">> }},
+            {ok, #{ <<"status">> => 200 }},
             [],
             #{},
             #{}
@@ -1957,7 +1957,7 @@ head_raw_tx_test_parallel() ->
     ),
     ?assertEqual(
         {ok, 774},
-        hb_maps:find(<<"content-length">>, Result, Opts)
+        hb_maps:find(<<"data-length">>, Result, Opts)
     ),
     ?assertEqual(
         {ok, 0},
@@ -1988,7 +1988,7 @@ head_raw_ans104_test_parallel() ->
     ),
     ?assertEqual(
         {ok, 575},
-        hb_maps:find(<<"content-length">>, Result, Opts)
+        hb_maps:find(<<"data-length">>, Result, Opts)
     ).
 
 %% @doc Raw reads must check the full ID of a published-index candidate.
@@ -2017,15 +2017,16 @@ raw_published_index_id_test_parallel() ->
             {ok, Result} =
                 hb_ao:resolve(Base, Req#{ <<"raw">> => ID }, Opts),
             ?assertEqual(ID, hb_maps:get(<<"raw-id">>, Result, Opts)),
+            ?assertEqual(2827, hb_maps:get(<<"data-length">>, Result, Opts)),
             ?assertEqual(Length,
-                hb_maps:get(<<"content-length">>, Result, Opts)),
+                byte_size(hb_maps:get(<<"body">>, Result, <<>>, Opts))),
             ?assertEqual(
                 {error, not_found},
                 hb_ao:resolve(Base, Req#{ <<"raw">> => WrongID }, Opts)
             )
         end,
         [
-            {#{ <<"method">> => <<"HEAD">> }, 2827},
+            {#{ <<"method">> => <<"HEAD">> }, 0},
             {#{ <<"method">> => <<"GET">> }, 2827},
             {#{
                 <<"method">> => <<"GET">>,

@@ -729,6 +729,15 @@ store_hook_signed_test() ->
     {ok, Read} = hb_http:get(Node, <<"/", ID/binary>>, #{}),
     ?assertEqual(<<"stored-value">>, hb_ao:get(<<"stored-key">>, Read, #{})).
 
+%% @doc A request with a path segment in parentheses resolves on a node with
+%% the default request hooks.
+subpath_request_test() ->
+    Node = hb_http_server:start_node(#{ <<"priv-wallet">> => ar_wallet:new() }),
+    ?assertMatch(
+        {ok, #{ <<"status">> := 200 }},
+        hb_http:get(Node, <<"/(/~meta@1.0/info)">>, #{})
+    ).
+
 %% @doc The cookie hook test(s) call `GET /commitments', which returns the 
 %% commitments found on the client request during execution on the server.
 %% This function filters the response to return only the signers of that message,

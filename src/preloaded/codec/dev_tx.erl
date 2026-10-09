@@ -45,7 +45,14 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
             <<"tx@1.0">>,
             Opts
         ),
-    {ok, SignedStructured};
+    {ok,
+        lib_arweave_common:add_commitment(
+            <<"tx@1.0">>,
+            Msg,
+            SignedStructured,
+            Opts
+        )
+    };
 commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
     % Remove the commitments from the message, convert it to an L1 TX, 
     % then back. This forces the message to be normalized and the unsigned ID
@@ -1260,8 +1267,12 @@ binary_tags_roundtrip_test() ->
             Signed, <<"structured@1.0">>, <<"tx@1.0">>, Opts),
         ?assertEqual(<<"literal percent">>, hb_maps:get(<<"%ff">>, Msg)),
         ?assertEqual(<<"binary name">>, hb_maps:get(<<255>>, Msg)),
-        ?assertEqual(<<"unicode name">>, hb_maps:get(<<"é"/utf8>>, Msg)),
-        ?assert(hb_maps:is_key(<<"Tag", 255, ":, %ff">>, Msg)),
+        % Only A-Z is lowercased: `É' stays, and `Tag\xff' is `tag\xff'.
+        ?assertEqual(
+            <<"unicode name">>,
+            hb_maps:get(<<"É"/utf8>>, Msg, undefined, Opts)
+        ),
+        ?assert(hb_maps:is_key(<<"tag", 255, ":, %ff">>, Msg, Opts)),
         ?assertNot(hb_message:verify(
             Msg#{ <<255>> => <<"changed">> }, all, Opts)),
         {ok, _} = hb_cache:write(Msg, Opts),

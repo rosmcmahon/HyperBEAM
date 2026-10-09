@@ -106,12 +106,21 @@ handle(_Base, RawReq, Opts) ->
             error ->
                 % Parse the query, assuming that the request body is a JSON
                 % object with the necessary fields.
-                hb_json:decode(hb_maps:get(<<"body">>, RawReq, <<>>, Opts))
+                Body = hb_maps:get(<<"body">>, RawReq, <<>>, Opts),
+                {ok, Decoded} =
+                    hb_ao:raw(
+                        <<"structured@1.0">>,
+                        <<"to">>,
+                        hb_json:decode(Body),
+                        #{},
+                        Opts
+                    ),
+                Decoded
         end,
     ?event({request, {processed, Req}}),
     Query = hb_maps:get(<<"query">>, Req, <<>>, Opts),
     OpName = 
-        case hb_maps:get(<<"operationName">>, Req, undefined, Opts) of
+        case hb_maps:get(<<"operationname">>, Req, undefined, Opts) of
             Name when is_binary(Name) -> Name;
             _ -> undefined
         end,
@@ -141,7 +150,12 @@ handle(_Base, RawReq, Opts) ->
                 ?event(graphql_type_checked_successfully),
                 ok = graphql:validate(AST2),
                 ?event(graphql_validated),
-                Coerced = graphql:type_check_params(FunEnv, OpName, Vars),
+                Coerced =
+                    graphql:type_check_params(
+                        FunEnv,
+                        OpName,
+                        declared_variables(FunEnv, Vars)
+                    ),
                 ?event(graphql_type_checked_params),
                 Ctx =
                     #{
@@ -181,6 +195,19 @@ handle(_Base, RawReq, Opts) ->
                     {error, Error}
             end
     end.
+
+%% @doc The variables of a request under the names the document declares: the
+%% request has them lowercase, and GraphQL variable names are case-sensitive.
+declared_variables(FunEnv, Vars) ->
+    maps:from_list(
+        [
+            {Name, Value}
+        ||
+            VarEnv <- maps:values(FunEnv),
+            Name <- maps:keys(VarEnv),
+            {ok, Value} <- [maps:find(hb_util:lowercase_key(Name), Vars)]
+        ]
+    ).
 
 %% @doc Give each binary in a GraphQL response that is not UTF-8 text as its
 %% base64url, typed `binary' in the `ao-types' of the object that holds it, as
@@ -463,9 +490,9 @@ lookup_with_vars_test() ->
                 hb_json:encode(#{
                     <<"query">> => 
                         <<""" 
-                            query GetMessage($keys: [KeyInput]) { 
+                            query GetMessage($Keys: [KeyInput]) { 
                                 message(
-                                    keys: $keys
+                                    keys: $Keys
                                 ) {
                                     id
                                     keys {
@@ -477,7 +504,7 @@ lookup_with_vars_test() ->
                         """>>,
                     <<"operationName">> => <<"GetMessage">>,
                     <<"variables">> => #{
-                        <<"keys">> => 
+                        <<"Keys">> => 
                             [
                                 #{
                                     <<"name">> => <<"basic">>,

@@ -121,9 +121,13 @@ store_secret(Secret, Msg, Opts) ->
     % Create the cookie parameters, using the name as the key and the secret as
     % the value.
     {ok, Cookies} = dev_cookie:extract(Msg, #{}, Opts),
-    NewCookies = Cookies#{ <<"secret-", CookieAddr/binary>> => Secret },
+    NewCookies = Cookies#{ secret_ref(CookieAddr) => Secret },
     {ok, WithCookie} = dev_cookie:store(Msg, NewCookies, Opts),
     {ok, WithCookie}.
+
+%% @doc The cookie name of a committer's secret: a key, so it is lowercase.
+secret_ref(Committer) ->
+    hb_util:lowercase_key(<<"secret-", Committer/binary>>).
 
 %% @doc Verify that the caller holds the secret bound to the base message: the
 %% secret must hash to the `committer' recorded by `commit'. The secret is taken
@@ -213,7 +217,7 @@ find_secret(Request, Opts) ->
 find_secret(Committer, Request, Opts) ->
     maybe
         {ok, Cookie} ?= dev_cookie:extract(Request, #{}, Opts),
-        {ok, _Secret} ?= hb_maps:find(<<"secret-", Committer/binary>>, Cookie, Opts)
+        {ok, _Secret} ?= hb_maps:find(secret_ref(Committer), Cookie, Opts)
     else error -> {error, not_found}
     end.
 
@@ -240,7 +244,7 @@ commit_verify_test() ->
         dev_cookie:store(
             #{ <<"path">> => <<"verify">> },
             #{
-                <<"secret-", Committer/binary>> =>
+                secret_ref(Committer) =>
                     hb_util:encode(crypto:strong_rand_bytes(64))
             },
             #{}

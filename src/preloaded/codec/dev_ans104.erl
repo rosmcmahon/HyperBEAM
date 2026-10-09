@@ -56,11 +56,11 @@ commit(Msg, Req = #{ <<"type">> := Type }, Opts)
     lib_arweave_common:enforce_tag_names(TX, Msg, Opts),
     case {hb_opts:get(priv_wallet, no_viable_wallet, Opts), Type} of
         {{{?RSA_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?RSA_SIGN_TYPE} ->
-            sign_tx(TX, Wallet, Opts);
+            sign_tx(Msg, TX, Wallet, Opts);
         {{{?EDDSA_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?EDDSA_SIGN_TYPE} ->
-            sign_tx(TX, Wallet, Opts);
+            sign_tx(Msg, TX, Wallet, Opts);
         {{{?ETHEREUM_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?ETHEREUM_SIGN_TYPE} ->
-            sign_tx(TX, Wallet, Opts);
+            sign_tx(Msg, TX, Wallet, Opts);
         {{{WalletType, _, _}, _}, _Type} ->
             ?event(warning, {wrong_wallet_to_sign, {request_type, Type}, {wallet_type, WalletType}}),
             throw({wrong_wallet_to_sign, {request_type, Type}, {wallet_type, WalletType}})
@@ -79,7 +79,8 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
         )
     }.
 
-sign_tx(TX, Wallet, Opts) ->
+%% @doc Sign `TX', the item of `Msg', and add its commitment to those of `Msg'.
+sign_tx(Msg, TX, Wallet, Opts) ->
     Signed = ar_bundles:sign_item(TX, Wallet),
     SignedStructured =
         hb_message:convert(
@@ -88,7 +89,14 @@ sign_tx(TX, Wallet, Opts) ->
             <<"ans104@1.0">>,
             Opts
         ),
-    {ok, SignedStructured}.
+    {ok,
+        lib_arweave_common:add_commitment(
+            <<"ans104@1.0">>,
+            Msg,
+            SignedStructured,
+            Opts
+        )
+    }.
 
 %% @doc Verify an ANS-104 commitment. Encoding refuses a message that lacks a
 %% key that its commitment lists, or that bundles such a message, by throwing

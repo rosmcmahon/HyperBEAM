@@ -173,23 +173,30 @@ parse_dictionary(<<>>) ->
 parse_dictionary(<<C, R/bits>>) when ?IS_ALPHA(C)
         or ?IS_DIGIT(C) or (C =:= $*) or (C =:= $%) or (C =:= $_) or (C =:= $-) 
         or (C =:= $.) ->
-    parse_dict_key(R, [], <<C>>).
+    parse_dict_key(R, {[], #{}}, <<C>>).
 
 parse_dict_key(<<$=, $(, R0/bits>>, Acc, K) ->
     {Item, R} = parse_inner_list(R0, []),
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, Item}));
+    parse_dict_before_sep(R, dict_member(K, Item, Acc));
 parse_dict_key(<<$=, R0/bits>>, Acc, K) ->
     {Item, R} = parse_item1(R0),
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, Item}));
+    parse_dict_before_sep(R, dict_member(K, Item, Acc));
 parse_dict_key(<<C, R/bits>>, Acc, K) when
         ?IS_ALPHA(C) or ?IS_DIGIT(C) or
         (C =:= $_) or (C =:= $-) or (C =:= $.) or (C =:= $*) or (C =:= $%) ->
     parse_dict_key(R, Acc, <<K/binary, C>>);
 parse_dict_key(<<$;, R0/bits>>, Acc, K) ->
     {Params, R} = parse_before_param(R0, []),
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, {item, true, Params}}));
+    parse_dict_before_sep(R, dict_member(K, {item, true, Params}, Acc));
 parse_dict_key(R, Acc, K) ->
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, {item, true, []}})).
+    parse_dict_before_sep(R, dict_member(K, {item, true, []}, Acc)).
+
+%% @doc Keep the first position and last value of each dictionary key.
+dict_member(K, Item, {Keys, Items}) ->
+    case is_map_key(K, Items) of
+        true -> {Keys, Items#{K => Item}};
+        false -> {[K | Keys], Items#{K => Item}}
+    end.
 
 %% @doc Parse a binary SF dictionary before a separator.
 parse_dict_before_sep(<<$\s, R/bits>>, Acc) ->
@@ -198,8 +205,8 @@ parse_dict_before_sep(<<$\t, R/bits>>, Acc) ->
     parse_dict_before_sep(R, Acc);
 parse_dict_before_sep(<<C, R/bits>>, Acc) when C =:= $, ->
     parse_dict_before_member(R, Acc);
-parse_dict_before_sep(<<>>, Acc) ->
-    Acc.
+parse_dict_before_sep(<<>>, {Keys, Items}) ->
+    [{K, maps:get(K, Items)} || K <- lists:reverse(Keys)].
 
 %% @doc Parse a binary SF dictionary before a member.
 parse_dict_before_member(<<$\s, R/bits>>, Acc) ->
@@ -666,6 +673,38 @@ params(Params) ->
     ].
 
 %%% Tests
+
+parse_dictionary_duplicates_test() ->
+    ?assertEqual(
+        [
+            {<<"z">>, {item, true, [{<<"p">>, 3}]}},
+            {<<"a">>, {list, [{item, 4, []}], []}},
+            {<<"m">>, {item, 5, []}},
+            {<<"b">>, {item, true, []}}
+        ],
+        parse_dictionary(
+            <<"z=1, a=2, m, b=0, z;p=3, a=(4), m=5, b">>
+        )
+    ).
+
+parse_dictionary_scaling_test() ->
+    Measure =
+        fun(N) ->
+            Pairs = [
+                {<<"key", (integer_to_binary(I))/binary>>, {item, I, []}}
+            || I <- lists:seq(1, N)],
+            Bin = iolist_to_binary(dictionary(Pairs)),
+            erlang:garbage_collect(),
+            {reductions, Before} = process_info(self(), reductions),
+            Parsed = parse_dictionary(Bin),
+            {reductions, After} = process_info(self(), reductions),
+            ?assertEqual(Pairs, Parsed),
+            After - Before
+        end,
+    % Eight times the input must not require quadratic list traversal.
+    Small = Measure(512),
+    Large = Measure(4096),
+    ?assert(Large < 16 * Small).
 
 to_dictionary_test() ->
     {ok, SfDictionary} = to_dictionary(#{

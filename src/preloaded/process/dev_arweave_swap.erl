@@ -187,7 +187,7 @@ make_offer(Base, Body, Height, Opts) ->
         % still make an offer that asks collateral.
         true ?= balance(Base, Seller, Opts) >= Quantity,
         OrderID = hb_util:human_id(hb_message:id(Body, signed, Opts)),
-        not_found ?= hb_maps:get(OrderID, order_book(Base, Opts), not_found, Opts),
+        not_found ?= state([<<"orders">>, OrderID], Base, not_found, Opts),
         Order =
             #{
                 <<"order-id">> => OrderID,
@@ -270,7 +270,7 @@ register_interest(Base, Body, Height, Opts) ->
         not_found ?=
             case Fill of
                 Quantity -> not_found;
-                _ -> hb_maps:get(RemainderID, order_book(Base, Opts), not_found, Opts)
+                _ -> state([<<"orders">>, RemainderID], Base, not_found, Opts)
             end,
         {ok, Paid} ?= hb_util:safe_int(tx_field(Body, <<"reward">>, 0, Opts)),
         true ?= Paid >= FillFee,
@@ -521,7 +521,7 @@ find_order(Base, Body, Opts) ->
     case
         hb_cache:ensure_all_loaded(
             hb_maps:get(
-                field(<<"order-id">>, Body, <<>>, Opts),
+                hb_util:lowercase_key(field(<<"order-id">>, Body, <<>>, Opts)),
                 order_book(Base, Opts),
                 not_found,
                 Opts
@@ -555,7 +555,7 @@ put_order(Base, Order = #{ <<"order-id">> := OrderID }, Opts) ->
 drop_order(Base, #{ <<"order-id">> := OrderID }, Opts) ->
     Base#{
         <<"orders">> =>
-            hb_maps:without([OrderID], order_book(Base, Opts), Opts)
+            hb_ao:set(order_book(Base, Opts), #{ OrderID => unset }, Opts)
     }.
 
 %% @doc Read an address's token balance from the ledger this process shares.

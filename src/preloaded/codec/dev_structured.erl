@@ -229,7 +229,7 @@ linkify_mode(Req, Opts) ->
             hb_opts:get(<<"linkify-mode">>, offload, Opts)
     end.
 
-%% @doc Convert a TABM into a native HyperBEAM message.
+%% @doc Convert a TABM into a native HyperBEAM message. Its keys are lowercased.
 -spec to(binary() | [_] | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, binary() | [_] | #{ _ => _ }} | {error, #{ _ => _ }}.
 to(TABM, Req, Opts) ->
@@ -242,43 +242,65 @@ to(TABM, Req, Opts) ->
         throw:{unexpected_type, _, _} -> invalid_types()
     end.
 
-%% @doc Decode types recursively, leaving malformed inputs to the codec boundary.
+%% @doc Decode types and links recursively, leaving malformed inputs to the
+%% codec boundary. Private keys keep their values, and a link is not loaded.
 decode(Bin, _Req, _Opts) when is_binary(Bin) -> {ok, Bin};
-decode(TABM0, Req, Opts) when is_list(TABM0) ->
-    % If we receive a list, we convert it to a message and run `to/3' on it. 
-    % Finally, we convert the result back to a list.
-    {ok, TABM1} = decode(hb_util:list_to_numbered_message(TABM0), Req, Opts),
-    {ok, hb_util:numbered_keys_to_list(TABM1, Opts)};
-decode(TABM0, Req, Opts) ->
-    Types = decode_ao_types(TABM0, Opts),
-    % Decode all links to their HyperBEAM-native, resolvable form.
-    TABM1 = hb_link:decode_all_links(TABM0),
+decode(List, Req, Opts) when is_list(List) ->
+    {ok, [ hb_util:ok(decode(Value, Req, Opts)) || Value <- List ]};
+decode(TABM0, Req, Opts) when is_map(TABM0) ->
+    % `ao-types' names keys, so its names are lowercased as the keys are.
+    Types =
+        maps:from_list(
+            [
+                {hb_util:lowercase_key(Name), Type}
+            ||
+                {Name, Type} <- maps:to_list(decode_ao_types(TABM0, Opts))
+            ]
+        ),
+    TABM1 = decode_keys(TABM0),
     % 1. Remove 'ao-types' field
     % 2. Decode any binary values that have a type;
     % 3. Recursively decode any maps that we encounter;
     % 4. Return the remaining keys and values as a map.
+    % The fold starts from the TABM, so a key that needs no decoding is not
+    % rebuilt.
     ResMsg =
         maps:fold(
             fun (<<"ao-types">>, _Value, Acc) -> Acc;
             (RawKey, BinValue, Acc) when is_binary(BinValue) ->
-                case hb_maps:find(hb_ao:normalize_key(RawKey), Types, Opts) of
+                case maps:find(RawKey, Types) of
                     % The value is a binary, no parsing required
-                    error -> Acc#{ RawKey => BinValue };
+                    error -> Acc;
                     % Parse according to its type
                     {ok, Type} ->
                         Acc#{ RawKey => hb_util:decode(Type, BinValue) }
                 end;
-            (RawKey, ChildTABM, Acc) when is_map(ChildTABM) or is_list(ChildTABM) ->
-                % Decode the child TABM
+            (<<"commitments">>, Commitments, Acc) when is_map(Commitments) ->
+                % The keys of `commitments' are IDs: only its values are decoded.
                 Acc#{
-                    RawKey => hb_util:ok(decode(ChildTABM, Req, Opts))
+                    <<"commitments">> =>
+                        maps:map(
+                            fun(_ID, Commitment) ->
+                                hb_util:ok(decode(Commitment, Req, Opts))
+                            end,
+                            Commitments
+                        )
                 };
-            (RawKey, Value, Acc) ->
+            (RawKey, ChildTABM, Acc) when is_map(ChildTABM) or is_list(ChildTABM) ->
+                % Decode the child TABM, unless the key is private
+                case hb_private:is_private(RawKey) of
+                    true -> Acc;
+                    false ->
+                        Acc#{
+                            RawKey => hb_util:ok(decode(ChildTABM, Req, Opts))
+                        }
+                end;
+            (_RawKey, _Value, Acc) ->
                 % We encountered a key that already has a converted type.
                 % We can just return it as is.
-                Acc#{ RawKey => Value }
+                Acc
             end,
-            #{},
+            maps:remove(<<"ao-types">>, TABM1),
             TABM1
         ),
     % If the message is a list, we need to convert it back. A `.' type other
@@ -286,6 +308,64 @@ decode(TABM0, Req, Opts) ->
     case maps:get(<<".">>, Types, not_found) of
         <<"list">> -> {ok, hb_util:message_to_ordered_list(ResMsg, Opts)};
         _ -> {ok, ResMsg}
+    end;
+decode(Literal, _Req, _Opts) -> {ok, Literal}.
+
+%% @doc Decode the keys of a TABM: lowercase them, and give the value of a
+%% `+link' key as a link under the key without `+link'. Keys that decode to the
+%% same key hold their values as a list, in the order of the keys' bytes, as
+%% HTTP joins the values of a repeated header: `Action' and `action' give
+%% `action => [A, B]'. Private keys and keys that are not binaries are kept.
+%% The same term is returned when no key changes.
+decode_keys(TABM) ->
+    Groups =
+        maps:groups_from_list(
+            fun decode_key/1,
+            [
+                Key
+            ||
+                Key <- maps:keys(TABM),
+                is_binary(Key),
+                decode_key(Key) =/= Key,
+                not hb_private:is_private(Key)
+            ]
+        ),
+    maps:fold(
+        fun(Key, RawKeys, Acc) ->
+            Members =
+                lists:sort(
+                    case is_map_key(Key, TABM) of
+                        true -> [Key | RawKeys];
+                        false -> RawKeys
+                    end
+                ),
+            Values =
+                [
+                    decode_link(RawKey, maps:get(RawKey, TABM))
+                ||
+                    RawKey <- Members
+                ],
+            Decoded =
+                case Values of
+                    [Value] -> Value;
+                    _ -> Values
+                end,
+            (maps:without(Members, Acc))#{ Key => Decoded }
+        end,
+        TABM,
+        Groups
+    ).
+
+%% @doc The key that a TABM key decodes to: lowercase, without `+link'.
+decode_key(Key) ->
+    hb_link:remove_link_specifier(hb_util:lowercase_key(Key)).
+
+%% @doc The value of a TABM key: a link if the key has the `+link' specifier.
+decode_link(Key, Value) ->
+    case hb_link:is_link_key(hb_util:lowercase_key(Key)) of
+        true ->
+            {link, Value, #{ <<"type">> => <<"link">>, <<"lazy">> => false }};
+        false -> Value
     end.
 
 %% @doc Generate an `ao-types' structured field from a map of keys and their
@@ -457,6 +537,37 @@ malformed_types_return_error_test() ->
         #{ <<"ao-types">> => <<"a=\"integer\"">>, <<"a">> => <<"42">> },
         #{}, #{}
     )).
+
+%% @doc Keys are lowercased, a link key holds a link, keys that become one key
+%% hold a list, and a private key and the IDs that key `commitments' keep their
+%% case.
+lowercase_keys_test() ->
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(
+        {ok, #{
+            <<"count">> => 1,
+            <<"child">> =>
+                {link, ID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
+            <<"action">> => [<<"a">>, <<"b">>],
+            hb_util:lowercase_key(ID) => <<"balance">>,
+            <<"commitments">> => #{ ID => #{ <<"keyid">> => <<"k">> } },
+            <<"Priv-Key">> => #{ <<"Inner">> => 1 }
+        }},
+        hb_ao:raw(
+            <<"structured@1.0">>, <<"to">>,
+            #{
+                <<"ao-types">> => <<"%43ount=\"integer\"">>,
+                <<"Count">> => <<"1">>,
+                <<"Child+link">> => ID,
+                <<"Action">> => <<"a">>,
+                <<"action">> => <<"b">>,
+                ID => <<"balance">>,
+                <<"commitments">> => #{ ID => #{ <<"Keyid">> => <<"k">> } },
+                <<"Priv-Key">> => #{ <<"Inner">> => 1 }
+            },
+            #{}, #{}
+        )
+    ).
 
 list_encoding_test() ->
     % Test that we can encode and decode a list of integers.

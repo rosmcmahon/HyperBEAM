@@ -183,13 +183,19 @@ from_path(RelativeRef) when is_binary(RelativeRef) ->
     {ok, path_parts($/, Path), parse_query(QStr)};
 from_path(Other) -> from_path(hb_util:bin(Other)).
 
-%% @doc Parse a query string into a message of its unquoted values, or throw
-%% `invalid_query' naming the query string.
+%% @doc Parse a query string into a message of its unquoted values, with the
+%% keys in lowercase, or throw `invalid_query' naming the query string.
 parse_query(QStr) ->
     try
         maps:map(
             fun(_, Val) -> hb_util:unquote(Val) end,
-            hb_maps:from_list(cowboy_req:parse_qs(#{ qs => QStr }))
+            hb_maps:from_list(
+                [
+                    {hb_util:lowercase_key(Key), Val}
+                ||
+                    {Key, Val} <- cowboy_req:parse_qs(#{ qs => QStr })
+                ]
+            )
         )
     catch _:_ -> throw({invalid_singleton, invalid_query, QStr})
     end.
@@ -341,12 +347,25 @@ parse_part(Part, Opts) when is_binary(Part) ->
     case maybe_subpath(Part, Opts) of
         {resolve, Subpath} -> {resolve, Subpath};
         Part ->
-            case part([$&, $~, $+, $ , $=], Part) of
+            case part([$&, $~, $=], Part) of
                 {no_match, PartKey, <<>>} when ?IS_ID(PartKey) ->
                     PartKey;
                 {no_match, PartKey, <<>>} ->
                     #{ <<"path">> =>
                         binary:replace(PartKey, <<"/">>, <<"%2f">>, [global]) };
+                {$=, _, _} ->
+                    % The key of `Key=Value' or `Key+Type=Value' is the path.
+                    {_, KeyVal, PartModBin} = part($&, Part),
+                    {Key, Val} = parse_inlined_key_val(KeyVal, Opts),
+                    parse_part_mods(
+                        << "&", PartModBin/binary >>,
+                        #{
+                            <<"path">> =>
+                                binary:replace(Key, <<"/">>, <<"%2f">>, [global]),
+                            Key => Val
+                        },
+                        Opts
+                    );
                 {Sep, PartKey, PartModBin} ->
                     parse_part_mods(
                         << Sep:8/integer, PartModBin/binary >>,
@@ -382,14 +401,7 @@ parse_part_mods(<< "&", InlinedMsgBin/binary >>, Msg, Opts) ->
             Msg,
             InlinedKeys
         ),
-    MsgWithInlined;
-parse_part_mods(<<$=, InlinedMsgBin/binary>>, M = #{ <<"path">> := Path }, Opts)
-        when map_size(M) =:= 1, is_binary(Path) ->
-    parse_part_mods(<< "&", Path/binary, "=", InlinedMsgBin/binary >>, M, Opts);
-parse_part_mods(<<$+, InlinedMsgBin/binary>>, M = #{ <<"path">> := Path }, Opts)
-        when map_size(M) =:= 1, is_binary(InlinedMsgBin) ->
-    parse_part_mods(<< "&", Path/binary, "+", InlinedMsgBin/binary >>, M, Opts);
-parse_part_mods(_, Msg, _Opts) -> Msg.
+    MsgWithInlined.
 
 %% @doc Extrapolate the inlined key-value pair from a path segment. If the
 %% key has a value, it may provide a type (as with typical keys), but if a

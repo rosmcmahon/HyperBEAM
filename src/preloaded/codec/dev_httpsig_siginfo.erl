@@ -60,8 +60,10 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
     % `keyid' in the `signature-input' keys. Absent in the commitment =>
     % absent on the wire (permitted by RFC 9421 §1.4.2.3).
     KeyID = maps:get(<<"keyid">>, Commitment, undefined),
-    % Extract the signature from the commitment.
-    Signature = hb_util:decode(maps:get(<<"signature">>, Commitment)),
+    % Extract the signature from the commitment. A commitment of another
+    % device without one, such as that of an unsigned item, is sent with an
+    % empty signature.
+    Signature = hb_util:decode(maps:get(<<"signature">>, Commitment, <<>>)),
     % Extract the keys present in the commitment.
     CommittedKeys = to_siginfo_keys(Msg, Commitment, Opts),
     ?event_debug({normalized_for_enc, CommittedKeys, {commitment, Commitment}}),
@@ -71,8 +73,14 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
     Nonce = maps:get(<<"nonce">>, Commitment, undefined),
     Created = maps:get(<<"created">>, Commitment, undefined),
     Expires = maps:get(<<"expires">>, Commitment, undefined),
-    % Generate the name of the signature.
-    SigName = hb_util:to_lower(hb_util:human_id(crypto:hash(sha256, Signature))),
+    % Generate the name of the signature. A commitment without a signature is
+    % named by its ID.
+    NameSource =
+        case Signature of
+            <<>> -> CommID;
+            _ -> Signature
+        end,
+    SigName = hb_util:to_lower(hb_util:human_id(crypto:hash(sha256, NameSource))),
     % If the decoder's derivation would not reproduce the sender's map key,
     % transport it explicitly as an `id' parameter. Content-addressed devices
     % (e.g. `~ipfs@1.0') key on a CID that is not a function of `Sig'; HMAC,
@@ -315,16 +323,23 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
                 lists:map(fun hb_escape:decode/1, RawCommittedKeys)
         end,
     % Merge and cleanup the output:
-    % 1. Decode `keyid' and `signature' to raw bytes.
+    % 1. Decode `keyid' and `signature' to raw bytes. An empty signature of
+    %    another device is that of a commitment without one.
     % 2. Filter undefined keys.
     % 3. Use the transported `id' parameter when present (content-addressed
     %    devices), otherwise fall back to `derived_commitment_id/1'.
     % 4. Keep a transported committer, or derive it from the HTTPSig keyid.
     Commitment3 =
-        Commitment2#{
-            <<"signature">> => hb_util:encode(Sig),
-            <<"committed">> => CommittedKeys
-        },
+        case {Sig, Commitment2} of
+            {<<>>, #{ <<"commitment-device">> := Device }}
+                    when Device =/= <<"httpsig@1.0">> ->
+                Commitment2#{ <<"committed">> => CommittedKeys };
+            _ ->
+                Commitment2#{
+                    <<"signature">> => hb_util:encode(Sig),
+                    <<"committed">> => CommittedKeys
+                }
+        end,
     {ID, Commitment4} =
         case maps:take(<<"id">>, Commitment3) of
             {ExplicitID, Stripped} -> {ExplicitID, Stripped};
