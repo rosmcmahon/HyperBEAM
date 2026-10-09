@@ -143,7 +143,7 @@ price_from_count(Messages, NodeMsg) ->
 %% will be
 -spec charge(
     #{ _ => _ },
-    #{ request => #{ _ => _ }, quantity => integer(), _ => _ },
+    #{ request => #{ _ => _ }, quantity => non_neg_integer(), _ => _ },
     #{ _ => _ }
 ) ->
     {ok, boolean()}
@@ -360,6 +360,22 @@ get_balance_and_top_up_test() ->
     % not have generated a charge in itself. The top-up did not generate a charge
     % because it is the operator that performed it, and not a user.
     ?assertEqual(180, NewBalance),
+    % A charge of a negative quantity is refused, even from the operator.
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"key">> := <<"quantity">> }},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/charge">>,
+                    <<"quantity">> => -1000,
+                    <<"request">> => Req
+                },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
     {ok, Res2} =
         hb_http:get(
             Node,
