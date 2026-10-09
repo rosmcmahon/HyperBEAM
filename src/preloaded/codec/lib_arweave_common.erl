@@ -270,6 +270,8 @@ data_keys(Data, Opts) ->
 %% a key on the TABM, it will be interpreted as the message's actual data.
 %% Instead if a user has provided a `data` tag, we'll preserve it in
 %% `original-tags` but will strip it from the top-level message keys.
+%% Tags with private names (`hb_private:is_private/1`) are kept in
+%% `original-tags` the same way, as `structured@1.0` drops private keys.
 tag_keys(Item, _Opts) ->
     MetaTags = [
         <<"bundle-format">>,
@@ -281,7 +283,8 @@ tag_keys(Item, _Opts) ->
     lists:filtermap(
         fun({Tag, _}) ->
             NormalizedTag = normalize_key(Tag),
-            case lists:member(NormalizedTag, MetaTags) of
+            case lists:member(NormalizedTag, MetaTags) orelse
+                    hb_private:is_private(NormalizedTag) of
                 true -> false;
                 false -> {true, NormalizedTag}
             end
@@ -473,6 +476,7 @@ normal_tags(BaseFields, Tags) ->
         lists:all(
             fun({Key, _}) ->
                 normalize_key(Key) =:= Key andalso
+                not hb_private:is_private(Key) andalso
                 not lists:member(Key, ReservedFields)
             end,
             Tags
