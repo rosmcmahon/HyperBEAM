@@ -286,7 +286,7 @@ fallback_direct_key_access(Store, Base, Req, Opts) ->
     end.
 
 do_is_direct_key_access(DevRes, #{ <<"path">> := Key }, Opts) ->
-    do_is_direct_key_access(DevRes, Key, Opts);
+    do_is_direct_key_access(DevRes, hb_util:lowercase_key(Key), Opts);
 do_is_direct_key_access({_Status, DevRes}, Key, Opts) ->
     do_is_direct_key_access(DevRes, Key, Opts);
 do_is_direct_key_access(not_found, Key, Opts) ->

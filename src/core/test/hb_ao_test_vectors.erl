@@ -526,6 +526,12 @@ resolve_id_test(Opts) ->
     ?assertMatch(
         ID when byte_size(ID) == 43,
         hb_ao:get(<<"id">>, #{ <<"test_key">> => <<"1">> }, Opts)
+    ),
+    % `ID' on a message with a literal `id' key gives the ID that `id' gives.
+    Msg = #{ <<"test_key">> => <<"1">>, <<"id">> => <<"literal">> },
+    ?assertEqual(
+        hb_ao:get(<<"id">>, Msg, Opts),
+        hb_ao:get(<<"ID">>, Msg, Opts)
     ).
 
 resolve_key_twice_test(Opts) ->
