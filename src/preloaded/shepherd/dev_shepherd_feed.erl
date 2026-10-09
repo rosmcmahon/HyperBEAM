@@ -2,7 +2,9 @@
 %%% Shepherd content-moderation server. Each report is a JSON object whose
 %%% `items' are GraphQL-shaped transaction nodes (`id', `data/size',
 %%% `data/type', `tags', `owner/address' and `owner/key'), POSTed to the node
-%%% option `shepherd-feed-url' with `shepherd-feed-token' as a bearer token.
+%%% option `shepherd-feed-url'. Each report is signed with the node's wallet, as
+%%% an `httpsig@1.0' commitment (`rsa-pss-sha512') over its body and content
+%%% type, so that the receiver can check which node sent it.
 %%% Every field is read from an item the node has verified, from its signed
 %%% `ans104@1.0' or `tx@1.0' commitment: `owner/address' is the committer,
 %%% which is native to the signer's chain for Ethereum and Solana signers, as
@@ -330,27 +332,35 @@ add(Node, URL, Opts, Page, Count, Bytes) ->
             end
     end.
 
-%% @doc POST a page to the feed URL as JSON, as a request to an explicit URL,
-%% so that the node's HTTP client and its TLS and retry settings apply. The
-%% bearer token is sent only when one is set: an `authorization' value that
-%% cannot be a header would turn the request into a multipart body.
+%% @doc POST a page to the feed URL as a JSON body, signed with the node's
+%% wallet. The request goes to an explicit URL, so that the node's HTTP client
+%% and its TLS and retry settings apply. Its `method', `path' and
+%% `codec-device' are not signed: the router removes an unsigned `path', and
+%% `codec-device' tells a receiving HyperBEAM node to read the request as the
+%% signed message rather than as a JSON body.
 send(_URL, [], _Opts) ->
     ok;
 send(URL, Page, Opts) ->
-    Authorization =
-        case hb_util:bin(hb_opts:get(<<"shepherd-feed-token">>, <<>>, Opts)) of
-            <<>> -> #{};
-            Token -> #{ <<"authorization">> => <<"Bearer ", Token/binary>> }
-        end,
-    Report =
-        Authorization#{
-            <<"method">> => <<"POST">>,
-            <<"path">> => URL,
-            <<"content-type">> => <<"application/json">>,
-            <<"body">> =>
-                hb_json:encode(#{ <<"items">> => lists:reverse(Page) })
-        },
-    try hb_http:request(Report, Opts) of
+    try
+        Report =
+            hb_message:commit(
+                #{
+                    <<"content-type">> => <<"application/json">>,
+                    <<"body">> =>
+                        hb_json:encode(#{ <<"items">> => lists:reverse(Page) })
+                },
+                Opts,
+                <<"httpsig@1.0">>
+            ),
+        hb_http:request(
+            Report#{
+                <<"method">> => <<"POST">>,
+                <<"path">> => URL,
+                <<"codec-device">> => <<"httpsig@1.0">>
+            },
+            Opts
+        )
+    of
         {ok, _Res} ->
             ok;
         Other ->
@@ -403,17 +413,19 @@ start_receiver() ->
         }
     ).
 
-%% @doc Wait for a report, returning its authorization and the fields of its
-%% items as the receiving node parsed them.
+%% @doc Wait for a report, returning the signers that the receiving node
+%% verified and the fields of the report's items.
 receive_report() ->
     receive
         {received, Request} ->
+            Body = hb_maps:get(<<"body">>, Request, <<"{}">>, #{}),
             {
-                hb_maps:get(<<"authorization">>, Request, undefined, #{}),
+                hb_message:signers(Request, #{}),
                 [
                     item_fields(Item)
                 ||
-                    Item <- hb_maps:get(<<"items">>, Request, [], #{})
+                    Item <-
+                        hb_maps:get(<<"items">>, hb_json:decode(Body), [], #{})
                 ]
             }
     after 10000 -> timeout
@@ -473,8 +485,7 @@ upload_test() ->
                                     <<"path">> => <<"install">>
                                 }
                         },
-                    <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>,
-                    <<"shepherd-feed-token">> => <<"test-token">>
+                    <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>
                 }
             ),
         Hooks = node_hooks(NodeWallet),
@@ -546,7 +557,7 @@ upload_test() ->
         RSAAddress = hb_util:human_id(ar_wallet:to_address(RSAWallet)),
         ?assertEqual(
             {
-                <<"Bearer test-token">>,
+                [hb_util:human_id(ar_wallet:to_address(NodeWallet))],
                 [
                     #{
                         id => hb_util:encode(RSAItem#tx.id),
@@ -603,9 +614,10 @@ install_without_url_test() ->
 %% reported and an item written without one is not.
 copycat_test() ->
     Receiver = start_receiver(),
+    Wallet = ar_wallet:new(),
     Opts =
         #{
-            <<"priv-wallet">> => ar_wallet:new(),
+            <<"priv-wallet">> => Wallet,
             <<"store">> => hb_test_utils:test_store(),
             <<"on">> =>
                 #{
@@ -628,7 +640,8 @@ copycat_test() ->
     {ok, _} = hb_cache:write(Unplaced, Opts),
     {ok, _} =
         hb_cache:write(hb_private:set(Placed, <<"offset">>, 1000, Opts), Opts),
-    {_Authorization, Report} = receive_report(),
+    {Signers, Report} = receive_report(),
+    ?assertEqual([hb_util:human_id(ar_wallet:to_address(Wallet))], Signers),
     ?assertEqual(
         [hb_message:id(Placed, signed, Opts)],
         [maps:get(id, Item) || Item <- Report]

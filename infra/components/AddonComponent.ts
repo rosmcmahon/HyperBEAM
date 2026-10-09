@@ -65,7 +65,6 @@ export class AddonComponent extends pulumi.ComponentResource {
         const nodeConfig = JSON.stringify(feedUrl ? {
             'on': { 'start': { 'device': 'shepherd-feed@1.0', 'path': 'install' } },
             'shepherd-feed-url': feedUrl,
-            'shepherd-feed-token': extConfig.SHEPHERD_FEED_TOKEN ?? '',
         } : {}, null, 2)
         const startScript = fs.readFileSync(path.join(import.meta.dirname, '../start.sh'), 'utf-8')
 
