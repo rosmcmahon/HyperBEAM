@@ -139,12 +139,7 @@ node(Base, RawReq, RawOpts) ->
         Opts
     ),
     Signers = hb_message:signers(OnlyCommitted, Opts),
-    Self =
-        hb_util:human_id(
-            ar_wallet:to_address(
-                hb_opts:get(priv_wallet, hb:wallet(), Opts)
-            )
-        ),
+    Self = hb_opts:address(hb:wallet(), Opts),
     IsOperator = lists:member(Self, Signers),
     ExistingNonce = latest_known_nonce(Self, Opts),
     RequestedNonce = hb_maps:get(<<"nonce">>, OnlyCommitted, not_found, Opts),

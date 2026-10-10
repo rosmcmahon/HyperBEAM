@@ -14,6 +14,7 @@
 %%% with a refusal to execute.
 -module(hb_opts).
 -export([get/1, get/2, get/3, as/2, identities/1, load/1, load/2, load_bin/2]).
+-export([address/1, address/2]).
 -export([default_message/0, default_message_with_env/0, mimic_default_types/3]).
 -export([ensure_node_history/2]).
 -export([check_required_opts/2]).
@@ -818,12 +819,22 @@ coerce_value(_DefaultValue, Value) ->
 %% @doc Find a given identity from the `identities' map, and return the options
 %% merged with the sub-options for that identity.
 as(Identity, Opts) ->
-    case identities(Opts) of
+    case identities(hb_http_server:with_node_key(Opts)) of
         #{ Identity := SubOpts } ->
             ?event({found_identity_sub_opts_are, SubOpts}),
             {ok, maps:merge(Opts, mimic_default_types(SubOpts, false, Opts))};
         _ ->
             {error, not_found}
+    end.
+
+%% @doc Return the address of the `priv-wallet' in `Opts', else the `address'
+%% option, which request execution `Opts' hold in its place, else the address
+%% of `Default'.
+address(Opts) -> address(undefined, Opts).
+address(Default, Opts) ->
+    case ?MODULE:get(priv_wallet, ?MODULE:get(address, Default, Opts), Opts) of
+        undefined -> undefined;
+        WalletOrAddress -> hb_util:human_id(WalletOrAddress)
     end.
 
 %% @doc Find all known IDs and their sub-options from the `priv_ids' map. Allows

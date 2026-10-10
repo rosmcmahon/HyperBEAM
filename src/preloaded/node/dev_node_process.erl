@@ -74,10 +74,9 @@ spawn_register(Name, Opts) ->
                 ),
             ?event(node_process, {initialized, {name, Name}, {assignment, Assignment}}),
             RegisterOpts =
-                case hb_opts:get(priv_wallet, no_viable_wallet, Opts) of
-                    no_viable_wallet -> Opts;
-                    Wallet ->
-                        Opts#{ <<"operator">> => ar_wallet:to_address(Wallet) }
+                case hb_opts:address(Opts) of
+                    undefined -> Opts;
+                    Address -> Opts#{ <<"operator">> => Address }
                 end,
             RegResult =
                 hb_ao:resolve(
@@ -111,12 +110,7 @@ spawn_register(Name, Opts) ->
 
 %% @doc Augment the given process definition with the node's address.
 augment_definition(BaseDef, Opts) ->
-    Address =
-        hb_util:human_id(
-            ar_wallet:to_address(
-                hb_opts:get(priv_wallet, no_viable_wallet, Opts)
-            )
-        ),
+    Address = hb_opts:address(Opts),
     SchedulersFromBase =
         hb_util:binary_to_strings(
             hb_ao:get(<<"scheduler">>, BaseDef, <<>>, Opts)

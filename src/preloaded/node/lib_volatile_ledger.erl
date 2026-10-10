@@ -58,7 +58,7 @@ ensure_started(Ledger, Opts) ->
     ServerID =
         {
             hb_maps:get(<<"name">>, Ledger, undefined, Opts),
-            hb_util:human_id(hb_opts:get(priv_wallet, undefined, Opts))
+            hb_opts:address(Opts)
         },
     hb_name:singleton(
         ServerID,

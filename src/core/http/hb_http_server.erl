@@ -11,7 +11,7 @@
 %%% the execution parameters of all downstream requests to be controlled.
 -module(hb_http_server).
 -export([start/0, start/1, start_application/0, allowed_methods/2, init/2]).
--export([set_opts/1, set_opts/2, get_opts/0, get_opts/1]).
+-export([set_opts/1, set_opts/2, get_opts/0, get_opts/1, with_node_key/1]).
 -export([set_default_opts/1, set_proc_server_id/1]).
 -export([static/3, static/4]).
 -export([start_node/0, start_node/1]).
@@ -683,7 +683,8 @@ set_opts(Opts) ->
         no_server_ref ->
             ok;
         ServerRef ->
-            ok = cowboy:set_env(ServerRef, node_msg, Opts)
+            % `Opts' from a request hold no key material: keep the node's.
+            ok = cowboy:set_env(ServerRef, node_msg, with_node_key(Opts))
     end.
 set_opts(Request, Opts) ->
     PreparedRequest = hb_message:uncommitted(Request),
@@ -709,8 +710,19 @@ set_opts(Request, Opts) ->
 get_opts() ->
     get_opts(#{ <<"http-server">> => get(server_id) }).
 get_opts(NodeMsg) ->
-    ServerRef = hb_opts:get(http_server, no_server_ref, NodeMsg),
-    cowboy:get_env(ServerRef, node_msg, no_node_msg).
+    case hb_opts:get(http_server, no_server_ref, NodeMsg) of
+        no_server_ref -> NodeMsg;
+        ServerRef -> cowboy:get_env(ServerRef, node_msg, no_node_msg)
+    end.
+
+%% @doc Return `Opts' with the node message's key material if they hold no
+%% wallet, as request execution `Opts' do not.
+with_node_key(Opts) ->
+    case hb_opts:get(priv_wallet, undefined, Opts#{ <<"only">> => local }) of
+        undefined ->
+            maps:merge(Opts, maps:with(?NODE_KEY_OPTS, get_opts(Opts)));
+        _ -> Opts
+    end.
 
 %% @doc Initialize the server ID for the current process.
 set_proc_server_id(ServerID) ->

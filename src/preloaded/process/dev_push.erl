@@ -769,7 +769,7 @@ apply_security(default, Msg, TargetProcess, Codec, Opts) ->
     ?event(push, {default_policy, {target, TargetProcess}}, Opts),
     commit_result(
         Msg,
-        [hb_util:human_id(hb_opts:get(priv_wallet, no_viable_wallet, Opts))],
+        [hb_opts:address(Opts)],
         Codec,
         Opts
     ).

@@ -216,7 +216,9 @@ ensure_server(Opts) ->
         PID when is_pid(PID) -> PID;
         undefined ->
             ItemIDs = dev_bundler_cache:list_item_ids(Opts),
-            hb_name:singleton(Name, fun() -> init(ItemIDs, Opts) end)
+            % The server signs bundles with the node key.
+            ServerOpts = hb_http_server:with_node_key(Opts),
+            hb_name:singleton(Name, fun() -> init(ItemIDs, ServerOpts) end)
     end.
 
 %% @doc Return the current bundler server state for tests.
