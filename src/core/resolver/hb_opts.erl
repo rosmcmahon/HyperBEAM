@@ -691,11 +691,10 @@ load(Path, Opts) ->
 
 %% @doc Load a single configuration source from disk.
 load_path(Path, Opts) ->
-    {ok, Device} = path_to_device(Path),
-    case file:read_file(Path) of
-        {ok, Bin} ->
-            load_bin(Device, Bin, Opts);
-        _ -> {error, not_found}
+    maybe
+        {ok, Device} ?= path_to_device(Path),
+        {ok, Bin} ?= file:read_file(Path),
+        load_bin(Device, Bin, Opts)
     end.
 
 %% @doc Load each configuration source in turn, deep-merging the results in
@@ -1033,6 +1032,8 @@ global_preference_test() ->
     ?assertNotEqual(undefined, ?MODULE:get(mode, undefined, Global)).
 
 load_flat_test() ->
+    % A path that cannot be read returns its read error.
+    ?assertEqual({error, eisdir}, load("test")),
     % File contents:
     % port: 1234
     % node-host: https://ao.computer

@@ -32,14 +32,16 @@ start_application() ->
     ?event(http, {start_store, <<"cache-mainnet">>}),
     EnvConfig = hb_opts:default_message_with_env(),
     Loc = hb_opts:get(hb_config_location, <<"config.flat">>, EnvConfig),
+    HBConfig = os:getenv("HB_CONFIG"),
     Loaded =
         case hb_opts:load(Loc, EnvConfig) of
             {ok, Conf} ->
                 ?event(boot, {loaded_config, {path, Loc}, {config, Conf}}),
                 Conf;
+            % No `HB_CONFIG' and no `config.flat': the node uses its defaults.
+            {error, enoent} when HBConfig =:= false -> #{};
             {error, Reason} ->
-                ?event(boot, {failed_to_load_config, Loc, Reason}),
-                #{}
+                throw({failed_to_load_config, Loc, Reason})
         end,
     MergedConfig = hb_maps:merge(EnvConfig, Loaded),
     hb_http_client:setup_conn(MergedConfig),
