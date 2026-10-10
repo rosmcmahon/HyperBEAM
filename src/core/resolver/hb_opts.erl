@@ -1034,6 +1034,11 @@ global_preference_test() ->
 load_flat_test() ->
     % A path that cannot be read returns its read error.
     ?assertEqual({error, eisdir}, load("test")),
+    % A line that is not blank or `key: value' is an error.
+    ?assertEqual(
+        {error, {invalid_line, 3}},
+        load_bin(<<"port: 1234\n\ncompute-mode aggressive">>, #{})
+    ),
     % File contents:
     % port: 1234
     % node-host: https://ao.computer
