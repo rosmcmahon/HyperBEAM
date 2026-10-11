@@ -176,8 +176,8 @@
 -define(DEFAULT_AUTH_DEVICE, <<"cookie@1.0">>).
 
 %% @doc Generate a new wallet for a user and register it on the node. If the
-%% `committer' field is provided, we first check whether there is a wallet
-%% already registered for it. If there is, we return the wallet details.
+%% request references a wallet that it may access, we return the wallet's
+%% `access-control' message instead, as for a new wallet.
 -spec generate(#{ _ => _ }, #{ committer => binary(), _ => _ }, #{ _ => _ }) ->
     {ok, #{ body := binary(), _ => _ }} | {error, _}.
 generate(Base, Request, Opts) ->
@@ -191,10 +191,11 @@ generate(Base, Request, Opts) ->
             Committer =
                 hb_maps:get(<<"committer">>, WalletDetails, undefined, Opts),
             ?event({priv_details, WalletDetails}),
-            % Wallets found, return them.
+            % Wallet found: reply with its `access-control' message.
             {
                 ok,
-                WalletDetails#{
+                (hb_maps:get(<<"access-control">>, WalletDetails, #{}, Opts))#{
+                    <<"cache-control">> => [<<"no-store">>],
                     <<"body">> =>
                         <<"secret:", Committer/binary>>
                 }
@@ -802,6 +803,14 @@ test_wallet_generate_and_verify(GeneratePath, ExpectedName, CommitParams) ->
     end,
     ?assertMatch(#{ <<"priv">> := #{ <<"cookie">> := _ } }, GenResponse),
     #{ <<"priv">> := Priv } = GenResponse,
+    % Generating again with the cookie does not return the wallet.
+    {ok, Regenerated} =
+        hb_http:get(
+            Node,
+            #{ <<"path">> => GeneratePath, <<"priv">> => Priv },
+            #{}
+        ),
+    ?assertNot(maps:is_key(<<"wallet">>, Regenerated)),
     % Now verify by signing a message
     TestMessage =
         maps:merge(
