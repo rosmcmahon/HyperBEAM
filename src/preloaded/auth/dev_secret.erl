@@ -187,17 +187,16 @@ generate(Base, Request, Opts) ->
             Wallet = ar_wallet:new(),
             register_wallet(Wallet, Base, Request, Opts);
         [WalletDetails] ->
+            % The wallet is keyed by the `keyid' of its access secret.
+            Committer =
+                hb_maps:get(<<"committer">>, WalletDetails, undefined, Opts),
             ?event({priv_details, WalletDetails}),
             % Wallets found, return them.
             {
                 ok,
                 WalletDetails#{
                     <<"body">> =>
-                        hb_maps:get(
-                            <<"keyid">>,
-                            Base,
-                            Opts
-                        )
+                        <<"secret:", Committer/binary>>
                 }
             }
     end.
@@ -1263,6 +1262,17 @@ stored_access_control_verifies_test() ->
     #{ <<"body">> := KeyID, <<"priv">> := Priv } = GenResponse,
     WalletAddr = maps:get(<<"wallet-address">>, GenResponse),
     Committer = hb_util:remove_scheme_prefix(KeyID),
+    % Generating again with the cookie answers with the same `keyid'.
+    {ok, Regenerated} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/~secret@1.0/generate?persist=non-volatile">>,
+                <<"priv">> => Priv
+            },
+            #{}
+        ),
+    ?assertEqual(KeyID, maps:get(<<"body">>, Regenerated)),
     % The stored access-control message records the committer of the cookie
     % secret and carries no commitment by it.
     {ok, ExportResponse} =
