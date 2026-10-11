@@ -192,20 +192,21 @@ body_to_parts(ContentType, Body, _Opts) ->
             {body, Body}
         }
     ),
+    % Only a multipart type has a `boundary'. A `content-type' is not a
+    % structured field: RFC 9110 gives it its own grammar.
     Params =
         case ContentType of
-            undefined -> [];
-            _ ->
-                {item, {_, _XT}, XParams} =
-                    hb_structured_fields:parse_item(ContentType),
-                XParams
+            <<"multipart/", _/binary>> ->
+                {_, _, XParams} = cow_http_hd:parse_content_type(ContentType),
+                XParams;
+            _ -> []
         end,
     case lists:keyfind(<<"boundary">>, 1, Params) of
         false ->
             % The body is not a multipart, so just set as is to the Inlined key on
             % the TABM.
             {normal, Body};
-        {_, {_Type, Boundary}} ->
+        {_, Boundary} ->
             % We need to manually parse the multipart body into key/values on the
             % TABM.
             % 
@@ -990,6 +991,21 @@ multipart_content_type_test() ->
     ?assertEqual(
         Msg,
         hb_message:uncommitted(hb_cache:ensure_all_loaded(Decoded, Opts), Opts)
+    ),
+    % A browser sends the `boundary' unquoted, starting with `-'.
+    ?assertEqual(
+        #{ <<"a">> => <<"x">> },
+        hb_message:convert(
+            #{
+                <<"content-type">> => <<"multipart/form-data; boundary=--b">>,
+                <<"body">> =>
+                    <<"----b\r\ncontent-disposition: form-data; name=\"a\"\r\n"
+                        "\r\nx\r\n----b--\r\n">>
+            },
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>,
+            Opts
+        )
     ).
 
 group_maps_test() ->
