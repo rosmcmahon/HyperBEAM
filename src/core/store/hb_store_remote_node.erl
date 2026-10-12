@@ -109,9 +109,9 @@ has_id(Bin, ID, Opts) ->
 %% @doc Remove the transport commitments from the response: the replying
 %% node's signature over `hashpath', and its unsigned commitment over the keys
 %% of its reply, once the keys that it does not cover are removed. The reply's
-%% `hashpath' and `status' are removed with them, unless a signed commitment
-%% of the message covers them.
-without_transport_commitment(Msg, Opts) when is_map(Msg) ->
+%% `hashpath' is removed with them, unless a signed commitment of the message
+%% covers it. A reply without commitments loses its `hashpath' and `status'.
+without_transport_commitment(Msg = #{ <<"commitments">> := _ }, Opts) ->
     {ok, Committed} =
         hb_message:with_only_committed(
             hb_message:without_commitments(
@@ -122,7 +122,7 @@ without_transport_commitment(Msg, Opts) when is_map(Msg) ->
             Opts
         ),
     hb_message:without_unless_signed(
-        [<<"hashpath">>, <<"status">>],
+        [<<"hashpath">>],
         hb_message:with_commitments(
             #{ <<"committer">> => '_' },
             Committed,
@@ -130,6 +130,8 @@ without_transport_commitment(Msg, Opts) when is_map(Msg) ->
         ),
         Opts
     );
+without_transport_commitment(Msg, _Opts) when is_map(Msg) ->
+    maps:without([<<"hashpath">>, <<"status">>], Msg);
 without_transport_commitment(Res, _Opts) ->
     Res.
 
@@ -328,6 +330,19 @@ read_test() ->
         {ok, []},
         hb_cache:read(
             hb_util:ok(hb_cache:write([], #{ <<"store">> => LocalStore })),
+            #{ <<"store">> => RemoteStore }
+        )
+    ),
+    % A message keeps the `status' key that it holds.
+    ?assertMatch(
+        {ok, #{ <<"status">> := <<"pending">> }},
+        hb_cache:read(
+            hb_util:ok(
+                hb_cache:write(
+                    #{ <<"status">> => <<"pending">> },
+                    #{ <<"store">> => LocalStore }
+                )
+            ),
             #{ <<"store">> => RemoteStore }
         )
     ).
