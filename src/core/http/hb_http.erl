@@ -161,9 +161,7 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
                 ?event(debug_cookie, {msg_with_cookies, MsgWithCookies}),
                 MsgWithCookies
         end,
-    % Merge the set-cookie message into the header map, which itself is
-    % constructed from the header key-value pair list.
-    HeaderMap = hb_maps:merge(hb_maps:from_list(Headers), MaybeSetCookie, Opts),
+    HeaderMap = hb_maps:from_list(Headers),
     % A reply to a `HEAD' request, or with a 204 or 304 status, carries no
     % body. Its `content-digest' is that of the body that it omits, so we remove
     % it: the reply decodes without a body, rather than with an empty one.
@@ -202,11 +200,20 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             Body,
             Opts
         ),
+    % A reply keeps the keys that any of its commitments covers. The keys that
+    % no commitment covers, such as the reply's headers and the node's index
+    % page, are removed.
+    {ok, Committed} = hb_message:with_only_committed(Msg, any, Opts),
     % A reply in any codec keeps the `status' that it carries, and gets the
-    % HTTP status as its `status' if it carries none.
+    % HTTP status as its `status' if it carries none, and the cookies that it
+    % sets.
     WithStatus =
         case is_map(Msg) of
-            true -> maps:merge(#{ <<"status">> => hb_util:int(Status) }, Msg);
+            true ->
+                maps:merge(
+                    #{ <<"status">> => hb_util:int(Status) },
+                    hb_maps:merge(Committed, MaybeSetCookie, Opts)
+                );
             false -> Msg
         end,
     % The result may be a link to a message that the peer holds.
@@ -934,6 +941,11 @@ remote_response_links_test() ->
         ),
     % The reply's unsigned commitment gives it the ID of the message read.
     ?assertEqual(ID, hb_message:id(Res, unsigned, ClientOpts)),
+    % The reply keeps the keys of the message read, and gets its HTTP status.
+    ?assertEqual(
+        [<<"a">>, <<"commitments">>, <<"status">>],
+        lists:sort(maps:keys(Res))
+    ),
     ?assertEqual(123, hb_ao:get(<<"a/b">>, Res, ClientOpts)).
 
 send_large_signed_request_test() ->

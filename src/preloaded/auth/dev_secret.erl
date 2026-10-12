@@ -865,7 +865,7 @@ import_wallet_with_key_test() ->
     % Wallet name is the address of the wallet.
     ?assertMatch([WalletAddress], Imported),
     % Should include cookie setup from auth device.
-    ?assert(maps:is_key(<<"set-cookie">>, ImportResponse)).
+    ?assertMatch(#{ <<"priv">> := #{ <<"cookie">> := _ } }, ImportResponse).
 
 list_wallets_test() ->
     Node = hb_http_server:start_node(#{

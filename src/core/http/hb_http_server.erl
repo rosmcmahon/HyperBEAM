@@ -2041,38 +2041,53 @@ accept_codec_precedence_test() ->
 
 cors_get_test() ->
     URL = start_node(),
-    LocalOpts = test_opts(),
-    {ok, Res} = hb_http:get(URL, <<"/~meta@1.0/info">>, LocalOpts),
+    % The CORS headers are headers of the HTTP reply, not keys of its message.
+    {ok, 200, Headers, _} =
+        hb_http_client:request(
+            #{
+                peer => URL,
+                path => <<"/~meta@1.0/info">>,
+                method => <<"GET">>,
+                headers => #{},
+                body => <<>>
+            },
+            test_opts()
+        ),
     ?assertEqual(
         <<"*">>,
-        hb_ao:get(<<"access-control-allow-origin">>, Res, LocalOpts)
+        proplists:get_value(<<"access-control-allow-origin">>, Headers)
     ).
 
 index_test() ->
     NodeURL = start_node(),
-    {ok, Res} =
-        hb_http:get(
-            NodeURL,
+    % The index page is the body of the HTTP reply, not a key of its message.
+    {ok, 200, _, Body} =
+        hb_http_client:request(
             #{
-                <<"path">> => <<"/~test-device@1.0/load">>,
-                <<"accept-bundle">> => false
+                peer => NodeURL,
+                path => <<"/~test-device@1.0/load">>,
+                method => <<"GET">>,
+                headers => #{ <<"accept-bundle">> => <<"false">> },
+                body => <<>>
             },
             #{}
         ),
-    ?assertEqual(<<"i like turtles!">>, hb_ao:get(<<"body">>, Res, #{})).
+    ?assertEqual(<<"i like turtles!">>, Body).
 
 index_request_test() ->
     URL = start_node(),
-    {ok, Res} =
-        hb_http:get(
-            URL,
+    {ok, 200, _, Body} =
+        hb_http_client:request(
             #{
-                <<"path">> => <<"/~test-device@1.0/load?name=dogs">>,
-                <<"accept-bundle">> => false
+                peer => URL,
+                path => <<"/~test-device@1.0/load?name=dogs">>,
+                method => <<"GET">>,
+                headers => #{ <<"accept-bundle">> => <<"false">> },
+                body => <<>>
             },
             #{}
         ),
-    ?assertEqual(<<"i like dogs!">>, hb_ao:get(<<"body">>, Res, #{})).
+    ?assertEqual(<<"i like dogs!">>, Body).
 
 %% @doc A query parameter overrides a request header of the same name, so the
 %% keys that a request sets in its path keep working beside headers.

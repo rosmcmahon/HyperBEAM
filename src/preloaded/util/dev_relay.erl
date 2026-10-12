@@ -206,9 +206,13 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
                 end,
             case Res of
                 {ok, R} ->
+                    % A reply that carries commitments is the message that the
+                    % peer sent: the result keeps the keys that they cover, so
+                    % the `status' that the client adds to the reply is not one.
+                    {ok, Sent} = hb_message:with_only_committed(R, any, Opts),
                     % The reply's links name messages in the peer's stores, and
                     % a client reads them from this node: load them here.
-                    Loaded = hb_cache:ensure_all_loaded(R, Opts),
+                    Loaded = hb_cache:ensure_all_loaded(Sent, Opts),
                     {ok, strip_cookies(Loaded, Opts)};
                 Err -> Err
             end
@@ -537,7 +541,9 @@ relay_peer_allowed_test() ->
             },
             #{ <<"relay-block-internal">> => false }
         ),
-    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})).
+    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})),
+    % The result is the peer's message, without the `status' the client adds.
+    ?assertNot(maps:is_key(<<"status">>, Res)).
 
 %% @doc A `call' whose `relay-path' is an absolute URL on an internal host is
 %% refused by default.
