@@ -150,6 +150,19 @@ price_from_count(Messages, NodeMsg) ->
     | {error, #{ status := integer(), body := binary(), _ => _ }}.
 charge(_, RawReq, NodeMsg) ->
     ?event(payment, {charge, RawReq}),
+    % Only the node may charge: p4 signs its charge with the node's key.
+    Signers = hb_message:signers(RawReq, NodeMsg),
+    case lists:member(hb_opts:address(NodeMsg), Signers) of
+        true -> do_charge(RawReq, NodeMsg);
+        false ->
+            {error, #{
+                <<"status">> => 403,
+                <<"body">> => <<"Charge not signed by the node.">>
+            }}
+    end.
+
+%% @doc Debit the signer of the request's `request' by its `quantity'.
+do_charge(RawReq, NodeMsg) ->
     Req =
         hb_ao:get(
             <<"request">>,
@@ -385,7 +398,23 @@ get_balance_and_top_up_test() ->
             ),
             Opts
         ),
-    ?assertEqual(180, Res2).
+    ?assertEqual(180, Res2),
+    % A client's direct charge is refused, whatever request it carries.
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/charge">>,
+                    <<"quantity">> => 10,
+                    <<"request">> => Req
+                },
+                Opts#{ <<"priv-wallet">> => ClientWallet }
+            ),
+            Opts
+        )
+    ).
 
 apply_price_test() ->
     ClientWallet = ar_wallet:new(),
