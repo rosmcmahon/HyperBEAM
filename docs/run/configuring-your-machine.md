@@ -15,18 +15,14 @@ Another possibility is to use `config.flat` that uses a simple `Key: Value` form
 **Example `config.flat`:**
 
 ```
-% Set the HTTP port
 port: 8080
 
-% Specify the Arweave key file
 priv_key_location: /path/to/your/wallet.json
 
-% Nested messages use forward slashes (/)
 default_store/lmdb/ao-types: store-module=atom
 default_store/lmdb/store-module: hb_store_lmdb
 default_store/lmdb/name: /tmp/store
 
-% Lists use numbered message keys and an ao-types annotation
 store/ao-types: .=list
 store/1/ao-types: store-module=atom
 store/1/store-module: hb_store_lmdb
@@ -43,7 +39,8 @@ store/2/region: us-east-1
 ```
 
 Below is a reference of commonly used configuration keys. `config.flat` supports
-atoms, strings, integers, booleans, nested messages and lists.
+atoms, strings, integers, booleans, nested messages (forward slashes in keys)
+and lists (numbered message keys and an `ao-types` annotation).
 
 ### Core Configuration
 

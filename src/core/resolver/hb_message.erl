@@ -458,7 +458,8 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
     error({deprecated_commit_call, {arg_must_be_node_msg, NotOpts}});
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
-commit(Msg, Opts, Spec) ->
+commit(Msg, GivenOpts, Spec) ->
+    Opts = hb_http_server:with_node_key(GivenOpts),
     % hb_ao:raw does not vary for us but ~message@1.0/commit|id expects a
     % ~structured@1.0 form, so we force an idempotent 'to' call to ensure it
     {ok, Structured} =

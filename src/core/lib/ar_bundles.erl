@@ -266,7 +266,7 @@ serialize_bundle(BundleType, Map, Normalize) when is_map(Map) ->
     % For now we just serialize the map to a JSON string of Key=>TXID
     BinItems = maps:map(
         fun(_, Item) -> 
-            to_serialized_pair(Item, Normalize, unsigned)
+            to_serialized_pair(Item, Normalize, signed)
         end,
         Map),
     {Manifest, BinItems2} = maybe_generate_manifest(BundleType, BinItems, Normalize),
@@ -497,15 +497,18 @@ unbundle_map(Item) ->
     end.
 
 %% @doc An internal helper for finding an item in a single-layer of a bundle.
-%% Does not recurse! You probably want `find/2' in most cases.
-find_single_layer(UnsignedID, TX) when is_record(TX, tx) ->
-    find_single_layer(UnsignedID, TX#tx.data);
-find_single_layer(UnsignedID, Items) ->
-    TX = lists:keyfind(UnsignedID, #tx.unsigned_id, Items),
-    case is_record(TX, tx) of
-        true -> TX;
-        false ->
-            throw({cannot_find_item, hb_util:encode(UnsignedID)})
+%% Does not recurse! You probably want `find/2' in most cases. An item is
+%% listed by its signed ID, or by its unsigned ID if it is unsigned.
+find_single_layer(ID, TX) when is_record(TX, tx) ->
+    find_single_layer(ID, TX#tx.data);
+find_single_layer(ID, Items) ->
+    ListedID =
+        fun(#tx{ id = ?DEFAULT_ID, unsigned_id = UnsignedID }) -> UnsignedID;
+            (#tx{ id = SignedID }) -> SignedID
+        end,
+    case lists:search(fun(TX) -> ListedID(TX) =:= ID end, Items) of
+        {value, TX} -> TX;
+        false -> throw({cannot_find_item, hb_util:encode(ID)})
     end.
 
 unbundle(<<Count:256/little-integer, Content/binary>>) ->
@@ -947,14 +950,17 @@ bundle_map_test() ->
         format = ans104,
         data = <<"item1_data">>
     }, W),
+    % The content of `Item1', signed by another wallet.
+    Item1B = sign_item(Item1, ar_wallet:new()),
     Item2 = sign_item(#tx{
         format = ans104,
         anchor = crypto:strong_rand_bytes(32),
-        data = #{<<"key1">> => Item1}
+        data = #{<<"key1">> => Item1, <<"key2">> => Item1B}
     }, W),
     Bundle = serialize(ar_tx:normalize(Item2)),
     BundleItem = deserialize(Bundle),
     ?assertEqual(Item1#tx.data, (maps:get(<<"key1">>, BundleItem#tx.data))#tx.data),
+    ?assertEqual(Item1B#tx.id, (maps:get(<<"key2">>, BundleItem#tx.data))#tx.id),
     ?assert(verify_item(BundleItem)).
 
 eddsa_cases_test() ->
@@ -1148,9 +1154,9 @@ arbundles_single_list_bundle_roundtrip_test() ->
 
 %% @doc Read a serialized bundle from disk, assert it is as it should be, and
 %% do a full deserialize/serialize roundtrip to confirm idempotency.
-%% The file in question was validated against dha-team/arbundles v1.0.3 on
-%% 2025-09-07, so this test also serves to validate that ar_bundles.erl can
-%% read and write to a bundle that is compatible with dha-team/arbundles.
+%% The file in question is written by `generate_and_write_map_bundle_test'.
+%% dha-team/arbundles v1.0.3 reads its outer item as valid, and gives each
+%% signed item in it the ID that the bundle header lists.
 arbundles_map_bundle_roundtrip_test() ->
     {ok, Bin} = file:read_file(<<"test/arbundles.js/ans104-map-bundle-erlang.bundle">>),
     
@@ -1160,7 +1166,7 @@ arbundles_map_bundle_roundtrip_test() ->
     ?assertEqual([
         {<<"bundle-format">>, <<"binary">>},
         {<<"bundle-version">>, <<"2.0.0">>},
-        {<<"bundle-map">>, <<"DwgwetwuSXGrnQiHFziiRLPKIucN5ua9KWkHA-nRQJQ">>}
+        {<<"bundle-map">>, <<"-APvf-F6eeqKb5wJOI3DGstNDVq5y5XAl0rwpLkhrHY">>}
     ], Deserialized#tx.tags),
 
     #{ <<"key1">> := Item1, <<"key2">> := Item2 } = Deserialized#tx.data,
@@ -1180,8 +1186,8 @@ arbundles_map_bundle_roundtrip_test() ->
     Index = hb_json:decode(Manifest#tx.data),
     ?event(debug_test, {index, Index}),
     ?assertEqual(#{ 
-        <<"key1">> => <<"zZXTg5K_9G3EnpMUOhp9QX1tqa8dJa32p2JPkQtiPT0">>,
-        <<"key2">> => <<"m4D2fObeaz5qFkhpacO1K351jaksg2j0-wpyCetAOb4">>
+        <<"key1">> => <<"7anINFl5GrvJxzK03VLZtml-CYtSOuC1MkOKEu29v0w">>,
+        <<"key2">> => <<"jdlr8hdxQq6c_8jcS6-WMNtWBBS4cI4T34Y0iso4ZK4">>
     }, Index),
     
     Reserialized = serialize(ar_tx:normalize(Deserialized)),

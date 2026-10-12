@@ -84,8 +84,9 @@ set_priv(Msg, PrivMap)
 set_priv(Msg, PrivMap) ->
     Msg#{ <<"priv">> => PrivMap }.
 
-%% @doc Check if a key is private: it starts with `priv', in any case, as keys
-%% are case-insensitive. `bor 32' lowercases an ASCII capital.
+%% @doc Check if a key is private: it starts with `priv', in any case.
+%% `structured@1.0' does not lowercase private keys, and `message@1.0' checks a
+%% requested key before it lowercases it. `bor 32' lowercases an ASCII capital.
 is_private(Key) ->
 	try hb_util:bin(Key) of
 		<<P, R, I, V, _/binary>>

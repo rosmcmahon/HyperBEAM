@@ -249,12 +249,17 @@ handle_resolve(Req, Msgs, NodeMsg) ->
         {ok, PreProcessedMsg} ->
             ?event(http_request, {request_after_preprocessing, PreProcessedMsg}),
             AfterPreprocOpts = hb_http_server:get_opts(NodeMsg),
-            % Resolve the request message.
-            HTTPOpts = hb_maps:merge(
-                AfterPreprocOpts,
-                hb_opts:get(http_extra_opts, #{}, NodeMsg),
-				NodeMsg
-            ),
+            % Resolve the request message without the node's key material, and
+            % with `http_extra_opts' overriding the node defaults.
+            HTTPOpts =
+                maps:without(
+                    ?NODE_KEY_OPTS,
+                    hb_maps:merge(
+                        AfterPreprocOpts,
+                        hb_opts:get(http_extra_opts, #{}, NodeMsg),
+                        NodeMsg
+                    )
+                ),
             Res =
                 hb_ao:resolve_many(
                     PreProcessedMsg,
@@ -492,7 +497,26 @@ unauthorized_set_node_msg_fails_test() ->
         ),
     {ok, Res} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
     ?assertEqual(not_found, hb_ao:get(<<"evil-config-item">>, Res, Opts)),
-    ?assertEqual(0, length(hb_ao:get(<<"node-history">>, Res, [], Opts))).
+    ?assertEqual(0, length(hb_ao:get(<<"node-history">>, Res, [], Opts))),
+    % A client's `~message@1.0/commit' is not signed with the node key, through
+    % `httpsig@1.0' or a codec that commits through it.
+    lists:foreach(
+        fun(Device) ->
+            ?assertNotMatch(
+                {ok, _},
+                hb_http:post(
+                    Node,
+                    #{
+                        <<"path">> => <<"/~message@1.0/commit">>,
+                        <<"commitment-device">> => Device,
+                        <<"k">> => <<"v">>
+                    },
+                    #{}
+                )
+            )
+        end,
+        [<<"httpsig@1.0">>, <<"flat@1.0">>]
+    ).
 
 %% @doc Test that we can set the node message if the request is signed by the
 %% owner of the node.

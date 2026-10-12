@@ -809,13 +809,6 @@ set(Base, NewValuesMsg, Opts) ->
 			end,
 			NewValuesKeys
 		),
-	% Find keys in the message that are already set (case-insensitive), and 
-	% note them for removal.
-	_ConflictingKeys =
-		lists:filter(
-			fun(Key) -> lists:member(Key, KeysToSet) end,
-			hb_maps:keys(Base, Opts)
-		),
     UnsetKeys =
         lists:filter(
             fun(Key) ->
@@ -830,7 +823,6 @@ set(Base, NewValuesMsg, Opts) ->
     BaseValues = hb_maps:without(UnsetKeys, Base, Opts),
     ?event_debug(debug_message_set,
         {performing_set,
-            {conflicting_keys, _ConflictingKeys},
             {keys_to_unset, UnsetKeys},
             {new_values, NewValuesMsg},
             {original_message, Base}
@@ -1141,7 +1133,14 @@ key_from_device_test() ->
     ),
     ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})),
     % A key named `get' is read like any other.
-    ?assertEqual({ok, 2}, hb_ao:resolve(#{ <<"get">> => 2 }, <<"get">>, #{})).
+    ?assertEqual({ok, 2}, hb_ao:resolve(#{ <<"get">> => 2 }, <<"get">>, #{})),
+    % A key named `with-commitments' is computed, as with `no-cache'.
+    Msg = #{ <<"with-commitments">> => 3 },
+    NoCache = #{ <<"cache-control">> => [<<"no-cache">>] },
+    ?assertEqual(
+        hb_ao:resolve(Msg, <<"with-commitments">>, NoCache),
+        hb_ao:resolve(Msg, <<"with-commitments">>, #{})
+    ).
 
 remove_test() ->
 	Msg = #{ <<"key1">> => <<"Value1">>, <<"key2">> => <<"Value2">> },

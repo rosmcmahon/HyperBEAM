@@ -1241,6 +1241,16 @@ deep_set(Msg, [Key], Value, Opts) ->
     device_set(Msg, Key, Value, Opts);
 deep_set(Msg, [Key|Rest], Value, Opts) ->
     case resolve(Msg, Key, Opts) of 
+        {ok, Literal} when not is_map(Literal), not is_list(Literal) ->
+            % A literal on the path is replaced with a message, as
+            % `hb_util:deep_set/4' replaces it.
+            device_set(
+                Msg,
+                Key,
+                deep_set(#{}, Rest, Value, Opts),
+                <<"explicit">>,
+                Opts
+            );
         {ok, SubMsg} ->
             ?event_debug(debug_set,
                 {traversing_deeper_to_set,

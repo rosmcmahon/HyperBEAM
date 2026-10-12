@@ -12,13 +12,15 @@
 %%% All keys in the `message@1.0` device that are not resolved to underlying
 %%% data in the their Erlang map representations.
 -define(MESSAGE_KEYS, [
-    <<"get">>,
+    <<"index">>,
     <<"set">>,
+    <<"set-path">>,
     <<"remove">>,
     <<"keys">>,
     <<"id">>,
     <<"commit">>,
     <<"verify">>,
+    <<"with-commitments">>,
     <<"committers">>,
     <<"committed">>
 ]).

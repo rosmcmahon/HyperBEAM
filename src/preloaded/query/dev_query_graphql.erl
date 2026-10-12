@@ -105,20 +105,30 @@ handle(_Base, RawReq, Opts) ->
             {ok, _} -> RawReq;
             error ->
                 % Parse the query, assuming that the request body is a JSON
-                % object with the necessary fields.
+                % object with the necessary fields. Any other body carries
+                % no query.
                 Body = hb_maps:get(<<"body">>, RawReq, <<>>, Opts),
-                {ok, Decoded} =
-                    hb_ao:raw(
-                        <<"structured@1.0">>,
-                        <<"to">>,
-                        hb_json:decode(Body),
-                        #{},
-                        Opts
-                    ),
-                Decoded
+                try hb_json:decode(Body) of
+                    Object when is_map(Object) ->
+                        {ok, Decoded} =
+                            hb_ao:raw(
+                                <<"structured@1.0">>,
+                                <<"to">>,
+                                Object,
+                                #{},
+                                Opts
+                            ),
+                        Decoded;
+                    _ -> #{}
+                catch error:_ -> #{}
+                end
         end,
     ?event({request, {processed, Req}}),
-    Query = hb_maps:get(<<"query">>, Req, <<>>, Opts),
+    Query =
+        case hb_maps:get(<<"query">>, Req, <<>>, Opts) of
+            QueryBin when is_binary(QueryBin) -> QueryBin;
+            _ -> <<>>
+        end,
     OpName = 
         case hb_maps:get(<<"operationname">>, Req, undefined, Opts) of
             Name when is_binary(Name) -> Name;
@@ -126,13 +136,14 @@ handle(_Base, RawReq, Opts) ->
         end,
     % The `graphql' library takes the variables as Erlang terms without links.
     Vars = 
-        hb_message:uncommitted_deep(
-            hb_cache:ensure_all_loaded(
-                hb_maps:get(<<"variables">>, Req, #{}, Opts),
-                Opts
-            ),
-            Opts
-        ),
+        case hb_maps:get(<<"variables">>, Req, #{}, Opts) of
+            RawVars when is_map(RawVars) ->
+                hb_message:uncommitted_deep(
+                    hb_cache:ensure_all_loaded(RawVars, Opts),
+                    Opts
+                );
+            _ -> #{}
+        end,
     ?event(
         {graphql_run_called,
             {query, Query},
@@ -193,7 +204,10 @@ handle(_Base, RawReq, Opts) ->
                 throw:Error:Stacktrace ->
                     ?event({graphql_error, {error, Error}, {trace, Stacktrace}}),
                     {error, Error}
-            end
+            end;
+        {error, Error} ->
+            ?event({graphql_error, {error, Error}}),
+            {error, Error}
     end.
 
 %% @doc The variables of a request under the names the document declares: the
