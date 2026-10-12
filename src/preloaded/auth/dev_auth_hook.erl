@@ -516,6 +516,22 @@ cookie_test() ->
     ?assertEqual(
         [CookieAddress],
         signers_from_commitments_response(Response2, ServerWallet)
+    ),
+    % The hook signs a request with the node's commitment device, regardless
+    % of the codec that the client accepts for the reply.
+    {ok, Response3} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"commitments">>,
+                <<"body">> => <<"Test data">>,
+                <<"accept">> => <<"application/ans104">>
+            },
+            #{}
+        ),
+    ?assertMatch(
+        [_],
+        signers_from_commitments_response(Response3, ServerWallet)
     ).
 
 http_auth_test() ->

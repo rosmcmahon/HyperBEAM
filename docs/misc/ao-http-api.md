@@ -23,7 +23,11 @@ that message during that resolution.
 - When AO-Core is not given a base hashpath (the first key is not a 43 character
 base64URL encoded string), the request message is assumed to be its own base
 message, with the path applied alone as the request (`Message2`).
-- Query parameters are treated as equivalent to headers.
+- Query parameters are treated as equivalent to headers. A query parameter
+replaces a header of the same name, unless the request's `signature-input`
+names that header. If the request has no `path` key or header, its query
+parameters are also added to the request, replacing any keys of the same name,
+signed or not.
 - When not otherwise specified, a query parameter or header is interpreted as
 being present in all messages in the path, in addition to the path key.
 - `+` in path segments delimits the `key` and an optional message dictionary. 
@@ -41,6 +45,32 @@ enclosed path, as if it were an independent invocation. For example,
 `GET /hashpath1/path2+key1=(/hashpath2/key2)` implies that `key1` in the 
 message for the resolution of `path2` is the result of the invocation of 
 `/hashpath2/key2`.
+
+## Requests and replies
+
+The module documentation of `hb_http_server` and `hb_http` gives these rules
+in full.
+
+- A request is decoded with the codec named by its `codec-device` key. Without
+that key, it is decoded with the codec of its `content-type`. The node's
+`default-codec` is used when the request has neither.
+- If a request has commitments, the node keeps only its committed keys. Every
+commitment must verify, or the node replies with a 400. The commitments of an
+unsigned request are removed.
+- The node sets `method` and `host` from the HTTP request. It adds `path`,
+`accept` and `accept-bundle` to a request that does not have them.
+- A device that authorizes a request by its signer must only read the keys that
+the signer committed, after verifying them.
+- The HTTP status of a reply is the result's `status`, if that is an integer
+from 100 to 599. Otherwise, it is the code of the result's Erlang status. The
+node does not add a `status` key to the reply.
+- The codec of a reply is the request's `require-codec`, if it has one.
+Otherwise, a result with a `content-type` is sent in `httpsig@1.0`. Otherwise,
+the codec is the request's `accept-codec`, or its `accept`.
+- A result without commitments is sent with its unsigned commitment over its
+own keys. A client keeps only the keys of a reply that at least one of its
+commitments covers. If the reply has no `status` key, the client adds the HTTP
+status as `status`.
 
 ## Example workflows
 

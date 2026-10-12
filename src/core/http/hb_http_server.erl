@@ -3,8 +3,73 @@
 %%% only has to marshal the HTTP request into a message, and then
 %%% pass it to the AO-Core resolver. 
 %%% 
-%%% `reply/4' responds to the client, converting a message back into an
-%%% HTTP response.
+%%% `req_to_tabm_singleton/3' converts the HTTP request into a message,
+%%% `resolve_request/3' resolves it, and `reply/4' responds to the client,
+%%% converting the result back into an HTTP response.
+%%%
+%%% We parse a request in five steps:
+%%%
+%%% 1. We merge the query parameters of the request over its headers. A query
+%%%    parameter does not replace a header that the request's `signature-input'
+%%%    names, as the signature covers the value of that header.
+%%% 2. We find the codec of the request. The precedence order is:
+%%%    a. The `codec-device' field of the request.
+%%%    b. The codec of the request's `content-type'.
+%%%    c. The node's `default-codec'.
+%%% 3. We decode the request with its codec. An `ans104@1.0' or `tx@1.0'
+%%%    request is decoded from its body alone. An `httpsig@1.0' request is
+%%%    decoded from its headers and body. A request in any other codec is
+%%%    decoded from its body, and the decoded keys are set over its headers.
+%%%    For `httpsig@1.0' and the other codecs, if the request has commitments,
+%%%    we keep only the keys that they cover. We then remove the commitments
+%%%    of an unsigned request, as `hb_ao' does for every execution input.
+%%% 4. We add the details of the HTTP request to the message. The `method' and
+%%%    `host' keys are always set from the HTTP request. The `path', `accept'
+%%%    and `accept-bundle' keys are only added if the message does not have
+%%%    them. The `path' is taken from a `path' header, or from the request
+%%%    target if there is no such header. The `accept' and `accept-bundle'
+%%%    keys are taken from the query or the headers, and default to `*/*' and
+%%%    `false'. The cookies of the `cookie' header are placed in `priv/cookie',
+%%%    and the caller's address in `priv/ip'. An `ao-peer-port' key is
+%%%    replaced by an `ao-peer' key, which holds the caller's address and that
+%%%    port. We remove the `content-length' key and an empty `body', unless
+%%%    they are signed. A `device' header or query parameter replaces the
+%%%    `device' of the message.
+%%% 5. We verify every commitment of the request, and of the messages that it
+%%%    holds. If the node has `force-signed-requests' set, the request must
+%%%    also have a signer. If either check fails, the node replies with a 400.
+%%%
+%%% `hb_singleton' then parses the `path' of the request into the messages to
+%%% resolve. When the path is the request target, its query parameters are
+%%% added to the request, replacing any keys of the same name, signed or not.
+%%% Each of the messages keeps the commitments of the request. As a result, a
+%%% device that authorizes a request by its signer must only read the keys
+%%% that the signer committed, after verifying them. `lib_meta:authorized/3'
+%%% returns these keys.
+%%%
+%%% We reply to the client with the result as follows:
+%%%
+%%% 1. The HTTP status of the reply is the result's `status' key, if it is an
+%%%    integer from 100 to 599, or the binary encoding of one. Otherwise, it is
+%%%    the code that `hb_http:status_code/2' gives for the result's Erlang
+%%%    status. We do not add a `status' key to the reply.
+%%% 2. If the result is a literal or a list, we send it as the `body' of a
+%%%    message, with an `ao-result' key that names `body'.
+%%% 3. If the result has no commitments, we send it with its unsigned
+%%%    commitment over its own keys. If the node has `force-signed' set, we
+%%%    also sign the `hashpath' of the result, committing only that key. We do
+%%%    this only if the message that we send is the result that the hashpath
+%%%    names, and the message has no `hashpath' key of its own.
+%%% 4. We find the codec of the reply. The precedence order is:
+%%%    a. The `require-codec' field of the request.
+%%%    b. `httpsig@1.0', if the result has a `content-type'.
+%%%    c. The `accept-codec' field of the request.
+%%%    d. The `accept' field of the request.
+%%%    e. The node's `default-codec'.
+%%% 5. If the reply is in `httpsig@1.0' and the request does not have
+%%%    `accept-bundle: true', we add the node's index page to the reply as its
+%%%    `body' and `content-type'. We only do this if the message has neither
+%%%    key, as a value or as a link.
 %%% 
 %%% The router uses an `Opts' message as its Cowboy initial state, 
 %%% such that changing it on start of the router server allows for
@@ -582,22 +647,12 @@ handle_request(RawReq, Body, ServerID) ->
     try req_to_tabm_singleton(Req, Body, NodeMsg) of
         ReqSingleton ->
             try
-                CommitmentCodec =
-                    accept_to_codec(ReqSingleton, NodeMsg),
                 ?event(http,
                     {parsed_singleton,
-                        {req_singleton, ReqSingleton},
-                        {accept_codec, CommitmentCodec}},
+                        {req_singleton, ReqSingleton}},
                     #{}
                 ),
-                Res =
-                    resolve_request(
-                        Req,
-                        ReqSingleton,
-                        NodeMsg#{
-                            <<"commitment-device">> => CommitmentCodec
-                        }
-                    ),
+                Res = resolve_request(Req, ReqSingleton, NodeMsg),
                 reply(Req, ReqSingleton, Res, NodeMsg)
             catch
                 Type:Details:Stacktrace ->
@@ -1232,8 +1287,6 @@ encode_reply(Status, TABMReq, Message, Opts) ->
 %% 5. The default codec
 %% Options can be specified in mime-type format (`application/*') or in
 %% AO device format (`device@1.0').
-accept_to_codec(OriginalReq, Opts) ->
-    accept_to_codec(OriginalReq, undefined, Opts).
 accept_to_codec(#{ <<"require-codec">> := RequiredCodec }, _Reply, Opts) ->
     mime_to_codec(RequiredCodec, Opts);
 accept_to_codec(OriginalReq, Reply = #{ <<"content-type">> := Link }, Opts) when ?IS_LINK(Link) ->
@@ -1380,8 +1433,11 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                     ),
                 Committed
         end,
+    % Remove the commitments of an unsigned request, as `hb_ao' does for every
+    % execution input.
+    Input = hb_ao:execution_input(Decoded, Opts),
     % Cookie-backed commitments need the request's cookie and peer context.
-    Normalized = normalize_unsigned(PrimitiveMsg, Req, Decoded, Opts),
+    Normalized = normalize_unsigned(PrimitiveMsg, Req, Input, Opts),
     maybe
         true ?= hb_message:deep_verify(Normalized, Opts),
         Signers = hb_message:signers(Normalized, Opts),
@@ -1886,6 +1942,18 @@ ingress_json_links_test() ->
     ?assertMatch(
         {link, <<"ao:", ID/binary>>, _},
         maps:get(<<"reference">>, Decoded)
+    ),
+    % An unsigned request carries no commitment once it is decoded.
+    Unsigned = hb_message:normalize_commitments(#{ <<"a">> => <<"1">> }, Opts),
+    ?assertNot(
+        maps:is_key(
+            <<"commitments">>,
+            req_to_tabm_singleton(
+                Req,
+                hb_message:convert(Unsigned, <<"json@1.0">>, Opts),
+                Opts
+            )
+        )
     ),
     ?assertThrow(
         {invalid_commitments, _},

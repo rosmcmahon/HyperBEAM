@@ -1,7 +1,22 @@
-%%% Hyperbeam's outbound HTTP requests. The functions in this module take a
+%%% @doc Hyperbeam's outbound HTTP requests. The functions in this module take a
 %%% message request from their caller, send it to a peer, and return the peer's
 %%% response in message form. Inbound requests and their replies are handled by
 %%% `hb_http_server'.
+%%%
+%%% We send a request message in the codec named by its `codec-device' key, or
+%%% in `httpsig@1.0' if it has none. We add `accept-bundle: true' to the
+%%% message, unless the caller has set it. The cookies of the message, from
+%%% `priv/cookie' and from its `cookie' and `set-cookie' keys, are sent in a
+%%% `cookie' header.
+%%%
+%%% We read the response in the codec named by its `codec-device' header. If
+%%% the response has commitments, we keep only the keys that at least one of
+%%% them covers. For example, the `hashpath' of a computed response is kept
+%%% when the node's signature covers it. A response without commitments keeps
+%%% all of its keys. We add the HTTP status to the message as `status', if it
+%%% has no such key. The cookies that the response sets are placed in
+%%% `priv/cookie'. If `http-only-result' is set, as it is by default, we return
+%%% only the value of the key that the response's `ao-result' names.
 -module(hb_http).
 -export([start/0]).
 -export([get/2, get/3, post/3, post/4, request/2, request/4, request/5]).
