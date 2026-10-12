@@ -616,6 +616,21 @@ empty_body_http_test() ->
     {ok, Reply} = get(URL, ID, Client#{ <<"http-only-result">> => false }),
     ?assertEqual(<<>>, hb_maps:get(<<"body">>, Reply, missing, Client)),
     ?assertEqual(true, hb_message:deep_verify(Reply, Client)),
+    % A reply to `accept-bundle: false' keeps its empty body or its list body
+    % as a link: no index page.
+    ?assertMatch(
+        {ok, #{ <<"body">> := <<>> }},
+        get(URL, #{ <<"path">> => ID, <<"accept-bundle">> => false }, Client)
+    ),
+    {ok, ListID} = hb_cache:write([], Origin),
+    ?assertEqual(
+        {ok, []},
+        get(
+            URL,
+            #{ <<"path">> => ListID, <<"accept-bundle">> => false },
+            Client
+        )
+    ),
     ?assertEqual({ok, <<>>}, post(URL, <<"/body">>, Signed, Client)).
 
 simple_ao_resolve_signed_test() ->
