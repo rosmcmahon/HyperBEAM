@@ -20379,7 +20379,7 @@ Save this as `config.json`, replacing `node.example.com` with your domain:
 
 ```json
 {
-  "ao-types": "protocol=atom",
+  "ao-types": "atom=(\"protocol\")",
   "port": 443,
   "protocol": "http2",
   "tls": {
@@ -20426,14 +20426,14 @@ For `config.flat`, use the equivalent configuration below and start with
 `HB_CONFIG=config.flat rebar3 shell`:
 
 ```text
-ao-types: protocol=atom
+ao-types: atom=("protocol")
 port: 443
 protocol: http2
 
-tls/domains/ao-types: .=list
+tls/domains/ao-types: list=(".")
 tls/domains/1: node.example.com
 
-tls/acme/ao-types: terms-of-service-agreed=atom, http-port=integer
+tls/acme/ao-types: atom=("terms-of-service-agreed"), integer=("http-port")
 tls/acme/directory-url: https://acme-v02.api.letsencrypt.org/directory
 tls/acme/terms-of-service-agreed: true
 tls/acme/http-port: 80

@@ -583,7 +583,7 @@ resolve_capitalised_key_test(Opts) ->
         )
     ),
     ?assertEqual(
-        {ok, <<"a=\"integer\"">>},
+        {ok, <<"integer=(\"a\")">>},
         hb_ao:resolve(
             #{ <<"Device">> => <<"structured@1.0">> },
             #{

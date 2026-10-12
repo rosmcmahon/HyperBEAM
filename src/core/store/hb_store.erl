@@ -1581,7 +1581,8 @@ normalize_children_test() ->
         [{<<"~message@1.0/body">>, [<<"abc">>, <<0, 255>>, 17, [<<"a">>]]},
             {<<"~message@1.0&body=fixed/body">>, [<<"abc">>]},
             {<<"~message@1.0/set&value=constant/body">>, [<<"abc">>]},
-            {<<"~message@1.0&ao-types=body%3D%22integer%22/body">>, [<<"12">>]}]
+            {<<"~message@1.0&ao-types=integer%3D%28%22body%22%29/body">>,
+                [<<"12">>]}]
     ).
 
 %% @doc Test that `to-key' and `to-value' rewrite a request's paths and

@@ -1417,7 +1417,12 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                 {ok, Committed} =
                     hb_message:with_only_committed(
                         hb_maps:merge(
-                            PrimitiveMsg,
+                            hb_message:convert(
+                                PrimitiveMsg,
+                                <<"structured@1.0">>,
+                                tabm,
+                                Opts
+                            ),
                             hb_message:convert(
                                 Body,
                                 <<"structured@1.0">>,

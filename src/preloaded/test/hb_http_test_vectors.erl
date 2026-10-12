@@ -123,7 +123,7 @@ messages() ->
         {"explicit types",
             {
                 #{
-                    <<"ao-types">> => <<"answer=\"integer\"">>,
+                    <<"ao-types">> => <<"integer=(\"answer\")">>,
                     <<"answer">> => <<"42">>
                 },
                 #{ <<"answer">> => 42 }

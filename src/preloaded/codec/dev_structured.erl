@@ -1,18 +1,32 @@
 %%% @doc A device implementing the codec interface (to/1, from/1) for 
-%%% HyperBEAM's internal, richly typed message format. Supported rich types are:
-%%% - `integer'
-%%% - `float'
-%%% - `atom'
-%%% - `list'
+%%% HyperBEAM's internal, richly typed message format. Each supported rich type
+%%% has one encoding, and `to/1' refuses a value in any other:
+%%% - `integer': decimal digits with no leading zero, and `-' before any value
+%%%   but zero;
+%%% - `float': an RFC 9651 Decimal, the float rounded to three places, to the
+%%%   even digit when halfway, with no trailing zero after the first
+%%%   fractional digit and at most 12 integer digits (a larger float gives the
+%%%   largest Decimal of its sign); and the parameter `binary64', the float's
+%%%   8 IEEE 754 bytes, big-endian, as base64url with no padding, which gives
+%%%   its value: `0.062;binary64="P7AAAAAAAAA"' for 0.0625;
+%%% - `atom': an RFC 9651 Token;
+%%% - `list': a message with the keys `1' to `N', marked in `ao-types';
 %%% - `binary', when named in `encode-types': a binary that is not UTF-8 text,
-%%%   as base64url.
+%%%   as base64url with no padding.
+%%% 
+%%% `ao-types' holds the types of a message's values: an RFC 9651 dictionary
+%%% with a member for each type, whose inner list holds the keys of that type
+%%% as strings. Types, and the keys of each type, are sorted by their bytes,
+%%% and the key `.' of type `list' marks a message that is a list:
+%%% `integer=("1" "2"), list=(".")'. `to/3' refuses any other encoding, and a
+%%% type for a key that holds no binary.
 %%% 
 %%% Encoding to TABM can be limited to a subset of types (with other types
 %%% passing through in their rich representation) by specifying the types 
 %%% that should be encoded with the `encode-types' request key.
 %%% 
 %%% This format mirrors HTTP Structured Fields, aside from its limitations of 
-%%% compound type depths, as well as limited floating point representations.
+%%% compound type depths, and integers of more than 15 digits.
 %%% 
 %%% As with all AO-Core codecs, its target format (the format it expects to 
 %%% receive in the `to/1' function, and give in `from/1') is TABM.
@@ -21,11 +35,15 @@
 -module(dev_structured).
 -export([to/3, from/3, commit/3, verify/3, encode_types/3, decode_types/3]).
 -export([encode_ao_types/2, decode_ao_types/2, is_list_from_ao_types/2]).
--export([decode_value/2, encode_value/1, implicit_keys/2]).
+-export([decode_value/3, encode_value/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(SUPPORTED_TYPES, [<<"integer">>, <<"float">>, <<"atom">>, <<"list">>]).
+%% The types that `ao-types' holds, in the order of their bytes.
+-define(AO_TYPES,
+    [<<"atom">>, <<"binary">>, <<"float">>, <<"integer">>, <<"list">>]
+).
 
 %% @doc Route commitments through `httpsig@1.0'.
 -spec commit(#{ _ => _ }, #{ _ => _ }, map()) -> term().
@@ -167,15 +185,7 @@ from(Msg, Req, Opts) when is_map(Msg) ->
         hb_maps:from_list(case Types of
             [] -> Values;
             T ->
-                AoTypes = iolist_to_binary(hb_structured_fields:dictionary(
-                    lists:map(
-                        fun({N, {Key, Value}}) ->
-                            {ok, Item} = hb_structured_fields:to_item(Value),
-                            {encode_key(N, Key), Item}
-                        end,
-                        lists:enumerate(lists:reverse(T))
-                    )
-                )),
+                AoTypes = encode_ao_types(maps:from_list(T), Opts),
                 [{<<"ao-types">>, AoTypes} | Values]
         end),
     % If the message has a `commitments' field, add it to the TABM unmodified.
@@ -255,20 +265,34 @@ decode(Bin, _Links, _Opts) when is_binary(Bin) -> {ok, Bin};
 decode(List, Links, Opts) when is_list(List) ->
     {ok, [ hb_util:ok(decode(Value, Links, Opts)) || Value <- List ]};
 decode(TABM0, Links, Opts) when is_map(TABM0) ->
-    % `ao-types' names keys, so its names are lowercased as the keys are.
+    % `ao-types' names keys, so its names are lowercased as the keys are, and
+    % two names of one key are refused.
+    AOTypes = decode_ao_types(TABM0, Opts),
     Types =
         maps:from_list(
             [
                 {hb_util:lowercase_key(Name), Type}
             ||
-                {Name, Type} <- maps:to_list(decode_ao_types(TABM0, Opts))
+                {Name, Type} <- maps:to_list(AOTypes)
             ]
         ),
+    true = map_size(Types) == map_size(AOTypes),
     TABM1 = decode_keys(TABM0),
     % 1. Remove 'ao-types' field
-    % 2. Decode any binary values that have a type, or that are links;
+    % 2. Decode the value of each key that `ao-types' names, which holds a
+    %    binary, and the other values that are links;
     % 3. Recursively decode any maps that we encounter;
     % 4. Return the remaining keys and values as a map.
+    Typed =
+        maps:fold(
+            fun(<<".">>, <<"list">>, Acc) -> Acc;
+               (Key, Type, Acc) ->
+                    #{ Key := Encoded } = Acc,
+                    Acc#{ Key := decode_value(Type, Encoded) }
+            end,
+            maps:remove(<<"ao-types">>, TABM1),
+            Types
+        ),
     % The fold starts from the TABM, so a key that needs no decoding is not
     % rebuilt.
     ResMsg =
@@ -282,14 +306,6 @@ decode(TABM0, Links, Opts) when is_map(TABM0) ->
                 case hb_private:is_private(RawKey) of
                     true -> Acc;
                     false -> Acc#{ RawKey => hb_link:decode(RawKey, Value) }
-                end;
-            (RawKey, BinValue, Acc) when is_binary(BinValue) ->
-                case maps:find(RawKey, Types) of
-                    % The value is a binary, no parsing required
-                    error -> Acc;
-                    % Parse according to its type
-                    {ok, Type} ->
-                        Acc#{ RawKey => hb_util:decode(Type, BinValue) }
                 end;
             (<<"commitments">>, Commitments, Acc) when is_map(Commitments) ->
                 % The keys of `commitments' are IDs, so only its values are
@@ -313,11 +329,11 @@ decode(TABM0, Links, Opts) when is_map(TABM0) ->
                         }
                 end;
             (_RawKey, _Value, Acc) ->
-                % We encountered a key that already has a converted type.
-                % We can just return it as is.
+                % A binary, or a value that already has its type, is kept as
+                % it is.
                 Acc
             end,
-            maps:remove(<<"ao-types">>, TABM1),
+            Typed,
             TABM1
         ),
     % If the message is a list, we need to convert it back. A `.' type other
@@ -372,38 +388,47 @@ decode_keys(TABM) ->
 encode_types(Base, Req, Opts) ->
     {ok, encode_ao_types(hb_maps:get(<<"body">>, Req, Base, Opts), Opts)}.
 
+%% @doc Encode a map of keys and their types as an `ao-types' dictionary: a
+%% member for each type, whose inner list holds the keys of that type as
+%% strings. Types, and the keys of each type, are sorted by their bytes.
 encode_ao_types(Types, _Opts) ->
+    Groups =
+        maps:groups_from_list(
+            fun(Key) -> maps:get(Key, Types) end,
+            hb_util:to_sorted_keys(Types)
+        ),
     iolist_to_binary(hb_structured_fields:dictionary(
-        lists:map(
-            fun({N, Key}) ->
-                {ok, Item} = hb_structured_fields:to_item(maps:get(Key, Types)),
-                {encode_key(N, Key), Item}
-            end,
-            lists:enumerate(hb_util:to_sorted_keys(Types))
-        )
+        [
+            {Type, {list, lists:map(fun encode_key/1, Keys), []}}
+        ||
+            {Type, Keys} <- hb_util:to_sorted_list(Groups)
+        ]
     )).
 
-%% @doc Percent-encode the key of the `N'th member of an `ao-types'
-%% dictionary. Keys keep `a-z', `0-9', `_', `-' and `.', and write every
-%% other byte as `%xx'. The dictionary parser refuses a member after the
-%% first that starts with `.', so such a key writes its first `.' as `%2e'.
-encode_key(N, Key) ->
-    case << <<(encode_key_char(C))/binary>> || <<C>> <= Key >> of
-        <<".", Rest/binary>> when N > 1 -> <<"%2e", Rest/binary>>;
-        Encoded -> Encoded
+%% @doc Encode a key of `ao-types' as a string, which holds the bytes `0x20'
+%% to `0x7e'. A key with any other byte cannot hold a typed value.
+encode_key(Key) ->
+    case << <<C>> || <<C>> <= Key, C < 16#20 orelse C > 16#7e >> of
+        <<>> -> {item, {string, Key}, []};
+        _ -> throw({invalid_ao_types_key, Key})
     end.
-
-encode_key_char(C) when C >= $a, C =< $z; C >= $0, C =< $9 -> <<C>>;
-encode_key_char(C) when C == $_; C == $-; C == $. -> <<C>>;
-encode_key_char(C) -> <<$%, (hex_digit(C bsr 4)), (hex_digit(C band 15))>>.
-
-hex_digit(D) when D < 10 -> $0 + D;
-hex_digit(D) -> $a + D - 10.
 
 %% @doc Device key for parsing an `ao-types' field.
 decode_types(Base, Req, Opts) ->
     Types = hb_maps:get(<<"body">>, Req, Base, Opts),
     try {ok, decode_ao_types(Types, Opts)}
+    catch
+        error:badarg -> invalid_types();
+        error:function_clause -> invalid_types();
+        error:{badmatch, _} -> invalid_types();
+        error:{case_clause, _} -> invalid_types()
+    end.
+
+%% @doc Device key for decoding a typed value: the base, by the `type' of the
+%% request.
+decode_value(Base, Req, Opts) ->
+    Type = hb_maps:get(<<"type">>, Req, undefined, Opts),
+    try {ok, decode_value(Type, Base)}
     catch
         error:badarg -> invalid_types();
         error:function_clause -> invalid_types();
@@ -419,16 +444,41 @@ invalid_types() ->
 %% as there can be no `ao-types'.
 decode_ao_types(List, _Opts) when is_list(List) -> #{};
 decode_ao_types(Msg, Opts) when is_map(Msg) ->
-    decode_ao_types(hb_maps:get(<<"ao-types">>, Msg, <<>>, Opts), Opts);
+    case hb_maps:find(<<"ao-types">>, Msg, Opts) of
+        {ok, Types} -> decode_ao_types(Types, Opts);
+        error -> #{}
+    end;
 decode_ao_types(Bin, _Opts) when is_binary(Bin) ->
-    hb_maps:from_list(
-        lists:map(
-            fun({Key, {item, {_, Value}, _}}) ->
-                {hb_escape:decode(Key), Value}
-            end,
-            hb_structured_fields:parse_dictionary(Bin)    
-        )
-    ).
+    decode_ao_types(Bin, ?AO_TYPES, #{}).
+
+%% @doc Read `ao-types' in the one encoding that `encode_ao_types/2' writes,
+%% and refuse any other: at least one member, the members in the order of
+%% their types, each holding its keys in the order of their bytes, and each
+%% key in one member.
+decode_ao_types(Bin, [Type | Types], Acc) ->
+    Size = byte_size(Type),
+    case Bin of
+        <<Type:Size/binary, "=(", Rest/binary>> ->
+            {Keys, Next} = decode_ao_types_keys(Rest, []),
+            Keys = lists:usort(Keys),
+            Merged = maps:merge(Acc, maps:from_keys(Keys, Type)),
+            true = map_size(Merged) == map_size(Acc) + length(Keys),
+            case Next of
+                <<>> -> Merged;
+                <<", ", Members/binary>> ->
+                    decode_ao_types(Members, Types, Merged)
+            end;
+        _ -> decode_ao_types(Bin, Types, Acc)
+    end.
+
+%% @doc Read the keys of an `ao-types' member up to its `)': strings,
+%% separated by a space.
+decode_ao_types_keys(Bin, Keys) ->
+    {{string, Key}, Rest} = hb_structured_fields:parse_bare_item(Bin),
+    case Rest of
+        <<")", Next/binary>> -> {lists:reverse([Key | Keys]), Next};
+        <<" ", More/binary>> -> decode_ao_types_keys(More, [Key | Keys])
+    end.
 
 %% @doc Determine if the `ao-types' field of a TABM indicates that the message
 %% is a list.
@@ -439,19 +489,6 @@ is_list_from_ao_types(Types, _Opts) ->
         {ok, <<"list">>} -> true;
         _ -> false
     end.
-
-%% @doc Find the implicit keys of a TABM.
-implicit_keys(Req, Opts) ->
-    hb_maps:keys(
-        hb_maps:filtermap(
-            fun(_Key, Val = <<"empty-", _/binary>>) -> {true, Val};
-            (_Key, _Val) -> false
-            end,
-            decode_ao_types(Req, Opts),
-            Opts
-        ),
-		Opts
-    ).
 
 %% @doc Encode a value if it is in the list of supported types. A binary that
 %% is UTF-8 text is not encoded.
@@ -471,44 +508,108 @@ encode_value(Value) when is_integer(Value) ->
     [Encoded, _] = hb_structured_fields:item({item, Value, []}),
     {<<"integer">>, Encoded};
 encode_value(Value) when is_float(Value) ->
-    ?no_prod("Must use structured field representation for floats!"),
-    {<<"float">>, float_to_binary(Value)};
+    {
+        <<"float">>,
+        <<
+            (decimal(thousandths(Value)))/binary,
+            ";binary64=\"", (hb_util:encode(<<Value/float>>))/binary, "\""
+        >>
+    };
 encode_value(Value) when is_atom(Value) ->
     EncodedIOList =
         hb_structured_fields:item({item, {token, hb_util:bin(Value)}, []}),
     Encoded = hb_util:bin(EncodedIOList),
     {<<"atom">>, Encoded};
-encode_value(Values) when is_list(Values) ->
-    EncodedValues =
-        lists:map(
-            fun(Bin) when is_binary(Bin) -> {item, {string, Bin}, []};
-               (Item) ->
-                {RawType, Encoded} = encode_value(Item),
-                Type = hb_ao:normalize_key(RawType),
-                {
-                    item,
-                    {
-                        string,
-                        <<
-                            "(ao-type-", Type/binary, ") ",
-                            Encoded/binary
-                        >>
-                    },
-                    []
-                }
-            end,
-            Values
-        ),
-    EncodedList = hb_structured_fields:list(EncodedValues),
-    {<<"list">>, iolist_to_binary(EncodedList)};
 encode_value(Value) when is_binary(Value) ->
     {<<"binary">>, hb_util:encode(Value)};
 encode_value(Value) ->
     Value.
 
-%% @doc Decode a structured field value by AO-Core structured type.
-decode_value(Type, Value) ->
-    hb_util:decode(Type, Value).
+%% @doc Write a number of thousandths as an RFC 9651 Decimal, which has at most
+%% 12 integer digits: a larger number gives the largest Decimal of its sign.
+decimal(Thousandths) when Thousandths > 999999999999999 ->
+    decimal(999999999999999);
+decimal(Thousandths) when Thousandths < -999999999999999 ->
+    decimal(-999999999999999);
+decimal(Thousandths) ->
+    <<_, Fraction/binary>> =
+        integer_to_binary(1000 + abs(Thousandths) rem 1000),
+    iolist_to_binary(
+        [
+            case Thousandths < 0 of true -> <<"-">>; false -> <<>> end,
+            integer_to_binary(abs(Thousandths) div 1000),
+            <<".">>,
+            case string:trim(Fraction, trailing, "0") of
+                <<>> -> <<"0">>;
+                Digits -> Digits
+            end
+        ]
+    ).
+
+%% @doc A float in thousandths, rounded to the nearest, or to the even one
+%% when halfway. A float is exactly `Mantissa * 2^Exponent'.
+thousandths(Float) ->
+    {Sign, Mantissa, Exponent} =
+        case <<Float/float>> of
+            <<S:1, 0:11, M:52>> -> {S, M, -1074};
+            <<S:1, E:11, M:52>> -> {S, M bor (1 bsl 52), E - 1075}
+        end,
+    Scaled = Mantissa * 1000,
+    Abs =
+        case Exponent >= 0 of
+            true -> Scaled bsl Exponent;
+            false ->
+                Floor = Scaled bsr -Exponent,
+                Half = 1 bsl (-Exponent - 1),
+                case Scaled - (Floor bsl -Exponent) of
+                    Rest when Rest > Half -> Floor + 1;
+                    Half -> Floor + (Floor band 1);
+                    _ -> Floor
+                end
+        end,
+    case Sign of
+        1 -> -Abs;
+        0 -> Abs
+    end.
+
+%% @doc Decode a typed value from the one encoding that `encode_value/1'
+%% writes for it. Any other encoding of the value is refused.
+decode_value(<<"integer">>, <<"0">>) -> 0;
+decode_value(<<"integer">>, Encoded = <<"-", D, _/binary>>)
+        when D >= $1, D =< $9 ->
+    binary_to_integer(Encoded);
+decode_value(<<"integer">>, Encoded = <<D, _/binary>>) when D >= $1, D =< $9 ->
+    binary_to_integer(Encoded);
+decode_value(<<"float">>, Encoded) ->
+    % The value is the `binary64' parameter, and the Decimal its rounding.
+    [Decimal, <<"binary64=\"", Bits:11/binary, "\"">>] =
+        binary:split(Encoded, <<";">>),
+    <<Value/float>> = base64url(Bits),
+    Decimal = decimal(thousandths(Value)),
+    Value;
+decode_value(<<"atom">>, Encoded) ->
+    {{token, Encoded}, <<>>} = hb_structured_fields:parse_bare_item(Encoded),
+    hb_util:atom(Encoded);
+decode_value(<<"binary">>, Encoded) ->
+    Value = base64url(Encoded),
+    false = is_text(Value),
+    Value.
+
+%% @doc Decode unpadded base64url. The decoder refuses every byte outside
+%% base64url but `+' and `/', which it reads as `-' and `_', and a final `=';
+%% those are refused here, as are a length that leaves one character over and
+%% a last character that sets a bit past the last byte.
+base64url(Encoded) ->
+    nomatch = binary:match(Encoded, <<"+">>),
+    nomatch = binary:match(Encoded, <<"/">>),
+    true =
+        case byte_size(Encoded) rem 4 of
+            0 -> Encoded == <<>> orelse binary:last(Encoded) =/= $=;
+            1 -> false;
+            2 -> lists:member(binary:last(Encoded), "AQgw");
+            3 -> lists:member(binary:last(Encoded), "AEIMQUYcgkosw048")
+        end,
+    hb_util:decode(Encoded).
 
 %%% Tests
 
@@ -526,14 +627,80 @@ malformed_types_return_error_test() ->
             )
         end,
         [<<"a=1.2345">>, <<"a=1">>, <<"a=?1">>,
-            <<"a=\"unknown-type\"">>, <<"a=\"float\"">>, <<"a=\"integer\"">>]
+            <<"unknown-type=(\"a\")">>, <<"float=(\"a\")">>,
+            <<"integer=(\"a\")">>]
     ),
-    ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
-        <<"structured@1.0">>, <<"decode-types">>, <<"a=1">>, #{}, #{}
-    )),
+    % `ao-types' in an encoding that `from/3' does not write: empty, a member
+    % for each key, keys or types out of order, a key of two types, a space.
+    lists:foreach(
+        fun(Types) ->
+            ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
+                <<"structured@1.0">>, <<"decode-types">>, Types, #{}, #{}
+            ))
+        end,
+        [<<>>, <<"a=1">>, <<"a=\"integer\"">>, <<"integer=(\"b\" \"a\")">>,
+            <<"list=(\".\"), integer=(\"a\")">>,
+            <<"atom=(\"a\"), integer=(\"a\")">>, <<"integer=( \"a\")">>]
+    ),
     ?assertEqual({ok, #{ <<"a">> => 42 }}, hb_ao:raw(
         <<"structured@1.0">>, <<"to">>,
-        #{ <<"ao-types">> => <<"a=\"integer\"">>, <<"a">> => <<"42">> },
+        #{ <<"ao-types">> => <<"integer=(\"a\")">>, <<"a">> => <<"42">> },
+        #{}, #{}
+    )),
+    % A type for a key that holds no binary.
+    ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
+        <<"structured@1.0">>, <<"to">>,
+        #{ <<"ao-types">> => <<"integer=(\"b\")">>, <<"a">> => <<"42">> },
+        #{}, #{}
+    )),
+    % Two names of one key: `A' and `a' are one key.
+    ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
+        <<"structured@1.0">>, <<"to">>,
+        #{ <<"ao-types">> => <<"integer=(\"A\" \"a\")">>, <<"a">> => <<"42">> },
+        #{}, #{}
+    )),
+    % A typed value in an encoding that `from/3' does not write.
+    lists:foreach(
+        fun({Type, Value}) ->
+            ?assertMatch({error, #{ <<"status">> := 400 }}, hb_ao:raw(
+                <<"structured@1.0">>, <<"to">>,
+                #{
+                    <<"ao-types">> => <<Type/binary, "=(\"a\")">>,
+                    <<"a">> => Value
+                },
+                #{}, #{}
+            ))
+        end,
+        [{<<"integer">>, <<"042">>}, {<<"integer">>, <<"-0">>},
+            {<<"float">>, <<"0.062">>},
+            {<<"float">>, <<"0.063;binary64=\"P7AAAAAAAAA\"">>},
+            {<<"float">>, <<"0.062;binary64=\"P7AAAAAAAAB\"">>},
+            {<<"float">>, <<"0.062;binary64=\"P7AAAAAAAAA\";x=1">>},
+            {<<"atom">>, <<"\"true\"">>}, {<<"binary">>, <<"aGVsbG8">>},
+            {<<"binary">>, <<"AP9">>}]
+    ),
+    % A float is its rounding to three places, as an RFC 9651 Decimal, and its
+    % IEEE 754 bytes, which give its value.
+    lists:foreach(
+        fun({Float, Encoded}) ->
+            ?assertMatch({ok, #{ <<"a">> := Encoded }}, hb_ao:raw(
+                <<"structured@1.0">>, <<"from">>,
+                #{ <<"a">> => Float },
+                #{}, #{}
+            )),
+            ?assertEqual({ok, #{ <<"a">> => Float }}, hb_ao:raw(
+                <<"structured@1.0">>, <<"to">>,
+                #{ <<"ao-types">> => <<"float=(\"a\")">>, <<"a">> => Encoded },
+                #{}, #{}
+            ))
+        end,
+        [{0.0625, <<"0.062;binary64=\"P7AAAAAAAAA\"">>},
+            {0.1, <<"0.1;binary64=\"P7mZmZmZmZo\"">>}]
+    ),
+    % A key with a byte outside `0x20'-`0x7e' cannot hold a typed value.
+    ?assertThrow({invalid_ao_types_key, _}, hb_ao:raw(
+        <<"structured@1.0">>, <<"from">>,
+        #{ <<"caf", 195, 169>> => 1 },
         #{}, #{}
     )).
 
@@ -554,7 +721,7 @@ lowercase_keys_test() ->
         hb_ao:raw(
             <<"structured@1.0">>, <<"to">>,
             #{
-                <<"ao-types">> => <<"%43ount=\"integer\"">>,
+                <<"ao-types">> => <<"integer=(\"Count\")">>,
                 <<"Count">> => <<"1">>,
                 <<"Child">> => <<"ao:", ID/binary>>,
                 <<"Action">> => <<"a">>,
@@ -566,15 +733,3 @@ lowercase_keys_test() ->
             #{}, #{}
         )
     ).
-
-list_encoding_test() ->
-    % Test that we can encode and decode a list of integers.
-    {<<"list">>, Encoded} = encode_value(List1 = [1, 2, 3]),
-    Decoded = decode_value(list, Encoded),
-    ?assertEqual(List1, Decoded),
-    % Test that we can encode and decode a list of binaries.
-    {<<"list">>, Encoded2} = encode_value(List2 = [<<"1">>, <<"2">>, <<"3">>]),
-    ?assertEqual(List2, decode_value(list, Encoded2)),
-    % Test that we can encode and decode a mixed list.
-    {<<"list">>, Encoded3} = encode_value(List3 = [1, <<"2">>, 3]),
-    ?assertEqual(List3, decode_value(list, Encoded3)).

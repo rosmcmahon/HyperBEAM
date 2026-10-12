@@ -1434,7 +1434,7 @@ unprocessable_transaction_test() ->
                 format = 2,
                 tags = [
                     {<<"from-process">>, Value},
-                    {<<"ao-types">>, <<"from-process=\"integer\"">>}
+                    {<<"ao-types">>, <<"integer=(\"from-process\")">>}
                 ]
             }, Wallet),
             ID = hb_util:human_id(TX#tx.id),

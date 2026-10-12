@@ -155,36 +155,16 @@ tags(Item, Opts) ->
 normalize_key(Key) -> hb_util:lowercase_key(hb_ao:normalize_key(Key)).
 
 %% @doc Ensure the encoded keys in the `ao-types' field are lowercased and
-%% normalized like the other keys in the tags field.
+%% normalized like the other keys in the tags field, and that the field is
+%% encoded as `structured@1.0' writes it.
 ao_types(#{ <<"ao-types">> := AoTypes } = Tags, Opts) ->
-    ConvOpts = Opts#{ <<"hashpath">> => ignore },
-    {ok, AOTypes} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"structured@1.0">> },
-            #{
-                <<"path">> => <<"decode-types">>,
-                <<"body">> => AoTypes
-            },
-            ConvOpts
-        ),
-    % Normalize all keys in the ao-types map and re-encode
-    NormAOTypes =
-        maps:fold(
-            fun(Key, Val, Acc) ->
-                NormKey = normalize_key(Key),
-                Acc#{ NormKey => Val }
-            end,
-            #{},
-            AOTypes
-        ),
     {ok, EncodedAOTypes} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"structured@1.0">> },
-            #{
-                <<"path">> => <<"encode-types">>,
-                <<"body">> => NormAOTypes
-            },
-            ConvOpts
+        hb_ao:raw(
+            <<"structured@1.0">>,
+            <<"encode-types">>,
+            decode_types(AoTypes, Opts),
+            #{},
+            Opts
         ),
     Tags#{ <<"ao-types">> := EncodedAOTypes };
 ao_types(Tags, _Opts) ->

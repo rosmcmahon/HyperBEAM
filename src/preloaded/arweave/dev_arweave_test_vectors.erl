@@ -56,7 +56,7 @@ private_tags_test_() ->
                 format = Format,
                 tags = [{Name, <<"True">>}, {<<"public">>, <<"1">>}] ++
                     case Typed of
-                        true -> [{<<"ao-types">>, <<"public=integer">>}];
+                        true -> [{<<"ao-types">>, <<"integer=(\"public\")">>}];
                         false -> []
                     end
             },
@@ -115,7 +115,7 @@ private_link_binding_test_() ->
             Opts = test_opts(),
             Raw = #tx{ format = Format, tags = [
                 {Name, <<"ao:", (hb_util:human_id(<<1:256>>))/binary>>},
-                {<<"ao-types">>, <<TypeKey/binary, "=list">>},
+                {<<"ao-types">>, <<"list=(\"", TypeKey/binary, "\")">>},
                 {<<"public">>, <<"ok">>}
             ] },
             Signed = case Codec of

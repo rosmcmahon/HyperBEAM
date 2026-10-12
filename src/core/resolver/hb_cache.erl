@@ -109,7 +109,7 @@ ensure_loaded(Ref, Link = {link, ID, LinkOpts = #{ <<"lazy">> := true }}, RawOpt
                         Value -> Value
                     end;
                 undefined -> LoadedMsg;
-                Type -> hb_util:decode(Type, LoadedMsg)
+                Type -> structured_decode_value(Type, LoadedMsg, Opts)
             end;
         {error, not_found} ->
             report_ensure_loaded_not_found(Ref, Link, Opts);
@@ -996,11 +996,19 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                     PreparedValue =
                         case maps:get(Subpath, Values, none) of
                             <<"raw:", ImmediateValue/binary>> ->
-                                apply_type_to_immediate(ImmediateValue, LinkOpts);
+                                apply_type_to_immediate(
+                                    ImmediateValue,
+                                    LinkOpts,
+                                    Opts
+                                );
                             <<"link:", Path/binary>> ->
                                 {link, Path, LinkOpts};
                             ImmediateValue when is_binary(ImmediateValue) ->
-                                apply_type_to_immediate(ImmediateValue, LinkOpts);
+                                apply_type_to_immediate(
+                                    ImmediateValue,
+                                    LinkOpts,
+                                    Opts
+                                );
                             _ ->
                                 {link, SubkeyPath, LinkOpts}
                         end,
@@ -1042,9 +1050,9 @@ key_value(Key, Value, Store, Opts) ->
             end
     end.
 
-apply_type_to_immediate(Value, #{ <<"type">> := Type }) ->
-    hb_util:decode(Type, Value);
-apply_type_to_immediate(Value, _LinkOpts) ->
+apply_type_to_immediate(Value, #{ <<"type">> := Type }, Opts) ->
+    structured_decode_value(Type, Value, Opts);
+apply_type_to_immediate(Value, _LinkOpts, _Opts) ->
     Value.
 
 %% @doc Read and parse the ao-types for a given path if it is in the supplied
@@ -1094,6 +1102,18 @@ structured_decode_types(Types, Opts) ->
             <<"decode-types">>,
             Types,
             #{},
+            Opts
+        )
+    ).
+
+%% @doc Decode a value of the given type through the structured device.
+structured_decode_value(Type, Value, Opts) ->
+    hb_util:ok(
+        hb_ao:raw(
+            <<"structured@1.0">>,
+            <<"decode-value">>,
+            Value,
+            #{ <<"type">> => Type },
             Opts
         )
     ).
