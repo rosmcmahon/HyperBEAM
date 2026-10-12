@@ -67,7 +67,7 @@
 -export([is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
 -export([with_only_committed/2, with_only_committed/3]).
--export([with_links/3, without_unless_signed/3]).
+-export([without_unless_signed/3]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -381,7 +381,7 @@ with_only_committed(Msg, Spec, Opts) when is_map(Msg) ->
                 % already present.
                 ?event_debug(debug_bundle, {committed_keys, CommittedKeys, {msg, Msg}}),
                 {ok,
-                    with_links(
+                    hb_maps:with(
                         [<<"commitments">> | CommittedKeys],
                         Msg,
                         Opts
@@ -402,21 +402,6 @@ with_only_committed(Msg, Spec, Opts) when is_map(Msg) ->
 with_only_committed(Msg, _, _) ->
     % If the message is not a map, it cannot be signed.
     {ok, Msg}.
-
-%% @doc Filter keys from a map that do not match either the list of keys or
-%% their relative `+link` variants.
-with_links(Keys, Map, Opts) ->
-    hb_maps:with(
-        Keys ++
-            lists:map(
-                fun(Key) ->
-                    <<(hb_link:remove_link_specifier(Key))/binary, "+link">>
-                end,
-                Keys
-            ),
-        Map,
-        Opts
-    ).
 
 %% @doc Return the message with only the specified committers attached.
 with_only_committers(Msg, Committers) ->

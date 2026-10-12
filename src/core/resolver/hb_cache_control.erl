@@ -116,7 +116,8 @@ cacheable(Link, AllowSigned, Opts) when ?IS_LINK(Link) ->
         % A link must expose the identity used to name it in its parent.
         Identified =
             case hb_link:normalize(#{ <<"child">> => Link }, discard, Opts) of
-                #{ <<"child+link">> := ID } when is_map(Loaded); is_list(Loaded) ->
+                #{ <<"child">> := <<"ao:", ID/binary>> }
+                        when is_map(Loaded); is_list(Loaded) ->
                     hb_message:id(Loaded, all, Opts) == ID;
                 _ -> true
             end,
@@ -605,7 +606,7 @@ unsigned_child_metadata_test() ->
     Child = #{ <<"a">> => <<"1">> },
     Committed = hb_message:commit(Child, Opts, #{ <<"type">> => <<"unsigned">> }),
     {ok, ID} = hb_cache:write(Committed, Opts),
-    Link = {link, ID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
+    Link = {link, <<"ao:", ID/binary>>, #{}},
     lists:foreach(fun(Wrap) ->
         Base = #{ <<"device">> => <<"json@1.0">>, <<"child">> => Wrap(Child) },
         Req = #{ <<"path">> => <<"serialize">>, <<"bundle">> => true },
@@ -641,8 +642,7 @@ linked_signed_child(Count) ->
     hb_cache:write(Signed, Opts),
     ID = hb_message:id(Signed, all, Opts),
     Base = #{ <<"device">> => <<"json@1.0">>,
-        <<"child">> => {link, ID,
-            #{ <<"type">> => <<"link">>, <<"lazy">> => false }} },
+        <<"child">> => {link, <<"ao:", ID/binary>>, #{}} },
     Req = #{ <<"path">> => <<"serialize">>, <<"bundle">> => true },
     {ok, _} = hb_ao:resolve(Base, Req, Opts),
     Extended = Base#{ <<"child">> => Signed#{ <<"extra">> => <<"2">> } },

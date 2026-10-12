@@ -114,7 +114,7 @@ private_link_binding_test_() ->
         {binary_to_list(Codec) ++ ": " ++ binary_to_list(TypeKey), fun() ->
             Opts = test_opts(),
             Raw = #tx{ format = Format, tags = [
-                {Name, hb_util:human_id(<<1:256>>)},
+                {Name, <<"ao:", (hb_util:human_id(<<1:256>>))/binary>>},
                 {<<"ao-types">>, <<TypeKey/binary, "=list">>},
                 {<<"public">>, <<"ok">>}
             ] },
@@ -123,7 +123,7 @@ private_link_binding_test_() ->
                 <<"ans104@1.0">> -> ar_bundles:sign_item(Raw, hb:wallet())
             end,
             TABM = hb_message:convert(Signed, tabm, Codec, Opts),
-            Key = hb_link:remove_link_specifier(hb_util:to_lower(Name)),
+            Key = hb_util:to_lower(Name),
             [Commitment] = maps:values(maps:get(<<"commitments">>, TABM)),
             CommittedKeys =
                 hb_util:message_to_ordered_list(
@@ -149,12 +149,10 @@ private_link_binding_test_() ->
     ||
         {Codec, Format} <- [{<<"tx@1.0">>, 2}, {<<"ans104@1.0">>, ans104}],
         {Name, TypeKey} <- [
-            {<<"private-field+link">>, <<"private-field">>},
-            {<<"Private-Field+link">>, <<"Private-Field">>},
-            {<<"Private-Field+link">>, <<"%50rivate-%46ield">>},
+            {<<"private-field">>, <<"private-field">>},
+            {<<"Private-Field">>, <<"Private-Field">>},
+            {<<"Private-Field">>, <<"%50rivate-%46ield">>},
             {<<"private-field+link">>, <<"private-field%2blink">>},
-            {<<"private-field+link+link">>, <<"private-field">>},
-            {<<"Private-Field+link+link+link">>, <<"%50rivate-%46ield">>},
             {<<"Private">>, <<"priv-unused">>},
             {<<"Private">>, <<"%50riv-unused">>}
         ]

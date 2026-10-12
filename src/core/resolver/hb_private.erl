@@ -190,7 +190,7 @@ priv_opts_store_read_link_test() ->
     {ok, <<"test-message">>} = hb_store:read(PrivStore, <<"link">>, #{}),
     Loaded =
         hb_cache:ensure_loaded(
-            {link, <<"link">>, #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
+            {link, <<"link">>, #{ <<"lazy">> => true }},
             PrivOpts
         ),
     ?assertEqual(<<"test-message">>, Loaded).

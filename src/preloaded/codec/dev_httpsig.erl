@@ -339,8 +339,6 @@ to_hint(Msg, Req, Opts) ->
 %% base message.
 keys_to_commit(_Base, #{ <<"committed">> := Explicit}, _Opts) ->
     % Case 1: Explicitly provided keys to commit.
-    % Add `+link` specifiers to the user given list as necessary, in order for
-    % their given keys to match the HTTPSig encoded TABM form.
     hb_util:list_to_numbered_message(Explicit);
 keys_to_commit(Base = #{ <<"commitments">> := Commitments }, _Req, Opts)
         when ?IS_EMPTY_MESSAGE(Commitments) ->
@@ -363,11 +361,7 @@ keys_to_commit(Base, _Req, Opts) ->
 
 default_keys_to_commit(Base, Opts) ->
     hb_util:list_to_numbered_message(
-        lists:map(
-            fun hb_link:remove_link_specifier/1,
-            hb_util:to_sorted_keys(Base, Opts)
-                -- [<<"commitments">>, <<"priv">>]
-        )
+        hb_util:to_sorted_keys(Base, Opts) -- [<<"commitments">>, <<"priv">>]
     ).
 
 %% @doc If the `body' key is present and a binary, replace it with a
@@ -399,7 +393,7 @@ add_content_digest(Msg, _Opts) ->
 normalize_for_encoding(Msg, Commitment, Opts) ->
     % Extract the requested keys to include in the signature base.
     RawInputs = committed_keys(Commitment, Opts),
-    Inputs = input_keys(Msg, RawInputs),
+    Inputs = input_keys(RawInputs),
     ?event_debug({inputs, {list, Inputs}}),
     % A commitment is over every key it lists. A committed key that the
     % message lacks cannot be left out of the signature base silently: the
@@ -504,23 +498,10 @@ committed_keys(Commitment, Opts) ->
         Opts
     ).
 
-%% @doc The keys a commitment lists, in the form the message carries them: a
-%% key held as a link carries its `+link' specifier.
-input_keys(Msg, RawInputs) ->
-    lists:map(
-        fun(Key) ->
-            NormalizedKey = hb_ao:normalize_key(Key),
-            case maps:is_key(NormalizedKey, Msg) of
-                true -> NormalizedKey;
-                false ->
-                    case maps:is_key(<<NormalizedKey/binary, "+link">>, Msg) of
-                        true -> <<NormalizedKey/binary, "+link">>;
-                        false -> NormalizedKey
-                    end
-            end
-        end,
-        RawInputs
-    ).
+%% @doc Normalize the keys that a commitment lists, so that they can be matched
+%% against the keys of the message.
+input_keys(RawInputs) ->
+    lists:map(fun hb_ao:normalize_key/1, RawInputs).
 
 %% @doc The committed values with the message's `ao-types' entries for their
 %% keys and for `.', which marks the message as a list. Whether or not a
@@ -553,20 +534,15 @@ missing_keys(Msg, Commitment, Opts) ->
     [
         Key
     ||
-        Key <- input_keys(Msg, committed_keys(Commitment, Opts)),
+        Key <- input_keys(committed_keys(Commitment, Opts)),
         not key_present(Key, Msg)
     ].
 
-%% @doc Calculate if a key or its `+link' TABM variant is present in a message,
-%% as it is or percent-encoded as on the wire.
+%% @doc Calculate if a key is present in a message, either as it is or
+%% percent-encoded as it is on the wire.
 key_present(Key, Msg) ->
-    lists:any(
-        fun(K) ->
-            is_map_key(K, Msg)
-                orelse is_map_key(dev_httpsig_conv:encode_key(K), Msg)
-        end,
-        [Key, <<Key/binary, "+link">>]
-    ).
+    is_map_key(Key, Msg)
+        orelse is_map_key(dev_httpsig_conv:encode_key(Key), Msg).
 
 %% @doc create the signature base that will be signed in order to create the
 %% Signature and SignatureInput.

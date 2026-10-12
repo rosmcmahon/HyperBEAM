@@ -337,8 +337,8 @@ to(Link, _Req, _FormatOpts, _Opts) when ?IS_LINK(Link) -> {ok, Link};
 to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
     % If the caller has specified that an `index` page is requested, we:
     % 1. Convert the message to HTTPSig as usual.
-    % 2. Check if the `body` and `content-type` keys are set, as values or as
-    %    links. If either are, we return the message as normal.
+    % 2. Check if the `body` and `content-type` keys are set. If either are, we
+    %    return the message as normal.
     % 3. If they are not, we convert the given message back to its original
     %    form and resolve `path = index` upon it.
     % 4. If this yields a result, we convert it to TABM and merge it with the
@@ -347,7 +347,7 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
     % 5. The resulting combined message is returned to the user.
     {ok, EncOriginal} = to(TABM, maps:without([<<"index">>], Req), Opts),
     BodyKeys =
-        hb_message:with_links([<<"body">>, <<"content-type">>], EncOriginal, Opts),
+        hb_maps:with([<<"body">>, <<"content-type">>], EncOriginal, Opts),
     case map_size(BodyKeys) of
         0 ->
             % The message has no body or content-type set. Resolve the `index`

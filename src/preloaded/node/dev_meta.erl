@@ -218,7 +218,7 @@ unread_request_link_test() ->
             Node,
             #{
                 <<"path">> => <<"/~meta@1.0/info/address">>,
-                <<"x+link">> => Missing
+                <<"x">> => <<"ao:", Missing/binary>>
             },
             #{}
         )
@@ -364,8 +364,7 @@ nested_authorization_test() ->
     ?assertEqual(Child, hb_maps:get(<<"child">>, Authorized, Opts)),
     {ok, _} = hb_cache:write(Child, Opts),
     ChildID = hb_message:id(Child, all, Opts),
-    Linked = Msg#{ <<"child">> =>
-        {link, ChildID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }} },
+    Linked = Msg#{ <<"child">> => {link, <<"ao:", ChildID/binary>>, #{}} },
     {ok, Loaded} = lib_meta:is_authorized(<<"node-message">>, admin, Linked, Opts),
     LoadedChild = hb_maps:get(<<"child">>, Loaded, Opts),
     ?assertEqual(ChildID, hb_message:id(LoadedChild, all, Opts)),
@@ -373,7 +372,7 @@ nested_authorization_test() ->
     {ok, _} = hb_cache:write(Msg, Opts),
     MsgID = hb_message:id(Msg, all, Opts),
     {ok, Cached} = lib_meta:is_authorized(<<"node-message">>, admin,
-        {link, MsgID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }}, Opts),
+        {link, <<"ao:", MsgID/binary>>, #{}}, Opts),
     ?assertEqual(MsgID, hb_message:id(Cached, all, Opts)),
     ?assertEqual({error, not_authorized},
         lib_meta:is_authorized(<<"node-message">>, admin,

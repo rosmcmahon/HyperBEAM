@@ -341,8 +341,7 @@ pairs(Handler, Msg, Names, Opts) ->
         ),
     OwnPairs = case Names of
         all -> hb_maps:to_list(Own, Opts);
-        _ -> template(hb_maps:with(Names ++
-            [hb_link:remove_link_specifier(Name) || Name <- Names], Own, Opts),
+        _ -> template(hb_maps:with(Names, Own, Opts),
             Opts#{ <<"linkify-mode">> => discard })
     end,
     OwnPairs ++ Single ++

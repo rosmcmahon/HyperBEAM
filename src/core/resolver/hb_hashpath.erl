@@ -390,7 +390,7 @@ dependency_paths(Varied, Origin) when is_map(Varied) ->
         public_values(Varied)
     );
 dependency_paths(_Varied, Origin) ->
-    {link, Origin, #{ <<"type">> => <<"link">>, <<"lazy">> => false }}.
+    {link, Origin, #{}}.
 
 %% @doc Read a source member only when the source is itself a message.
 source_value(Key, Original, Opts) ->
@@ -516,22 +516,16 @@ execute(Ctx, Opts) ->
 
 %% @doc Load the minimal executable base for a hashpath or a given part number
 %% within it.
-load(Link = {link, ID, LinkOpts}, Opts) ->
+load(Link = {link, _, LinkOpts}, Opts) ->
     MergedOpts = hb_store:scope(
         hb_util:deep_merge(Opts, LinkOpts, Opts),
         hb_opts:get(scope, local, LinkOpts)
     ),
-    Address =
-        case LinkOpts of
-            #{ <<"type">> := <<"link">> } ->
-                #{ <<"hashpath+link">> := HP } =
-                    hb_link:normalize(
-                        #{ <<"hashpath">> => Link }, discard, MergedOpts),
-                HP;
-            _ -> ID
-        end,
+    #{ <<"hashpath">> := Address } =
+        hb_link:normalize(#{ <<"hashpath">> => Link }, discard, MergedOpts),
     case Address of
         _ when ?IS_HASHPATH(Address) -> load(Address, MergedOpts);
+        <<"ao:", ID/binary>> when ?IS_ID(ID) -> read_id(ID, MergedOpts);
         _ when ?IS_ID(Address) -> read_id(Address, MergedOpts);
         _ ->
             case hb_cache:ensure_loaded(Link, MergedOpts) of
@@ -944,7 +938,7 @@ failed_load_test() ->
                                 hb_ao:resolve(Link, <<"value">>, Opts))
                     end
                 end,
-                [#{}, #{ <<"type">> => <<"link">>, <<"lazy">> => false }]
+                [#{}]
             )
         end,
         [
@@ -1179,14 +1173,14 @@ coerced_dependencies_test() ->
     ReqHP = <<"ao://", ReqID/binary>>,
     ExpectedDeps = #{
         <<"base">> => #{
-            <<"device+link">> => BaseHP,
-            <<"required+link">> => BaseHP,
-            <<"deep">> => #{ <<"slot+link">> => BaseHP }
+            <<"device">> => BaseHP,
+            <<"required">> => BaseHP,
+            <<"deep">> => #{ <<"slot">> => BaseHP }
         },
         <<"request">> => #{
-            <<"path+link">> => ReqHP,
+            <<"path">> => ReqHP,
             <<"deep-request">> => #{
-                <<"slot+link">> => ReqHP
+                <<"slot">> => ReqHP
             }
         }
     },
@@ -1197,7 +1191,7 @@ coerced_dependencies_test() ->
     ?assert(verify_all(HP, Opts)),
     WrongDeps = ExpectedDeps#{ <<"base">> =>
         (maps:get(<<"base">>, ExpectedDeps))#{
-            <<"required+link">> => <<BaseHP/binary, "/omitted">>
+            <<"required">> => <<BaseHP/binary, "/omitted">>
         }
     },
     {ok, WrongID} = hb_cache:write(WrongDeps, Opts),
@@ -1368,7 +1362,7 @@ literal_result_test() ->
             {
                 link,
                 Serialized,
-                #{ <<"type">> => <<"link">>, <<"lazy">> => true }
+                #{ <<"lazy">> => true }
             },
             Opts
         )
@@ -1379,8 +1373,7 @@ literal_result_test() ->
         {ok, 7},
         hb_cache:read(<<"ao://", BaseID/binary, "/value">>, Opts)
     ),
-    Link = {link, <<"ao://", BaseID/binary, "/value">>,
-        #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
+    Link = {link, <<"ao://", BaseID/binary, "/value">>, #{}},
     ?assertEqual({ok, 7}, load(Link, Opts)),
     ?assertEqual(7, hb_cache:ensure_loaded(Link, Opts)),
     {ok, Ctx} = hb_ao:resolve(BaseID, <<"value">>,
@@ -1395,8 +1388,7 @@ store_path_link_test() ->
     {ok, ID} = hb_cache:write(Child, Opts),
     Path = <<(hb_message:id(#{}, all, Opts))/binary, "/child.name">>,
     hb_cache:link(ID, Path, Opts),
-    LinkOpts = #{ <<"type">> => <<"link">>, <<"lazy">> => false },
-    Loaded = hb_cache:ensure_loaded({link, Path, LinkOpts}, Opts),
+    Loaded = hb_cache:ensure_loaded({link, Path, #{}}, Opts),
     ?assertEqual(hb_message:id(Child, all, Opts),
         hb_message:id(Loaded, all, Opts)),
     HP = <<"ao://", ID/binary>>,
@@ -1404,12 +1396,9 @@ store_path_link_test() ->
     ?assertEqual(ID, hb_message:id(Root, all, Opts)),
     {ok, StoredHP} = hb_cache:write(HP, Opts),
     ?assertEqual(
-        #{ <<"value+link">> => HP },
+        #{ <<"value">> => HP },
         hb_link:normalize(
-            #{
-                <<"value">> =>
-                    {link, StoredHP, LinkOpts#{ <<"lazy">> => true }}
-            },
+            #{ <<"value">> => {link, StoredHP, #{ <<"lazy">> => true }} },
             discard,
             Opts
         )
@@ -1430,7 +1419,7 @@ scoped_link_test() ->
             },
             Opts
         ),
-    LinkOpts = #{ <<"type">> => <<"link">>, <<"lazy">> => false },
+    LinkOpts = #{},
     ?assertMatch({error, _}, load({link, HP, LinkOpts}, Opts)),
     ?assertThrow({necessary_message_not_found, _, _},
         hb_cache:ensure_loaded({link, HP, LinkOpts}, Opts)),
@@ -1478,12 +1467,7 @@ http_receipt_test() ->
                 Node,
                 <<"/~message@1.0/value">>,
                 #{
-                    <<"value">> =>
-                        {
-                            link,
-                            HP,
-                            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
-                        }
+                    <<"value">> => {link, HP, #{}}
                 },
                 Opts
             ),

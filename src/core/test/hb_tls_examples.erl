@@ -39,14 +39,18 @@ certificate_file() ->
         {ok, NamesID} = hb_cache:write(
             #{ <<"1">> => <<"localhost">>, <<"2">> => <<"*.localhost">> }, Opts
         ),
-        TLS = #{ <<"domains">> => {link, NamesID, #{}} },
+        TLS = #{ <<"domains">> => {link, <<"ao:", NamesID/binary>>, #{}} },
         {ok, TLSID} = hb_cache:write(TLS, Opts),
         {ok, Linked} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
-            #{ <<"path">> => <<"csr">>, <<"domains">> => {link, NamesID, #{}} },
+            #{
+                <<"path">> => <<"csr">>,
+                <<"domains">> => {link, <<"ao:", NamesID/binary>>, #{}}
+            },
             Opts),
         ?assertEqual(PEM, hb_maps:get(<<"body">>, Linked)),
         {ok, Default} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
-            <<"csr">>, Opts#{ <<"tls">> => {link, TLSID, #{}} }),
+            <<"csr">>,
+            Opts#{ <<"tls">> => {link, <<"ao:", TLSID/binary>>, #{}} }),
         ?assertEqual(PEM, hb_maps:get(<<"body">>, Default)),
         ok = cowboy:stop_listener(ServerID),
         % A locally issued chain exercises file loading without any ACME service.
@@ -67,7 +71,7 @@ certificate_file() ->
         ])),
         {ok, PathID} = hb_cache:write(hb_util:bin(Path), Opts),
         FileOpts = Opts#{ <<"tls">> => #{
-            <<"certificate-path">> => {link, PathID, #{}},
+            <<"certificate-path">> => {link, PathID, #{ <<"lazy">> => true }},
             <<"domains">> => [<<"localhost">>, <<"*.localhost">>],
             <<"acme">> => #{ <<"http-port">> => GuardPort }
         } },

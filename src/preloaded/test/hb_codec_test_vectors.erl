@@ -1677,9 +1677,10 @@ sign_links_test(Codec, Opts) ->
     % Make a message with definitively non-accessible lazy-loadable links. Sign
     % it, ensuring that we can produce signatures and IDs without having the 
     % data directly in memory.
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = #{
         <<"immediate-key">> => <<"immediate-value">>,
-        <<"submap+link">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+        <<"submap">> => {link, <<"ao:", ID/binary>>, #{}}
     },
     Signed = hb_message:commit(Msg, Opts, Codec),
     ?event({signed, Signed}),
@@ -1734,13 +1735,10 @@ bundled_and_unbundled_ids_differ_test(_Codec, _Opts) ->
 id_of_linked_message_test(#{ <<"bundle">> := true }, _Opts) ->
     skip;
 id_of_linked_message_test(Codec, Opts) ->
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = #{
         <<"immediate-key">> => <<"immediate-value">>,
-        <<"link-key">> =>
-            {link, hb_util:human_id(crypto:strong_rand_bytes(32)), #{
-                <<"type">> => <<"link">>,
-                <<"lazy">> => false
-            }}
+        <<"link-key">> => {link, <<"ao:", ID/binary>>, #{}}
     },
     UnsignedID = hb_message:id(Msg, Opts),
     ?event({id, UnsignedID}),

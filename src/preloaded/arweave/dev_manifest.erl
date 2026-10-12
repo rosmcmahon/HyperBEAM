@@ -246,7 +246,7 @@ decode_manifest(JSON, Path, Opts) ->
 %% structured) manifest.
 linkify(#{ <<"id">> := ID }, Opts) when is_binary(ID) ->
     LinkOptsBase = (maps:with([<<"store">>], Opts))#{ <<"scope">> => [local, remote]},
-    {link, ID, LinkOptsBase#{ <<"type">> => <<"link">>, <<"lazy">> => false }};
+    {link, <<"ao:", ID/binary>>, LinkOptsBase};
 linkify(Manifest, Opts) when is_map(Manifest) ->
     hb_maps:map(
         fun(_Key, Val) -> linkify(Val, Opts) end,

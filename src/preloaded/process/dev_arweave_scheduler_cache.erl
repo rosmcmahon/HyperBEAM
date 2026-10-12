@@ -297,10 +297,9 @@ linked_spawn_uses_process_store_test() ->
             <<"process-store">> => [Process]
         },
     CacheOpts = lib_process:cache_opts(Opts),
-    LinkOpts = #{ <<"type">> => <<"link">>, <<"lazy">> => false },
     Balances = #{ <<"alice">> => <<"100">> },
     {ok, BalancesID} = hb_cache:write(Balances, Opts#{ <<"store">> => [Target] }),
-    Spawn = #{ <<"balances">> => {link, BalancesID, LinkOpts} },
+    Spawn = #{ <<"balances">> => {link, <<"ao:", BalancesID/binary>>, #{}} },
     {ok, ProcessID} = hb_cache:write(Spawn, Opts#{ <<"store">> => [Source] }),
     {ok, LazySpawn} = hb_cache:read(ProcessID, Opts#{ <<"store">> => [Source] }),
     ?assertEqual(
@@ -313,7 +312,7 @@ linked_spawn_uses_process_store_test() ->
             #{
                 <<"process">> => ProcessID,
                 <<"slot">> => 0,
-                <<"body">> => {link, ProcessID, LinkOpts}
+                <<"body">> => {link, <<"ao:", ProcessID/binary>>, #{}}
             },
             Opts
         ),

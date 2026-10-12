@@ -443,11 +443,7 @@ write_process_assignments(
     end.
 
 write_assignment(ProcessID, Slot, Height, Index, TXID, Opts) ->
-    Body =
-        {link,
-            TXID,
-            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
-        },
+    Body = {link, <<"ao:", TXID/binary>>, #{}},
     Assignment =
         #{
             <<"path">> => <<"compute">>,

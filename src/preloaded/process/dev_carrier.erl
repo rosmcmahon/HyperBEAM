@@ -115,7 +115,7 @@ compute(Base, Assignment, Opts) ->
 %%
 %% This is a `~stack@1.0' written out by hand, and deliberately so. A process
 %% spawned as an Arweave transaction can only carry flat, scalar tags: the
-%% codec turns a submessage or a list into a `+link' to content that is not on
+%% codec turns a submessage or a list into a link to content that is not on
 %% the weave, so nothing else can read it back. `device-stack' is a list, so a
 %% stack cannot survive the spawn -- but `swap-device' is one word.
 swap(Base, Assignment, Opts) ->

@@ -445,7 +445,7 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
                 % bundle state of another commitment does not set the
                 % encoding of this one.
                 Covered =
-                    hb_message:with_links(
+                    hb_maps:with(
                         [
                             <<"commitments">>,
                             <<"priv">>
@@ -567,7 +567,7 @@ read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
 %% that every one covers.
 -spec committed(
     #{ _ => _ },
-    #{ raw => boolean(), committers => _, ids => _, _ => _ },
+    #{ committers => _, ids => _, _ => _ },
     #{ _ => _ }
 ) -> {ok, [binary()]}.
 committed(Self, Req, Opts) ->
@@ -625,22 +625,8 @@ committed(Self, Req, Opts) ->
                     AllCommittedKeys
                 )
         end,
-    % Remove any `+link` suffixes from TABM-form committed keys if the `raw` flag
-    % is not set. This means that callers to `committed/3' will receive a list of
-    % keys that they can match  against the 'normal' representation of the message
-    % in devices, etc., without exposure to TABM-specifics. If `raw' is set, the
-    % recipient receives the `committed` list in its unprocessed form.
-    CommittedNormalizedKeys =
-        case maps:get(<<"raw">>, Req, false) of
-            true -> OnlyCommittedKeys;
-            false ->
-                lists:map(
-                    fun hb_link:remove_link_specifier/1,
-                    OnlyCommittedKeys
-                )
-        end,
-    ?event_debug(debug_commitments, {only_committed_keys, CommittedNormalizedKeys}),
-    {ok, CommittedNormalizedKeys}.
+    ?event_debug(debug_commitments, {only_committed_keys, OnlyCommittedKeys}),
+    {ok, OnlyCommittedKeys}.
 
 %% @doc Return a message with only the relevant commitments for a given request.
 %% See `commitment_ids_from_request/3' for more information on the request format.
@@ -1456,8 +1442,8 @@ commit_keeps_private_links_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
     Missing =
         {link,
-            hb_util:human_id(crypto:strong_rand_bytes(32)),
-            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+            <<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+            #{}
         },
     Priv = #{ <<"request">> => #{ <<"x">> => Missing } },
     Committed =

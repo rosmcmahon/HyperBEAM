@@ -1236,8 +1236,8 @@ linked_key_test() ->
     {ok, PathID} = hb_cache:write(<<"/a">>, Opts),
     Missing =
         {link,
-            hb_util:human_id(crypto:strong_rand_bytes(32)),
-            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+            <<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+            #{}
         },
     Req = #{
         <<"path">> => {link, PathID, #{}},

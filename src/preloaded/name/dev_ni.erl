@@ -48,11 +48,7 @@ uri_test() ->
         {ok, Bin},
         hb_ao:resolve(<<"/ni:%2f%2f%2fsha-256;", ID/binary>>, Opts)
     ),
-    Linked =
-        hb_message:convert(
-            #{ <<"k+link">> => URI },
-            <<"structured@1.0">>,
-            tabm,
-            Opts
-        ),
-    ?assertEqual({ok, Bin}, hb_ao:resolve(Linked, <<"k">>, Opts)).
+    ?assertEqual(
+        {ok, Bin},
+        hb_ao:resolve(#{ <<"k">> => {link, URI, #{}} }, <<"k">>, Opts)
+    ).

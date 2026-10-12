@@ -448,13 +448,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
             false ->
                 WithBody
         end,
-    Normalized =
-        hb_ao:normalize_keys(
-            lists:map(
-                fun hb_link:remove_link_specifier/1,
-                ListWithoutBodyKey
-            )
-        ),
+    Normalized = hb_ao:normalize_keys(ListWithoutBodyKey),
     List = hb_util:message_to_ordered_list(Normalized),
     ?event_debug({from_siginfo_keys, {list, List}}),
     List.

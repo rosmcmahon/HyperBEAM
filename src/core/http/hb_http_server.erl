@@ -1703,13 +1703,14 @@ restart_server_test() ->
 %% gets 404.
 read_missing_link_test() ->
     Node = start_node(#{ <<"store">> => hb_test_utils:test_store() }),
+    Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ?assertMatch(
         {error, #{ <<"status">> := 404 }},
         hb_http:get(
             Node,
             #{
                 <<"path">> => <<"/x">>,
-                <<"x+link">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+                <<"x">> => <<"ao:", Missing/binary>>
             },
             #{}
         )
@@ -1878,11 +1879,14 @@ ingress_json_links_test() ->
     Msg = #{
         <<"body">> => <<"original">>,
         <<"child">> => Child,
-        <<"reference+link">> => ID
+        <<"reference">> => <<"ao:", ID/binary>>
     },
     Decoded = req_to_tabm_singleton(Req, hb_json:encode(Msg), Opts),
     ?assertEqual(Child, maps:get(<<"child">>, Decoded)),
-    ?assertMatch({link, ID, _}, maps:get(<<"reference">>, Decoded)),
+    ?assertMatch(
+        {link, <<"ao:", ID/binary>>, _},
+        maps:get(<<"reference">>, Decoded)
+    ),
     ?assertThrow(
         {invalid_commitments, _},
         req_to_tabm_singleton(
