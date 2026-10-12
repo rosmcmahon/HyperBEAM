@@ -29,17 +29,29 @@ to(Msg, Req = #{ <<"type">> := <<"uri">> }, Opts) ->
 %%% Tests
 
 %% @doc A DID is read by the device of its method: `did:pkh:...' by
-%% `did-pkh@1.0', which this node does not have.
+%% `did-pkh@1.0', and `did:web:...' by `did-web@1.0', which this node does
+%% not have.
 method_device_test() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
     ?assertMatch(
-        {error,
+        {ok,
             #{
-                <<"error">> := <<"unsupported-uri-scheme">>,
-                <<"offender">> := <<"did-pkh">>
+                <<"device">> := <<"did-pkh@1.0">>,
+                <<"body">> :=
+                    <<"eip155:1:0xb9c5714089478a327f09197987f16f9e5d936e8a">>
             }
         },
         hb_ao:resolve_many(
             [<<"did:pkh:eip155:1:0xb9c5714089478a327f09197987f16f9e5d936e8a">>],
-            #{ <<"store">> => hb_test_utils:test_store() }
+            Opts
         )
+    ),
+    ?assertMatch(
+        {error,
+            #{
+                <<"error">> := <<"unsupported-uri-scheme">>,
+                <<"offender">> := <<"did-web">>
+            }
+        },
+        hb_ao:resolve_many([<<"did:web:example.com">>], Opts)
     ).
