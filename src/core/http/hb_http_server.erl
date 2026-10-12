@@ -969,11 +969,26 @@ reply(InitReq, TABMReq, Result, Opts) ->
     ),
     {ok, PostStreamReq, no_state}.
 
-%% @doc Sign the hashpath of a result if the node signs its replies and the
-%% message that is sent is the result of the hashpath. A message that carries a
-%% `hashpath' key, such as another node's reply that this node relays, is sent
-%% as it is.
-maybe_sign(Msg, Opts) ->
+%% @doc Commit the result that a reply sends. A result without commitments gets
+%% its unsigned commitment, over its own keys before the reply adds any, so a
+%% receiver keeps those keys. If the node signs its replies and the message
+%% that is sent is the result of its hashpath, the node also signs the hashpath.
+%% A message that carries a `hashpath' key, such as another node's reply that
+%% this node relays, gets no signature from this node.
+maybe_sign(RawMsg, Opts) ->
+    Msg =
+        case hb_maps:is_key(<<"commitments">>, RawMsg, Opts) of
+            true -> RawMsg;
+            false ->
+                hb_message:commit(
+                    RawMsg,
+                    Opts,
+                    #{
+                        <<"device">> => <<"httpsig@1.0">>,
+                        <<"type">> => <<"unsigned">>
+                    }
+                )
+        end,
     case hb_private:from_message(Msg) of
         #{ <<"hashpath">> := Hashpath, <<"hashpath-result">> := ID } ->
             case hb_opts:get(force_signed, false, Opts) andalso
@@ -1758,8 +1773,8 @@ maybe_sign_hashpath_only_test() ->
     ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
     ?assert(hb_message:verify(Signed, all, Opts)).
 
-%% @doc Test that forced response signing leaves replies without hashpaths
-%% alone.
+%% @doc Test that forced response signing gives a reply without a hashpath its
+%% unsigned commitment alone, and leaves a signed reply as it is.
 maybe_sign_without_hashpath_test() ->
     Res = #{ <<"body">> => <<"test">> },
     Opts =
@@ -1767,7 +1782,10 @@ maybe_sign_without_hashpath_test() ->
             <<"force-signed">> => true,
             <<"priv-wallet">> => ar_wallet:new()
         },
-    ?assertEqual(Res, maybe_sign(Res, Opts)),
+    ?assertEqual(
+        [hb_message:id(Res, all, Opts)],
+        maps:keys(maps:get(<<"commitments">>, maybe_sign(Res, Opts)))
+    ),
     Signed = hb_message:commit(Res, Opts),
     ?assertNotEqual([], hb_message:signers(Signed, Opts)),
     ?assertEqual(Signed, maybe_sign(Signed, Opts)).
@@ -1791,7 +1809,7 @@ maybe_sign_unsigned_hashpath_test() ->
     ?assert(hb_message:verify(Signed, all, Opts)),
     % A message changed after its hashpath was attached is not signed.
     Changed = Result#{ <<"body">> => <<"changed">> },
-    ?assertEqual(Changed, maybe_sign(Changed, Opts)).
+    ?assertEqual([], hb_message:signers(maybe_sign(Changed, Opts), Opts)).
 
 %% @doc Every ingress codec verifies commitments and applies the node's
 %% signature policy before executing the request.

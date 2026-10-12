@@ -932,6 +932,8 @@ remote_response_links_test() ->
             },
             ClientOpts
         ),
+    % The reply's unsigned commitment gives it the ID of the message read.
+    ?assertEqual(ID, hb_message:id(Res, unsigned, ClientOpts)),
     ?assertEqual(123, hb_ao:get(<<"a/b">>, Res, ClientOpts)).
 
 send_large_signed_request_test() ->
