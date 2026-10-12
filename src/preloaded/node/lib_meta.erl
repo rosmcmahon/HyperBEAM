@@ -22,7 +22,7 @@ authorized(Committers, Msg, Opts) ->
     try
         maybe
             Loaded = hb_cache:ensure_loaded(Msg, Opts),
-            Identities = addresses(Committers),
+            Identities = committers(Committers),
             % Retain signed inputs so their computations cannot be cached.
             [_ | _] ?= hb_message:signers(
                 hb_message:with_only_committers(Loaded, Identities, Opts), Opts
@@ -45,15 +45,17 @@ authorized(Committers, Msg, Opts) ->
 
 %% @doc Return the configured identities for a role. Unclaimed roles deny access.
 role(admin, Opts) ->
-    addresses(hb_opts:get(admin, role(operator, Opts), Opts));
+    committers(hb_opts:get(admin, role(operator, Opts), Opts));
 role(operator, Opts) ->
-    addresses(hb_opts:get(operator, hb_opts:address(Opts), Opts)).
+    committers(hb_opts:get(operator, hb_opts:committer(Opts), Opts)).
 
-%% @doc Accept a role address or list of addresses in native or human form.
-addresses(Address) when ?IS_ID(Address) -> [hb_util:human_id(Address)];
-addresses(Addresses) when is_list(Addresses) ->
-    [hb_util:human_id(Address) || Address <- Addresses, ?IS_ID(Address)];
-addresses(_) -> [].
+%% @doc Accept a role's committer or list of committers. An Arweave address is
+%% read as its `did:pkh:' committer.
+committers(Committer) when is_binary(Committer) ->
+    [hb_util:committer(Committer)];
+committers(Committers) when is_list(Committers) ->
+    [hb_util:committer(C) || C <- Committers, is_binary(C)];
+committers(_) -> [].
 
 %% @doc Follow committed children without admitting their uncommitted fields.
 signed_keys(Msg, Opts) when is_map(Msg) ->

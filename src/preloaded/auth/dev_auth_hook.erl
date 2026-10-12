@@ -216,9 +216,11 @@ is_relevant_from_committers(Base, Request, Opts) ->
         <<"always">> -> true;
         <<"uncommitted">> -> hb_message:signers(Request, Opts) == [];
         RelevantCommitters ->
+            Committers =
+                lists:map(fun hb_util:committer/1, RelevantCommitters),
             lists:any(
                 fun(Signer) ->
-                    lists:member(Signer, RelevantCommitters)
+                    lists:member(Signer, Committers)
                 end,
                 hb_message:signers(Request, Opts)
             )

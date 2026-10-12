@@ -140,8 +140,9 @@ validate_return_mode(Req, Opts) ->
 validate_signer(Req, Opts) ->
     case find_profiling_config(Opts) of
         ValidSigners when is_list(ValidSigners) ->
+            Committers = lists:map(fun hb_util:committer/1, ValidSigners),
             lists:any(
-                fun(Signer) -> lists:member(Signer, ValidSigners) end,
+                fun(Signer) -> lists:member(Signer, Committers) end,
                 hb_message:signers(Req, Opts)
             );
         EnableProfiling -> EnableProfiling

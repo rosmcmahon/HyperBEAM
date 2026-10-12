@@ -1339,7 +1339,7 @@ dynamic_router() ->
     LiveProxyOpts = hb_http_server:get_opts(#{ <<"http-server">> => ProxyServerID }),
     ok = hb_http_server:set_opts(LiveProxyOpts#{ <<"on">> => RouterHook }),
     ProxyWalletAddr = hb_util:human_id(ar_wallet:to_address(ProxyWallet)),
-    ExecNodeAddr = hb_util:human_id(ar_wallet:to_address(ExecWallet)),
+    ExecNodeAddr = hb_test_utils:committer(ExecWallet),
     % Ensure that the `~meta@1.0/info/address' response is produced by the
     % proxy wallet.
     ?event(debug_dynrouter,
@@ -1854,7 +1854,7 @@ add_route() ->
                     <<"priority">> => 10
                 }
             ],
-            <<"operator">> => hb_util:encode(ar_wallet:to_address(Owner))
+            <<"operator">> => hb_test_utils:committer(Owner)
         }
     ),
     Res =

@@ -97,7 +97,7 @@ request(State, Raw, NodeMsg) ->
                     % The device has estimated the cost of the request. We check
                     % the user's balance to see if they have enough funds to
                     % service the request.
-                    LedgerReq = #{
+                    BalanceReq = #{
                         <<"path">> => <<"balance">>,
                         <<"target">> =>
                             case hb_message:signers(Request, NodeMsg) of
@@ -107,6 +107,7 @@ request(State, Raw, NodeMsg) ->
                             end,
                         <<"request">> => Request
                     },
+                    LedgerReq = ledger_request(LedgerDevice, BalanceReq),
                     ?event(payment, {p4_pre_pricing_estimate, Price}),
                     case hb_ao:resolve(LedgerMsg, LedgerReq, NodeMsg) of
                         {ok, Sufficient} when
@@ -224,8 +225,9 @@ response(State, RawResponse, NodeMsg) ->
                     % so we proceed to charge the user's account. We sign the
                     % request with the node's private key, as it is the node
                     % that is performing the charge, not the user.
-                    LedgerReq =
-                        hb_message:commit(
+                    ChargeReq =
+                        ledger_request(
+                            LedgerDevice,
                             #{
                                 <<"path">> => <<"charge">>,
                                 <<"quantity">> => Price,
@@ -236,20 +238,20 @@ response(State, RawResponse, NodeMsg) ->
                                     end,
                                 <<"recipient">> =>
                                     case hb_opts:get(p4_recipient, undefined, NodeMsg) of
-                                        Addr when ?IS_ID(Addr) ->
-                                            hb_util:human_id(Addr);
+                                        Addr when is_binary(Addr) ->
+                                            hb_util:committer(Addr);
                                         _ ->
                                             case hb_opts:get(operator, undefined, NodeMsg) of
                                                 undefined ->
                                                     <<"unknown">>;
-                                                Operator->
-                                                    hb_util:human_id(Operator)
+                                                Operator ->
+                                                    hb_util:committer(Operator)
                                             end
                                     end,
                                 <<"request">> => Request
-                            },
-                            NodeMsg
+                            }
                         ),
+                    LedgerReq = hb_message:commit(ChargeReq, NodeMsg),
                     ?event(payment,
                         {post_charge,
                             {msg, LedgerMsg},
@@ -300,6 +302,24 @@ balance(_, Req, NodeMsg) ->
                     {error, Error}
             end
     end.
+
+%% @doc Prepare a request for the ledger. A `lua@5.3a' ledger reads an
+%% Arweave committer as its address, so we convert the accounts in the request
+%% to that form.
+ledger_request(<<"lua@5.3a">>, Req) ->
+    maps:map(
+        fun(Key, Account)
+                when Key =:= <<"target">>;
+                    Key =:= <<"account">>;
+                    Key =:= <<"recipient">> ->
+            hb_util:committer_address(Account);
+           (_Key, Value) ->
+            Value
+        end,
+        Req
+    );
+ledger_request(_LedgerDevice, Req) ->
+    Req.
 
 %% @doc Pick the P4 handler out of the request hook list.
 p4_handler([], _NodeMsg) ->
@@ -377,7 +397,7 @@ faff_test() ->
        test_opts(
             #{
                 <<"faff-allow-list">> =>
-                    [hb_util:human_id(ar_wallet:to_address(GoodWallet))]
+                    [hb_test_utils:committer(GoodWallet)]
             }
         )
     ),
@@ -398,7 +418,7 @@ faff_test() ->
 multi_request_hook_test() ->
     Parent = self(),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     PassThrough = #{
         <<"device">> => #{
             <<"request">> => fun(_, HookReq, _) -> {ok, HookReq} end

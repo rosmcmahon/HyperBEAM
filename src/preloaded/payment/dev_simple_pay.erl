@@ -152,7 +152,7 @@ charge(_, RawReq, NodeMsg) ->
     ?event(payment, {charge, RawReq}),
     % Only the node may charge: p4 signs its charge with the node's key.
     Signers = hb_message:signers(RawReq, NodeMsg),
-    case lists:member(hb_opts:address(NodeMsg), Signers) of
+    case lists:member(hb_opts:committer(NodeMsg), Signers) of
         true -> do_charge(RawReq, NodeMsg);
         false ->
             {error, #{
@@ -242,12 +242,12 @@ balance(_, RawReq, NodeMsg) ->
         end,
     {ok, get_balance(Target, NodeMsg)}.
 
-%% @doc Debit a user's balance, normalizing their wallet ID first, and return
-%% the new balance. A negative amount credits the user.
+%% @doc Debit a user's balance, keyed by their committer, and return the new
+%% balance. A negative amount credits the user.
 debit(Signer, Amount, NodeMsg) ->
     lib_volatile_ledger:debit(
         ledger(NodeMsg),
-        hb_util:human_id(Signer),
+        Signer,
         Amount,
         NodeMsg
     ).
@@ -256,7 +256,14 @@ debit(Signer, Amount, NodeMsg) ->
 ledger(NodeMsg) ->
     #{
         <<"name">> => <<"simple-pay@1.0">>,
-        <<"balances">> => hb_opts:get(simple_pay_ledger, #{}, NodeMsg)
+        <<"balances">> =>
+            maps:fold(
+                fun(Account, Balance, Balances) ->
+                    Balances#{ hb_util:committer(Account) => Balance }
+                end,
+                #{},
+                hb_opts:get(simple_pay_ledger, #{}, NodeMsg)
+            )
     }.
 
 %% @doc Get the balance of a user in the ledger. A request with no signer and
@@ -265,7 +272,7 @@ get_balance(undefined, _NodeMsg) -> 0;
 get_balance(Signer, NodeMsg) ->
     lib_volatile_ledger:balance(
         ledger(NodeMsg),
-        hb_util:human_id(Signer),
+        Signer,
         NodeMsg
     ).
 
@@ -294,27 +301,21 @@ topup(_, Req, NodeMsg) ->
             {ok, NewBalance}
     end.
 
-%% @doc Check if the request is from the operator.
+%% @doc Check if the request is from the operator, as `meta@1.0' finds it.
 is_operator(Req, NodeMsg) ->
-    is_operator(Req, NodeMsg, hb_opts:get(operator, undefined, NodeMsg)).
-
-is_operator(Req, NodeMsg, OperatorAddr) when ?IS_ID(OperatorAddr) ->
-    Signers = hb_message:signers(Req, NodeMsg),
-    HumanOperatorAddr = hb_util:human_id(OperatorAddr),
-    lists:any(
-        fun(Signer) ->
-            HumanOperatorAddr =:= hb_util:human_id(Signer)
-        end,
-        Signers
-    );
-is_operator(_, _, _) ->
-    false.
+    {ok, IsOperator} =
+        hb_ao:resolve(
+            #{ <<"device">> => <<"meta@1.0">> },
+            #{ <<"path">> => <<"is-operator">>, <<"body">> => Req },
+            NodeMsg#{ <<"hashpath">> => ignore }
+        ),
+    IsOperator.
 
 %%% Tests
 
 test_opts(Ledger) ->
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     ProcessorMsg =
         #{
             <<"device">> => <<"p4@1.0">>,
@@ -337,7 +338,7 @@ test_opts(Ledger) ->
 
 get_balance_and_top_up_test() ->
     ClientWallet = ar_wallet:new(),
-    ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
+    ClientAddress = hb_test_utils:committer(ClientWallet),
     % The ledger keys the client lowercase, as a config file loads it.
     {HostAddress, HostWallet, Opts} =
         test_opts(#{ hb_util:lowercase_key(ClientAddress) => 100 }),
@@ -433,7 +434,7 @@ get_balance_and_top_up_test() ->
 
 apply_price_test() ->
     ClientWallet = ar_wallet:new(),
-    ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
+    ClientAddress = hb_test_utils:committer(ClientWallet),
     ClientOpts = #{ <<"priv-wallet">> => ClientWallet },
     {HostAddress, _HostWallet, Opts} =
         test_opts(#{ ClientAddress => 100 }),

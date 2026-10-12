@@ -517,9 +517,12 @@ verify_controllers(WalletDetails, Request, Opts) ->
     RequiredControllers =
         hb_util:int(hb_maps:get(<<"required-controllers">>, WalletDetails, 1, Opts)),
     Controllers =
-        parse_controllers(
-            hb_maps:get(<<"controllers">>, WalletDetails, [], Opts),
-            Opts
+        lists:map(
+            fun hb_util:committer/1,
+            parse_controllers(
+                hb_maps:get(<<"controllers">>, WalletDetails, [], Opts),
+                Opts
+            )
         ),
     PresentControllers =
         lists:filter(
@@ -687,15 +690,15 @@ secrets_to_keyids(Secret) when is_binary(Secret) ->
     KeyID = hb_util:secret_key_to_committer(Secret),
     [ {secret, <<"secret:", KeyID/binary>>, Secret} ].
 
-%% @doc Parse the exportable setting for a wallet and return a list of addresses
-%% which are allowed to export the wallet.
+%% @doc Parse the exportable setting for a wallet and return a list of the
+%% committers which are allowed to export the wallet.
 parse_controllers(default, Opts) ->
     case hb_opts:get(wallet_admin, undefined, Opts) of
         undefined -> 
             case hb_opts:get(operator, undefined, Opts) of
                 undefined ->
-                    [hb_opts:address(Opts)];
-                Op -> [hb_util:human_id(Op)]
+                    [hb_opts:committer(Opts)];
+                Op -> [Op]
             end;
         Admin -> [Admin]
     end;
@@ -845,7 +848,7 @@ test_wallet_generate_and_verify(GeneratePath, ExpectedName, CommitParams) ->
     % transport commitments.
     hb_test_utils:assert_hashpath_reply(
         SignedMessage,
-        WalletAddr,
+        ?ARWEAVE_COMMITTER(WalletAddr),
         <<"Test message">>
     ).
 
@@ -945,7 +948,7 @@ commit_with_cookie_wallet_test() ->
     % transport commitments.
     hb_test_utils:assert_hashpath_reply(
         SignedMessage,
-        WalletName,
+        ?ARWEAVE_COMMITTER(WalletName),
         <<"Test data">>
     ).
 
@@ -995,8 +998,8 @@ export_requires_distinct_controllers_test() ->
                 <<"persist">> => <<"in-memory">>,
                 <<"controllers">> =>
                     [
-                        hb_util:human_id(ar_wallet:to_address(A)),
-                        hb_util:human_id(ar_wallet:to_address(B))
+                        hb_test_utils:committer(A),
+                        hb_test_utils:committer(B)
                     ],
                 <<"required-controllers">> => 2
             },
@@ -1221,7 +1224,7 @@ sync_wallets_test() ->
     Node2 =
         hb_http_server:start_node(#{
             <<"priv-wallet">> => ar_wallet:new(),
-            <<"wallet-admin">> => hb_util:human_id(AdminWallet)
+            <<"wallet-admin">> => hb_test_utils:committer(AdminWallet)
         }),
     % Generate a wallet on the second node.
     {ok, GenResponse} =
@@ -1280,7 +1283,7 @@ sync_non_volatile_wallets_test() ->
     Node2 =
         hb_http_server:start_node(#{
             <<"priv-wallet">> => ar_wallet:new(),
-            <<"wallet-admin">> => hb_util:human_id(Node1Wallet)
+            <<"wallet-admin">> => hb_test_utils:committer(Node1Wallet)
         }),
     % Generate a wallet on the second node.
     {ok, GenResponse} =
@@ -1385,6 +1388,6 @@ stored_access_control_verifies_test() ->
         hb_http:post(Node, SignRequest#{ <<"priv">> => Priv }, #{}),
     hb_test_utils:assert_hashpath_reply(
         SignedMessage,
-        WalletAddr,
+        ?ARWEAVE_COMMITTER(WalletAddr),
         <<"Test message">>
     ).

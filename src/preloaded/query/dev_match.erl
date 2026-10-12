@@ -1112,7 +1112,7 @@ alignment_test() ->
 paths_test() ->
     Opts = test_opts(),
     Wallets = [ar_wallet:new(), ar_wallet:new()],
-    Addresses = [ hb_util:human_id(ar_wallet:to_address(W)) || W <- Wallets ],
+    Addresses = [ hb_test_utils:committer(W) || W <- Wallets ],
     Signed =
         lists:foldl(
             fun(Wallet, Msg) ->

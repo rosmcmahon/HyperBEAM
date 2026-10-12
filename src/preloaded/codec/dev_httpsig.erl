@@ -86,73 +86,94 @@ verify(Base, Req, RawOpts) ->
             {ok, false}
     end.
 
-%% @doc Verify a commitment whose committed keys the base carries. A
-%% rsa-pss-sha512 commitment is verified by regenerating the signature base
-%% and validating against the signature.
+%% @doc Verify a commitment whose committed keys the base carries. We
+%% regenerate the signature base, and the committer named by the `keyid'
+%% verifies the signature against it.
 do_verify(Base, Req, Opts) ->
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
     SigBase = signature_base(EncMsg, EncComm, Opts),
-    KeyRes = dev_httpsig_keyid:req_to_key_material(Req, Opts),
-    RawSignature = hb_util:decode(Signature = maps:get(<<"signature">>, Req)),
+    KeyID = maps:get(<<"keyid">>, Req, ?UNSIGNED_COMMITTER),
     ?event_debug(debug_httpsig,
         {
             httpsig_verifying,
-            {signature, Signature},
-            {parsed_key_material, KeyRes},
+            {keyid, KeyID},
             {req, Req},
             {signature_base, {string, SigBase}}
         }
     ),
-    case {KeyRes, maps:get(<<"type">>, Req)} of
-        {{ok, publickey, Key, KeyID}, <<"rsa-pss-sha512">>} ->
-            ?event(httpsig_verify, {verify, {rsa_pss_sha512, {sig_base, SigBase}}}),
-            {
-                ok,
-                maps:get(<<"committer">>, Req, undefined) =:=
-                    dev_httpsig_keyid:keyid_to_committer(publickey, KeyID)
-                andalso binary:decode_unsigned(Key) >= (1 bsl 2047)
-                andalso ar_wallet:verify(
-                    {{rsa, 65537}, Key},
-                    SigBase,
-                    RawSignature,
-                    sha512
-                )
-            };
-        {{ok, Scheme, Key, KeyID}, <<"hmac-sha256">>}
-                when Scheme =:= constant; Scheme =:= secret ->
-            % Generate the HMAC from the key and signature base.
-            ActualHMac =
-                hb_util:human_id(
-                    crypto:mac(hmac, sha256, Key, SigBase)
+    {
+        ok,
+        maps:get(<<"committer">>, Req, undefined) =:=
+            dev_httpsig_siginfo:keyid_to_committer(KeyID)
+        andalso strong_key(Req)
+        andalso committer_verifies(KeyID, SigBase, Req, Opts)
+    }.
+
+%% @doc Check that a commitment uses one of this device's algorithms. An
+%% `rsa-pss-sha512' commitment must also have a key of at least 2048 bits.
+strong_key(#{ <<"type">> := <<"rsa-pss-sha512">>, <<"owner">> := Owner }) ->
+    binary:decode_unsigned(hb_util:decode(Owner)) >= (1 bsl 2047);
+strong_key(#{ <<"type">> := <<"hmac-sha256">> }) ->
+    true;
+strong_key(_Req) ->
+    false.
+
+%% @doc Ask the committer named by a `keyid' to verify the signature of a
+%% signature base. The request is the commitment. Its `priv' message is given
+%% to the committer, as it holds the verifier's key material, such as a
+%% secret.
+committer_verifies(KeyID, SigBase, Req, Opts) ->
+    case committer(#{ <<"committer">> => KeyID }, Opts) of
+        {ok, Committer, KeyID} ->
+            % The signature and the public key are base64url encoded in a
+            % commitment, so we decode them before verification.
+            Raw =
+                maps:map(
+                    fun(_Key, Value) -> hb_util:decode(Value) end,
+                    maps:with([<<"signature">>, <<"owner">>], Req)
                 ),
-            ?event(httpsig_verify,
-                {verify,
-                    {hmac_sha256,
-                        {keyid, KeyID},
-                        {sig_base, SigBase},
-                        {actual_hmac, {string, ActualHMac}},
-                        {signature, {string, Signature}},
-                        {matches, Signature =:= ActualHMac}
-                    }
-                }),
-            {ok, Signature =:= ActualHMac andalso
-                maps:get(<<"committer">>, Req, undefined) =:=
-                    dev_httpsig_keyid:keyid_to_committer(Scheme, KeyID)};
-        {{ok, _, _, _}, _Type} ->
-            {ok, false};
-        {{error, Reason}, _Type} ->
-            ?event(httpsig_verify, {verify, {error, Reason}}),
-            {ok, false};
-        {{failure, Info}, _Type} ->
-            ?event(httpsig_verify, {verify, {failure, Info}}),
-            {failure, Info}
+            {ok, Verified} =
+                hb_ao:raw(
+                    hb_private:set_priv(Committer, hb_private:from_message(Req)),
+                    (maps:merge(Req, Raw))#{
+                        <<"path">> => <<"verify">>,
+                        <<"body">> => SigBase
+                    },
+                    Opts
+                ),
+            Verified;
+        _ -> false
     end.
 
-%% @doc Whether a wallet holds an RSA key, in either of the forms that
-%% `ar_wallet' signs with.
-rsa_wallet({{rsa, 65537}, _, _}) -> true;
-rsa_wallet({{{rsa, 65537}, _, _}, {{rsa, 65537}, _}}) -> true;
-rsa_wallet(_) -> false.
+%% @doc Find the committer of a request, returning it as a message along with
+%% the URI that names it. The request's `committer' may be a message or a URI.
+%% We never load the committer of unsigned commitments by its URI, because
+%% loading a URI makes an unsigned commitment to its inputs, which would call
+%% this function again.
+committer(#{ <<"committer">> := ?UNSIGNED_COMMITTER }, _Opts) ->
+    {ok, Scheme, Rest} = hb_uri:scheme(?UNSIGNED_COMMITTER),
+    {
+        ok,
+        #{ <<"device">> => hb_uri:device(Scheme), <<"body">> => Rest },
+        ?UNSIGNED_COMMITTER
+    };
+committer(#{ <<"committer">> := URI }, Opts) when is_binary(URI) ->
+    maybe
+        {ok, Committer} ?= hb_uri:from(URI, Opts),
+        {ok, Committer, URI}
+    end;
+committer(#{ <<"committer">> := Committer }, Opts) ->
+    maybe
+        {ok, URI} ?=
+            hb_ao:raw(
+                Committer,
+                #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
+                Opts
+            ),
+        {ok, Committer, URI}
+    end;
+committer(_Req, _Opts) ->
+    {error, not_found}.
 
 %% @doc Commit to a message using the HTTP-Signature format. We use the `type'
 %% parameter to determine the type of commitment to use. If the `type' parameter
@@ -177,18 +198,14 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
         {generating_rsa_pss_sha512_commitment, {msg, MsgToSign}, {req, Req}}
     ),
     Opts = opts(RawOpts),
-    Wallet = hb_opts:get(priv_wallet, no_viable_wallet, Opts),
-    if Wallet =:= no_viable_wallet ->
-        throw({cannot_commit, no_viable_wallet, MsgToSign});
-    true ->
-        ok
-    end,
-    % The algorithm signs with an RSA key; a wallet of another type cannot
-    % produce a commitment that this device verifies.
-    case rsa_wallet(Wallet) of
-        true -> ok;
-        false -> throw({cannot_commit, 'unsupported-key-type', MsgToSign})
-    end,
+    % Find the committer of the request. Its public key, the `owner', is a
+    % parameter of the signature.
+    {CommitterMsg, KeyID} =
+        case committer(Req, Opts) of
+            {ok, Committer, URI} -> {Committer, URI};
+            Error -> throw({cannot_commit, Error, MsgToSign})
+        end,
+    Owner = hb_maps:get(<<"owner">>, CommitterMsg, <<>>, Opts),
     % Utilize the hashpath, if present, as the tag for the commitment.
     MaybeTagMap =
         case MsgToSign of
@@ -203,13 +220,9 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
             MaybeTagMap#{
                 <<"commitment-device">> => <<"httpsig@1.0">>,
                 <<"type">> => <<"rsa-pss-sha512">>,
-                <<"keyid">> =>
-                    <<
-                        "publickey:",
-                        (base64:encode(ar_wallet:to_pubkey(Wallet)))/binary
-                    >>,
-                <<"committer">> =>
-                    hb_util:human_id(ar_wallet:to_address(Wallet)),
+                <<"keyid">> => KeyID,
+                <<"committer">> => KeyID,
+                <<"owner">> => hb_util:encode(Owner),
                 <<"committed">> => ToCommit
             },
             MsgToSign,
@@ -223,8 +236,22 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
     SignatureBase = signature_base(EncMsg, EncComm, Opts),
     ?event_debug({rsa_signature_base, {string, SignatureBase}}),
     ?event_debug({mod_committed_keys, ModCommittedKeys}),
-    % Sign the signature base
-    Signature = ar_wallet:sign(Wallet, SignatureBase, sha512),
+    % Sign the signature base with the committer.
+    CommitRes =
+        hb_ao:raw(
+            CommitterMsg,
+            #{
+                <<"path">> => <<"commit">>,
+                <<"body">> => SignatureBase,
+                <<"type">> => <<"rsa-pss-sha512">>
+            },
+            Opts
+        ),
+    Signature =
+        case CommitRes of
+            {ok, #{ <<"signature">> := Sig, <<"owner">> := Owner }} -> Sig;
+            CommitError -> throw({cannot_commit, CommitError, MsgToSign})
+        end,
     % Generate the ID of the signature
     ID = hb_util:human_id(crypto:hash(sha256, Signature)),
     ?event_debug({rsa_commit, {committed, ToCommit}}),
@@ -245,11 +272,15 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
         }
     };
 commit(BaseMsg, Req = #{ <<"type">> := <<"hmac-sha256">> }, RawOpts) ->
-    % Extract the key material from the request.
+    % Find the committer of the request and the URI that names it. If the
+    % request gives no committer, we use the committer of unsigned commitments.
     Opts = opts(RawOpts),
-    ?event_debug({req_to_key_material, {priv_req, Req}}),
-    {ok, Scheme, Key, KeyID} = dev_httpsig_keyid:req_to_key_material(Req, Opts),
-    Committer = dev_httpsig_keyid:keyid_to_committer(Scheme, KeyID),
+    {ok, CommitterMsg, KeyID} =
+        committer(
+            maps:merge(#{ <<"committer">> => ?UNSIGNED_COMMITTER }, Req),
+            Opts
+        ),
+    Committer = dev_httpsig_siginfo:keyid_to_committer(KeyID),
     % Remove any existing hmac commitments with the given keyid before adding
     % the new one.
     Msg =
@@ -288,7 +319,13 @@ commit(BaseMsg, Req = #{ <<"type">> := <<"hmac-sha256">> }, RawOpts) ->
     {ok, EncMsg, EncComm, ModCommittedKeys} =
         normalize_for_encoding(Msg, UnauthedCommitment, Opts),
     SigBase = signature_base(EncMsg, EncComm, Opts),    
-    HMac = hb_util:human_id(crypto:mac(hmac, sha256, Key, SigBase)),
+    {ok, #{ <<"signature">> := Signature }} =
+        hb_ao:raw(
+            CommitterMsg,
+            #{ <<"path">> => <<"commit">>, <<"body">> => SigBase },
+            Opts
+        ),
+    HMac = hb_util:human_id(Signature),
     ?event_debug(
         debug_commitments,
         {hmac_commit,
@@ -657,6 +694,24 @@ commitment_identity_test() ->
     Victim = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
     Signed = hb_message:commit(Msg, Opts),
     Unsigned = hb_message:commit(Msg, Opts, #{ <<"type">> => <<"unsigned">> }),
+    % An unsigned commitment is named by the committer of unsigned commitments.
+    ?assertMatch(
+        [#{ <<"keyid">> := ?UNSIGNED_COMMITTER }],
+        maps:values(maps:get(<<"commitments">>, Unsigned))
+    ),
+    % A signed commitment is named by the `did:pkh:' URI of its key, and it
+    % carries the key as its `owner'.
+    Committer = hb_test_utils:committer(maps:get(<<"priv-wallet">>, Opts)),
+    ?assertMatch(
+        [
+            #{
+                <<"keyid">> := Committer,
+                <<"committer">> := Committer,
+                <<"owner">> := _
+            }
+        ],
+        maps:values(maps:get(<<"commitments">>, Signed))
+    ),
     lists:foreach(
         fun(Committed) ->
             ?assert(hb_message:verify(
@@ -680,18 +735,29 @@ commitment_identity_test() ->
     ),
     ?assert(hb_message:verify(Roundtrip, all, Opts)).
 
-%% @doc A publicly known RSA key cannot authenticate an HMAC signer.
+%% @doc Ensure that a publicly known RSA key cannot authenticate an HMAC
+%% signer. A commitment that uses the key as its secret is made by its own
+%% `hmac:secret:' committer, not by the key's address.
 public_key_hmac_is_not_authority_test() ->
     {_, {_, Pub}} = ar_wallet:new(),
     Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
+    ID = hb_util:secret_key_to_committer(Pub),
     Committed = hb_message:commit(
         #{ <<"body">> => <<"public-key-hmac">> }, Opts,
         #{
             <<"type">> => <<"hmac-sha256">>,
-            <<"keyid">> => <<"publickey:", (base64:encode(Pub))/binary>>
+            <<"committer">> =>
+                #{
+                    <<"device">> => <<"hmac@1.0">>,
+                    <<"body">> => <<"secret:", ID/binary>>,
+                    <<"priv">> => #{ <<"secret">> => Pub }
+                }
         }
     ),
-    ?assertNot(hb_message:verify(Committed, all, Opts)).
+    ?assertEqual(
+        [<<"hmac:secret:", ID/binary>>],
+        hb_message:signers(Committed, Opts)
+    ).
 
 %% @doc HTTPSig rejects weak moduli, including zero-padded keys.
 rsa_minimum_modulus_test() ->
@@ -769,20 +835,26 @@ committed_id_test() ->
 commit_secret_key_test() ->
     Msg = #{ <<"basic">> => <<"value">> },
     Opts = #{ <<"priv-wallet">> => hb:wallet() },
+    ID = hb_util:secret_key_to_committer(<<"test-secret">>),
     CommittedMsg =
         hb_message:commit(
             Msg,
             Opts,
             #{
                 <<"type">> => <<"hmac-sha256">>,
-                <<"priv">> => #{ <<"secret">> => <<"test-secret">> },
                 <<"commitment-device">> => <<"httpsig@1.0">>,
-                <<"scheme">> => <<"secret">>
+                <<"committer">> =>
+                    #{
+                        <<"device">> => <<"hmac@1.0">>,
+                        <<"body">> => <<"secret:", ID/binary>>,
+                        <<"priv">> => #{ <<"secret">> => <<"test-secret">> }
+                    }
             }
         ),
     ?event_debug({committed_msg, CommittedMsg}),
     Committers = hb_message:signers(CommittedMsg, #{}),
-    ?assert(length(Committers) == 1),
+    % The commitment of a secret is named by its `hmac:secret:' committer.
+    ?assertEqual([<<"hmac:secret:", ID/binary>>], Committers),
     ?event_debug({committers, Committers}),
     ?assert(
         hb_message:verify(
@@ -809,8 +881,8 @@ multicommitted_id_test() ->
     Msg = #{ <<"basic">> => <<"value">> },
     Signed1 = hb_message:commit(Msg, #{ <<"priv-wallet">> => Wallet1 = ar_wallet:new() }),
     Signed2 = hb_message:commit(Signed1, #{ <<"priv-wallet">> => Wallet2 = ar_wallet:new() }),
-    Addr1 = hb_util:human_id(ar_wallet:to_address(Wallet1)),
-    Addr2 = hb_util:human_id(ar_wallet:to_address(Wallet2)),
+    Addr1 = hb_test_utils:committer(Wallet1),
+    Addr2 = hb_test_utils:committer(Wallet2),
     ?event_debug({signed_msg, Signed2}),
     UnsignedID = hb_message:id(Signed2, none),
     SignedID = hb_message:id(Signed2, all),

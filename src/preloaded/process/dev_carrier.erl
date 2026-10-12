@@ -368,12 +368,12 @@ credit(Base, Address, Amount, Opts) ->
 
 debit(Base, Address, Amount, Opts) -> credit(Base, Address, -Amount, Opts).
 
-%% @doc The single signer of a message. A message with any other number of
-%% signers is not attributable to one party, so it can neither move the unit nor
-%% speak for the name.
+%% @doc Return the Arweave address of the single signer of a message. A
+%% message with any other number of signers is not attributable to one party,
+%% so it can neither move the unit nor speak for the name.
 signer(Body, Opts) ->
     case hb_message:signers(Body, Opts) of
-        [Signer] -> {ok, hb_util:human_id(Signer)};
+        [?ARWEAVE_COMMITTER(Address)] -> {ok, Address};
         _ -> not_found
     end.
 

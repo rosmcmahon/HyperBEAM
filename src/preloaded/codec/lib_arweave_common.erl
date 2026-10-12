@@ -1,7 +1,8 @@
 %%% @doc Shared Arweave codec helpers.
 -module(lib_arweave_common).
 -export([from/3]).
--export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
+-export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/3]).
+-export([sign/4]).
 -export([verify_committed_keys/5]).
 -export([add_commitment/4]).
 -export([with_commitments/8]).
@@ -285,17 +286,56 @@ base(CommittedKeys, Fields, Tags, Data, Opts) ->
 %% `commitment_to_tx/4' takes the commitment's fields and tags only while the
 %% message holds their values, and gives a changed message its own, which the
 %% item's signature then does not verify.
-verify_identity(Item, TABM) ->
+verify_identity(Item, TABM, Opts) ->
     [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
     case maps:get(<<"type">>, Commitment) of
         <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
         _ ->
             hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
-                maps:get(<<"committer">>, Commitment, undefined) =:=
-                    hb_util:human_id(
-                        ar_wallet:to_address(
-                            Item#tx.owner, Item#tx.signature_type)
-                    )
+                maps:get(<<"committer">>, Commitment, unset) =:=
+                    committer(Item, Opts)
+    end.
+
+%% @doc Return the URI of the committer of an item's signature: the
+%% `did-pkh@1.0' committer of the item's owner. If the key has no account, we
+%% return `unset'.
+committer(Item, Opts) ->
+    Committer =
+        #{
+            <<"device">> => <<"did-pkh@1.0">>,
+            <<"owner">> => Item#tx.owner,
+            <<"type">> => ar_tx:serialize_sig_type(Item#tx.signature_type)
+        },
+    ToURI = #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
+    case hb_ao:raw(Committer, ToURI, Opts) of
+        {ok, URI} -> URI;
+        {error, _} -> unset
+    end.
+
+%% @doc Sign the item or transaction of a message with the committer of the
+%% request, using the signature type of the request's `type'. The committer's
+%% public key becomes the owner of the item, which the signature covers.
+sign(Msg, TX, #{ <<"committer">> := Committer, <<"type">> := Type }, Opts) ->
+    Owner = hb_maps:get(<<"owner">>, Committer, ?DEFAULT_OWNER, Opts),
+    Unsigned =
+        TX#tx{
+            owner = Owner,
+            signature_type = ar_tx:deserialize_sig_type(Type)
+        },
+    CommitRes =
+        hb_ao:raw(
+            Committer,
+            #{
+                <<"path">> => <<"commit">>,
+                <<"body">> => ar_tx:generate_signature_data_segment(Unsigned),
+                <<"type">> => Type
+            },
+            Opts
+        ),
+    case CommitRes of
+        {ok, #{ <<"signature">> := Sig, <<"owner">> := Owner }} ->
+            ar_tx:reset_ids(Unsigned#tx{ signature = Sig });
+        CommitError -> throw({cannot_commit, CommitError, Msg})
     end.
 
 %% @doc Check that a commitment's committed keys are the keys of the item
@@ -371,7 +411,6 @@ with_unsigned_commitment(
 with_signed_commitment(
         BaseFields, Item, Device, FieldCommitments, Tags,
         UncommittedMessage, CommittedKeys, Opts) ->
-    Address = hb_util:human_id(ar_wallet:to_address(Item#tx.owner, Item#tx.signature_type)),
     ID = hb_util:human_id(Item#tx.id),
     ExtraCommitments = hb_maps:merge(
         FieldCommitments,
@@ -384,11 +423,10 @@ with_signed_commitment(
                 ExtraCommitments,
                 #{
                     <<"commitment-device">> => Device,
-                    <<"committer">> => Address,
+                    <<"committer">> => committer(Item, Opts),
                     <<"committed">> => CommittedKeys,
                     <<"signature">> => hb_util:encode(Item#tx.signature),
-                    <<"keyid">> =>
-                        <<"publickey:", (hb_util:encode(Item#tx.owner))/binary>>,
+                    <<"owner">> => hb_util:encode(Item#tx.owner),
                     <<"type">> => ar_tx:serialize_sig_type(Item#tx.signature_type),
                     <<"bundle">> => bundle_commitment_key(Tags, Opts),
                     <<"original-tags">> => original_tags(
@@ -580,9 +618,8 @@ commitment_to_tx(Message, Commitment, FieldsFun, Opts) ->
             maps:get(<<"signature">>, Commitment, hb_util:encode(?DEFAULT_SIG))
         ),
     Owner =
-        case hb_maps:find(<<"keyid">>, Commitment, Opts) of
-            {ok, KeyID} ->
-                hb_util:decode(hb_util:remove_scheme_prefix(KeyID));
+        case hb_maps:find(<<"owner">>, Commitment, Opts) of
+            {ok, EncodedOwner} -> hb_util:decode(EncodedOwner);
             error -> ?DEFAULT_OWNER
         end,
     Tags =

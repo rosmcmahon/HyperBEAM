@@ -493,7 +493,7 @@ do_decode(EncMsg, _Opts) when is_list(EncMsg) andalso length(EncMsg) == 0 ->
 do_decode(EncMsg = [{_K, _V} | _], Opts) when is_list(EncMsg) ->
     do_decode(
         maps:map(
-            fun(_, V) -> do_decode(V, Opts) end,
+            fun(Key, V) -> decode_value(Key, do_decode(V, Opts)) end,
             maps:from_list(EncMsg)
         ),
         Opts
@@ -512,14 +512,26 @@ do_decode(Msg, Opts) when is_map(Msg) ->
 do_decode(Other, _Opts) ->
     Other.
 
-%% @doc Encode a HyperBEAM `structured@1.0' message into a Lua term.
+%% @doc Decode a value of a message from Lua. Lua holds the Arweave committer
+%% of a commitment as its address, so we convert it back to its URI.
+decode_value(<<"commitments">>, Commitments) when is_map(Commitments) ->
+    map_committers(fun hb_util:committer/1, Commitments);
+decode_value(_Key, Value) ->
+    Value.
+
+%% @doc Encode a HyperBEAM `structured@1.0' message into a Lua term. Arweave
+%% committers are given to Lua as their addresses, because Lua code compares
+%% them with the addresses that process definitions hold.
 encode(Map, Opts) ->
     hb_message:normalize_commitments(do_encode(Map, Opts), Opts).
 do_encode(Map, Opts) when is_map(Map) ->
     hb_cache:ensure_all_loaded(
         case hb_util:is_ordered_list(Map, Opts) of
             true -> do_encode(hb_util:message_to_ordered_list(Map), Opts);
-            false -> maps:to_list(maps:map(fun(_, V) -> do_encode(V, Opts) end, Map))
+            false ->
+                maps:to_list(
+                    maps:map(fun(K, V) -> encode_value(K, V, Opts) end, Map)
+                )
         end,
         Opts
     );
@@ -532,6 +544,27 @@ do_encode(Atom, _Opts) when is_atom(Atom) and (Atom /= false) and (Atom /= true)
     hb_util:bin(Atom);
 do_encode(Other, _Opts) ->
     Other.
+
+%% @doc Encode a value of a message for Lua. The Arweave committer of a
+%% commitment is given as its address.
+encode_value(<<"commitments">>, Commitments, Opts) when is_map(Commitments) ->
+    do_encode(
+        map_committers(fun hb_util:committer_address/1, Commitments),
+        Opts
+    );
+encode_value(_Key, Value, Opts) ->
+    do_encode(Value, Opts).
+
+%% @doc Apply `Fun' to the committer of each commitment.
+map_committers(Fun, Commitments) ->
+    maps:map(
+        fun(_ID, Commitment = #{ <<"committer">> := Committer }) ->
+            Commitment#{ <<"committer">> => Fun(Committer) };
+           (_ID, Commitment) ->
+            Commitment
+        end,
+        Commitments
+    ).
 
 %% @doc Parse a Lua stack trace into a list of messages.
 decode_stacktrace(StackTrace, State0, Opts) ->
@@ -619,7 +652,10 @@ post_invocation_message_validation_test() ->
     {ok, ReadMsg} = hb_cache:read(UnsignedID, Opts),
     ?assertEqual(<<"test-value-1">>, hb_ao:get(<<"test-key">>, ReadMsg, Opts)),
     ?assert(length(hb_message:signers(Res, Opts)) == 0),
-    ?assert(hb_message:verify(Res, all, Opts)).
+    ?assert(hb_message:verify(Res, all, Opts)),
+    % A `committer' key outside of a commitment is not converted.
+    Bare = #{ <<"committer">> => <<"bare">> },
+    ?assertEqual(Bare, decode(encode(Bare, Opts), Opts)).
 
 load_modules_by_id_test_() ->
     {timeout, 30, fun load_modules_by_id/0}.
@@ -1091,6 +1127,7 @@ invoke_aos_test() ->
     {ok, _Assignment} =
         hb_ao:resolve(Process, Message, Opts#{ <<"hashpath">> => ignore }),
     {ok, Results} = hb_ao:resolve(Process, <<"now/results/output">>, Opts),
+    % The process names its authority by address, and trusts its message.
     ?assertEqual(<<"1">>, hb_ao:get(<<"data">>, Results, #{})),
     ?assertEqual(<<"aos> ">>, hb_ao:get(<<"prompt">>, Results, #{})).
 

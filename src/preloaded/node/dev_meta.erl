@@ -116,7 +116,10 @@ add_dynamic_keys(NodeMsg) ->
             Wallet ->
                 %% Create a new map with address and merge it (overwriting existing)
                 Address = hb_util:id(ar_wallet:to_address(Wallet)),
-                NodeMsg#{ <<"address">> => Address }
+                NodeMsg#{
+                    <<"address">> => Address,
+                    <<"committer">> => hb_opts:committer(NodeMsg)
+                }
         end,
     add_identity_addresses(UpdatedNodeMsg).
 
@@ -222,6 +225,11 @@ unread_request_link_test() ->
             },
             #{}
         )
+    ),
+    % The node's `committer' is the URI of the committer of its key.
+    ?assertEqual(
+        {ok, hb_test_utils:committer(Wallet)},
+        hb_http:get(Node, <<"/~meta@1.0/info/committer">>, #{})
     ).
 
 %% @doc Test that we can't set the node message if the request is not signed by
@@ -275,7 +283,7 @@ authorized_set_node_msg_succeeds_test() ->
     Owner = ar_wallet:new(),
     Node = hb_http_server:start_node(
         Opts = #{
-            <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
+            <<"operator">> => hb_test_utils:committer(Owner),
             <<"test-config-item">> => <<"test">>,
 			<<"store">> => StoreOpts
         }
@@ -304,7 +312,7 @@ authorized_set_node_msg_succeeds_test() ->
 typed_authorization_test() ->
     Owner = ar_wallet:new(),
     Other = ar_wallet:new(),
-    Opts = #{ <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)) },
+    Opts = #{ <<"operator">> => hb_test_utils:committer(Owner) },
     Fields = #{ <<"type">> => <<"node-message">>, <<"setting">> => <<"signed">> },
     Signed = hb_message:commit(Fields, #{ <<"priv-wallet">> => Owner }),
     UnsignedType = hb_message:commit(
@@ -340,14 +348,18 @@ typed_authorization_test() ->
         lib_meta:is_authorized(<<"node-message">>, admin, Extended, Opts),
     ?assertEqual(Fields, hb_message:uncommitted(Authorized)),
     ?assert(hb_message:verify(Authorized, all, Opts)),
-    AdminOpts = Opts#{ <<"admin">> => hb_util:human_id(ar_wallet:to_address(Other)) },
+    AdminOpts = Opts#{ <<"admin">> => hb_test_utils:committer(Other) },
     ?assertEqual({error, not_authorized},
         lib_meta:is_authorized(<<"node-message">>, admin, Signed, AdminOpts)),
     ?assertMatch({ok, _},
         lib_meta:is_authorized(<<"node-message">>, admin,
             hb_message:commit(Fields, #{ <<"priv-wallet">> => Other }), AdminOpts)),
     ?assertMatch({ok, _},
-        lib_meta:is_authorized(<<"node-message">>, operator, Signed, AdminOpts)).
+        lib_meta:is_authorized(<<"node-message">>, operator, Signed, AdminOpts)),
+    % An operator given as an address is its `did:pkh:' committer.
+    ?assertMatch({ok, _},
+        lib_meta:is_authorized(<<"node-message">>, operator, Signed,
+            #{ <<"operator">> => hb_util:human_id(Owner) })).
 
 %% @doc A signed child ID authorizes its committed fields, not extensions.
 nested_authorization_test() ->
@@ -402,7 +414,7 @@ node_message_signed_fields_test() ->
 invalid_optional_signature_cannot_update_node_test() ->
     Owner = ar_wallet:new(),
     Opts = #{
-        <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
+        <<"operator">> => hb_test_utils:committer(Owner),
         <<"priv-wallet">> => ar_wallet:new(),
         <<"force-signed-requests">> => false,
         <<"test-config-item">> => <<"original">>,
@@ -440,7 +452,7 @@ permanent_node_message_test() ->
     Owner = ar_wallet:new(),
     Node = hb_http_server:start_node(
         Opts =#{
-            <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
+            <<"operator">> => hb_test_utils:committer(Owner),
             <<"initialized">> => false,
             <<"test-config-item">> => <<"test">>,
 			<<"store">> => StoreOpts
@@ -497,7 +509,7 @@ unclaimed_node_rejects_mutation_test() ->
     Req = #{
         <<"path">> => <<"/~meta@1.0/info">>,
         <<"type">> => <<"node-message">>,
-        <<"operator">> => hb_util:human_id(ar_wallet:to_address(Owner)),
+        <<"operator">> => hb_test_utils:committer(Owner),
         <<"test-config-item">> => <<"changed">>
     },
     lists:foreach(

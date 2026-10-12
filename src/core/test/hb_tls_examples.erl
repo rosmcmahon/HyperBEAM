@@ -190,6 +190,7 @@ pebble() ->
             }, Guard}
     end,
     ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Committer = hb_test_utils:committer(Wallet),
     RuntimeName = {<<"tls@1.0">>, ServerID},
     ResolverOrder = inet_db:res_option(lookup),
     ok = inet_db:set_lookup([file | lists:delete(file, ResolverOrder)]),
@@ -212,7 +213,7 @@ pebble() ->
             hb_tls:socket_options(ar_wallet:load_keyfile("test/key-2.json"),
                 [FirstCertificate])),
         {ok, Info} = hb_http:get(PublicURL, <<"/~meta@1.0/info">>, ClientOpts),
-        ?assertEqual([ServerID], hb_message:signers(Info, ClientOpts)),
+        ?assertEqual([Committer], hb_message:signers(Info, ClientOpts)),
         ?assert(hb_message:verify(Info, all, ClientOpts)),
         HTTP2 = http2_connection(Domain, Port, IssuerCAs),
         http2_address(HTTP2, ServerID),

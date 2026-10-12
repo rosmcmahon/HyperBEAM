@@ -14,7 +14,7 @@
 %%% with a refusal to execute.
 -module(hb_opts).
 -export([get/1, get/2, get/3, as/2, identities/1, load/1, load/2, load_bin/2]).
--export([address/1, address/2]).
+-export([address/1, address/2, committer/1, committer/2, wallet_committer/1]).
 -export([default_message/0, default_message_with_env/0, mimic_default_types/3]).
 -export([ensure_node_history/2]).
 -export([check_required_opts/2]).
@@ -819,7 +819,7 @@ coerce_value(_DefaultValue, Value) ->
 %% @doc Find a given identity from the `identities' map, and return the options
 %% merged with the sub-options for that identity.
 as(Identity, Opts) ->
-    case identities(hb_http_server:with_node_key(Opts)) of
+    case identities(hb_http_server:with_node_committer(Opts)) of
         #{ Identity := SubOpts } ->
             ?event({found_identity_sub_opts_are, SubOpts}),
             {ok, maps:merge(Opts, mimic_default_types(SubOpts, false, Opts))};
@@ -837,6 +837,35 @@ address(Default, Opts) ->
         WalletOrAddress -> hb_util:human_id(WalletOrAddress)
     end.
 
+%% @doc Return the URI of the committer of the `priv-wallet' in `Opts'.
+%% Request execution `Opts' hold no wallet, so for them we return the
+%% `committer' option. If neither is set, we return the URI of the committer
+%% of `Default'.
+committer(Opts) -> committer(undefined, Opts).
+committer(Default, Opts) ->
+    Given = ?MODULE:get(committer, Default, Opts),
+    case ?MODULE:get(priv_wallet, Given, Opts) of
+        undefined -> undefined;
+        Committer when is_binary(Committer) -> Committer;
+        Wallet -> uri(Wallet, Opts)
+    end.
+
+%% @doc Generate the `did-pkh@1.0' committer of a wallet's key. The committer
+%% holds the wallet in its `priv' message, so that it can sign.
+wallet_committer(Wallet = {{KeyType, _, Owner}, _}) ->
+    #{
+        <<"device">> => <<"did-pkh@1.0">>,
+        <<"owner">> => Owner,
+        <<"type">> => ar_tx:serialize_sig_type(KeyType),
+        <<"priv">> => #{ <<"wallet">> => Wallet }
+    }.
+
+%% @doc Return the URI of the committer of a wallet.
+uri(Wallet, Opts) ->
+    ToURI = #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
+    {ok, URI} = hb_ao:raw(wallet_committer(Wallet), ToURI, Opts),
+    URI.
+
 %% @doc Find all known IDs and their sub-options from the `priv_ids' map. Allows
 %% the identities to be named, or based on addresses. The results are normalized
 %% such that the map returned by this function contains both mechanisms for 
@@ -852,9 +881,7 @@ identities(Default, Opts) ->
         maps:from_list(lists:filtermap(
             fun({_Name, SubOpts}) ->
                 case maps:find(<<"priv-wallet">>, SubOpts) of
-                    {ok, Wallet} ->
-                        Addr = hb_util:human_id(ar_wallet:to_address(Wallet)),
-                        {true, {Addr, SubOpts}};
+                    {ok, Wallet} -> {true, {uri(Wallet, Opts), SubOpts}};
                     error -> false
                 end
             end,
@@ -876,7 +903,7 @@ identities(Default, Opts) ->
     ?event({identities_without_default, Identities}),
     % Add a default identity if one is not already present.
     DefaultWallet = ?MODULE:get(priv_wallet, Default, Opts),
-    case maps:find(DefaultID = hb_util:human_id(DefaultWallet), Identities) of
+    case maps:find(DefaultID = uri(DefaultWallet, Opts), Identities) of
         {ok, _} -> Identities;
         error ->
             Identities#{
@@ -1123,7 +1150,7 @@ as_identity_test() ->
     DefaultWallet = ar_wallet:new(),
     TestWallet1 = ar_wallet:new(),
     TestWallet2 = ar_wallet:new(),
-    TestID2 = hb_util:human_id(TestWallet2),
+    TestID2 = hb_test_utils:committer(TestWallet2),
     Opts = #{
         <<"test-key">> => 0,
         <<"priv-wallet">> => DefaultWallet,
@@ -1152,7 +1179,7 @@ as_identity_test() ->
     ),
     ?assertMatch(
         {ok, #{ <<"priv-wallet">> := DefaultWallet, <<"test-key">> := 0 }},
-        as(hb_util:human_id(DefaultWallet), Opts)
+        as(hb_test_utils:committer(DefaultWallet), Opts)
     ),
     ?assertMatch(
         {ok, #{ <<"priv-wallet">> := TestWallet1, <<"test-key">> := 1 }},
@@ -1160,7 +1187,7 @@ as_identity_test() ->
     ),
     ?assertMatch(
         {ok, #{ <<"priv-wallet">> := TestWallet1, <<"test-key">> := 1 }},
-        as(hb_util:human_id(TestWallet1), Opts)
+        as(hb_test_utils:committer(TestWallet1), Opts)
     ),
     ?assertMatch(
         {ok, #{ <<"priv-wallet">> := TestWallet2, <<"test-key">> := 2 }},

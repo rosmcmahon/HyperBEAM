@@ -62,7 +62,7 @@ csr(_Base, Request, Opts) ->
             fun(Domain) -> is_binary(Domain) andalso byte_size(Domain) > 0 end,
             Domains
         ),
-        NodeOpts = hb_http_server:with_node_key(Opts),
+        NodeOpts = hb_http_server:with_node_committer(Opts),
         DER = hb_tls:csr(hb_opts:get(priv_wallet, no_viable_wallet, NodeOpts), Domains),
         {ok, #{
             <<"status">> => 200,

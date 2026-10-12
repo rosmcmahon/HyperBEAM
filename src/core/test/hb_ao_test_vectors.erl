@@ -437,7 +437,7 @@ load_device_test() ->
     Wallet = ar_wallet:new(),
     Opts = #{
         <<"trusted-device-signers">> =>
-            [hb:address(), hb_util:human_id(ar_wallet:to_address(Wallet))],
+            [hb:address(), hb_test_utils:committer(Wallet)],
         <<"store">> => Store = hb_test_utils:test_store(hb_store_fs),
         <<"priv-wallet">> => Wallet
     },
@@ -450,7 +450,7 @@ untrusted_load_device_test() ->
     TrustedWallet = ar_wallet:new(),
     Opts = #{
         <<"trusted-device-signers">> =>
-            [hb:address(), hb_util:human_id(ar_wallet:to_address(TrustedWallet))],
+            [hb:address(), hb_test_utils:committer(TrustedWallet)],
         <<"store">> => Store = hb_test_utils:test_store(hb_store_fs),
         <<"priv-wallet">> => UntrustedWallet
     },

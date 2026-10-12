@@ -74,9 +74,9 @@ spawn_register(Name, Opts) ->
                 ),
             ?event(node_process, {initialized, {name, Name}, {assignment, Assignment}}),
             RegisterOpts =
-                case hb_opts:address(Opts) of
+                case hb_opts:committer(Opts) of
                     undefined -> Opts;
-                    Address -> Opts#{ <<"operator">> => Address }
+                    Committer -> Opts#{ <<"operator">> => Committer }
                 end,
             RegResult =
                 hb_ao:resolve(
@@ -110,7 +110,7 @@ spawn_register(Name, Opts) ->
 
 %% @doc Augment the given process definition with the node's address.
 augment_definition(BaseDef, Opts) ->
-    Address = hb_opts:address(Opts),
+    Address = hb_util:committer_address(hb_opts:committer(Opts)),
     SchedulersFromBase =
         hb_util:binary_to_strings(
             hb_ao:get(<<"scheduler">>, BaseDef, <<>>, Opts)

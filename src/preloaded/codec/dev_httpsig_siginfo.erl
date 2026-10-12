@@ -4,7 +4,7 @@
 -export([commitments_to_siginfo/3, siginfo_to_commitments/3]).
 -export([committed_keys_to_siginfo/1, to_siginfo_keys/3, from_siginfo_keys/3]).
 -export([add_derived_specifiers/1, remove_derived_specifiers/1]).
--export([commitment_to_sig_name/1, derived_commitment_id/1]).
+-export([keyid_to_committer/1, derived_commitment_id/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -347,7 +347,7 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
         end,
     KeyID = maps:get(<<"keyid">>, Commitment4, <<>>),
     Commitment5 =
-        case dev_httpsig_keyid:keyid_to_committer(KeyID) of
+        case keyid_to_committer(KeyID) of
             undefined ->
                 Commitment4;
             Committer ->
@@ -513,29 +513,12 @@ commitment_to_alg(Commitment, _Opts) ->
     CommitmentDevice = maps:get(<<"commitment-device">>, Commitment),
     <<CommitmentDevice/binary, Type/binary>>.
 
-%% @doc Generate a signature name from a commitment. The commitment message is
-%% not expected to be complete: Only the `commitment-device`, and the
-%% `committer' or `keyid' keys are required.
-commitment_to_sig_name(Commitment) ->
-    BaseStr =
-        case maps:get(<<"committer">>, Commitment, undefined) of
-            undefined -> maps:get(<<"keyid">>, Commitment);
-            Committer ->
-                <<
-                    (hb_util:to_hex(binary:part(hb_util:native_id(Committer), 1, 8)))
-                        /binary
-                >>
-        end,
-    DeviceStr =
-        binary:replace(
-            maps:get(
-                <<"commitment-device">>,
-                Commitment
-            ),
-            <<"@">>,
-            <<"-">>
-        ),
-    <<DeviceStr/binary, ".", BaseStr/binary>>.
+%% @doc Convert a `keyid' to the committer of a commitment. The `keyid' is the
+%% URI of the committer that made the commitment. Unsigned commitments and
+%% commitments without a `keyid' have no committer, so we return `undefined'.
+keyid_to_committer(<<>>) -> undefined;
+keyid_to_committer(?UNSIGNED_COMMITTER) -> undefined;
+keyid_to_committer(KeyID) -> KeyID.
 
 %% @doc Normalize key parameters to ensure their names are correct for inclusion
 %% in the `signature-input' and associated keys.

@@ -186,7 +186,7 @@ setup_test_env() ->
     hb_store:reset(LocalStore),
     ?event(dev_cache, {setup_test_env, {store_reset}}),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     ?event(dev_cache, {setup_test_env, {address, Address}}),
     Node = hb_http_server:start_node(#{ 
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],

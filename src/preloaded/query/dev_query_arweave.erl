@@ -7,7 +7,8 @@
 %%% optional string `count'. Supported filters are `ids', `tags', `owners',
 %%% `recipients' and `block'. Tag names address message keys. Values within a
 %%% tag are ORed; separate tags and other filters are ANDed. Owners are
-%%% committers; indexed recipients use the commitment's `field-target'.
+%%% Arweave addresses, matched by their `did:pkh:' committers; indexed
+%%% recipients use the commitment's `field-target'.
 %%% Without these selecting filters,
 %%% queries enumerate confirmed base-layer TXs from block headers, optionally
 %%% within inclusive `block.min/max' heights. This excludes bundled data items
@@ -275,12 +276,12 @@ query(Msg, <<"owner">>, _Args, Opts) ->
                 [] -> {ok, null};
                 [CommID | _] ->
                     {ok, Commitment} = hb_maps:find(CommID, Commitments, Opts),
-                    {ok, Address} = hb_maps:find(<<"committer">>, Commitment, Opts),
-                    {ok, KeyID} = hb_maps:find(<<"keyid">>, Commitment, Opts),
-                    Key = hb_util:remove_scheme_prefix(KeyID),
+                    {ok, Committer} =
+                        hb_maps:find(<<"committer">>, Commitment, Opts),
                     {ok, #{
-                        <<"address">> => Address,
-                        <<"key">> => Key
+                        <<"address">> => hb_util:committer_address(Committer),
+                        <<"key">> =>
+                            hb_maps:get(<<"owner">>, Commitment, null, Opts)
                     }}
             end
     end;
@@ -1030,20 +1031,15 @@ index_connection(Predicates, Args, Opts) ->
             end}
     end.
 
-%% @doc The query's AND predicates, each with alternative values. Owners and
-%% recipients use `committer' and `field-target'. Explicit IDs, a height or bundle
+%% @doc The query's AND predicates, each with alternative values. Owners use
+%% `committer', and recipients `field-target'. Explicit IDs, a height or bundle
 %% filter are `unservable'. An empty predicate list selects block enumeration.
 index_predicates(Args, Opts) ->
     Get = fun(Filter) -> hb_maps:get(Filter, Args, null, Opts) end,
     Fields =
         [
-            {Pair, Get(Filter)}
-        ||
-            {Pair, Filter} <-
-                [
-                    {<<"committer">>, <<"owners">>},
-                    {<<"field-target">>, <<"recipients">>}
-                ]
+            {<<"committer">>, owner_committers(Get(<<"owners">>))},
+            {<<"field-target">>, Get(<<"recipients">>)}
         ],
     maybe
         true ?= Get(<<"ids">>) =/= [] orelse unservable,
@@ -1514,9 +1510,10 @@ match(<<"tags">>, Tags, Opts) ->
             )
     end;
 match(<<"owners">>, Owners, Opts) ->
-    {ok, matching_commitments(<<"committer">>, Owners, Opts)};
+    {ok, matching_commitments(<<"committer">>, owner_committers(Owners), Opts)};
 match(<<"owner">>, Owner, Opts) ->
-    Res =  matching_commitments(<<"committer">>, Owner, Opts),
+    Res =
+        matching_commitments(<<"committer">>, ?ARWEAVE_COMMITTER(Owner), Opts),
     ?event({match_owner, Owner, Res}),
     {ok, Res};
 match(<<"recipients">>, Recipients, Opts) ->
@@ -1628,6 +1625,11 @@ do_filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
         ),
     ?event({filtered_out_of_range, length(AnnotatedIDs) - length(Filtered)}),
     Filtered.
+
+%% @doc Convert the owners of a GraphQL query, which are Arweave addresses, to
+%% their `did:pkh:' committers.
+owner_committers(null) -> null;
+owner_committers(Owners) -> [?ARWEAVE_COMMITTER(Owner) || Owner <- Owners].
 
 %% @doc Return the IDs of the messages whose commitments carry a field:
 %% their committer, or their target.

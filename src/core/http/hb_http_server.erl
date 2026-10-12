@@ -76,7 +76,7 @@
 %%% the execution parameters of all downstream requests to be controlled.
 -module(hb_http_server).
 -export([start/0, start/1, start_application/0, allowed_methods/2, init/2]).
--export([set_opts/1, set_opts/2, get_opts/0, get_opts/1, with_node_key/1]).
+-export([set_opts/1, set_opts/2, get_opts/0, get_opts/1, with_node_committer/1]).
 -export([set_default_opts/1, set_proc_server_id/1]).
 -export([static/3, static/4]).
 -export([start_node/0, start_node/1]).
@@ -836,7 +836,7 @@ set_opts(Opts) ->
             ok;
         ServerRef ->
             % `Opts' from a request hold no key material: keep the node's.
-            ok = cowboy:set_env(ServerRef, node_msg, with_node_key(Opts))
+            ok = cowboy:set_env(ServerRef, node_msg, with_node_committer(Opts))
     end.
 set_opts(Request, Opts) ->
     PreparedRequest = hb_message:uncommitted(Request),
@@ -868,8 +868,9 @@ get_opts(NodeMsg) ->
     end.
 
 %% @doc Return `Opts' with the node message's key material if they hold no
-%% wallet, as request execution `Opts' do not.
-with_node_key(Opts) ->
+%% wallet, as request execution `Opts' do not. The node's committer is made
+%% from this key material.
+with_node_committer(Opts) ->
     case hb_opts:get(priv_wallet, undefined, Opts#{ <<"only">> => local }) of
         undefined ->
             maps:merge(Opts, maps:with(?NODE_KEY_OPTS, get_opts(Opts)));
@@ -910,6 +911,7 @@ set_default_opts(Opts) ->
         <<"store">> => Store,
         <<"priv-wallet">> => Wallet,
         <<"address">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
+        <<"committer">> => hb_opts:committer(#{ <<"priv-wallet">> => Wallet }),
         <<"force-signed">> => true
     }.
 
@@ -1814,8 +1816,8 @@ maybe_sign_hashpath_only_test() ->
             <<"force-signed">> => true,
             <<"priv-wallet">> => NewWallet
         },
-    OldSigner = hb_util:human_id(ar_wallet:to_address(OldWallet)),
-    NewSigner = hb_util:human_id(ar_wallet:to_address(NewWallet)),
+    OldSigner = hb_test_utils:committer(OldWallet),
+    NewSigner = hb_test_utils:committer(NewWallet),
     AlreadySigned =
         hb_hashpath:attach(
             hb_message:commit(
@@ -1858,7 +1860,7 @@ maybe_sign_unsigned_hashpath_test() ->
     Wallet = ar_wallet:new(),
     Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
     Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => Wallet },
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Result =
         hb_hashpath:attach(
             #{ <<"body">> => <<"test">>, <<"status">> => 200 },

@@ -29,6 +29,7 @@
 -export([all_atoms/0, binary_is_atom/1]).
 -export([lowercase_key/1]).
 -export([base58_encode/1, atom_to_dashed_binary/1]).
+-export([committer/1, committer_address/1]).
 -include("include/hb.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
@@ -298,6 +299,23 @@ human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
 human_id(Wallet = {_Priv, _Pub}) ->
     human_id(ar_wallet:to_address(Wallet)).
 
+%% @doc Convert a committer given by a node's configuration, a process
+%% definition or Lua code to its URI. An Arweave address has no URI scheme, so
+%% it becomes the URI of its `did:pkh:' committer. A URI or any other term is
+%% returned as it is.
+committer(Value) when is_binary(Value) ->
+    case hb_uri:scheme(Value) of
+        {ok, _Scheme, _Rest} -> Value;
+        _ -> ?ARWEAVE_COMMITTER(Value)
+    end;
+committer(Value) ->
+    Value.
+
+%% @doc Convert a committer to the form that Lua and AOS code read. The
+%% `did:pkh:' committer of an Arweave address becomes the address. Any other
+%% committer is returned as it is.
+committer_address(?ARWEAVE_COMMITTER(Address)) -> Address;
+committer_address(Committer) -> Committer.
 
 %% @doc Add `,' characters to a number every 3 digits to make it human readable.
 human_int(Float) when is_float(Float) ->

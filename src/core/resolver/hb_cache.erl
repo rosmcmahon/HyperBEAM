@@ -1362,7 +1362,7 @@ test_store_simple_signed_message(Store) ->
     Opts = #{ <<"store">> => Store },
     hb_store:reset(Store),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     Item = test_signed(<<"Simple signed data item">>, #{ <<"priv-wallet">> => Wallet }),
     ?event_debug({writing_test_message, Item}),
     %% Write the simple unsigned item

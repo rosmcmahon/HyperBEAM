@@ -458,9 +458,9 @@ trusted_signer_accepts(_Ref, _SpecID, _Signer, _Opts) ->
     false.
 
 trusted_signer_address(Signer, _Opts) when is_binary(Signer) ->
-    Signer;
+    hb_util:committer(Signer);
 trusted_signer_address(Signer, Opts) when is_map(Signer) ->
-    hb_maps:get(<<"address">>, Signer, undefined, Opts);
+    hb_util:committer(hb_maps:get(<<"address">>, Signer, undefined, Opts));
 trusted_signer_address(_Signer, _Opts) ->
     undefined.
 
@@ -468,7 +468,12 @@ trusted_signer_devices_test() ->
     Ref = <<"copycat@1.0">>,
     SpecID = <<"SPEC_ID">>,
     ?assertEqual(
-        [<<"plain">>, <<"unscoped">>, <<"by-ref">>, <<"by-spec">>],
+        [
+            ?ARWEAVE_COMMITTER(Address)
+        ||
+            Address <-
+                [<<"plain">>, <<"unscoped">>, <<"by-ref">>, <<"by-spec">>]
+        ],
         trusted_signers(
             Ref,
             SpecID,
@@ -485,6 +490,11 @@ trusted_signer_devices_test() ->
                 ]
             }
         )
+    ),
+    % With no signers configured, the committer of `hb:address()' is trusted.
+    ?assertEqual(
+        [?ARWEAVE_COMMITTER(hb:address())],
+        trusted_signers(Ref, SpecID, #{ <<"trusted-device-signers">> => [] })
     ).
 
 %% @doc Every `requires-*' key must match this machine's `system_info'.

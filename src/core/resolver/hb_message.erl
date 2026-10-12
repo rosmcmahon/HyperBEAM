@@ -62,7 +62,7 @@
 -export([with_only_committers/2, with_only_committers/3, commitment_devices/2]).
 -export([verify/1, verify/2, verify/3, deep_verify/2]).
 -export([paranoid_verify/2, paranoid_verify/3]).
--export([commit/2, commit/3, signers/2, type/1, minimize/1]).
+-export([commit/2, commit/3, with_committer/2, signers/2, type/1, minimize/1]).
 -export([normalize_commitments/2, normalize_commitments/3]).
 -export([is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
@@ -451,7 +451,7 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
 commit(Msg, GivenOpts, Spec) ->
-    Opts = hb_http_server:with_node_key(GivenOpts),
+    Opts = hb_http_server:with_node_committer(GivenOpts),
     % hb_ao:raw does not vary for us but ~message@1.0/commit|id expects a
     % ~structured@1.0 form, so we force an idempotent 'to' call to ensure it
     {ok, Structured} =
@@ -489,6 +489,17 @@ commit(Msg, GivenOpts, Spec) ->
         ),
     Signed.
 
+%% @doc Add a committer to a commitment request, if it does not have one. The
+%% committer is made from the `priv-wallet' in `Opts'. Requests for unsigned
+%% commitments are returned unchanged.
+with_committer(Spec = #{ <<"committer">> := _ }, _Opts) -> Spec;
+with_committer(Spec = #{ <<"type">> := <<"unsigned">> }, _Opts) -> Spec;
+with_committer(Spec, Opts) ->
+    case hb_opts:get(priv_wallet, no_viable_wallet, Opts) of
+        no_viable_wallet -> Spec;
+        Wallet -> Spec#{ <<"committer">> => hb_opts:wallet_committer(Wallet) }
+    end.
+
 %% @doc Return the list of committed keys from a message.
 committed(Msg, all, Opts) ->
     committed(Msg, #{ <<"committers">> => <<"all">> }, Opts);
@@ -525,17 +536,7 @@ verify(Msg, none, Opts) ->
 verify(Msg, signers, Opts) ->
     verify(Msg, #{ <<"committers">> => <<"all">> }, Opts);
 verify(Msg, Committers, Opts) when not is_map(Committers) ->
-    verify(
-        Msg,
-        #{
-            <<"committers">> =>
-                case ?IS_ID(Committers) of
-                    true -> [Committers];
-                    false -> Committers
-                end
-        },
-        Opts
-    );
+    verify(Msg, #{ <<"committers">> => Committers }, Opts);
 verify(Msg, Spec, Opts) ->
     ?event(verify, {verify, {spec, Spec}}),
     {ok, Res} =

@@ -753,14 +753,22 @@ apply_security(authority, Msg, TargetProcess, Codec, Opts) ->
     	Authorities when is_list(Authorities) ->
             % The `authority` key has already been parsed into a list of
             % committers. Sign with all local valid keys.
-            commit_result(Msg, Authorities, Codec, Opts);
+            commit_result(
+                Msg,
+                lists:map(fun hb_util:committer/1, Authorities),
+                Codec,
+                Opts
+            );
         Authority ->
             % Parse the authority string into a list of committers. Sign with
             % all local valid keys.
             ?event(push, {found_authority, {authority, Authority}}, Opts),
             commit_result(
                 Msg,
-                hb_util:binary_to_strings(Authority),
+                lists:map(
+                    fun hb_util:committer/1,
+                    hb_util:binary_to_strings(Authority)
+                ),
                 Codec,
                 Opts
             )
@@ -769,7 +777,7 @@ apply_security(default, Msg, TargetProcess, Codec, Opts) ->
     ?event(push, {default_policy, {target, TargetProcess}}, Opts),
     commit_result(
         Msg,
-        [hb_opts:address(Opts)],
+        [hb_opts:committer(Opts)],
         Codec,
         Opts
     ).
@@ -1050,11 +1058,13 @@ test_push_as_identity() ->
         hb_cache:read_all_commitments(Assignment, Opts),
         Opts
     ),
-    ?assert(lists:member(SchedulingID, Committers)),
-    ?assert(lists:member(ComputeID, Committers)),
+    ?assert(
+        lists:member(hb_test_utils:committer(SchedulingWallet), Committers)
+    ),
+    ?assert(lists:member(hb_test_utils:committer(ComputeWallet), Committers)),
     % Validate that the compute wallet was used to sign the message.
     ?assertEqual(
-        [ComputeID],
+        [hb_test_utils:committer(ComputeWallet)],
         hb_ao:get(<<"schedule/assignments/2/body/committers">>, Base, Opts)
     ).
 

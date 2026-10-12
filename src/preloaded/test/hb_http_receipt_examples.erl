@@ -514,7 +514,10 @@ no_receipt(Ref) ->
 %% @doc Both hook bodies are committed by the requesting client, not the peer.
 check_signed(Receipt, Reference, Opts) ->
     ?assert(hb_message:verify(Receipt, all, Opts)),
-    ?assertEqual([address(Opts)], hb_message:signers(Receipt, Opts)),
+    ?assertEqual(
+        [hb_test_utils:committer(maps:get(<<"priv-wallet">>, Opts))],
+        hb_message:signers(Receipt, Opts)
+    ),
     ?assertEqual(Reference, hb_maps:get(<<"reference">>, Receipt, Opts)),
     ?assertEqual(<<"POST">>, hb_maps:get(<<"method">>, Receipt, Opts)).
 

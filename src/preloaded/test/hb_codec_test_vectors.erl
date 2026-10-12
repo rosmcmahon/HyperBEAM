@@ -1130,8 +1130,8 @@ deep_multisignature_test() ->
     ?assert(hb_message:verify(MsgSignedTwice, all, Opts)),
     Committers = hb_message:signers(MsgSignedTwice, Opts),
     ?event({committers, Committers}),
-    ?assert(lists:member(hb_util:human_id(ar_wallet:to_address(Wallet1)), Committers)),
-    ?assert(lists:member(hb_util:human_id(ar_wallet:to_address(Wallet2)), Committers)).
+    ?assert(lists:member(hb_test_utils:committer(Wallet1), Committers)),
+    ?assert(lists:member(hb_test_utils:committer(Wallet2), Committers)).
 
 deep_typed_message_id_test(Codec, Opts) ->
     Msg = #{

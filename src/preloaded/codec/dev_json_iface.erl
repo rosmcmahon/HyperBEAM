@@ -109,7 +109,7 @@ denormalize_message(Message, Opts) ->
             [PrimarySigner|_] ->
                 {ok, _, Commitment} = hb_message:commitment(PrimarySigner, Message, Opts),
                 Message#{
-                    <<"owner">> => hb_util:human_id(PrimarySigner),
+                    <<"owner">> => hb_util:committer_address(PrimarySigner),
                     <<"signature">> =>
                         hb_ao:get(<<"signature">>, Commitment, <<>>, Opts)
                 }
@@ -138,15 +138,13 @@ message_to_json_struct(RawMsg, Features, Opts) ->
                     hb_message:commitment(Signer, RawMsg, Opts),
                 CommitmentSignature =
                     hb_ao:get(<<"signature">>, Commitment, <<>>, Opts),
-                CommitmentKeyId = hb_util:remove_scheme_prefix(
-                    hb_ao:get(<<"keyid">>, Commitment, <<>>, Opts)
-                ),
+                CommitmentKey = hb_ao:get(<<"owner">>, Commitment, <<>>, Opts),
                 case lists:member(owner_as_address, Features) of
                     true -> 
                         {
-                            hb_util:native_id(Signer),
+                            hb_util:committer_address(Signer),
                             CommitmentSignature,
-                            CommitmentKeyId
+                            CommitmentKey
                         };
                     false ->
                         CommitmentOwner =
@@ -158,7 +156,7 @@ message_to_json_struct(RawMsg, Features, Opts) ->
                                 no_signing_public_key_found_in_commitment,
                                 Opts
                             ),
-                        {CommitmentOwner, CommitmentSignature, CommitmentKeyId}
+                        {CommitmentOwner, CommitmentSignature, CommitmentKey}
                 end
         end,
     Last =
@@ -192,7 +190,7 @@ message_to_json_struct(RawMsg, Features, Opts) ->
         hb_ao:get(
             <<"from-process">>,
             {as, <<"message@1.0">>, MsgWithoutCommitments},
-            hb_util:encode(Owner),
+            Owner,
             Opts
         ),
     #{
@@ -200,7 +198,7 @@ message_to_json_struct(RawMsg, Features, Opts) ->
         % NOTE: In Arweave TXs, these are called "last_tx"
         <<"Anchor">> => Last,
         % NOTE: When sent to ao "Owner" is the wallet address
-        <<"Owner">> => hb_util:encode(Owner),
+        <<"Owner">> => Owner,
         <<"From">> => case ?IS_ID(From) of true -> safe_to_id(From); false -> From end,
         <<"Tags">> => prepare_tags(TABM, Opts),
         <<"Target">> => safe_to_id(Target),

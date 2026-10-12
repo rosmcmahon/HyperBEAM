@@ -207,9 +207,8 @@ rsa_wallet_not_match_message_ed25519_type_test() ->
     Opts = #{<<"priv-wallet">> => ar_wallet:new(?RSA_KEY_TYPE)},
     SignatureType = ?EDDSA_SIGN_TYPE,
     Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?EDDSA_SIGN_TYPE},
-                 {wallet_type, {rsa,65537}}},
+    ?assertThrow(
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             Msg,
             Opts,
@@ -220,9 +219,8 @@ ed25519_wallet_not_match_message_rsa_type_test() ->
     Opts = #{<<"priv-wallet">> => ar_wallet:new(?EDDSA_KEY_TYPE)},
     SignatureType = ?RSA_SIGN_TYPE,
     Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?RSA_SIGN_TYPE},
-                 {wallet_type, {eddsa,ed25519}}},
+    ?assertThrow(
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             Msg,
             Opts,
@@ -233,9 +231,8 @@ ethereum_wallet_not_match_message_rsa_type_test() ->
     Opts = #{<<"priv-wallet">> => ar_wallet:new(?ETHEREUM_KEY_TYPE)},
     SignatureType = ?RSA_SIGN_TYPE,
     Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?RSA_SIGN_TYPE},
-                 {wallet_type, ethereum}},
+    ?assertThrow(
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             Msg,
             Opts,

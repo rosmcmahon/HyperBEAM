@@ -308,7 +308,9 @@ commit(Self, Req, Opts) ->
             AttDev,
             <<"commit">>,
             Loaded,
-            Req#{ <<"type">> => maps:get(<<"type">>, Req, <<"signed">>) },
+            (hb_message:with_committer(Req, Opts))#{
+                <<"type">> => maps:get(<<"type">>, Req, <<"signed">>)
+            },
             CommitOpts
         ),
     {ok, Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) }}.
@@ -1333,7 +1335,7 @@ commitment_spec(?ETHEREUM_KEY_TYPE) ->
 test_unsupported_key(KeyType) ->
     Wallet = ar_wallet:new(KeyType),
     ?assertThrow(
-        {cannot_commit, 'unsupported-key-type', _},
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             #{ <<"a">> => <<"b">> },
             #{ <<"priv-wallet">> => Wallet }

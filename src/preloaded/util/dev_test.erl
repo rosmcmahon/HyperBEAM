@@ -541,7 +541,7 @@ vary_loaded_link_preserves_commitments_test_() ->
 %% @doc Check signed identity before and after varying and caching an input.
 vary_loaded_link_preserves_commitments(Which, Mode, Function) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = (vary_opts())#{ <<"priv-wallet">> => Wallet },
     Signed = hb_message:commit(
         #{
@@ -595,7 +595,7 @@ vary_child_commitments_test_() ->
 %% @doc Check each signed cache entry as well as the varied parent and child.
 vary_child_commitments(Required, Slot, Mode, {KeepChild, KeepParent}) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = (vary_opts())#{ <<"priv-wallet">> => Wallet },
     Child = hb_message:commit(#{ <<"slot">> => Slot }, Opts, <<"httpsig@1.0">>),
     ChildID = hb_message:id(Child, [Signer], Opts),
@@ -670,7 +670,7 @@ vary_coercion_preserves_original_signed_cache_entry_test_() ->
 %% @doc Exercise coercion of both in-memory and linked signed values.
 vary_coercion_preserves_original_signed_cache_entry(Which, Mode) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = (vary_opts())#{ <<"priv-wallet">> => Wallet },
     Signed = hb_message:commit(
         #{
