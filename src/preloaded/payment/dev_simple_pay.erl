@@ -22,7 +22,7 @@
 %%% This device acts as both a pricing device and a ledger device, by p4's
 %%% definition.
 -module(dev_simple_pay).
--device_libraries([lib_volatile_ledger]).
+-device_libraries([lib_volatile_ledger, lib_meta]).
 -export([estimate/3, charge/3, balance/3, topup/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -269,7 +269,8 @@ get_balance(Signer, NodeMsg) ->
         NodeMsg
     ).
 
-%% @doc Top up the user's balance in the ledger.
+%% @doc Top up the user's balance in the ledger. We read the `amount' and the
+%% `recipient' only from the keys that the operator signed.
 -spec topup(
     #{ _ => _ },
     #{ amount => integer(), recipient => binary(), _ => _ },
@@ -277,11 +278,12 @@ get_balance(Signer, NodeMsg) ->
 ) -> {ok, integer()} | {error, binary()}.
 topup(_, Req, NodeMsg) ->
     ?event({topup, {req, Req}, {node_msg, NodeMsg}}),
-    case is_operator(Req, NodeMsg) of
-        false -> {error, <<"Unauthorized">>};
-        true ->
-            Amount = hb_ao:get(<<"amount">>, Req, 0, NodeMsg),
-            Recipient = hb_ao:get(<<"recipient">>, Req, undefined, NodeMsg),
+    Operator = hb_opts:get(operator, undefined, NodeMsg),
+    case lib_meta:authorized(Operator, Req, NodeMsg) of
+        {error, _} -> {error, <<"Unauthorized">>};
+        {ok, Signed} ->
+            Amount = hb_ao:get(<<"amount">>, Signed, 0, NodeMsg),
+            Recipient = hb_ao:get(<<"recipient">>, Signed, undefined, NodeMsg),
             NewBalance = debit(Recipient, -Amount, NodeMsg),
             ?event(payment,
                 {topup,
@@ -399,6 +401,19 @@ get_balance_and_top_up_test() ->
             Opts
         ),
     ?assertEqual(180, Res2),
+    % A query parameter does not change the amount that the operator signed.
+    ?assertEqual(
+        {ok, 280},
+        hb_http:post(
+            Node,
+            <<"/~simple-pay@1.0/topup?amount+integer=1">>,
+            hb_message:commit(
+                #{ <<"amount">> => 100, <<"recipient">> => ClientAddress },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
     % A client's direct charge is refused, whatever request it carries.
     ?assertMatch(
         {error, #{ <<"status">> := 403 }},
