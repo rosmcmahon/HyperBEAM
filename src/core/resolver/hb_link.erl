@@ -73,9 +73,10 @@ normalize_value(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
     <<"ao:", ID/binary>>;
 normalize_value(Key, {link, Path, LinkOpts = #{ <<"lazy">> := true }},
         Mode, Opts) when not is_map_key(<<"type">>, LinkOpts) ->
-    % The value is not loaded yet. It is read as it is stored: a link that it
-    % holds stays a link.
-    {ok, Value} = hb_cache:read(Path, hb_util:deep_merge(Opts, LinkOpts, Opts)),
+    % The value is not loaded yet. We read it as it is stored, as we do for
+    % the values in a commitment, so that a link in it stays a link.
+    ReadOpts = hb_util:deep_merge(Opts, LinkOpts, Opts),
+    {ok, Value} = hb_cache:read(Path, ReadOpts#{ <<"commitment">> => true }),
     normalize_value(Key, Value, Mode, Opts);
 normalize_value(Key, V = {link, _Path, #{ <<"lazy">> := true }}, Mode, Opts) ->
     % The value is a lazy link with a type. We load it, which decodes it to

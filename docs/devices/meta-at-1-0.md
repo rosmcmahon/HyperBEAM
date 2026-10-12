@@ -46,7 +46,7 @@ The [`dev_meta.erl`](../resources/source-code/dev_meta.md) module also contains 
 *   `is_operator(<RequestMsg>, <NodeMsg>) -> boolean()`: Checks if the signer of `RequestMsg` matches the configured `operator` in `NodeMsg`.
 *   `lib_meta:is_authorized(Type, Role, Msg, Opts)`: Verifies the role's signatures, requires their committed `type` to equal `Type`, and returns `{ok, OnlySignedKeysByRole}` or `{error, not_authorized}`. HTTP authorization uses the original singleton before path parsing. Authorization failures return HTTP 403, with a friendly page for browser requests.
 
-Cache mutations require the `operator` role and signed types `cache-write`, `cache-link`, or `cache-group`. Their body, source, destination, and group parameters must be signed. Batch writes use `write-type: batch`. The remote-node store signs these types automatically.
+Cache writes require the `operator` role and the signed type `cache-write`. Their body must be signed. Batch writes use `write-type: batch`.
 
 ## Pre/Post-Processing Hooks
 

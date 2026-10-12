@@ -713,15 +713,8 @@ store_wallet(non_volatile, KeyID, Details, Opts) ->
     % Find the private store of the node.
     PrivOpts = priv_store_opts(Opts),
     {ok, Msg} = hb_cache:write(#{ KeyID => Details }, PrivOpts),
-    PrivStore = hb_opts:get(priv_store, undefined, PrivOpts),
     % Link the wallet to the store.
-    ok =
-        hb_store:link(
-            PrivStore,
-            #{ <<"wallet@1.0/", KeyID/binary>> => Msg },
-            PrivOpts
-        ),
-    ok.
+    ok = hb_cache:link(Msg, <<"wallet@1.0/", KeyID/binary>>, PrivOpts).
 
 %% @doc Find the wallet by name or address in the node's options.
 find_wallet(KeyID, Opts) ->
@@ -740,16 +733,10 @@ find_wallet(in_memory, KeyID, Opts) ->
     end;
 find_wallet(non_volatile, KeyID, Opts) ->
     PrivOpts = priv_store_opts(Opts),
-    Store = hb_opts:get(priv_store, undefined, PrivOpts),
-    case hb_store:resolve(Store, <<"wallet@1.0/", KeyID/binary>>, PrivOpts) of
-        {ok, Resolved} ->
-            case hb_cache:read(Resolved, PrivOpts) of
-                {ok, Wallet} ->
-                    WalletDetails = hb_maps:get(KeyID, Wallet, not_found, PrivOpts),
-                    hb_cache:ensure_all_loaded(WalletDetails, PrivOpts);
-                _ ->
-                    not_found
-            end;
+    case hb_cache:read(<<"wallet@1.0/", KeyID/binary>>, PrivOpts) of
+        {ok, Wallet} ->
+            WalletDetails = hb_maps:get(KeyID, Wallet, not_found, PrivOpts),
+            hb_cache:ensure_all_loaded(WalletDetails, PrivOpts);
         _ ->
             not_found
     end.
@@ -766,7 +753,9 @@ list_wallets(non_volatile, Opts) ->
 %% @doc Generate a new `Opts' message with the `priv_store' as the only `store'
 %% option.
 priv_store_opts(Opts) ->
-    hb_private:opts(Opts).
+    (hb_private:opts(Opts))#{
+        <<"store">> => hb_opts:get(priv_store, [], Opts)
+    }.
 
 %% @doc Convert an export response into a list of wallet details. This is
 %% necessary because if a received result over HTTP is a list with a 
@@ -863,7 +852,15 @@ non_volatile_persist_generate_and_verify_test() ->
         <<"/~secret@1.0/generate?persist=non-volatile">>,
         undefined,
         #{}
-    ).
+    ),
+    % A hosted wallet is written to and read from the private store only.
+    Public = #{ <<"store-module">> => hb_store_fs, <<"name">> => <<"pub">> },
+    Private = #{ <<"store-module">> => hb_store_fs, <<"name">> => <<"priv">> },
+    Opts =
+        priv_store_opts(
+            #{ <<"store">> => [Public], <<"priv-store">> => [Private] }
+        ),
+    ?assertEqual([Private], hb_opts:get(store, [], Opts)).
 
 import_wallet_with_key_test() ->
     Node = hb_http_server:start_node(#{

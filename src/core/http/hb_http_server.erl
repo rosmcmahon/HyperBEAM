@@ -2094,7 +2094,7 @@ client_error_pages_test() ->
             ?assertEqual(nomatch, binary:match(Body, <<"not_authorized">>))
         end,
         [
-            {<<"/~cache@1.0/group">>, 403, <<"Access denied.">>},
+            {<<"/~cache@1.0/write">>, 403, <<"Access denied.">>},
             {<<"/~cache@1.0/read?read=missing">>, 404, <<"Page cannot be found.">>}
         ]
     ).

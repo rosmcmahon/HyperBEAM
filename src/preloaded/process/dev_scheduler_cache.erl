@@ -25,7 +25,6 @@ opts(Opts) ->
 write(ProcID, RawAssignment, RawOpts) ->
     Assignment = hb_cache:ensure_all_loaded(RawAssignment, RawOpts),
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
     % Write the message into the main cache
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
     ?event(
@@ -37,18 +36,15 @@ write(ProcID, RawAssignment, RawOpts) ->
     ),
     case hb_cache:write(Assignment, Opts) of
         {ok, _UnsignedID} ->
-            % Create symlinks from the message on the process and the 
-            % slot on the process to the underlying data.
-            ok = hb_store:link(
-                Store,
-                #{
-                    hb_path:to_binary([
-                        ?SCHEDULER_CACHE_PREFIX,
-                        <<"assignments">>,
-                        hb_util:human_id(ProcID),
-                        hb_ao:normalize_key(Slot)
-                    ]) => hb_message:id(Assignment, signed, Opts)
-                },
+            % Link the slot on the process to the signed message.
+            ok = hb_cache:link(
+                hb_message:id(Assignment, signed, Opts),
+                hb_path:to_binary([
+                    ?SCHEDULER_CACHE_PREFIX,
+                    <<"assignments">>,
+                    hb_util:human_id(ProcID),
+                    hb_ao:normalize_key(Slot)
+                ]),
                 Opts
             ),
             ok;
@@ -87,30 +83,23 @@ read(ProcID, Slot, RawOpts) ->
             {store, Store}
         }
     ),
-    case hb_store:resolve(Store, P1, Opts) of
-        {ok, ResolvedPath} ->
-            ?event({resolved_path, {p1, P1}, {p2, ResolvedPath}, {resolved, ResolvedPath}}),
-            case hb_cache:read(ResolvedPath, Opts) of
-                {ok, RawAssignment} ->
-                    % `hb_cache:read' no longer normalizes commitments; the
-                    % scheduler relies on each assignment carrying its unsigned
-                    % commitment ID, so we restore it here.
-                    Assignment =
-                        hb_message:normalize_commitments(RawAssignment, Opts),
-                    % If the slot key is not present, the format of the assignment is
-                    % AOS2, so we need to convert it to the canonical format.
-                    case hb_ao:get(<<"variant">>, Assignment, Opts) of
-                        <<"ao.TN.1">> ->
-                            Loaded = hb_cache:ensure_all_loaded(Assignment, Opts),
-                            Norm = lib_scheduler_formats:aos2_to_assignment(Loaded, Opts),
-                            ?event({normalized_aos2_assignment, Norm}),
-                            {ok, Norm};
-                        <<"ao.N.1">> ->
-                            {ok, hb_cache:ensure_all_loaded(Assignment, Opts)}
-                    end;
-                {error, not_found} ->
-                    ?event(debug_sched, {read_assignment, {res, not_found}}),
-                    not_found
+    case hb_cache:read(P1, Opts) of
+        {ok, RawAssignment} ->
+            % The scheduler relies on each assignment carrying its unsigned
+            % commitment ID, which `hb_cache:read' does not add.
+            Assignment =
+                hb_message:normalize_commitments(RawAssignment, Opts),
+            % If the slot key is not present, the format of the assignment is
+            % AOS2, so we need to convert it to the canonical format.
+            case hb_ao:get(<<"variant">>, Assignment, Opts) of
+                <<"ao.TN.1">> ->
+                    Loaded = hb_cache:ensure_all_loaded(Assignment, Opts),
+                    Norm =
+                        lib_scheduler_formats:aos2_to_assignment(Loaded, Opts),
+                    ?event({normalized_aos2_assignment, Norm}),
+                    {ok, Norm};
+                <<"ao.N.1">> ->
+                    {ok, hb_cache:ensure_all_loaded(Assignment, Opts)}
             end;
         {error, not_found} ->
             ?event(debug_sched, {read_assignment, {res, not_found}}),

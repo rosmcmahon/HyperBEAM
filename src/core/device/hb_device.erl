@@ -267,24 +267,32 @@ is_direct_key_access(Base, Req, Opts, MaybeStore) when ?IS_ID(Base) ->
         if MaybeStore =:= unknown -> hb_opts:get(store, no_viable_store, Opts);
         true -> MaybeStore
         end,
-    DevPath =
-        hb_util:ok_or(
-            hb_store:resolve(Store, [Base, <<"device">>], Opts),
-            [Base, <<"device">>]
-        ),
-    case hb_store:read(Store, DevPath, Opts) of
+    ReadOpts = Opts#{ <<"store">> => Store },
+    case hb_cache:read(<<Base/binary, "/device">>, ReadOpts) of
         {ok, Dev} ->
             do_is_direct_key_access(Dev, Req, Opts);
-        {error, not_found} ->
-            fallback_direct_key_access(Store, Base, Req, Opts)
+        _ ->
+            fallback_direct_key_access(Base, Req, ReadOpts)
     end;
 is_direct_key_access(Base, Req, Opts, _) when is_map(Base) ->
     do_is_direct_key_access(hb_maps:find(<<"device">>, Base, Opts), Req, Opts).
 
-fallback_direct_key_access(Store, Base, Req, Opts) ->
-    case hb_store:type(Store, Base, Opts) of
-        {error, not_found} -> unknown;
-        {ok, _} -> do_is_direct_key_access(<<"message@1.0">>, Req, Opts)
+%% @doc Determine whether a key can be read directly from a message that has no
+%% `device' key in the stores. Such a message is read by `message@1.0', and an
+%% ID that the stores do not hold is `unknown'. We first list one key under
+%% the ID in the local stores. If there is none, we list the ID with
+%% `hb_cache:list/2', which also follows a signed ID to its message.
+fallback_direct_key_access(Base, Req, Opts) ->
+    Local = hb_store:scope(hb_opts:get(store, no_viable_store, Opts), local),
+    OneKey = #{ <<"list">> => Base, <<"limit">> => 1 },
+    Listed =
+        case hb_store:list(Local, OneKey, Opts) of
+            {ok, [_ | _]} -> true;
+            _ -> hb_cache:list(Base, Opts) =/= []
+        end,
+    case Listed of
+        false -> unknown;
+        true -> do_is_direct_key_access(<<"message@1.0">>, Req, Opts)
     end.
 
 do_is_direct_key_access(DevRes, #{ <<"path">> := Key }, Opts) ->

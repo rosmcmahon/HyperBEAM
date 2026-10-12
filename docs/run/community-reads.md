@@ -8,8 +8,7 @@ the first verified result.
 ```erlang
 Peer = #{
     <<"store-module">> => hb_store_remote_node,
-    <<"node">> => PeerURL,
-    <<"read-only">> => true
+    <<"node">> => PeerURL
 },
 Backstops = #{
     <<"store-module">> => hb_store_multi,

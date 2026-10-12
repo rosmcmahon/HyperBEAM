@@ -44,7 +44,6 @@ read(Address, RawOpts) ->
 %% @doc Write the latest known scheduler location for an address.
 write(LocationMsg, RawOpts) ->
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
     Signers = hb_message:signers(LocationMsg, Opts),
     ?event(
         scheduler_location,
@@ -57,14 +56,12 @@ write(LocationMsg, RawOpts) ->
         {ok, RootPath} ->
             lists:foreach(
                 fun(Signer) ->
-                    ok = hb_store:link(
-                        Store,
-                        #{
-                            hb_path:to_binary([
-                                ?LOCATION_CACHE_PREFIX,
-                                Signer
-                            ]) => RootPath
-                        },
+                    ok = hb_cache:link(
+                        RootPath,
+                        hb_path:to_binary([
+                            ?LOCATION_CACHE_PREFIX,
+                            Signer
+                        ]),
                         Opts
                     )
                 end,

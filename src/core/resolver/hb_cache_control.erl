@@ -100,8 +100,11 @@ perform_cache_write(Base, Req, Res, Opts) when is_map(Res); is_binary(Res) ->
                 true -> hb_message:id(Res, all, Opts);
                 false -> Path
             end,
-            hb_store:link(hb_opts:get(attested_store, [], Opts),
-                #{ <<BaseID/binary, "/", ReqID/binary>> => ResultID }, Opts);
+            hb_cache:link(
+                ResultID,
+                <<BaseID/binary, "/", ReqID/binary>>,
+                Opts#{ <<"store">> => hb_opts:get(attested_store, [], Opts) }
+            );
         false ->
             ?event(caching, {skip_caching, uncacheable_computation}),
             skip_caching
@@ -566,13 +569,12 @@ varied_input_identity(Type, Which, Depth, Opts) ->
         BaseID = hb_message:id(VB, all, Opts),
         ReqID = hb_message:id(VQ, all, Opts),
         Path = <<BaseID/binary, "/", ReqID/binary>>,
-        Link = hb_store:resolve(maps:get(<<"attested-store">>, Opts), Path, Opts),
+        Link = hb_store:read(maps:get(<<"attested-store">>, Opts), Path, Opts),
         case Signed of
             true ->
-                ?assert(Link == {ok, Path} orelse Link == {error, not_found});
+                ?assertEqual({error, not_found}, Link);
             false ->
-                {ok, Target} = Link,
-                ?assertNotEqual(Path, Target),
+                {ok, <<"ao:", Target/binary>>} = Link,
                 lists:foreach(fun({ID, Expected}) ->
                     {ok, Stored} = hb_cache:read(ID, Opts),
                     ?assertEqual(cache_content(Expected, Opts), cache_content(Stored, Opts))
@@ -709,8 +711,9 @@ projected_signed_input_test() ->
     ?assertEqual(7, hb_maps:get(<<"required">>, VB, Opts)),
     BaseID = hb_message:id(VB, all, Opts),
     ReqID = hb_message:id(VQ, all, Opts),
-    {ok, ID} = hb_store:resolve(maps:get(<<"attested-store">>, Opts),
-        <<BaseID/binary, "/", ReqID/binary>>, Opts),
+    {ok, <<"ao:", ID/binary>>} =
+        hb_store:read(maps:get(<<"attested-store">>, Opts),
+            <<BaseID/binary, "/", ReqID/binary>>, Opts),
     ?assertEqual(hb_message:id(maps:get(<<"varied-result">>, Ctx), all, Opts), ID),
     ?assert(hb_hashpath:verify_all(hb_hashpath:format(Ctx, Opts), Opts)).
 

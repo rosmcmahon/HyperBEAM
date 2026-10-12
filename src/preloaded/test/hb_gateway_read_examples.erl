@@ -16,9 +16,8 @@ verified_read() ->
         {ok, ID} = hb_cache:write(Message, PeerOpts),
         {ok, Result} = hb_store:read(Remote, ID, ReaderOpts),
         ?assertEqual(Message, hb_message:uncommitted(Result)),
-        ?assertEqual({ok, simple}, hb_store:type(Remote, ID, ReaderOpts)),
         Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
-        ok = hb_store:link(#{ Missing => ID }, PeerOpts),
+        ok = hb_cache:link(ID, Missing, PeerOpts),
         ?assertEqual(
             {error, not_found}, hb_store:read(Remote, Missing, ReaderOpts)
         ),
@@ -101,7 +100,7 @@ backstops(Mode) ->
     try
         {ok, ID} = hb_cache:write(#{ <<"body">> => <<"correct">> }, GoodOpts),
         {ok, WrongID} = hb_cache:write(#{ <<"body">> => <<"wrong">> }, BadOpts),
-        ok = hb_store:link(#{ ID => WrongID }, BadOpts),
+        ok = hb_cache:link(WrongID, ID, BadOpts),
         Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
         ?assertEqual(
             {error, not_found}, hb_store:read(Store, Missing, ReaderOpts)
@@ -124,8 +123,7 @@ backstops(Mode) ->
 remote(Peer) ->
     #{
         <<"store-module">> => hb_store_remote_node,
-        <<"node">> => Peer,
-        <<"read-only">> => true
+        <<"node">> => Peer
     }.
 
 %% @doc Start an independent HTTP node and retain its options for cleanup.

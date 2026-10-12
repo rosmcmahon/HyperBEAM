@@ -429,7 +429,7 @@ has_commitment(Response, ID, Opts) ->
 install_bad(wrong_id, _Signed, ID, Opts) ->
     Wrong = hb_message:commit(#{ <<"body">> => <<"different content">> }, Opts),
     {ok, _} = hb_cache:write(Wrong, Opts),
-    ok = hb_store:link(#{ ID => hb_message:id(Wrong, all, Opts) }, Opts);
+    ok = hb_cache:link(hb_message:id(Wrong, all, Opts), ID, Opts);
 install_bad(_Kind, Signed, _ID, Opts) ->
     {ok, _} = hb_cache:write(Signed, Opts).
 

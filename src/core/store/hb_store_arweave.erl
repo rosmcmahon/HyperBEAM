@@ -5,9 +5,9 @@
 %%% before it has indexed the weave itself.
 -module(hb_store_arweave).
 %%% Store API:
--export([scope/0, scope/1, type/3, read/3, start/3]).
+-export([scope/0, scope/1, read/3, start/3]).
 %%% Unused Store API:
--export([resolve/3, write/3, link/3, group/3]).
+-export([write/3]).
 %%% Indexing API:
 -export([store_from_opts/1, write_offset/5, read_chunks/3]).
 -export([read_offset/3, read_index_offset/2]).
@@ -45,31 +45,8 @@ scope() -> remote.
 scope(#{ <<"scope">> := Scope }) -> Scope;
 scope(_) -> scope().
 
-%% @doc Resolve a key path in the Arweave store, ignoring other paths.
-resolve(_Store, #{ <<"resolve">> := ID }, _NodeOpts) when ?IS_ID(ID) ->
-    {ok, ID};
-resolve(_Store, #{ <<"resolve">> := _ID }, _NodeOpts) ->
-    {error, not_found}.
-
 %% @doc Unsupported.
 write(_, _, _) -> {error, not_found}.
-
-%% @doc Unsupported.
-link(_, _, _) -> {error, not_found}.
-
-%% @doc Unsupported.
-group(_, _, _) -> {error, not_found}.
-
-%% @doc Get the type of the data at the given key. We potentially cache the
-%% result, so that we don't have to read the data from the GraphQL route
-%% multiple times.
-type(StoreOpts, #{ <<"type">> := ID }, _NodeOpts) when ?IS_ID(ID) ->
-    case read_index_offset(StoreOpts, ID) of
-        {ok, _Offset} -> {ok, simple};
-        not_found -> {error, not_found}
-    end;
-type(_Store, #{ <<"type">> := _ID }, _NodeOpts) ->
-    {error, not_found}.
 
 %% @doc Read the offset of the data at the given key.
 read_offset(StoreOpts, ID, Opts) ->

@@ -185,8 +185,15 @@ from_preloaded(Ref, Opts) ->
 preloaded_spec(Ref, _Store, _Opts) when ?IS_ID(Ref) ->
     {ok, Ref};
 preloaded_spec(Ref, Store, Opts) ->
-    Key = hb_escape:encode_path_component(Ref),
-    hb_store:read(Store, <<?PRELOADED_INDEX_KEY/binary, "/", Key/binary>>, Opts).
+    % The index key holds `ao:' and the ID of the index, whose keys are the
+    % device names.
+    case hb_store:read(Store, ?PRELOADED_INDEX_KEY, Opts) of
+        {ok, <<"ao:", IndexID/binary>>} ->
+            Key = hb_escape:encode_path_component(Ref),
+            hb_cache:read(<<IndexID/binary, "/", Key/binary>>, Opts);
+        _ ->
+            {error, not_found}
+    end.
 
 %% @doc Device names are literal members of the preloaded index.
 preloaded_literal_names_test() ->
