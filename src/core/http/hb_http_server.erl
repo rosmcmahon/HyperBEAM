@@ -3,8 +3,8 @@
 %%% only has to marshal the HTTP request into a message, and then
 %%% pass it to the AO-Core resolver. 
 %%% 
-%%% `hb_http:reply/4' is used to respond to the client, handling the 
-%%% process of converting a message back into an HTTP response.
+%%% `reply/4' responds to the client, converting a message back into an
+%%% HTTP response.
 %%% 
 %%% The router uses an `Opts' message as its Cowboy initial state, 
 %%% such that changing it on start of the router server allows for
@@ -17,8 +17,12 @@
 -export([start_node/0, start_node/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
+
+-define(DEFAULT_FILTER_KEYS, [<<"content-length">>]).
 %% Define the max size we can return in 500 error details field.
 -define(DEFAULT_ERROR_DETAILS_MAX_SIZE, 32*1024).
+
+%%% HTTP server start and management functions.
 
 %% @doc Starts the HTTP server. Optionally accepts an `Opts' message, which
 %% is used as the source for server configuration settings, as well as the
@@ -250,6 +254,7 @@ new_server(RawNodeMsg) ->
         end,
     % Put server ID into node message so it's possible to update current server
     hb_http:start(),
+    init_prometheus(),
     Wallet = hb_opts:get(priv_wallet, no_wallet, NodeMsg),
     ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
     TLS = hb_tls:config(NodeMsg),
@@ -523,6 +528,8 @@ start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts) ->
             {error, Reason}
     end.
 
+%%% Request/response lifecycle.
+
 %% @doc Entrypoint for all HTTP requests. Receives the Cowboy request option and
 %% the server ID, which can be used to lookup the node message.
 init(Req, ServerID) ->
@@ -572,11 +579,11 @@ handle_request(RawReq, Body, ServerID) ->
         }
     ),
     % Parse the HTTP request into HyerBEAM's message format.
-    try hb_http:req_to_tabm_singleton(Req, Body, NodeMsg) of
+    try req_to_tabm_singleton(Req, Body, NodeMsg) of
         ReqSingleton ->
             try
                 CommitmentCodec =
-                    hb_http:accept_to_codec(ReqSingleton, NodeMsg),
+                    accept_to_codec(ReqSingleton, NodeMsg),
                 ?event(http,
                     {parsed_singleton,
                         {req_singleton, ReqSingleton},
@@ -591,7 +598,7 @@ handle_request(RawReq, Body, ServerID) ->
                             <<"commitment-device">> => CommitmentCodec
                         }
                     ),
-                hb_http:reply(Req, ReqSingleton, Res, NodeMsg)
+                reply(Req, ReqSingleton, Res, NodeMsg)
             catch
                 Type:Details:Stacktrace ->
                     handle_error(
@@ -734,7 +741,7 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
                         ErrorDetailsMaxSize
                 )
         },
-    hb_http:reply(
+    reply(
         Req,
         Singleton,
         {error_status(Type, Details), FormattedErrorMsg},
@@ -879,9 +886,703 @@ scheme(NodeMsg) ->
         false -> <<"http">>
     end.
 
+%% @doc Reply to the client's HTTP request with the result of resolving it. The
+%% HTTP status comes from the result and is not added to the message, which is
+%% sent with the node's signature on its hashpath (`maybe_sign/2'). A list is
+%% the `body' of the reply, which its `ao-result' key selects.
+reply(InitReq, TABMReq, {ErlStatus, List}, Opts) when is_list(List) ->
+    Msg = #{ <<"ao-result">> => <<"body">>, <<"body">> => List },
+    reply(InitReq, TABMReq, {ErlStatus, Msg}, Opts);
+reply(InitReq, TABMReq, Result, Opts) ->
+    ReplyStartTime = os:system_time(millisecond),
+    {ErlStatus, RawMessage} = hb_ao:force_message(Result, Opts),
+    KeyNormMessage = hb_ao:normalize_keys(RawMessage, Opts),
+    {ok, Req, Message} =
+        try reply_handle_cookies(InitReq, KeyNormMessage, Opts)
+        catch _Type:Error:_Stacktrace ->
+            ?event(warning, {reply_handle_cookies_error, {error, Error}}, Opts),
+            {ok, InitReq, KeyNormMessage}
+        end,
+    {Status, HeadersBeforeCors, EncodedBody} =
+        encode_reply(
+            hb_http:status_code({ErlStatus, Message}, Opts),
+            TABMReq,
+            maybe_sign(Message, Opts),
+            Opts
+        ),
+    % Get the CORS request headers from the message, if they exist.
+    ReqHdr = cowboy_req:header(<<"access-control-request-headers">>, Req, <<"">>),
+    HeadersWithCors = add_cors_headers(HeadersBeforeCors, ReqHdr, Opts),
+    % A reply to a `HEAD' request, or with a 204 or 304 status, carries no
+    % body, so it carries no `content-digest' either.
+    ReplyHeaders =
+        case cowboy_req:method(Req) of
+            Method when Method == <<"HEAD">>; Status == 204; Status == 304 ->
+                hb_maps:without([<<"content-digest">>], HeadersWithCors, Opts);
+            _ -> HeadersWithCors
+        end,
+    EncodedHeaders = hb_private:reset(ReplyHeaders),
+    ?event(debug_http,
+        {http_replying,
+            {status, {explicit, Status}},
+            {path, hb_maps:get(<<"path">>, Req, undefined_path, Opts)},
+            {raw_message, RawMessage},
+            {enc_headers, {explicit, EncodedHeaders}},
+            {enc_body, EncodedBody}
+        }
+    ),
+    ReqBeforeStream = Req#{ resp_headers => EncodedHeaders },
+    PostStreamReq = cowboy_req:stream_reply(Status, #{}, ReqBeforeStream),
+    % Stream the body back to the caller if there is content, ending the
+    % stream with it. If we already signal a non-content reply, skip.
+    case Status of
+        NonContentStatus
+            when (NonContentStatus == 204)
+            orelse (NonContentStatus == 304) -> skip;
+        _ -> cowboy_req:stream_body(EncodedBody, fin, PostStreamReq)
+    end,
+    EndTime = os:system_time(millisecond),
+    ReqDuration = EndTime - hb_maps:get(start_time, Req, undefined, Opts),
+    ReplyDuration = EndTime - ReplyStartTime,
+    record_request_metric(
+        ReqDuration * 1000000,
+        ReplyDuration * 1000000,
+        Status
+    ),
+    ?event(debug_http, {reply_headers, {explicit, PostStreamReq}}),
+    ?event(http_server_short,
+        {sent,
+            {status, Status},
+            {ip, {string, real_ip(Req, Opts)}},
+            {duration, EndTime - hb_maps:get(start_time, Req, undefined, Opts)},
+            {body_size, byte_size(EncodedBody)},
+            {method, cowboy_req:method(Req)},
+            {host, get_host(TABMReq, Opts)},
+            {path,
+                {string,
+                    uri_string:percent_decode(
+                        hb_maps:get(<<"path">>, TABMReq, <<"[NO PATH]">>, Opts)
+                    )
+                }
+            }
+        }
+    ),
+    {ok, PostStreamReq, no_state}.
+
+%% @doc Sign the hashpath of a result if the node signs its replies and the
+%% message that is sent is the result of the hashpath. A message that carries a
+%% `hashpath' key, such as another node's reply that this node relays, is sent
+%% as it is.
+maybe_sign(Msg, Opts) ->
+    case hb_private:from_message(Msg) of
+        #{ <<"hashpath">> := Hashpath, <<"hashpath-result">> := ID } ->
+            case hb_opts:get(force_signed, false, Opts) andalso
+                    not hb_maps:is_key(<<"hashpath">>, Msg, Opts) andalso
+                    hb_message:id(Msg, all, Opts) == ID of
+                true ->
+                    hb_message:commit(
+                        Msg#{ <<"hashpath">> => Hashpath },
+                        Opts,
+                        #{
+                            <<"device">> => <<"httpsig@1.0">>,
+                            <<"committed">> => [<<"hashpath">>]
+                        }
+                    );
+                false -> Msg
+            end;
+        _ -> Msg
+    end.
+
+%% @doc Handle replying with cookies if the message contains them. Returns the
+%% new Cowboy `Req` object, and the message without the cookie keys that no
+%% commitment covers. Both `set-cookie' and `cookie' fields are treated as
+%% viable sources of cookies.
+reply_handle_cookies(Req, Message, Opts) ->
+    {ok, Cookies} = hb_http:cookie(<<"extract">>, Message, #{}, Opts),
+    ?event(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
+    case Cookies of
+        NoCookies when map_size(NoCookies) == 0 -> {ok, Req, Message};
+        _ ->
+            % The internal values of the `cookie' field will be stored in the
+            % `priv_store' by default, so we let `dev_codec_cookie:opts/1'
+            % reset the options.
+            {ok, #{ <<"set-cookie">> := SetCookieLines }} =
+                hb_http:cookie(
+                    <<"to">>,
+                    Message,
+                    #{ <<"format">> => <<"set-cookie">> },
+                    Opts
+                ),
+            ?event(debug_cookie, {outbound_set_cookie_lines, SetCookieLines}),
+            % Add the cookies to the response headers.
+            FinalReq =
+                lists:foldl(
+                    fun(FullCookieLine, ReqAcc) ->
+                        [CookieRef, _] = binary:split(FullCookieLine, <<"=">>),
+                        RespCookies = maps:get(resp_cookies, ReqAcc, #{}),
+                        % Note: Cowboy handles cookies peculiarly. The key
+                        % given in the `resp_cookies' map is not used directly
+                        % in the response headers. Nonetheless, we use the
+                        % key parsed from the cookie line as the key, but do not
+                        % be surprised if while debugging you see a different
+                        % key created by Cowboy in the response headers.
+                        ReqAcc#{
+                            resp_cookies =>
+                                RespCookies#{ CookieRef => FullCookieLine }
+                        }
+                    end,
+                    Req,
+                    SetCookieLines
+                ),
+            {
+                ok,
+                FinalReq,
+                hb_message:without_unless_signed(
+                    [<<"cookie">>, <<"set-cookie">>], Message, Opts
+                )
+            }
+    end.
+
+%% @doc Add permissive CORS headers to a message, if the message has not already
+%% specified CORS headers.
+add_cors_headers(Msg, ReqHdr, Opts) ->
+    CorHeaders = #{
+        <<"access-control-allow-origin">> => <<"*">>,
+        <<"access-control-allow-methods">> => <<"GET, POST, PUT, DELETE, OPTIONS">>,
+        <<"access-control-expose-headers">> => <<"*">>
+    },
+     WithAllowHeaders = case ReqHdr of
+        <<>> -> CorHeaders;
+        _ -> CorHeaders#{
+             <<"access-control-allow-headers">> => ReqHdr
+        }
+    end,
+    % Keys in the given message will overwrite the defaults listed below if 
+    % included, due to `hb_maps:merge''s precidence order.
+    hb_maps:merge(WithAllowHeaders, Msg, Opts).
+
+%% @doc Generate the headers and body for a HTTP response message.
+encode_reply(Status, TABMReq, Message, Opts) ->
+    % Verify the result while it is still in `structured@1.0' form, before it is
+    % converted to the target wire codec, if paranoid mode enables http_result.
+    hb_message:paranoid_verify(http_result, Message, Opts),
+    Codec = accept_to_codec(TABMReq, Message, Opts),
+    ?event(debug_http, {encoding_reply, {codec, Codec}, {message, Message}}),
+    BaseHdrs =
+        hb_maps:merge(
+            #{
+                <<"codec-device">> => Codec
+            },
+            case codec_to_content_type(Codec, Opts) of
+                    undefined -> #{};
+                    CT -> #{ <<"content-type">> => CT }
+            end,
+			Opts
+        ),
+    AcceptBundle =
+        hb_util:bool(
+            hb_maps:get(<<"accept-bundle">>, TABMReq, false, Opts)
+        ),
+    ?event(debug_http,
+        {encoding_reply,
+            {status, Status},
+            {codec, Codec},
+            {should_bundle, AcceptBundle},
+            {response_message, Message}
+        }
+    ),
+    % Codecs generally do not need to specify headers outside of the content-type,
+    % aside the default `httpsig@1.0' codec, which expresses its form in HTTP
+    % documents, and subsequently must set its own headers.
+    case {Status, Codec, AcceptBundle} of
+        {500, <<"httpsig@1.0">>, false} ->
+            ?event(debug_accept,
+                {returning_500_error,
+                    {status, Status},
+                    {codec, Codec},
+                    {bundle, AcceptBundle}
+                }
+            ),
+            {ok, ErrMsg} =
+                static(
+                    <<"hyperbuddy@1.0">>,
+                    <<"500.html">>,
+                    #{ <<"error">> => hb_format:error(Message, Opts) },
+                    Opts
+                ),
+            {Status,
+                maps:without([<<"body">>], ErrMsg),
+                maps:get(<<"body">>, ErrMsg, <<>>)
+            };
+        {Code, <<"httpsig@1.0">>, false}
+                when Code == 403; Code == 404;
+                     Code == 400, is_map_key(<<"offender">>, Message);
+                     Code == 400, is_map_key(<<"resolving">>, Message) ->
+            {ok, ErrMsg} =
+                static(
+                    <<"hyperbuddy@1.0">>,
+                    <<"error.html">>,
+                    hb_ao_errors:page(Code, Message, TABMReq),
+                    Opts
+                ),
+            {Status,
+                maps:without([<<"body">>], ErrMsg),
+                maps:get(<<"body">>, ErrMsg, <<>>)
+            };
+        {_, <<"httpsig@1.0">>, _} ->
+            EncMessage =
+                hb_message:convert(
+                    Message,
+                    case AcceptBundle of
+                        true ->
+                            #{
+                                <<"device">> => <<"httpsig@1.0">>,
+                                <<"path">> => <<"to">>,
+                                <<"bundle">> => true
+                            };
+                        false ->
+                            TABMReq#{
+                                <<"device">> => <<"httpsig@1.0">>,
+                                <<"path">> => <<"to">>,
+                                <<"index">> =>
+                                    hb_opts:get(generate_index, true, Opts)
+                            }
+                    end,
+                    <<"structured@1.0">>,
+                    Opts#{ <<"topic">> => ao_internal }
+                ),
+            {
+                Status,
+                hb_maps:without([<<"body">>], EncMessage, Opts),
+                hb_maps:get(<<"body">>, EncMessage, <<>>, Opts)
+            };
+        {_, <<"ans104@1.0">>, _} ->
+            % The `ans104@1.0' codec is a binary format, so we must serialize
+            % the message to a binary before sending it.
+            {
+                Status,
+                BaseHdrs,
+                ar_bundles:serialize(
+                    hb_message:convert(
+                        hb_message:with_only_committers(
+                            Message,
+                            hb_message:signers(Message, Opts),
+							Opts
+                        ),
+                        #{
+                            <<"device">> => <<"ans104@1.0">>,
+                            <<"bundle">> =>
+                                hb_util:bool(
+                                    hb_ao:get(
+                                        <<"accept-bundle">>,
+                                        {as, <<"message@1.0">>, TABMReq},
+                                        true,
+                                        Opts
+                                    )
+                                )
+                        },
+                        <<"structured@1.0">>,
+                        Opts#{ <<"topic">> => ao_internal }
+                    )
+                )
+            };
+        _ ->
+            % Codecs that do not convert the message to a binary serialize it.
+            case
+                hb_message:convert(
+                    Message,
+                    #{ <<"device">> => Codec, <<"bundle">> => AcceptBundle },
+                    <<"structured@1.0">>,
+                    Opts#{ <<"topic">> => ao_internal }
+                )
+            of
+                Encoded when is_binary(Encoded) -> {Status, BaseHdrs, Encoded};
+                Encoded ->
+                    {ok, Body} =
+                        hb_ao:raw(Codec, <<"serialize">>, Encoded, #{}, Opts),
+                    {Status, BaseHdrs, Body}
+            end
+    end.
+
+%% @doc Calculate the codec name to use for a reply given the original parsed 
+%% singleton TABM request and the response message. The precidence
+%% order for finding the codec is:
+%% 1. The `require-codec' field in the original request.
+%% 2. If the `content-type' field is present in the response message, we
+%%    use `httpsig@1.0', as the device is expected to have already encoded the
+%%    message and the `body' field.
+%% 3. The `accept-codec' field in the original request.
+%% 4. The `accept' field in the original request.
+%% 5. The default codec
+%% Options can be specified in mime-type format (`application/*') or in
+%% AO device format (`device@1.0').
+accept_to_codec(OriginalReq, Opts) ->
+    accept_to_codec(OriginalReq, undefined, Opts).
+accept_to_codec(#{ <<"require-codec">> := RequiredCodec }, _Reply, Opts) ->
+    mime_to_codec(RequiredCodec, Opts);
+accept_to_codec(OriginalReq, Reply = #{ <<"content-type">> := Link }, Opts) when ?IS_LINK(Link) ->
+    accept_to_codec(
+        OriginalReq,
+        Reply#{ <<"content-type">> => hb_cache:ensure_loaded(Link, Opts) },
+        Opts
+    );
+accept_to_codec(_OriginalReq, #{ <<"content-type">> := CT }, _Opts) ->
+    <<"httpsig@1.0">>;
+accept_to_codec(#{ <<"accept-codec">> := Codec }, _Reply, Opts) ->
+    mime_to_codec(Codec, Opts);
+accept_to_codec(OriginalReq, _, Opts) ->
+    Accept = hb_maps:get(<<"accept">>, OriginalReq, <<"*/*">>, Opts),
+    ?event(debug_accept,
+        {accept_to_codec,
+            {original_req, OriginalReq},
+            {accept, Accept}
+        }
+    ),
+    mime_to_codec(Accept, Opts).
+
+%% @doc Find a codec name from a mime-type.
+mime_to_codec(<<"application/", Mime/binary>>, Opts) ->
+    Name =
+        case binary:match(Mime, <<"@">>) of
+            nomatch -> << Mime/binary, "@1.0" >>;
+            _ -> Mime
+        end,
+    case hb_device_load:reference(Name, Opts) of
+        {ok, _} -> Name;
+        {error, _} ->
+            Default = default_codec(Opts),
+            ?event(http,
+                {codec_parsing_error,
+                    {given, Name},
+                    {defaulting_to, Default}
+                }
+            ),
+            Default
+    end;
+mime_to_codec(<<"device/", Name/binary>>, _Opts) -> Name;
+mime_to_codec(Device, Opts) ->
+    case binary:match(Device, <<"@">>) of
+        nomatch -> default_codec(Opts);
+        _ -> Device
+    end.
+
+%% @doc Return the default codec for the given options.
+default_codec(Opts) ->
+    hb_opts:get(default_codec, <<"httpsig@1.0">>, Opts).
+
+%% @doc Call the `content-type' key on a message with the given codec, using
+%% a fast-path for options that are not needed for this one-time lookup.
+codec_to_content_type(Codec, Opts) ->
+    FastOpts =
+        Opts#{
+            <<"hashpath">> => ignore,
+            <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
+            <<"cache-lookup-hueristics">> => false,
+            <<"trusted-device-signers">> => [],
+            <<"error-strategy">> => continue
+        },
+    case hb_ao:get(<<"content-type">>, #{ <<"device">> => Codec }, FastOpts) of
+        not_found -> undefined;
+        CT -> CT
+    end.
+
+%% @doc Convert a cowboy request to a normalized message. We first parse the
+%% `primitive' message from the request: A message (represented as an Erlang
+%% map) of binary keys and values for the request headers and query parameters.
+%% We then determine the codec to use for the request, decode it, and merge it
+%% overriding the keys of the `primitive' message.
+req_to_tabm_singleton(Req, Body, Opts) ->
+    FullPath =
+        <<
+            (cowboy_req:path(Req))/binary,
+            "?",
+            (cowboy_req:qs(Req))/binary
+        >>,
+    Headers = cowboy_req:headers(Req),
+    {ok, _Path, QueryKeys} = hb_singleton:from_path(FullPath),
+    % The query parameters override the request's headers, except for the
+    % keys that its signatures cover: a signature is verified over the values
+    % that were signed.
+    SignedKeys = signed_keys(Headers, Opts),
+    PrimitiveMsg = maps:merge(Headers, maps:without(SignedKeys, QueryKeys)),
+    Codec =
+        case hb_maps:find(<<"codec-device">>, PrimitiveMsg, Opts) of
+            {ok, ExplicitCodec} -> ExplicitCodec;
+            error ->
+                case hb_maps:find(<<"content-type">>, PrimitiveMsg, Opts) of
+                    {ok, ContentType} -> mime_to_codec(ContentType, Opts);
+                    error -> default_codec(Opts)
+                end
+        end,
+    ?event(debug_http,
+        {parsing_req,
+            {path, FullPath},
+            {query, QueryKeys},
+            {headers, Headers},
+            {primitive_message, PrimitiveMsg}
+        }
+    ),
+    ?event({req_to_tabm_singleton, {codec, Codec}}),
+    Decoded =
+        case Codec of
+            <<"httpsig@1.0">> ->
+                % HTTPSig commitments share the transport headers. Retain only
+                % their committed fields before restoring request metadata.
+                {ok, Committed} =
+                    hb_message:with_only_committed(
+                        hb_message:convert(
+                            PrimitiveMsg#{ <<"body">> => Body },
+                            <<"structured@1.0">>,
+                            Codec,
+                            Opts
+                        ),
+                        Opts
+                    ),
+                Committed;
+            ArCodec when ArCodec == <<"tx@1.0">>
+                    orelse ArCodec == <<"ans104@1.0">> ->
+                {ok, TABM} =
+                    hb_ao:raw(ArCodec, <<"deserialize">>, Body, #{}, Opts),
+                hb_message:convert(TABM, <<"structured@1.0">>, tabm, Opts);
+            _ ->
+                {ok, Committed} =
+                    hb_message:with_only_committed(
+                        hb_maps:merge(
+                            PrimitiveMsg,
+                            hb_message:convert(
+                                Body,
+                                <<"structured@1.0">>,
+                                #{
+                                    <<"device">> => Codec,
+                                    <<"accept-codec">> => <<"structured@1.0">>
+                                },
+                                Opts
+                            ),
+                            Opts
+                        ),
+                        Opts
+                    ),
+                Committed
+        end,
+    % Cookie-backed commitments need the request's cookie and peer context.
+    Normalized = normalize_unsigned(PrimitiveMsg, Req, Decoded, Opts),
+    maybe
+        true ?= hb_message:deep_verify(Normalized, Opts),
+        Signers = hb_message:signers(Normalized, Opts),
+        true ?= not hb_opts:get(force_signed_requests, false, Opts)
+            orelse Signers =/= [],
+        case Signers =/= [] andalso hb_opts:get(store_all_signed, false, Opts) of
+            true ->
+                {ok, _} =
+                    hb_cache:write(Decoded,
+                        Opts#{
+                            <<"store">> =>
+                                #{
+                                    <<"store-module">> => hb_store_fs,
+                                    <<"name">> => <<"cache-http">>
+                                }
+                        }
+                    );
+            false -> do_nothing
+        end,
+        Normalized
+    else
+        _ -> throw({invalid_commitments, Normalized})
+    end.
+
+%% @doc Return the message keys that the request's HTTPSig signatures cover,
+%% from its `signature-input' headers. A signature covers its keys' values, so
+%% the query parameters do not replace the signed header values of these keys.
+%% HTTPSig is the only request form that carries signed content in headers:
+%% the other codecs sign the body, which the query parameters do not reach.
+signed_keys(Headers, Opts) ->
+    case hb_maps:find(<<"signature-input">>, Headers, Opts) of
+        {ok, SigInput} ->
+            lists:usort(
+                lists:append(
+                    [
+                        [hb_escape:decode(Key) || {item, {string, Key}, _} <- Fields]
+                    ||
+                        {_Name, {list, Fields, _Params}} <-
+                            hb_structured_fields:parse_dictionary(SigInput)
+                    ]
+                )
+            );
+        error -> []
+    end.
+
+%% @doc Add the method and path to a message, if they are not already present.
+%% Remove browser-added fields that are unhelpful during processing (for example,
+%% `content-length').
+%% The precidence order for finding the path is:
+%% 1. The path in the message
+%% 2. The path and query of the request URI
+normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
+    ?event(debug_http, {adding_method_and_path_from_request, {explicit, Req}}),
+    Method = cowboy_req:method(Req),
+    MsgPath =
+        hb_maps:get(
+            <<"path">>,
+            Msg,
+            hb_maps:get(
+                <<"path">>, 
+                RawHeaders,
+                iolist_to_binary(
+                    cowboy_req:uri(
+                        Req,
+                        #{
+                            host => undefined,
+                            port => undefined,
+                            scheme => undefined
+                        }
+                    )
+                ),
+                Opts
+            ),
+            Opts
+        ),
+    FilterKeys = hb_opts:get(http_inbound_filter_keys, ?DEFAULT_FILTER_KEYS, Opts),
+    FilteredMsg = hb_message:without_unless_signed(FilterKeys, Msg, Opts),
+    BaseMsg =
+        FilteredMsg#{
+            <<"method">> => Method,
+            <<"path">> => MsgPath,
+            <<"accept-bundle">> =>
+                maps:get(
+                    <<"accept-bundle">>,
+                    Msg,
+                    maps:get(
+                        <<"accept-bundle">>,
+                        PrimMsg,
+                        maps:get(<<"accept-bundle">>, RawHeaders, false)
+                    )
+                ),
+            <<"accept">> =>
+                Accept = maps:get(
+                    <<"accept">>,
+                    Msg,
+                    maps:get(
+                        <<"accept">>,
+                        PrimMsg,
+                        maps:get(<<"accept">>, RawHeaders, <<"*/*">>)
+                    )
+                )
+        },
+    ?event(debug_accept, {normalize_unsigned, {accept, Accept}}),
+    % Parse and add the cookie from the request, if present. We reinstate the
+    % `cookie' field in the message, as it is not typically signed, yet should
+    % be honored by the node anyway.
+    {ok, WithCookie} =
+        case maps:get(<<"cookie">>, RawHeaders, undefined) of
+            undefined -> {ok, BaseMsg};
+            Cookie ->
+                hb_http:cookie(
+                    <<"from">>,
+                    BaseMsg#{ <<"cookie">> => Cookie },
+                    #{},
+                    Opts
+                )
+        end,
+    % If the body is empty and unsigned, we remove it.
+    NormalBody =
+        case hb_maps:get(<<"body">>, WithCookie, undefined, Opts) of
+            <<"">> -> hb_message:without_unless_signed(<<"body">>, WithCookie, Opts);
+            _ -> WithCookie
+        end,
+    RealIP = real_ip(Req, Opts),
+    WithPeer = case hb_maps:get(<<"ao-peer-port">>, NormalBody, undefined, Opts) of
+        undefined -> NormalBody;
+        P2PPort ->
+            Peer = <<RealIP/binary, ":", (hb_util:bin(P2PPort))/binary>>,
+            (hb_message:without_unless_signed(<<"ao-peer-port">>, NormalBody, Opts))#{
+                <<"ao-peer">> => Peer
+            }
+    end,
+    WithPrivIP = hb_private:set(WithPeer, <<"ip">>, RealIP, Opts),
+    % Add device from PrimMsg if present
+    WithDevice = case maps:get(<<"device">>, PrimMsg, not_found) of
+        not_found -> WithPrivIP;
+        Device -> WithPrivIP#{<<"device">> => Device}
+    end,
+    Host = cowboy_req:host(Req),
+    WithDevice#{<<"host">> => Host}.
+
+
+%% @doc Determine the caller, honoring the `x-real-ip' header if present.
+real_ip(Req = #{ headers := RawHeaders }, Opts) ->
+    case hb_maps:get(<<"x-real-ip">>, RawHeaders, undefined, Opts) of
+        undefined ->
+            {{A, B, C, D}, _} = cowboy_req:peer(Req),
+            hb_util:bin(
+                io_lib:format(
+                    "~b.~b.~b.~b",
+                    [A, B, C, D]
+                )
+            );
+        IP -> IP
+    end.
+
+%% @doc Find the hostname from either the inbound TABM request form,
+%% or set explicitly in the node message.
+get_host(TABMReq, Opts) ->
+    ReqHost = maps:get(<<"host">>, TABMReq, <<"no_host">>),
+    case hb_opts:get(node_host, no_host, Opts) of
+        no_host ->
+            ReqHost;
+        NodeHost ->
+            % Replace suffix part
+            filename:rootname(ReqHost, <<".", NodeHost/binary>>)
+    end.
+
+%%% Metrics
+
+init_prometheus() ->
+    hb_prometheus:declare(histogram, [
+		{name, http_server_encoding_duration_seconds},
+        {labels, [status_code]},
+		{buckets, [0.001, 0.0025, 0.005,
+                    0.01, 0.025, 0.05,
+                    0.1, 0.25, 0.5,
+                    1, 2.5, 5,
+                    10, 30, 60]},
+		{
+			help,
+			"The total duration of an hb_http_server:reply call. This starts when a response"
+            "is ready to send back to the client and ends when the message is deliver"
+            "to the client."
+		}
+	]),
+    hb_prometheus:declare(histogram, [
+		{name, http_server_duration_seconds},
+        {labels, [status_code]},
+		{buckets, [0.001, 0.0025, 0.005,
+                    0.01, 0.025, 0.05,
+                    0.1, 0.25, 0.5,
+                    1, 2.5, 5,
+                    10, 30, 60]},
+		{
+			help,
+			"The total duration of an hb_http_server request call." 
+		}
+	]).
+
+record_request_metric(TotalDuration, ReplyDuration, StatusCode) ->
+    spawn(
+        fun() ->
+            hb_prometheus:observe(
+                TotalDuration,
+                http_server_duration_seconds,
+                [StatusCode]
+            ),
+            hb_prometheus:observe(
+                ReplyDuration,
+                http_server_encoding_duration_seconds,
+                [StatusCode]
+            )
+        end
+    ).
+
 %%% Tests
-%%% The following only covering the HTTP server initialization process. For tests
-%%% of HTTP server requests/responses, see `hb_http.erl'.
 
 %% @doc Ensure that the `start' hook can be used to modify the node options. We
 %% do this by creating a message with a device that has a `start' key. This 
@@ -996,4 +1697,417 @@ read_missing_link_test() ->
             },
             #{}
         )
+    ).
+
+test_opts() ->
+    #{ <<"store">> => hb_test_utils:test_store(), <<"priv-wallet">> => hb:wallet() }.
+
+isolated_test_opts() ->
+    #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"priv-wallet">> => ar_wallet:new()
+    }.
+
+%% @doc Verify that request hosts are formatted appropriately for logging.
+get_host_test_parallel() ->
+    Opts = #{ <<"node-host">> => <<"example.com">> },
+    ?assertEqual(
+        <<"abc">>,
+        get_host(#{ <<"host">> => <<"abc.example.com">> }, Opts)
+    ),
+    ?assertEqual(
+        <<"example.com">>,
+        get_host(#{ <<"host">> => <<"example.com">> }, Opts)
+    ).
+
+%% @doc Test that forced response signing preserves signers and commits the
+%% hashpath.
+maybe_sign_hashpath_only_test() ->
+    OldWallet = ar_wallet:new(),
+    NewWallet = ar_wallet:new(),
+    Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
+    OldOpts =
+        #{
+            <<"commitment-device">> => <<"httpsig@1.0">>,
+            <<"priv-wallet">> => OldWallet
+        },
+    Opts =
+        #{
+            <<"force-signed">> => true,
+            <<"priv-wallet">> => NewWallet
+        },
+    OldSigner = hb_util:human_id(ar_wallet:to_address(OldWallet)),
+    NewSigner = hb_util:human_id(ar_wallet:to_address(NewWallet)),
+    AlreadySigned =
+        hb_hashpath:attach(
+            hb_message:commit(
+                #{ <<"body">> => <<"test">> },
+                OldOpts,
+                #{ <<"committed">> => [<<"body">>] }
+            ),
+            Hashpath,
+            Opts
+        ),
+    Signed = maybe_sign(AlreadySigned, Opts),
+    ?assertEqual(Hashpath, maps:get(<<"hashpath">>, Signed)),
+    ?assertEqual(
+        lists:sort([OldSigner, NewSigner]),
+        lists:sort(hb_message:signers(Signed, Opts))
+    ),
+    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"body">>])),
+    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
+    ?assert(hb_message:verify(Signed, all, Opts)).
+
+%% @doc Test that forced response signing leaves replies without hashpaths
+%% alone.
+maybe_sign_without_hashpath_test() ->
+    Res = #{ <<"body">> => <<"test">> },
+    Opts =
+        #{
+            <<"force-signed">> => true,
+            <<"priv-wallet">> => ar_wallet:new()
+        },
+    ?assertEqual(Res, maybe_sign(Res, Opts)),
+    Signed = hb_message:commit(Res, Opts),
+    ?assertNotEqual([], hb_message:signers(Signed, Opts)),
+    ?assertEqual(Signed, maybe_sign(Signed, Opts)).
+
+%% @doc Test that unsigned responses get hashpath transport commitments.
+maybe_sign_unsigned_hashpath_test() ->
+    Wallet = ar_wallet:new(),
+    Hashpath = hb_path:hashpath(<<"test-hashpath">>, #{}),
+    Opts = #{ <<"force-signed">> => true, <<"priv-wallet">> => Wallet },
+    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Result =
+        hb_hashpath:attach(
+            #{ <<"body">> => <<"test">>, <<"status">> => 200 },
+            Hashpath,
+            Opts
+        ),
+    Signed = maybe_sign(Result, Opts),
+    ?assertEqual(Hashpath, maps:get(<<"hashpath">>, Signed)),
+    ?assertEqual([Signer], hb_message:signers(Signed, Opts)),
+    ?assert(hb_test_utils:has_committed_keys(Signed, [<<"hashpath">>])),
+    ?assert(hb_message:verify(Signed, all, Opts)),
+    % A message changed after its hashpath was attached is not signed.
+    Changed = Result#{ <<"body">> => <<"changed">> },
+    ?assertEqual(Changed, maybe_sign(Changed, Opts)).
+
+%% @doc Every ingress codec verifies commitments and applies the node's
+%% signature policy before executing the request.
+ingress_commitments_test_() ->
+    [
+        {binary_to_list(Codec), fun() ->
+            Opts = isolated_test_opts(),
+            CommitCodec = case Codec of
+                <<"json@1.0">> -> <<"httpsig@1.0">>;
+                _ -> Codec
+            end,
+            Msg = #{ <<"body">> => <<"original">> },
+            Signed = hb_message:commit(Msg, Opts, CommitCodec),
+            Unsigned = hb_message:normalize_commitments(Msg, Opts),
+            Invalid = Signed#{ <<"body">> => <<"modified">> },
+            WrongMethod = hb_message:commit(
+                Msg#{ <<"method">> => <<"GET">> }, Opts, CommitCodec),
+            Child = case Codec of
+                <<"tx@1.0">> -> hb_message:commit(Msg, Opts, <<"ans104@1.0">>);
+                _ -> Signed
+            end,
+            lists:foreach(
+                fun(Required) ->
+                    Node = start_node(
+                        (isolated_test_opts())#{
+                            <<"force-signed-requests">> => Required
+                        }
+                    ),
+                    UnsignedStatus = case Required of true -> 400; false -> 200 end,
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec, Msg, Opts)),
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec, Unsigned, Opts)),
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec,
+                            Msg#{ <<"child">> => Child }, Opts)),
+                    ?assertMatch({ok, 200, _, <<"original">>},
+                        ingress_request(Node, Codec, Signed, Opts)),
+                    ?assertMatch({ok, 400, _, _},
+                        ingress_request(Node, Codec, Invalid, Opts)),
+                    ?assertMatch({ok, 400, _, _},
+                        ingress_request(Node, Codec, WrongMethod, Opts)),
+                    ?assertMatch({ok, 400, _, _},
+                        ingress_request(Node, Codec,
+                            Msg#{ <<"child">> =>
+                                Child#{ <<"body">> => <<"modified">> } }, Opts))
+                end,
+                [false, true]
+            )
+        end}
+    || Codec <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>, <<"json@1.0">>]
+    ].
+
+%% @doc JSON ingress preserves explicit links and verifies inline children.
+ingress_json_links_test() ->
+    Opts = isolated_test_opts(),
+    Req = #{
+        method => <<"POST">>, path => <<"/body">>, qs => <<>>,
+        scheme => <<"http">>, host => <<"localhost">>, port => 80,
+        peer => {{127, 0, 0, 1}, 1234},
+        headers => #{ <<"codec-device">> => <<"json@1.0">> }
+    },
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Child = hb_message:commit(#{ <<"number">> => 42 }, Opts),
+    Msg = #{
+        <<"body">> => <<"original">>,
+        <<"child">> => Child,
+        <<"reference+link">> => ID
+    },
+    Decoded = req_to_tabm_singleton(Req, hb_json:encode(Msg), Opts),
+    ?assertEqual(Child, maps:get(<<"child">>, Decoded)),
+    ?assertMatch({link, ID, _}, maps:get(<<"reference">>, Decoded)),
+    ?assertThrow(
+        {invalid_commitments, _},
+        req_to_tabm_singleton(
+            Req,
+            hb_json:encode(Msg#{ <<"child">> => Child#{ <<"number">> => 43 } }),
+            Opts
+        )
+    ),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)).
+
+%% @doc Send the codec's wire representation directly to a real HTTP node.
+ingress_request(Node, Codec, Msg, Opts) ->
+    Wire = hb_message:convert(
+        Msg, #{ <<"device">> => Codec, <<"bundle">> => true }, Opts),
+    {Headers, Body} = case Codec of
+        <<"httpsig@1.0">> ->
+            {maps:remove(<<"body">>, Wire), maps:get(<<"body">>, Wire, <<>>)};
+        <<"ans104@1.0">> -> {#{}, ar_bundles:serialize(Wire)};
+        <<"tx@1.0">> -> {#{}, hb_json:encode(ar_tx:tx_to_json_struct(Wire))};
+        _ -> {#{}, Wire}
+    end,
+    hb_http_client:request(
+        #{
+            peer => Node,
+            path => <<"/body">>,
+            method => <<"POST">>,
+            headers => Headers#{ <<"codec-device">> => Codec },
+            body => Body
+        },
+        Opts
+    ).
+
+%% @doc Browser requests receive friendly, templated authorization and missing
+%% resource pages, with the corresponding HTTP status.
+client_error_pages_test() ->
+    Node = start_node(isolated_test_opts()),
+    lists:foreach(
+        fun({Path, Status, Title}) ->
+            {ok, {{_, Status, _}, Headers, Body}} = httpc:request(
+                get,
+                {binary_to_list(<<Node/binary, Path/binary>>), []},
+                [],
+                [{body_format, binary}]
+            ),
+            ?assertEqual("text/html", proplists:get_value("content-type", Headers)),
+            ?assertNotEqual(nomatch, binary:match(Body, Title)),
+            ?assertEqual(nomatch, binary:match(Body, <<"{{">>)),
+            ?assertEqual(nomatch, binary:match(Body, <<"not_authorized">>))
+        end,
+        [
+            {<<"/~cache@1.0/group">>, 403, <<"Access denied.">>},
+            {<<"/~cache@1.0/read?read=missing">>, 404, <<"Page cannot be found.">>}
+        ]
+    ).
+
+%% @doc A request whose commitment carries the operator's address but was not
+%% made with the operator's key is refused, and the node message stays as it
+%% is.
+forged_commitment_rejected_test() ->
+    Opts = test_opts(),
+    Node = start_node(Opts),
+    Update =
+        #{
+            <<"path">> => <<"/~meta@1.0/info">>,
+            <<"method">> => <<"POST">>,
+            <<"short-trace-len">> => 7,
+            <<"type">> => <<"node-message">>
+        },
+    Genuine = hb_message:commit(Update, Opts),
+    [{_, GenuineComm}] =
+        maps:to_list(hb_maps:get(<<"commitments">>, Genuine, Opts)),
+    Attacker = isolated_test_opts(),
+    Signed = hb_message:commit(Update, Attacker),
+    [{ID, Comm}] = maps:to_list(hb_maps:get(<<"commitments">>, Signed, Opts)),
+    Forged =
+        Signed#{
+            <<"commitments">> =>
+                #{
+                    ID =>
+                        Comm#{
+                            <<"keyid">> =>
+                                hb_maps:get(<<"keyid">>, GenuineComm, Opts),
+                            <<"committer">> =>
+                                hb_maps:get(<<"committer">>, GenuineComm, Opts)
+                        }
+                }
+        },
+    ?assertEqual(
+        hb_message:signers(Genuine, Opts),
+        hb_message:signers(Forged, Opts)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        hb_http:post(Node, Forged, Attacker)
+    ),
+    {ok, Unchanged} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertNotEqual(7, hb_ao:get(<<"short-trace-len">>, Unchanged, Opts)),
+    ?assertMatch({ok, _}, hb_http:post(Node, Genuine, Opts)),
+    {ok, Changed} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
+    ?assertEqual(7, hb_ao:get(<<"short-trace-len">>, Changed, Opts)).
+
+paranoid_http_result_test() ->
+    % The `http_result' topic verifies each response at the reply boundary (in
+    % `encode_reply', before wire conversion): a validly committed result
+    % encodes cleanly, while corrupting its committed body is caught.
+    Opts =
+        (test_opts())#{
+            <<"paranoid-verify">> => [http_result],
+            <<"debug-print">> => []
+        },
+    Valid = hb_message:commit(#{ <<"body">> => <<"ok">> }, Opts),
+    ?assertMatch({_, _, _}, encode_reply(200, #{}, Valid, Opts)),
+    ?assertThrow(
+        {paranoid_verification_failure, http_result, _, _, _},
+        encode_reply(200, #{}, Valid#{ <<"body">> => <<"mangled">> }, Opts)
+    ).
+
+binary_codec_reply_headers_test() ->
+    Opts = test_opts(),
+    Message = #{ <<"body">> => <<"value">>, <<"result">> => <<"ok">> },
+    {200, Headers, Body} =
+        encode_reply(
+            200,
+            #{ <<"require-codec">> => <<"json@1.0">> },
+            Message,
+            Opts
+        ),
+    ?assertEqual(
+        #{
+            <<"codec-device">> => <<"json@1.0">>,
+            <<"content-type">> => <<"application/json">>
+        },
+        Headers
+    ),
+    ?assertEqual(
+        Message,
+        hb_message:convert(Body, <<"structured@1.0">>, <<"json@1.0">>, Opts)
+    ).
+
+%% @doc Required codecs precede the reply's content type, then preferences.
+accept_codec_precedence_test() ->
+    Opts = test_opts(),
+    Request = #{
+        <<"require-codec">> => <<"json@1.0">>,
+        <<"accept-codec">> => <<"ans104@1.0">>,
+        <<"accept">> => <<"application/tx">>
+    },
+    Reply = #{ <<"content-type">> => <<"text/plain">> },
+    ?assertEqual(<<"json@1.0">>, accept_to_codec(Request, Reply, Opts)),
+    Preferred = maps:remove(<<"require-codec">>, Request),
+    ?assertEqual(<<"httpsig@1.0">>, accept_to_codec(Preferred, Reply, Opts)),
+    ?assertEqual(<<"ans104@1.0">>, accept_to_codec(Preferred, #{}, Opts)),
+    ?assertEqual(
+        <<"tx@1.0">>,
+        accept_to_codec(maps:remove(<<"accept-codec">>, Preferred), #{}, Opts)
+    ).
+
+cors_get_test() ->
+    URL = start_node(),
+    LocalOpts = test_opts(),
+    {ok, Res} = hb_http:get(URL, <<"/~meta@1.0/info">>, LocalOpts),
+    ?assertEqual(
+        <<"*">>,
+        hb_ao:get(<<"access-control-allow-origin">>, Res, LocalOpts)
+    ).
+
+index_test() ->
+    NodeURL = start_node(),
+    {ok, Res} =
+        hb_http:get(
+            NodeURL,
+            #{
+                <<"path">> => <<"/~test-device@1.0/load">>,
+                <<"accept-bundle">> => false
+            },
+            #{}
+        ),
+    ?assertEqual(<<"i like turtles!">>, hb_ao:get(<<"body">>, Res, #{})).
+
+index_request_test() ->
+    URL = start_node(),
+    {ok, Res} =
+        hb_http:get(
+            URL,
+            #{
+                <<"path">> => <<"/~test-device@1.0/load?name=dogs">>,
+                <<"accept-bundle">> => false
+            },
+            #{}
+        ),
+    ?assertEqual(<<"i like dogs!">>, hb_ao:get(<<"body">>, Res, #{})).
+
+%% @doc A query parameter overrides a request header of the same name, so the
+%% keys that a request sets in its path keep working beside headers.
+query_overrides_header_test() ->
+    Node = start_node(),
+    {ok, Res} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"/accept?accept=from-query">>,
+                <<"accept">> => <<"from-header">>,
+                <<"accept-bundle">> => false
+            },
+            #{}
+        ),
+    ?assertEqual(<<"from-query">>, Res).
+
+%% @doc A signed request's query keys apply over its signed content after its
+%% signature is verified. Its uncommitted headers do not reach its execution.
+signed_request_query_riders_test() ->
+    Opts = test_opts(),
+    Node = start_node(),
+    Signed =
+        hb_message:commit(
+            #{ <<"x">> => <<"original">> },
+            Opts,
+            #{ <<"committed">> => [<<"x">>] }
+        ),
+    % A query key that the request does not carry is added to it.
+    ?assertEqual(
+        {ok, <<"1">>},
+        hb_http:request(<<"GET">>, Node, <<"/y?y=1">>, Signed, Opts)
+    ),
+    % The same key sent as an uncommitted header is dropped.
+    ?assertMatch(
+        {error, _},
+        hb_http:request(
+            <<"GET">>,
+            Node,
+            <<"/y">>,
+            Signed#{ <<"y">> => <<"7">> },
+            Opts
+        )
+    ),
+    % A query key that shares a signed key's name replaces the signed value,
+    % and the signature, verified over the signed value, holds.
+    ?assertEqual(
+        {ok, <<"test">>},
+        hb_http:request(<<"GET">>, Node, <<"/x?x=test">>, Signed, Opts)
+    ),
+    % A query key is lowercase, so one that differs only in case replaces it
+    % too.
+    ?assertEqual(
+        {ok, <<"test">>},
+        hb_http:request(<<"GET">>, Node, <<"/x?X=test">>, Signed, Opts)
     ).
