@@ -268,7 +268,7 @@ read_result(Opts, Path) ->
 
 %% The literal `Path' was not present in the scan. Resolve any intermediate
 %% links in the path and, if that yields a different key, retry the read against
-%% the resolved target. Content-addressed `data' keys never carry links, so they
+%% the resolved target. Content-addressed `ni:' keys never carry links, so they
 %% short-circuit straight to `not_found' without a resolver walk.
 read_prefix_miss(Opts, Path) ->
     case hb_store_utils:is_data_path(Path) of
@@ -325,9 +325,7 @@ do_read_resolved(Opts, Path) ->
             Result;
         not_found ->
             case Path of
-                <<"data">> ->
-                    not_found;
-                <<"data/", _/binary>> ->
+                <<"ni:", _/binary>> ->
                     not_found;
                 _ ->
                     try
@@ -507,12 +505,12 @@ read_prefix_rows(Opts, Path) ->
 %% Classify the first (marker) row of a bare-prefix scan. `read_prefix' returns
 %% keys in lexicographic order, so the row whose key equals `Path' — when it
 %% exists — always sorts ahead of the `Path/...' descendants and lands first.
-%% A content-addressed `data/' row is a simple value, whatever its bytes.
+%% A content-addressed `ni:' row is a simple value, whatever its bytes.
 %% A `link:' marker chases its target, a `group' marker becomes a composite of
 %% its immediate children, and any other marker is a simple value. When no
 %% marker row is present the path is an implicit group: its descendants (if any)
 %% still resolve to a composite, otherwise the read is a miss.
-prefix_read_result(_Opts, <<"data/", _/binary>> = Path, [{Path, Value} | _]) ->
+prefix_read_result(_Opts, <<"ni:", _/binary>> = Path, [{Path, Value} | _]) ->
     {ok, Value};
 prefix_read_result(Opts, Path, [{Path, <<"link:", Link/binary>>} | _])
         when byte_size(Link) > 0 ->
@@ -968,8 +966,8 @@ link_test() ->
 link_fragment_test() ->
     StoreOpts = hb_test_utils:test_store(?MODULE),
     test_reset(StoreOpts),
-    test_write(StoreOpts, [<<"data">>, <<"bar">>, <<"baz">>], <<"Bam">>),
-    test_link(StoreOpts, [<<"data">>, <<"bar">>], <<"my-link">>),
+    test_write(StoreOpts, [<<"foo">>, <<"bar">>, <<"baz">>], <<"Bam">>),
+    test_link(StoreOpts, [<<"foo">>, <<"bar">>], <<"my-link">>),
     {ok, Result} = test_read(StoreOpts, [<<"my-link">>, <<"baz">>]),
     ?event_debug({ result, Result}),
     ?assertEqual(<<"Bam">>, Result).
@@ -1083,7 +1081,7 @@ cache_style_test() ->
 %% @doc Test nested map storage with cache-like linking behavior
 %%
 %% This test demonstrates how to store a nested map structure where:
-%% 1. Each value is stored at data/{hash_of_value} 
+%% 1. Each value is stored at its `ni:' name
 %% 2. Links are created to compose the values back into the original map structure
 %% 3. Reading the composed structure reconstructs the original nested map
 nested_map_cache_test() ->
@@ -1108,43 +1106,43 @@ nested_map_cache_test() ->
         }
     },
     ?event_debug({original_map, OriginalMap}),
-    % Step 1: Store each leaf value at data/{hash}
+    % Step 1: Store each leaf value at its `ni:' name
     TargetValue = <<"Foo">>,
     TargetHash = base64:encode(crypto:hash(sha256, TargetValue)),
-    test_write(StoreOpts, <<"data/", TargetHash/binary>>, TargetValue),
+    test_write(StoreOpts, <<"ni:", TargetHash/binary>>, TargetValue),
     AlgValue1 = <<"rsa-pss-512">>,
     AlgHash1 = base64:encode(crypto:hash(sha256, AlgValue1)),
-    test_write(StoreOpts, <<"data/", AlgHash1/binary>>, AlgValue1),
+    test_write(StoreOpts, <<"ni:", AlgHash1/binary>>, AlgValue1),
     CommitterValue1 = <<"unique-id">>,
     CommitterHash1 = base64:encode(crypto:hash(sha256, CommitterValue1)),
-    test_write(StoreOpts, <<"data/", CommitterHash1/binary>>, CommitterValue1),
+    test_write(StoreOpts, <<"ni:", CommitterHash1/binary>>, CommitterValue1),
     AlgValue2 = <<"hmac">>,
     AlgHash2 = base64:encode(crypto:hash(sha256, AlgValue2)),
-    test_write(StoreOpts, <<"data/", AlgHash2/binary>>, AlgValue2),
+    test_write(StoreOpts, <<"ni:", AlgHash2/binary>>, AlgValue2),
     CommitterValue2 = <<"unique-id-2">>,
     CommitterHash2 = base64:encode(crypto:hash(sha256, CommitterValue2)),
-    test_write(StoreOpts, <<"data/", CommitterHash2/binary>>, CommitterValue2),
+    test_write(StoreOpts, <<"ni:", CommitterHash2/binary>>, CommitterValue2),
     OtherKeyValue = <<"other-key-value">>,
     OtherKeyHash = base64:encode(crypto:hash(sha256, OtherKeyValue)),
-    test_write(StoreOpts, <<"data/", OtherKeyHash/binary>>, OtherKeyValue),
+    test_write(StoreOpts, <<"ni:", OtherKeyHash/binary>>, OtherKeyValue),
     % Step 2: Create the nested structure with groups and links
     % Create the root group
     test_group(StoreOpts, <<"root">>),
     % Create links for the root level keys
-    test_link(StoreOpts, <<"data/", TargetHash/binary>>, <<"root/target">>),
+    test_link(StoreOpts, <<"ni:", TargetHash/binary>>, <<"root/target">>),
     % Create the commitments subgroup
     test_group(StoreOpts, <<"root/commitments">>),
     % Create the key1 subgroup within commitments
     test_group(StoreOpts, <<"root/commitments/key1">>),
-    test_link(StoreOpts, <<"data/", AlgHash1/binary>>, <<"root/commitments/key1/alg">>),
-    test_link(StoreOpts, <<"data/", CommitterHash1/binary>>, <<"root/commitments/key1/committer">>),
+    test_link(StoreOpts, <<"ni:", AlgHash1/binary>>, <<"root/commitments/key1/alg">>),
+    test_link(StoreOpts, <<"ni:", CommitterHash1/binary>>, <<"root/commitments/key1/committer">>),
     % Create the key2 subgroup within commitments
     test_group(StoreOpts, <<"root/commitments/key2">>),
-    test_link(StoreOpts, <<"data/", AlgHash2/binary>>, <<"root/commitments/key2/alg">>),
-    test_link(StoreOpts, <<"data/", CommitterHash2/binary>>, <<"root/commitments/key2/commiter">>),
+    test_link(StoreOpts, <<"ni:", AlgHash2/binary>>, <<"root/commitments/key2/alg">>),
+    test_link(StoreOpts, <<"ni:", CommitterHash2/binary>>, <<"root/commitments/key2/commiter">>),
     % Create the other-key subgroup
     test_group(StoreOpts, <<"root/other-key">>),
-    test_link(StoreOpts, <<"data/", OtherKeyHash/binary>>, <<"root/other-key/other-key-key">>),
+    test_link(StoreOpts, <<"ni:", OtherKeyHash/binary>>, <<"root/other-key/other-key-key">>),
     % Step 3: Test reading the structure back
     % Verify the root is a composite
     ?assertEqual(composite, test_type(StoreOpts, <<"root">>)),
@@ -1196,10 +1194,10 @@ cache_debug_test() ->
     % 1. Create a group for message ID
     MessageID = <<"test_message_123">>,
     test_group(StoreOpts, MessageID),
-    % 2. Store a value at data/hash
+    % 2. Store a value at its `ni:' name
     Value = <<"test_value">>,
     ValueHash = base64:encode(crypto:hash(sha256, Value)),
-    DataPath = <<"data/", ValueHash/binary>>,
+    DataPath = <<"ni:", ValueHash/binary>>,
     test_write(StoreOpts, DataPath, Value),
     % 3. Calculate a key hashpath (simplified version)
     KeyHashPath = <<MessageID/binary, "/", "key_hash_abc">>,

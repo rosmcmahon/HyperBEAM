@@ -742,7 +742,7 @@ load_field(Name, Ctx, Opts) ->
 read_id(ID, Opts) ->
     Read =
         case hb_cache:read(ID, Opts) of
-            {error, not_found} -> hb_cache:read(<<"data/", ID/binary>>, Opts);
+            {error, not_found} -> hb_cache:read(?NI_URI(ID), Opts);
             Result -> Result
         end,
     maybe

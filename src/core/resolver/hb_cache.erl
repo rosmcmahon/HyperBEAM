@@ -274,13 +274,13 @@ store_match(NormalizedSpec, Opts) ->
         _ -> {error, not_found}
     end.
 
-%% @doc Generate the path at which a binary value should be stored.
+%% @doc Generate the path at which a binary value should be stored: its `ni:'
+%% name, as one path component.
 generate_binary_path(Bin, Opts) ->
-    Hashpath = hb_path:hashpath(Bin, Opts),
-    <<"data/", Hashpath/binary>>.
+    hb_escape:encode_path_component(?NI_URI(hb_path:hashpath(Bin, Opts))).
 
-%% @doc Write a message to the cache. For raw binaries, we write the data at
-%% the hashpath of the data (by default the SHA2-256 hash of the data). We link
+%% @doc Write a message to the cache. For raw binaries, we write the data under
+%% its `ni:' name, which holds the SHA2-256 hash of the data. We link
 %% the unattended ID's hashpath for the keys (including `/commitments') on the
 %% message to the underlying data and recurse. We then link each commitment ID
 %% to the uncommitted message, such that any of the committed or uncommitted IDs
@@ -578,7 +578,7 @@ write_key_ops(Base, Key, HPAlg, Value, Opts, Acc) ->
     end.
 
 %% @doc True when `Value' should be stored at `Key''s path instead of linked
-%% through `data/'.
+%% to its `ni:' name.
 is_immediate_value(Key, Value) ->
     is_binary(Value) andalso
         byte_size(Value) < ?DIRECT_VALUE_LENGTH andalso
@@ -593,9 +593,9 @@ encode_immediate_value(<<"link:", _/binary>> = Value) -> <<"raw:", Value/binary>
 encode_immediate_value(<<"raw:", _/binary>> = Value) -> <<"raw:", Value/binary>>;
 encode_immediate_value(Value) -> Value.
 
-%% @doc Decode a value read from a message key path. Linked payloads under
-%% `data/' are not immediate values, so leave them byte-for-byte intact.
-decode_immediate_value(<<"data/", _/binary>>, Value) -> Value;
+%% @doc Decode a value read from a message key path. A binary stored under its
+%% `ni:' name is not an immediate value, so leave it byte-for-byte intact.
+decode_immediate_value(<<"ni:", _/binary>>, Value) -> Value;
 decode_immediate_value(_Path, <<"raw:", Value/binary>>) -> Value;
 decode_immediate_value(_Path, Value) -> Value.
 
@@ -742,15 +742,25 @@ calculate_all_ids(Msg, UncommittedID, Opts) ->
     end.
 
 %% @doc Read the message at a path. Returns in `structured@1.0' format: Either
-%% a richly typed map or a direct binary. If `cache-read-mode' is `raw',
-%% composite reads return lazy links without decoding `ao-types'. An ID that
-%% holds an `ao://' path for which `is_commitments_path/1' is true reads as the
-%% result of the path, resolved against the local stores alone; in `raw' mode
-%% it reads as the stored path, as resolving it needs `message@1.0'. Any other
-%% `ao://' value at an ID is not found.
-read(Path, Opts) when ?IS_HASHPATH(Path) ->
-    hb_hashpath:load(Path, Opts);
+%% a richly typed map or a direct binary. A URI is read by the device of its
+%% scheme (`hb_uri'), except a `ni:' name, under which the stores hold a
+%% binary (`write/2'). If `cache-read-mode' is `raw', composite reads return
+%% lazy links without decoding `ao-types'. An ID that holds an `ao://' path for
+%% which `is_commitments_path/1' is true reads as the message of the path, read
+%% by `ao@1.0' from the local stores alone; in `raw' mode it reads as the
+%% stored path, as reading it needs `message@1.0'. Any other `ao://' value at
+%% an ID is not found.
+read(<<"ni:", _/binary>> = Name, Opts) ->
+    do_read(Name, Opts);
+read(ID, Opts) when ?IS_ID(ID) ->
+    % An ID has no scheme, so it is read without looking for one.
+    do_read(ID, Opts);
 read(Path, Opts) ->
+    case hb_uri:scheme(Path) of
+        {error, not_found} -> do_read(Path, Opts);
+        _ -> hb_uri:from(Path, Opts)
+    end.
+do_read(Path, Opts) ->
     Store = hb_opts:get(store, no_viable_store, Opts),
     case {
         store_read(Path, Store, Opts),
@@ -758,9 +768,9 @@ read(Path, Opts) ->
     } of
         {{ok, Res}, raw} ->
             {ok, Res};
-        {{ok, AOPath = <<"ao://", Singleton/binary>>}, _} when ?IS_ID(Path) ->
+        {{ok, AOPath = <<"ao://", _/binary>>}, _} when ?IS_ID(Path) ->
             case is_commitments_path(AOPath) of
-                true -> hb_ao:raw(Singleton, hb_store:scope(Opts, local));
+                true -> hb_uri:from(AOPath, hb_store:scope(Opts, local));
                 false -> {error, not_found}
             end;
         {{ok, Res}, _} ->
@@ -823,8 +833,11 @@ store_read(Path, Store, Opts) ->
     store_read(Path, Path, Store, Opts).
 store_read(_Target, _Path, no_viable_store, _) ->
     {error, not_found};
-store_read(Target, <<"data/", _/binary>> = PathBin, Store, Opts) ->
-    read_resolved_path(Target, PathBin, Store, Opts);
+store_read(Target, <<"ni:///", _/binary>> = Name, Store, Opts) ->
+    % A `ni:' name is stored as one escaped path component.
+    store_read(Target, hb_escape:encode_path_component(Name), Store, Opts);
+store_read(Target, <<"ni:", _/binary>> = Key, Store, Opts) ->
+    read_resolved_path(Target, Key, Store, Opts);
 store_read(Target, Path, Store, Opts) ->
     PathBin = hb_path:to_binary(Path),
     case hb_store:resolve(Store, PathBin, Opts) of
@@ -1236,7 +1249,12 @@ test_store_binary(Store) ->
     Opts = #{ <<"store">> => Store },
     {ok, ID} = write(Bin, Opts),
     {ok, RetrievedBin} = read(ID, Opts),
-    ?assertEqual(Bin, RetrievedBin).
+    ?assertEqual(Bin, RetrievedBin),
+    % A binary is stored under its `ni:' name, which reads it back.
+    ?assertEqual({ok, Bin}, read(?NI_URI(hb_path:hashpath(Bin, Opts)), Opts)),
+    % A binary whose bytes are a store marker reads back as those bytes.
+    {ok, Marker} = write(<<"group">>, Opts),
+    ?assertEqual({ok, <<"group">>}, read(Marker, Opts)).
 
 test_store_unsigned_empty_message(Store) ->
     ?event_debug(debug_store_test, {store, Store}),

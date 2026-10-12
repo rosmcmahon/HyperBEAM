@@ -102,10 +102,6 @@ process_simple_node(_Store, _Key, Parent, ResolvedPath, JoinedPath, Graph, Opts)
     end.
 
 %% @doc Process a composite (directory) node
-process_composite_node(_Store, <<"data">>, _Parent, _ResolvedPath, _JoinedPath, Graph, _Opts) ->
-    % Data is a special case: It contains every binary item in the store.
-    % We don't need to render it.
-    Graph;
 process_composite_node(Store, _Key, Parent, ResolvedPath, JoinedPath, Graph, Opts) ->
     % Add the node to the graph
     Graph1 = add_node(Graph, ResolvedPath, "lightcoral", Opts),

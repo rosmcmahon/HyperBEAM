@@ -300,8 +300,8 @@ path_read(Path, Meta, Opts) ->
 %% path's descendants: a link chases its target, a group answers with its
 %% immediate children, any other value answers itself, and a path with
 %% descendants but no marker is a group without a marker. A content-addressed
-%% `data/' row answers itself, whatever its bytes.
-path_result(<<"data/", _/binary>> = Path, [{Path, Value} | _], _Meta, _Opts) ->
+%% `ni:' row answers itself, whatever its bytes.
+path_result(<<"ni:", _/binary>> = Path, [{Path, Value} | _], _Meta, _Opts) ->
     {ok, Value};
 path_result(Path, [{Path, <<"link:", Link/binary>>} | _], Meta, Opts)
         when byte_size(Link) > 0 ->
@@ -324,7 +324,7 @@ path_miss(Path, Meta, Opts) ->
     through_links(Path, fun path_read/3, Meta, Opts).
 
 %% @doc A path taken again by `Then' with the links within it followed,
-%% when they lead elsewhere, and a miss otherwise. Content-addressed `data'
+%% when they lead elsewhere, and a miss otherwise. Content-addressed `ni:'
 %% keys hold no links.
 through_links(Path, Then, Meta, Opts) ->
     Parts = binary:split(Path, <<"/">>, [global, trim_all]),
@@ -1698,7 +1698,6 @@ published_paths() ->
     ?assertEqual({ok, <<"deep">>}, Read(<<"l/c/d">>)),
     Big = binary:copy(<<"0123456789abcdef">>, 6400),
     ?assertEqual({ok, Big}, Read(<<"a/big">>)),
-    ?assertEqual({ok, <<"raw">>}, Read(<<"data/k">>)),
     ?assertEqual({error, not_found}, Read(<<"nope">>)),
     {composite, Children} = Read(<<"a">>),
     ?assertEqual(

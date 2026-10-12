@@ -9,7 +9,7 @@
 %%%
 %%%     Path:
 %%%         - /Part1/Part2/.../PartN/ => [Part1, Part2, ..., PartN]
-%%%         - /ID/Part2/.../PartN => [ID, Part2, ..., PartN]
+%%%         - /ID or URI/Part2/.../PartN => [ID or URI, Part2, ..., PartN]
 %%%
 %%%     Part: (Key + Resolution), Device?, #{ K => V}?
 %%%         - Part => #{ path => Part }
@@ -32,6 +32,12 @@
 %%%         - key+res: /nested/path => #{ key => (resolve /nested/path), ... }
 %%%         - N.Key+res=(/a/b/c) => #{ Key => (resolve /a/b/c), ... }
 %%% </pre>
+%%%
+%%% A URI is written in a path with its `:' as it is, and with the bytes that
+%%% a path uses percent-escaped: `/', `?', `#' and `%'. A part that starts
+%%% with a URI scheme (`hb_uri') is that URI, decoded, whatever follows the
+%%% scheme: its `&', `~' and `=' are its own. Like an ID, it is a step of its
+%%% own, and as the first part it is the base.
 -module(hb_singleton).
 -export([from/2, from_request/2, from_path/1, to/1]).
 -include("include/hb.hrl").
@@ -202,7 +208,7 @@ parse_query(QStr) ->
 
 %% @doc Normalize the base path.
 normalize_base([]) -> [];
-normalize_base([First|Rest]) when ?IS_ID(First) -> [First|Rest];
+normalize_base([First|Rest]) when is_binary(First) -> [First|Rest];
 normalize_base([{as, DevID, First}|Rest]) -> [{as, DevID, First}|Rest];
 normalize_base([Subres = {resolve, _}|Rest]) -> [Subres|Rest];
 normalize_base(Rest) -> [#{}|Rest].
@@ -337,13 +343,22 @@ do_build(I, [Msg | Rest], ScopedKeys, Opts) ->
     ?event_debug(parsing, {build_messages, {base, Msg}, {additional, Additional}}),
     [StepMsg | do_build(I + 1, Rest, ScopedKeys, Opts)].
 
-%% @doc Parse a path part into a message or an ID.
+%% @doc Parse a path part into a message, an ID or a URI. A part that starts
+%% with a URI scheme is that URI, decoded, whatever follows the scheme.
+parse_part(Part, Opts) when is_binary(Part) ->
+    case hb_uri:scheme(Part) of
+        {error, not_found} -> parse_message_part(Part, Opts);
+        _ -> decode_string(Part)
+    end;
+parse_part(Part, _Opts) -> Part.
+
+%% @doc Parse a path part that is not a URI into a message or an ID.
 %% Applies the syntax rules outlined in the module doc, in the following order:
 %% 1. ID
 %% 2. Part subpath resolutions
 %% 3. Inlined key-value pairs
 %% 4. Device specifier
-parse_part(Part, Opts) when is_binary(Part) ->
+parse_message_part(Part, Opts) ->
     case maybe_subpath(Part, Opts) of
         {resolve, Subpath} -> {resolve, Subpath};
         Part ->
@@ -374,8 +389,7 @@ parse_part(Part, Opts) when is_binary(Part) ->
                         Opts
                     )
             end
-    end;
-parse_part(Part, _Opts) -> Part.
+    end.
 
 %% @doc Parse part modifiers:
 %% 1. `~Device' => `{as, Device, Msg}'
@@ -533,6 +547,12 @@ parse_explicit_message_test() ->
     ?assertEqual(
         [DummyID, #{ <<"path">> => <<"a">>, <<"a">> => <<"b">> }],
         from(Singleton3, #{})
+    ),
+    % A part that starts with a URI scheme is the URI, decoded, with the `&',
+    % `~' and `=' that follow the scheme.
+    ?assertEqual(
+        [<<"ni:///sha-256;x&k=v~d@1.0">>, #{ <<"path">> => <<"a">> }],
+        from(#{ <<"path">> => <<"/ni:%2f%2f%2fsha-256;x&k=v~d@1.0/a">> }, #{})
     ).
 
 %%% `to/1' function tests

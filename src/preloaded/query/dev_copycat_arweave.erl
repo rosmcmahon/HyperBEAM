@@ -2297,7 +2297,7 @@ pending_bundle_children(Rejected, StoreModule) ->
         ?assertEqual(
             {ok, Binary},
             hb_cache:read(
-                [<<"data">>, hb_path:hashpath(Binary, Opts)],
+                ?NI_URI(hb_path:hashpath(Binary, Opts)),
                 hb_store:scope(Opts, local)
             )
         ),

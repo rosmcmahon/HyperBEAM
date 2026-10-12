@@ -3,7 +3,7 @@
 -export([info/3]).
 -export([info/1, test_func/1, compute/3, init/3, restore/3, snapshot/3, mul/2]).
 -export([mangle/3, update_state/3, increment_counter/3, delay/3, append/3]).
--export([index/3, postprocess/3, load/3]).
+-export([index/3, postprocess/3, load/3, from/3, to/3]).
 -export([vary_projection/3, vary_wildcard/3, vary_unspecified/3, vary_inspect/3]).
 -export([vary_overlay/3, vary_request_overlay/3]).
 -export([vary_alternatives/3, vary_dependent/3]).
@@ -70,6 +70,26 @@ index(Msg, _Req, Opts) ->
     {ok, #{ device := binary(), _ => _ }}.
 load(Base, _, _Opts) ->
     {ok, Base#{ <<"device">> => <<"test-device@1.0">> }}.
+
+%% @doc Returns the resource of the URI `test:device:<body>': a message with
+%% this device and the given body. The proxy test of `hb_uri' reads it.
+-spec from(
+    #{ body := binary(), _ => _ },
+    #{ type := binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ device := binary(), body := binary() }}.
+from(#{ <<"body">> := Body }, #{ <<"type">> := <<"uri">> }, _Opts) ->
+    {ok, #{ <<"device">> => <<"test-device@1.0">>, <<"body">> => Body }}.
+
+%% @doc Writes the whole URI, `test:device:<body>', of a message that
+%% `from/3' returns.
+-spec to(
+    #{ body := binary(), _ => _ },
+    #{ type := binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, binary()}.
+to(#{ <<"body">> := Body }, #{ <<"type">> := <<"uri">> }, _Opts) ->
+    {ok, <<"test:device:", Body/binary>>}.
 
 test_func(_) ->
 	{ok, <<"GOOD FUNCTION">>}.

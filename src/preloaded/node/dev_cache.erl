@@ -64,8 +64,8 @@ read(_M1, M2, Opts) ->
                     {ok, Res}
             end;
         {error, not_found} ->
-            % The cache does not have this ID,but it may still be an explicit
-            % `data/' path.
+            % The cache does not have this ID, but the store may hold a value at
+            % the path.
             % Store = hb_opts:get(store, [], Opts),
             Store = hb_opts:get(store, no_viable_store, Opts),
             ?event(dev_cache, {read, {location, Location}, {store, Store}}),
@@ -203,7 +203,7 @@ setup_test_env() ->
                 <<"store-module">> => hb_store_remote_node,
                 <<"node">> => Node,
                 <<"priv-wallet">> => Wallet,
-                % The tests read back the `data/' path of a binary they write.
+                % The tests read back the `ni:' path of a binary they write.
                 <<"trusted">> => true
             }
 	    ]

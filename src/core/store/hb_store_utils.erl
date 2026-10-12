@@ -85,9 +85,9 @@ is_link(_) ->
 to_path(PathParts) ->
     hb_util:bin(lists:join(<<"/">>, PathParts)).
 
-%% @doc Whether a path is content-addressed data, which never holds links.
-is_data_path(<<"data">>) -> true;
-is_data_path(<<"data/", _/binary>>) -> true;
+%% @doc Whether a path is the `ni:' name of a binary: content-addressed data,
+%% which never holds links.
+is_data_path(<<"ni:", _/binary>>) -> true;
 is_data_path(_) -> false.
 
 %% @doc Resolve links in a path, checking each segment except the last,
@@ -113,8 +113,6 @@ resolve_path_links(Read, Path, Depth) ->
 resolve_path_links_acc(_Read, [], AccPath, _Depth) ->
     % No more segments to process
     {ok, lists:reverse(AccPath)};
-resolve_path_links_acc(_, FullPath = [<<"data">>|_], [], _Depth) ->
-    {ok, FullPath};
 resolve_path_links_acc(Read, [Head | Tail], AccPath, Depth) ->
     % Build the accumulated path so far
     CurrentPath = lists:reverse([Head | AccPath]),
