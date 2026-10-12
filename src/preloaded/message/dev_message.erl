@@ -1251,6 +1251,29 @@ set_new_key_drops_commitments_test() ->
             hb_message:committed(PartiallySigned, #{ <<"ids">> => <<"any">> }, Opts)
         )
     ),
+    % `with_only_committed' with `any' keeps both keys and both commitments.
+    ?assertEqual(
+        {ok, PartiallySigned},
+        hb_message:with_only_committed(PartiallySigned, any, Opts)
+    ),
+    % With a list of IDs, the keys that every listed commitment covers are kept.
+    ?assertEqual(
+        hb_message:with_only_committed(PartiallySigned, Opts),
+        hb_message:with_only_committed(
+            PartiallySigned,
+            maps:keys(maps:get(<<"commitments">>, PartiallySigned)),
+            Opts
+        )
+    ),
+    % With a spec, the keys that `committed/3' gives for it are kept.
+    ?assertEqual(
+        {ok, PartiallySigned},
+        hb_message:with_only_committed(
+            PartiallySigned,
+            #{ <<"ids">> => <<"any">> },
+            Opts
+        )
+    ),
     {ok, Set} = hb_ao:resolve(
         PartiallySigned,
         #{ <<"path">> => <<"set">>, <<"b">> => <<"3">> },

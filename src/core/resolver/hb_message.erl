@@ -66,7 +66,8 @@
 -export([normalize_commitments/2, normalize_commitments/3]).
 -export([is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
--export([with_only_committed/2, with_links/3, without_unless_signed/3]).
+-export([with_only_committed/2, with_only_committed/3]).
+-export([with_links/3, without_unless_signed/3]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -350,7 +351,9 @@ normalize_message(Msg, Opts, Settings) ->
 normalization_fast_hash(Msg) ->
     crypto:hash(sha256, term_to_binary(hb_private:reset(Msg))).
 
-%% @doc Return a message with only the committed keys. If no commitments are
+%% @doc Return a message with only the committed keys. `all', the default, keeps
+%% the keys that every commitment covers; `any', the keys that any covers; a
+%% list of IDs or a spec, those that `committed/3' gives. If no commitments are
 %% present, the message is returned unchanged. This means that you need to
 %% check if the message is:
 %% - Committed
@@ -358,7 +361,11 @@ normalization_fast_hash(Msg) ->
 %% ...before using the output of this function as the 'canonical' message. This
 %% is such that expensive operations like signature verification are not
 %% performed unless necessary.
-with_only_committed(Msg, Opts) when is_map(Msg) ->
+with_only_committed(Msg, Opts) ->
+    with_only_committed(Msg, all, Opts).
+with_only_committed(Msg, Mode, Opts) when is_atom(Mode) ->
+    with_only_committed(Msg, #{ <<"ids">> => hb_util:bin(Mode) }, Opts);
+with_only_committed(Msg, Spec, Opts) when is_map(Msg) ->
     ?event_debug({with_only_committed, {msg, Msg}, {opts, Opts}}),
     Comms = hb_maps:get(<<"commitments">>, Msg, not_found, Opts),
     case is_map(Msg) andalso Comms /= not_found of
@@ -367,7 +374,7 @@ with_only_committed(Msg, Opts) when is_map(Msg) ->
                 CommittedKeys =
                     hb_message:committed(
                         Msg,
-                        #{ <<"ids">> => <<"all">> },
+                        Spec,
                         Opts
                     ),
                 % Add the ao-body-key to the committed list if it is not
@@ -392,7 +399,7 @@ with_only_committed(Msg, Opts) when is_map(Msg) ->
             end;
         false -> {ok, Msg}
     end;
-with_only_committed(Msg, _) ->
+with_only_committed(Msg, _, _) ->
     % If the message is not a map, it cannot be signed.
     {ok, Msg}.
 
