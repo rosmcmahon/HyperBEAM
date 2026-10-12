@@ -20,14 +20,17 @@
 %%% Public interface.
 %%% ==================================================================
 
-%% @doc Use Opts to configure connection pool size.
+%% @doc Recreate the startup pool with configured settings in its child spec.
 setup_conn(Opts) ->
     MaxConnections =
         hb_opts:get(http_client_hackney_max_connections, ?DEFAULT_HACKNEY_MAX_CONNECTIONS, Opts),
     KeepAlive = hb_opts:get(http_client_keepalive, ?DEFAULT_KEEPALIVE_TIMEOUT, Opts),
     ?event(connection_pool, {http_client_hackney_max_connections, MaxConnections}),
-    hackney_pool:set_max_connections(?HACKNEY_POOL, MaxConnections),
-    hackney_pool:set_timeout(?HACKNEY_POOL, KeepAlive).
+    ok = hackney_pool:stop_pool(?HACKNEY_POOL),
+    hackney_pool:start_pool(?HACKNEY_POOL, [
+        {max_connections, MaxConnections},
+        {timeout, KeepAlive}
+    ]).
 
 start_link(Opts) ->
 	gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
@@ -256,7 +259,7 @@ gun_req(Args, Opts) ->
 	end.
 
 %% @doc Start the hackney connection pool with default settings.
-%% Overridden at runtime by setup_conn/1 once node config is available.
+%% Replaced by setup_conn/1 once node config is available.
 init_hackney_pool() ->
     hackney_pool:start_pool(?HACKNEY_POOL, [
         {max_connections, ?DEFAULT_HACKNEY_MAX_CONNECTIONS},
