@@ -632,8 +632,9 @@ resolve_request(Req, Singleton, NodeMsg) ->
                 cowboy_req:path(Req) == <<"/~meta@1.0/info">> orelse
                 {error, <<"Node must be initialized before use.">>},
         Msgs =
-            hb_singleton:from(
+            hb_hashpath:from(
                 hb_private:set(Singleton, <<"http-request">>, Singleton, NodeMsg),
+                requests,
                 NodeMsg
             ),
         {ok, PreProcessedMsgs} ?=

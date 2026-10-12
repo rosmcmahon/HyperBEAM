@@ -3,11 +3,10 @@
 %%% device.
 %%%
 %%% <pre>
-%%%     ao:<ID>         The message with the ID. A bare ID in a path or as a
-%%%                     base is read as this URI.
-%%%     ao://<path>     An AO-Core path, which is resolved. For example,
-%%%                     `ao://with-commitments=<ID>,<ID>' is the message
-%%%                     with those commitments.
+%%%     ao:<ID>         The message with the ID. A bare ID as a base, or as
+%%%                     the request of a hashpath, is read as this URI.
+%%%     ao://<path>     A hashpath, which `hb_hashpath' loads with its
+%%%                     claims, where `hb_ao:resolve' would ignore them.
 %%% </pre>
 %%%
 %%% `to' with `type: uri' writes the URI `ao:<ID>' of a message. `<ID>' is the
@@ -27,9 +26,10 @@
 from(#{ <<"body">> := Body }, #{ <<"type">> := <<"uri">> }, Opts) ->
     read(Body, Opts).
 
-%% @doc Read the message of an AO-Core path, which we resolve, or of an ID.
-read(<<"//", Path/binary>>, Opts) ->
-    hb_ao:resolve(Path, Opts);
+%% @doc Read the message named by the body of an `ao:' URI: a hashpath, which
+%% may be any AO-Core path, or an ID.
+read(<<"//", _/binary>> = Path, Opts) ->
+    hb_hashpath:load(<<"ao:", Path/binary>>, Opts);
 read(ID, Opts) when ?IS_ID(ID) ->
     hb_cache:read(ID, Opts);
 read(_Body, _Opts) ->

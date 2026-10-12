@@ -434,13 +434,13 @@ from_repeat_enum_test() ->
 from_malformed_repeat_format_test() ->
     lists:foreach(
         fun(Format) ->
+            % The format is given as a key of the request, because a path
+            % with an unbalanced `(' is refused before the device can read it.
             ?assertMatch(
                 {error, _},
                 hb_ao:resolve(
-                    #{
-                        <<"path">> => <<"~bits@1.0/from=", Format/binary>>,
-                        <<"body">> => <<0>>
-                    },
+                    #{ <<"device">> => <<"bits@1.0">>, <<"body">> => <<0>> },
+                    #{ <<"path">> => <<"from">>, <<"from">> => Format },
                     #{}
                 )
             )
