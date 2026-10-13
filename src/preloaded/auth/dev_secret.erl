@@ -623,26 +623,27 @@ sync(_Base, Request, Opts) ->
             {error, <<"Node not specified.">>};
         Node ->
             Wallets = hb_maps:get(<<"keyids">>, Request, <<"all">>, Opts),
-            SignAsOpts =
-                case hb_ao:get(<<"as">>, Request, undefined, Opts) of
-                    undefined -> Opts;
-                    SignAs -> hb_opts:as(SignAs, Opts)
-                end,
-            ExportRequest =
-                (hb_message:commit(
-                    #{ <<"keyids">> => Wallets },
-                    SignAsOpts
-                ))#{ <<"path">> => <<"/~secret@1.0/export">> },
-            ?event({sync, {export_req, ExportRequest}}),
-            case hb_http:get(Node, ExportRequest, SignAsOpts) of
-                {ok, ExportResponse} ->
-                    ExportedWallets = export_response_to_list(ExportResponse, #{}),
-                    ?event({sync, {priv_received_wallets, ExportedWallets}}),
-                    % Import each wallet. Ignore wallet imports that fail.
+            maybe
+                {ok, SignAsOpts} ?=
+                    case hb_ao:get(<<"as">>, Request, undefined, Opts) of
+                        undefined -> {ok, Opts};
+                        SignAs -> hb_opts:as(SignAs, Opts)
+                    end,
+                ExportRequest =
+                    (hb_message:commit(
+                        #{ <<"keyids">> => Wallets },
+                        SignAsOpts
+                    ))#{ <<"path">> => <<"/~secret@1.0/export">> },
+                ?event({sync, {export_req, ExportRequest}}),
+                case hb_http:get(Node, ExportRequest, SignAsOpts) of
+                    {ok, ExportResponse} ->
+                        ExportedWallets = export_response_to_list(ExportResponse, #{}),
+                        ?event({sync, {priv_received_wallets, ExportedWallets}}),
+                        % Import each wallet. Ignore wallet imports that fail.
                         lists:filtermap(
                             fun(Wallet) ->
                                 ?event({sync, {importing, {priv_wallet, Wallet}}}),
-                                case persist_registered_wallet(Wallet, SignAsOpts) of
+                                case persist_registered_wallet(Wallet, Opts) of
                                     {ok, #{ <<"body">> := Address }} ->
                                         ?event({sync, {imported, Address}}),
                                         {true, Address};
@@ -653,10 +654,11 @@ sync(_Base, Request, Opts) ->
                             end,
                             ExportedWallets
                         ),
-                    {ok, ExportedWallets};
-                {error, Reason} ->
-                    ?event({sync, {error, Reason}}),
-                    {error, Reason}
+                        {ok, ExportedWallets};
+                    {error, Reason} ->
+                        ?event({sync, {error, Reason}}),
+                        {error, Reason}
+                end
             end
     end.
 
@@ -1190,15 +1192,21 @@ export_batch_all_wallets_test() ->
 sync_wallets_test() ->
     % Remove all previous cached wallets.
     hb_store:reset(hb_opts:get(priv_store, no_wallet_store, #{})),
+    % Start a node that holds the key of the second node's wallet admin as its
+    % `admin' identity.
+    AdminWallet = ar_wallet:new(),
     Node =
         hb_http_server:start_node(#{
-            <<"priv-wallet">> => Node1Wallet = ar_wallet:new()
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"identities">> =>
+                #{ <<"admin">> => #{ <<"priv-wallet">> => AdminWallet } }
         }),
+    {ok, Address} = hb_http:get(Node, <<"/~meta@1.0/info/address">>, #{}),
     % Start a second node to sync from.
     Node2 =
         hb_http_server:start_node(#{
             <<"priv-wallet">> => ar_wallet:new(),
-            <<"wallet-admin">> => hb_util:human_id(Node1Wallet)
+            <<"wallet-admin">> => hb_util:human_id(AdminWallet)
         }),
     % Generate a wallet on the second node.
     {ok, GenResponse} =
@@ -1208,13 +1216,27 @@ sync_wallets_test() ->
             #{}
         ),
     WalletKeyID = maps:get(<<"body">>, GenResponse),
-    % Test sync to the first node from the second.
+    % A sync as an identity that the first node does not hold fails.
+    ?assertMatch(
+        {error, _},
+        hb_http:get(
+            Node,
+            <<"/~secret@1.0/sync?node=", Node2/binary, "&as=x">>,
+            #{}
+        )
+    ),
+    % Test sync to the first node from the second, signed as `admin'.
     {ok, _} =
         hb_http:get(
             Node,
-            <<"/~secret@1.0/sync?node=", Node2/binary, "&wallets=all">>,
+            <<"/~secret@1.0/sync?node=", Node2/binary, "&as=admin">>,
             #{}
         ),
+    % The first node keeps its own key.
+    ?assertEqual(
+        {ok, Address},
+        hb_http:get(Node, <<"/~meta@1.0/info/address">>, #{})
+    ),
     % Get the wallet list from the first node.
     {ok, WalletList} = hb_http:get(Node, <<"/~secret@1.0/list">>, #{}),
     ?event({sync_wallets_test, {wallet_list, WalletList}}),
