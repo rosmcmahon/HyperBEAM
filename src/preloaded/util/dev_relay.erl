@@ -180,20 +180,22 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
     % A request `peer' or absolute `relay-path' is checked; a relative
     % `relay-path' names no host and is routed by `hb_http:request/2', which
     % fails closed when no route matches.
-    {RelayPeer, Destination} =
+    {RelayPeer, Destination, RouteOpts} =
         case RelayRoute of
             not_found ->
-                {RequestPeer, relay_destination(RequestPeer, RelayPath)};
+                {RequestPeer, relay_destination(RequestPeer, RelayPath), HTTPOpts};
             _ ->
-                {route_node(RelayRoute, RelayMethod, Opts), undefined}
+                {Node, NodeOpts} = route_node(RelayRoute, RelayMethod, HTTPOpts),
+                {Node, undefined, NodeOpts}
         end,
+    RequestOpts = RouteOpts#{ <<"http-redirects">> => 0 },
     case is_blocked_host(Destination, Opts) of
         true -> {error, blocked_host};
         false ->
             Res =
                 case RelayPeer of
                     not_found ->
-                        hb_http:request(TargetMod5, HTTPOpts);
+                        hb_http:request(TargetMod5, RequestOpts);
                     _ ->
                         ?event(debug_relay, {relaying_to_peer, RelayPeer}),
                         hb_http:request(
@@ -201,7 +203,7 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
                             RelayPeer,
                             RelayPath,
                             TargetMod5,
-                            HTTPOpts
+                            RequestOpts
                         )
                 end,
             case Res of
@@ -228,15 +230,15 @@ relay_destination(not_found, _RelativePath) -> undefined;
 relay_destination(Peer, _RelayPath) -> Peer.
 
 %% @doc The node that the node's own routes resolve `Route' to: the destination
-%% the node's configuration chose for that path. Returns `not_found' when no
-%% route matches, which leaves the request with no peer to contact.
+%% the node's configuration chose for that path, with its request options.
+%% Returns `not_found' when no route matches, leaving no peer to contact.
 route_node(Route, Method, Opts) ->
     case hb_http:message_to_request(
             #{ <<"path">> => Route, <<"method">> => Method },
             Opts
         ) of
-        {ok, _Method, Node, _Path, _Msg, _NodeOpts} -> Node;
-        {error, _} -> not_found
+        {ok, _Method, Node, _Path, _Msg, NodeOpts} -> {Node, NodeOpts};
+        {error, _} -> {not_found, Opts}
     end.
 
 %% @doc Ensure that cookies are not forwarded either to or from the relayed
