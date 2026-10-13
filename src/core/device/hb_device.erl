@@ -6,6 +6,7 @@
 -export([is_direct_key_access/3, is_direct_key_access/4]).
 -export([find_exported_function/5, is_exported/4, info/2, info/3]).
 -include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -define(DEFAULT_DEVICE, <<"message@1.0">>).
 
@@ -134,11 +135,49 @@ message_to_fun(Dev, Msg, Key, Opts) ->
 %% internal module-loading path.
 message_to_device(Msg, Opts) ->
     DevID = hb_maps:get(<<"device">>, Msg, ?DEFAULT_DEVICE, Opts),
+    % Enforce node policy before consulting any loader or resolved-device cache.
+    case lists:member(DevID, hb_opts:get(exclude_devices, [], Opts)) of
+        true ->
+            throw({error, {device_not_loadable, DevID, 'device-excluded'}});
+        false -> ok
+    end,
     case hb_device_load:reference(DevID, Opts) of
         {error, Reason} -> throw({error, {device_not_loadable, DevID, Reason}});
         {ok, DevMod} -> DevMod
     end.
 
+
+%% @doc Exclusions take precedence over cold loading and trusted pins.
+excluded_device_test() ->
+    Ref = <<"excluded-test-device@1.0">>,
+    Msg = #{ <<"device">> => Ref },
+    Opts = #{ <<"exclude-devices">> => [Ref] },
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(Msg, Opts)
+    ),
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(Msg, Opts#{
+            <<"trusted-devices">> => #{ Ref => <<0:344>> }
+        })
+    ).
+
+%% @doc A resolved device cannot bypass a subsequently applied exclusion.
+excluded_cached_device_test() ->
+    Ref = <<"message@1.0">>,
+    Msg = #{ <<"device">> => Ref },
+    Mod = message_to_device(Msg, #{}),
+    ?assertEqual(Mod, message_to_device(Msg, #{ <<"exclude-devices">> => [] })),
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(Msg, #{ <<"exclude-devices">> => [Ref] })
+    ),
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(#{}, #{ <<"exclude-devices">> => [Ref] })
+    ),
+    ?assertEqual(Mod, message_to_device(#{}, #{})).
 %% @doc Parse a handler key given by a device's `info'.
 info_handler_to_fun(Handler, _Msg, _Key, _Opts) when is_function(Handler) ->
 	{add_key, Handler};
