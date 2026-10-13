@@ -173,6 +173,7 @@
 %%%     `keyid's of the imported secrets.
 %%% '''
 -module(dev_secret).
+-device_libraries([lib_meta]).
 -export([generate/3, import/3, list/3, commit/3, export/3, sync/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
@@ -626,58 +627,52 @@ export(Base, Request, Opts) ->
     #{ _ => _ }
 ) -> {ok, [binary()]} | {error, _}.
 sync(_Base, Request, Opts) ->
-    case hb_ao:get(<<"node">>, Request, undefined, Opts) of
-        undefined ->
-            {error, <<"Node not specified.">>};
-        Node ->
-            Wallets = hb_maps:get(<<"keyids">>, Request, <<"all">>, Opts),
-            maybe
-                % Check that the request is signed by the node's `wallet_admin',
-                % or by its operator address if no `wallet_admin' is set.
-                true ?=
-                    verify_controllers(
-                        #{ <<"controllers">> => default },
-                        Request,
-                        Opts
-                    ) orelse {error, <<"Verification failed.">>},
-                {ok, SignAsOpts} ?=
-                    case hb_ao:get(<<"as">>, Request, undefined, Opts) of
-                        undefined -> {ok, Opts};
-                        SignAs -> hb_opts:as(SignAs, Opts)
-                    end,
-                ExportRequest =
-                    (hb_message:commit(
-                        #{ <<"keyids">> => Wallets },
-                        SignAsOpts
-                    ))#{ <<"path">> => <<"/~secret@1.0/export">> },
-                ?event({sync, {export_req, ExportRequest}}),
-                case hb_http:get(Node, ExportRequest, SignAsOpts) of
-                    {ok, ExportResponse} ->
-                        ExportedWallets = export_response_to_list(ExportResponse, #{}),
-                        ?event({sync, {priv_received_wallets, ExportedWallets}}),
-                        % Import each wallet. Ignore wallet imports that fail.
-                        {
-                            ok,
-                            lists:filtermap(
-                                fun(Wallet) ->
-                                    ?event({sync, {importing, {priv_wallet, Wallet}}}),
-                                    case persist_registered_wallet(Wallet, Opts) of
-                                        {ok, #{ <<"body">> := KeyID }} ->
-                                            ?event({sync, {imported, KeyID}}),
-                                            {true, KeyID};
-                                        {error, Reason} ->
-                                            ?event({sync, {process_import_error, Reason}}),
-                                            false
-                                    end
-                                end,
-                                ExportedWallets
-                            )
-                        };
-                    {error, Reason} ->
-                        ?event({sync, {error, Reason}}),
-                        {error, Reason}
-                end
-            end
+    maybe
+        % Read the node, the identity to sign as, and the keyids only from the
+        % keys that the node's controllers signed: its `wallet_admin', or its
+        % operator address if no `wallet_admin' is set.
+        Controllers = parse_controllers(default, Opts),
+        {ok, Signed} ?= lib_meta:authorized(Controllers, Request, Opts),
+        Node = hb_ao:get(<<"node">>, Signed, undefined, Opts),
+        true ?= Node =/= undefined orelse {error, <<"Node not specified.">>},
+        Wallets = hb_maps:get(<<"keyids">>, Signed, <<"all">>, Opts),
+        {ok, SignAsOpts} ?=
+            case hb_ao:get(<<"as">>, Signed, undefined, Opts) of
+                undefined -> {ok, Opts};
+                SignAs -> hb_opts:as(SignAs, Opts)
+            end,
+        ExportRequest =
+            (hb_message:commit(
+                #{ <<"keyids">> => Wallets },
+                SignAsOpts
+            ))#{ <<"path">> => <<"/~secret@1.0/export">> },
+        ?event({sync, {export_req, ExportRequest}}),
+        case hb_http:get(Node, ExportRequest, SignAsOpts) of
+            {ok, ExportResponse} ->
+                ExportedWallets = export_response_to_list(ExportResponse, #{}),
+                ?event({sync, {priv_received_wallets, ExportedWallets}}),
+                % Import each wallet. Ignore wallet imports that fail.
+                {
+                    ok,
+                    lists:filtermap(
+                        fun(Wallet) ->
+                            ?event({sync, {importing, {priv_wallet, Wallet}}}),
+                            case persist_registered_wallet(Wallet, Opts) of
+                                {ok, #{ <<"body">> := KeyID }} ->
+                                    ?event({sync, {imported, KeyID}}),
+                                    {true, KeyID};
+                                {error, Reason} ->
+                                    ?event({sync, {process_import_error, Reason}}),
+                                    false
+                            end
+                        end,
+                        ExportedWallets
+                    )
+                };
+            {error, Reason} ->
+                ?event({sync, {error, Reason}}),
+                {error, Reason}
+        end
     end.
 
 %%% Helper functions
@@ -1257,6 +1252,20 @@ sync_wallets_test() ->
         end,
     % A sync as an identity that the first node does not hold fails.
     ?assertMatch({error, _}, Sync(<<"x">>)),
+    % A `node' supplied only as an unsigned query parameter is not acted on:
+    % the controller signs `as' alone, so the request has no signed node.
+    ?assertMatch(
+        {error, _},
+        hb_http:get(
+            Node,
+            (hb_message:commit(
+                #{ <<"as">> => <<"admin">> },
+                #{ <<"priv-wallet">> => Node1Wallet }
+            ))#{ <<"path">> =>
+                <<"/~secret@1.0/sync?node=", Node2/binary>> },
+            #{}
+        )
+    ),
     % Test sync to the first node from the second, signed as `admin'. The
     % response holds the `keyid' of the imported wallet, and not its key.
     {ok, SyncResponse} = Sync(<<"admin">>),
