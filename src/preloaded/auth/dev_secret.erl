@@ -167,6 +167,10 @@
 %%%     used to inform the node which key it should use to sign its request to
 %%%     the remote peer, such that its request validates against the secret's
 %%%     `access-control' messages on the remote peer.
+%%% 
+%%%     The request must be signed by the node's `wallet_admin', or by its
+%%%     operator address if no `wallet_admin' is set. The response lists the
+%%%     `keyid's of the imported secrets.
 %%% '''
 -module(dev_secret).
 -export([generate/3, import/3, list/3, commit/3, export/3, sync/3]).
@@ -606,7 +610,8 @@ export(Base, Request, Opts) ->
             }
     end.    
 
-%% @doc Sync wallets from a remote node
+%% @doc Sync wallets from a remote node. Returns the `keyid's of the imported
+%% wallets.
 -spec sync(
     #{ _ => _ },
     #{
@@ -616,7 +621,7 @@ export(Base, Request, Opts) ->
         _ => _
     },
     #{ _ => _ }
-) -> {ok, [_]} | {error, _}.
+) -> {ok, [binary()]} | {error, _}.
 sync(_Base, Request, Opts) ->
     case hb_ao:get(<<"node">>, Request, undefined, Opts) of
         undefined ->
@@ -624,6 +629,14 @@ sync(_Base, Request, Opts) ->
         Node ->
             Wallets = hb_maps:get(<<"keyids">>, Request, <<"all">>, Opts),
             maybe
+                % Check that the request is signed by the node's `wallet_admin',
+                % or by its operator address if no `wallet_admin' is set.
+                true ?=
+                    verify_controllers(
+                        #{ <<"controllers">> => default },
+                        Request,
+                        Opts
+                    ) orelse {error, <<"Verification failed.">>},
                 {ok, SignAsOpts} ?=
                     case hb_ao:get(<<"as">>, Request, undefined, Opts) of
                         undefined -> {ok, Opts};
@@ -640,21 +653,23 @@ sync(_Base, Request, Opts) ->
                         ExportedWallets = export_response_to_list(ExportResponse, #{}),
                         ?event({sync, {priv_received_wallets, ExportedWallets}}),
                         % Import each wallet. Ignore wallet imports that fail.
-                        lists:filtermap(
-                            fun(Wallet) ->
-                                ?event({sync, {importing, {priv_wallet, Wallet}}}),
-                                case persist_registered_wallet(Wallet, Opts) of
-                                    {ok, #{ <<"body">> := Address }} ->
-                                        ?event({sync, {imported, Address}}),
-                                        {true, Address};
-                                    {error, Reason} ->
-                                        ?event({sync, {process_import_error, Reason}}),
-                                        false
-                                end
-                            end,
-                            ExportedWallets
-                        ),
-                        {ok, ExportedWallets};
+                        {
+                            ok,
+                            lists:filtermap(
+                                fun(Wallet) ->
+                                    ?event({sync, {importing, {priv_wallet, Wallet}}}),
+                                    case persist_registered_wallet(Wallet, Opts) of
+                                        {ok, #{ <<"body">> := KeyID }} ->
+                                            ?event({sync, {imported, KeyID}}),
+                                            {true, KeyID};
+                                        {error, Reason} ->
+                                            ?event({sync, {process_import_error, Reason}}),
+                                            false
+                                    end
+                                end,
+                                ExportedWallets
+                            )
+                        };
                     {error, Reason} ->
                         ?event({sync, {error, Reason}}),
                         {error, Reason}
@@ -1197,7 +1212,7 @@ sync_wallets_test() ->
     AdminWallet = ar_wallet:new(),
     Node =
         hb_http_server:start_node(#{
-            <<"priv-wallet">> => ar_wallet:new(),
+            <<"priv-wallet">> => Node1Wallet = ar_wallet:new(),
             <<"identities">> =>
                 #{ <<"admin">> => #{ <<"priv-wallet">> => AdminWallet } }
         }),
@@ -1216,22 +1231,33 @@ sync_wallets_test() ->
             #{}
         ),
     WalletKeyID = maps:get(<<"body">>, GenResponse),
-    % A sync as an identity that the first node does not hold fails.
+    % A sync request that is not signed by the first node is refused.
     ?assertMatch(
         {error, _},
         hb_http:get(
             Node,
-            <<"/~secret@1.0/sync?node=", Node2/binary, "&as=x">>,
+            <<"/~secret@1.0/sync?node=", Node2/binary, "&as=admin">>,
             #{}
         )
     ),
-    % Test sync to the first node from the second, signed as `admin'.
-    {ok, _} =
-        hb_http:get(
-            Node,
-            <<"/~secret@1.0/sync?node=", Node2/binary, "&as=admin">>,
-            #{}
-        ),
+    % Sign the sync requests with the key of the first node.
+    Sync =
+        fun(As) ->
+            hb_http:get(
+                Node,
+                (hb_message:commit(
+                    #{ <<"node">> => Node2, <<"as">> => As },
+                    #{ <<"priv-wallet">> => Node1Wallet }
+                ))#{ <<"path">> => <<"/~secret@1.0/sync">> },
+                #{}
+            )
+        end,
+    % A sync as an identity that the first node does not hold fails.
+    ?assertMatch({error, _}, Sync(<<"x">>)),
+    % Test sync to the first node from the second, signed as `admin'. The
+    % response holds the `keyid' of the imported wallet, and not its key.
+    {ok, SyncResponse} = Sync(<<"admin">>),
+    ?assertEqual([WalletKeyID], export_response_to_list(SyncResponse, #{})),
     % The first node keeps its own key.
     ?assertEqual(
         {ok, Address},
@@ -1264,11 +1290,14 @@ sync_non_volatile_wallets_test() ->
             #{}
         ),
     WalletName = maps:get(<<"body">>, GenResponse),
-    % Test sync to the first node from the second.
+    % Test sync to the first node from the second, signed by the first node.
     {ok, _} =
         hb_http:get(
             Node,
-            <<"/~secret@1.0/sync?node=", Node2/binary, "&wallets=all">>,
+            (hb_message:commit(
+                #{ <<"node">> => Node2 },
+                #{ <<"priv-wallet">> => Node1Wallet }
+            ))#{ <<"path">> => <<"/~secret@1.0/sync">> },
             #{}
         ),
     % Get the wallet list from the first node.
