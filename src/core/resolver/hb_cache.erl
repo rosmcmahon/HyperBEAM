@@ -146,6 +146,8 @@ ensure_loaded(Ref, Link = {link, URI, LinkOpts}, RawOpts) ->
 ensure_loaded(_Ref, Msg, _Opts) when not ?IS_LINK(Msg) ->
     Msg.
 
+%% @doc Merge the options of a link over the caller's. A link that names stores
+%% is read from them first, and then from the caller's stores.
 link_opts(LinkOpts, RawOpts) ->
     Opts = hb_util:deep_merge(RawOpts, LinkOpts, RawOpts),
     case hb_opts:get(store, not_found, LinkOpts#{ <<"only">> => local }) of
@@ -154,7 +156,13 @@ link_opts(LinkOpts, RawOpts) ->
                 Opts,
                 hb_opts:get(scope, hb_opts:get(scope, local, RawOpts), LinkOpts)
             );
-        _ -> Opts
+        Store ->
+            Opts#{
+                <<"store">> =>
+                    lists:uniq(
+                        lists:flatten([Store, hb_opts:get(store, [], RawOpts)])
+                    )
+            }
     end.
 
 %% @doc Report that a value was not found in the cache. If a key is provided,
