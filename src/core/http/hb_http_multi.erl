@@ -139,9 +139,7 @@ is_admissible(ErlStatus, Res, Admissible, Statuses, Opts)
     ),
     AdmissibleStatus = admissible_status(Res, Statuses, Opts),
     ?event(debug_multi, {admissible_status, {result, AdmissibleStatus}}),
-    AdmissibleResponse = admissible_response(Res, Admissible, Opts),
-    ?event(debug_multi, {admissible_response, {result, AdmissibleResponse}}),
-    AdmissibleStatus andalso AdmissibleResponse;
+    AdmissibleStatus andalso admissible_response(Res, Admissible, Opts);
 is_admissible(_, _, _, _, _) -> false.
 
 %% @doc Serially request a message, collecting responses until the required
@@ -403,9 +401,15 @@ multirequest_test_() ->
                           <<"stop-after">> => false}))
             end},
             {"parallel crash", fun() ->
+                Self = self(),
+                Admissible = #{ <<"device">> => #{ <<"is-admissible">> =>
+                    fun(_, _, _) -> Self ! admissible_ran, {ok, true} end } },
                 ?assertMatch({error, {no_viable_responses, _}},
                     multi([crash(), crash()],
-                        #{<<"parallel">> => true, <<"stop-after">> => true}))
+                        #{<<"parallel">> => true, <<"stop-after">> => true,
+                          <<"admissible">> => Admissible})),
+                % The `admissible' message does not run on a request that fails.
+                ?assertNot(receive admissible_ran -> true after 0 -> false end)
             end}
         ]} end}.
 
