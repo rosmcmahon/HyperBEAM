@@ -1370,7 +1370,7 @@ dynamic_routing_by_performance() ->
     BenchRoutes = 16,
     TestPath = <<"/worker">>,
     % Start the main node for the test, loading the `dynamic-router' script and
-    % the http-monitor to generate performance messages.
+    % the HTTP client receipt hook to generate performance messages.
     {ok, Script} = file:read_file(<<"scripts/dynamic-router.lua">>),
     Node = hb_http_server:start_node(Opts = #{
         <<"relay-http-client">> => gun,
@@ -1401,11 +1401,23 @@ dynamic_routing_by_performance() ->
             }
         },
         % Define the request that should be called in order to record performance
-        % information into the process. The `body' of the `http-monitor' message
-        % is filled with the signed performance report.
-        <<"http-monitor">> => #{
-            <<"method">> => <<"POST">>,
-            <<"path">> => <<"/perf-router~node-process@1.0/schedule">>
+        % information into the process. The hook receives the signed report
+        % in its `body'.
+        <<"on">> => #{
+            <<"http-client-receipt">> => #{
+                <<"device">> => #{
+                    http_client_receipt => fun(_Base, Req, HookOpts) ->
+                        hb_ao:resolve(
+                            Req#{
+                                <<"method">> => <<"POST">>,
+                                <<"path">> =>
+                                    <<"/perf-router~node-process@1.0/schedule">>
+                            },
+                            HookOpts
+                        )
+                    end
+                }
+            }
         }
     }),
     % Start and add a series of nodes with decreasing performance, via lag 

@@ -231,7 +231,7 @@ relay_destination(Peer, _RelayPath) -> Peer.
 
 %% @doc The node that the node's own routes resolve `Route' to: the destination
 %% the node's configuration chose for that path, with its request options.
-%% Returns `not_found' when no route matches, leaving no peer to contact.
+%% Returns `{not_found, Opts}' when no route matches, leaving no peer to contact.
 route_node(Route, Method, Opts) ->
     case hb_http:message_to_request(
             #{ <<"path">> => Route, <<"method">> => Method },

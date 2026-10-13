@@ -6,7 +6,7 @@
 -include("include/hb_opts.hrl").
 -include("include/hb_http_client.hrl").
 %% Public API
--export([request/2, response_status_to_atom/1, setup_conn/1]).
+-export([request/2, response_status_to_atom/1, setup_conn/1, receipt/3]).
 %% GenServer
 -export([start_link/1, init/1]).
 -export([handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
@@ -85,12 +85,25 @@ location({ok, Status, Headers, _Body}) when Status == 307; Status == 308 ->
     proplists:get_value(<<"location">>, Lower, <<>>);
 location(_Response) -> <<>>.
 
+%% @doc Record one receipt per transport attempt, including failures and retries.
 do_request(Args, Opts) ->
-    case hb_opts:get(http_client, ?DEFAULT_HTTP_CLIENT, Opts) of
-        gun -> gun_req(Args, Opts);
-        httpc -> httpc_req(Args, Opts);
-        hackney -> hackney_req(Args, Opts)
-    end.
+    StartTime = erlang:monotonic_time(native),
+    Response =
+        case hb_opts:get(http_client, ?DEFAULT_HTTP_CLIENT, Opts) of
+            gun -> gun_req(Args, Opts);
+            httpc -> httpc_req(Args, Opts);
+            hackney -> hackney_req(Args, Opts)
+        end,
+    record_duration(
+        #{
+            <<"request-method">> => method_to_bin(maps:get(method, Args)),
+            <<"request-path">> => hb_util:bin(maps:get(path, Args)),
+            <<"status-class">> => get_status_class(Response),
+            <<"duration">> => erlang:monotonic_time(native) - StartTime
+        },
+        Opts
+    ),
+    Response.
 
 maybe_retry(0, _, OriginalResponse, _) -> OriginalResponse;
 maybe_retry(Remaining, Args, OriginalResponse, Opts) ->
@@ -163,11 +176,9 @@ httpc_req(Args, Opts) ->
                 end,
             ?event({http_client_outbound, Method, URL, {priv_req, Request}}),
             HTTPCOpts = [{full_result, true}, {body_format, binary}],
-            StartTime = os:system_time(native),
             case httpc:request(Method, Request, [{autoredirect, false}], HTTPCOpts) of
                 {ok, {{_, Status, _}, RawRespHeaders, RespBody}} ->
                     download_metric(RespBody, Opts),
-                    EndTime = os:system_time(native),
                     RespHeaders =
                         [
                             {list_to_binary(Key), list_to_binary(Value)}
@@ -175,14 +186,6 @@ httpc_req(Args, Opts) ->
                             {Key, Value} <- RawRespHeaders
                         ],
                     ?event(debug_http_client, {httpc_resp, Status, RespHeaders, RespBody}),
-                    record_duration(#{
-                            <<"request-method">> => method_to_bin(Method),
-                            <<"request-path">> => hb_util:bin(Path),
-                            <<"status-class">> => get_status_class(Status),
-                            <<"duration">> => EndTime - StartTime
-                        },
-                        Opts
-                    ),
                     {ok, Status, RespHeaders, RespBody};
                 {error, Reason} ->
                     ?event(http_client, {httpc_error, Reason}),
@@ -219,7 +222,6 @@ hackney_req(Args, Opts) ->
                 {connect_options, [{nodelay, true}]},
                 {checkout_timeout, CheckoutTimeout},
                 {recv_timeout, RecvTimeout}],
-            StartTime = erlang:monotonic_time(native),
             Response = case hackney:request(Method, URL, HeaderList, Body, HackneyOpts) of
                 {ok, Status, RespHeaders, RespBody} ->
                     download_metric(RespBody, Opts),
@@ -232,48 +234,26 @@ hackney_req(Args, Opts) ->
                     ?event(http_client, {hackney_error, Reason}),
                     {error, Reason}
             end,
-            EndTime = erlang:monotonic_time(native),
-            record_duration(#{
-                    <<"request-method">> => method_to_bin(Method),
-                    <<"request-path">> => hb_util:bin(Path),
-                    <<"status-class">> => get_status_class(Response),
-                    <<"duration">> => EndTime - StartTime
-                },
-                Opts
-            ),
             record_response_status(Method, Response, Path, Opts),
             Response
     end.
 
 gun_req(Args, Opts) ->
-	StartTime = os:system_time(native),
-	#{ path := Path, method := Method } = Args,
 	ConnectTimeout = hb_opts:get(http_client_connect_timeout, ?DEFAULT_CONNECT_TIMEOUT, Opts),
-	Response =
-		case open_connection(Args, Opts) of
-			{error, _} = Err ->
-				Err;
-			{ok, PID} ->
-				case gun:await_up(PID, ConnectTimeout) of
-					{error, Reason} ->
-						gun:close(PID),
-						{error, Reason};
-					{ok, _Protocol} ->
-						Result = do_gun_request(PID, Args, Opts),
-						gun:close(PID),
-						Result
-				end
-		end,
-	EndTime = os:system_time(native),
-	record_duration(#{
-			<<"request-method">> => method_to_bin(Method),
-			<<"request-path">> => hb_util:bin(Path),
-			<<"status-class">> => get_status_class(Response),
-			<<"duration">> => EndTime - StartTime
-		},
-		Opts
-	),
-	Response.
+	case open_connection(Args, Opts) of
+		{error, _} = Err ->
+			Err;
+		{ok, PID} ->
+			case gun:await_up(PID, ConnectTimeout) of
+				{error, Reason} ->
+					gun:close(PID),
+					{error, Reason};
+				{ok, _Protocol} ->
+					Result = do_gun_request(PID, Args, Opts),
+					gun:close(PID),
+					Result
+			end
+	end.
 
 %% @doc Start the hackney connection pool with default settings.
 %% Overridden at runtime by setup_conn/1 once node config is available.
@@ -283,30 +263,21 @@ init_hackney_pool() ->
         {timeout, ?DEFAULT_KEEPALIVE_TIMEOUT}
     ]).
 
-%% @doc Invoke the HTTP monitor message with AO-Core, if it is set in the 
-%% node message key. We invoke the given message with the `body' set to a signed
-%% version of the details. This allows node operators to configure their machine
-%% to record duration statistics into customized data stores, computations, or
-%% processes etc. Additionally, we include the `http-reference' value, if set in
-%% the given `opts'.
-%% 
-%% We use `hb_ao:get' rather than `hb_opts:get', as settings configured
-%% by the `~router@1.0' route `opts' key are unable to generate atoms.
-maybe_invoke_monitor(Details, Opts) ->
-    case hb_ao:get(<<"http-monitor">>, Opts, Opts) of
-        not_found -> ok;
-        Monitor ->
-            % We have a monitor message. Place the `details' into the body, set
-            % the `method' to "POST", add the `http-reference' (if applicable)
-            % and sign the request. We use the node message's wallet as the
-            % source of the key.
+%% @doc Invoke a receipt hook with signed details in its `body'. The reference
+%% comes from the selected peer's options, never its response. Callers run this
+%% outside the request process so handlers cannot delay or replace its result.
+receipt(Hook, Details, Opts) ->
+    case hb_hook:find(Hook, Opts) of
+        [] -> ok;
+        _ ->
             MaybeWithReference =
                 case hb_ao:get(<<"http-reference">>, Opts, Opts) of
                     not_found -> Details;
                     Ref -> Details#{ <<"reference">> => Ref }
                 end,
-            Req =
-                Monitor#{
+            hb_hook:on(
+                Hook,
+                #{
                     <<"body">> =>
                         hb_message:commit(
                             MaybeWithReference#{
@@ -315,11 +286,8 @@ maybe_invoke_monitor(Details, Opts) ->
                             Opts
                         )
                 },
-            % Use the singleton parse to generate the message sequence to 
-            % execute.
-            ReqMsgs = hb_singleton:from(Req, Opts),
-            Res = hb_ao:resolve_many(ReqMsgs, Opts),
-            ?event(debug_http_monitor, {resolved_monitor, Res})
+                Opts
+            )
     end.
 
 %%% ==================================================================
@@ -659,8 +627,8 @@ init_prometheus() ->
     ok.
 
 %% @doc Record the duration of the request in an async process. We write the 
-%% data to prometheus if the application is enabled, as well as invoking the
-%% `http-monitor' if appropriate.
+%% data to prometheus if enabled and invoke `on/http-client-receipt'. The
+%% receipt describes a transport attempt, not application-level acceptance.
 record_duration(Details, Opts) ->
     spawn(
         fun() ->
@@ -690,7 +658,8 @@ record_duration(Details, Opts) ->
                 false ->
                     ok
             end,
-            maybe_invoke_monitor(
+            receipt(
+                <<"http-client-receipt">>,
                 Details#{ <<"path">> => <<"duration">> },
                 Opts
             )
