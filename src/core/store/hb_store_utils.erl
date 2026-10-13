@@ -3,7 +3,7 @@
 -module(hb_store_utils).
 -export([list_request_bounds/1, apply_list_bounds/2]).
 -export([list_request_bounds/2, apply_list_bounds/3]).
--export([to_path/1, is_data_path/1, child_prefix/1]).
+-export([child_prefix/1]).
 -export([immediate_children/2]).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -40,7 +40,8 @@ apply_list_bounds(Children, Req, Store) ->
 %% @doc The children a list request answers with, from every child a store
 %% holds: all of them, in the store's own order, unless the request bounds
 %% the list -- from a child, in a direction, or up to a limit -- when they
-%% are the sorted children within its bounds. A batch is every child.
+%% are the children within its bounds, sorted by name. A batch is every child.
+%% Each child is a name, or a `{Name, Value}' pair.
 apply_list_bounds(Children, Req) ->
     case list_request_bounds(Req) of
         #{ <<"from">> := none, <<"limit">> := all, <<"direction">> := asc } ->
@@ -52,12 +53,12 @@ apply_list_bounds(Children, Req) ->
         } ->
             Ordered =
                 case Direction of
-                    asc -> lists:sort(Children);
-                    desc -> lists:reverse(lists:sort(Children))
+                    asc -> by_name(Children);
+                    desc -> lists:reverse(by_name(Children))
                 end,
             Ahead =
                 lists:dropwhile(
-                    fun(Child) -> behind(Direction, Child, From) end,
+                    fun(Child) -> behind(Direction, name(Child), From) end,
                     Ordered
                 ),
             case Limit of
@@ -66,6 +67,15 @@ apply_list_bounds(Children, Req) ->
             end
     end.
 
+%% @doc Sort children by their names.
+by_name(Children) ->
+    lists:sort(fun(Child, Next) -> name(Child) =< name(Next) end, Children).
+
+%% @doc Return the name of a child, whether it is listed alone or with its
+%% value.
+name({Name, _Value}) -> Name;
+name(Name) -> Name.
+
 %% @doc Whether a child lies before the start of a bounded list.
 behind(_Direction, _Child, none) -> false;
 behind(asc, Child, From) -> Child < From;
@@ -73,38 +83,24 @@ behind(desc, Child, From) -> Child > From.
 
 %%% Paths laid out as keys, as `hb_store_lmdb' lays them out.
 
-%% @doc Path parts joined into a path.
-to_path(PathParts) ->
-    hb_util:bin(lists:join(<<"/">>, PathParts)).
-
-%% @doc Return whether a path is the `ni:' name of content-addressed data.
-is_data_path(<<"ni:", _/binary>>) -> true;
-is_data_path(_) -> false.
-
 %% @doc Find the immediate children of a prefix among the rows under it. A
 %% child with a row of its own is given as `{Child, Value}', and a child with
-%% only rows below it as `Child'.
+%% only rows below it as `Child'. The rows are in key order, as a prefix read
+%% returns them, so a child's own row comes before the rows below it. We keep
+%% the first entry of each name.
 immediate_children(Prefix, Rows) ->
     PrefixSize = byte_size(Prefix),
-    Children =
-        lists:foldl(
-            fun({Key, Value}, Acc) ->
-                case Key of
-                    <<Prefix:PrefixSize/binary, Rest/binary>>
-                            when Rest =/= <<>> ->
-                        case binary:split(Rest, <<"/">>) of
-                            [Child] -> Acc#{ Child => {Child, Value} };
-                            [Child, _] ->
-                                Acc#{ Child => maps:get(Child, Acc, Child) }
-                        end;
-                    _ ->
-                        Acc
-                end
-            end,
-            #{},
-            Rows
-        ),
-    [Child || {_, Child} <- lists:sort(maps:to_list(Children))].
+    Entries =
+        [
+            case binary:split(Rest, <<"/">>) of
+                [Child] -> {Child, {Child, Value}};
+                [Child, _] -> {Child, Child}
+            end
+        ||
+            {<<_:PrefixSize/binary, Rest/binary>>, Value} <- Rows,
+            Rest =/= <<>>
+        ],
+    [ Entry || {_Name, Entry} <- lists:ukeysort(1, Entries) ].
 
 %% @doc The prefix of a path's children: the path and a `/', with none at
 %% the root.

@@ -8,8 +8,8 @@
 %%% Each entry is stored as `{Path, {raw, Bin} | group}`. Group membership is
 %%% discovered by a lexicographic range scan over the `Path ++ "/"` prefix,
 %%% mirroring the LMDB and FS store layouts. An explicit `group` marker is
-%%% inserted at every ancestor path so that a read of a path with keys below
-%%% it stays a single lookup.
+%%% inserted at every ancestor path, so that a single lookup tells whether a
+%%% path has keys below it.
 -module(hb_store_volatile).
 -export([start/3, stop/3, reset/3, scope/0, scope/1]).
 -export([write/3, read/3, list/3]).
@@ -109,23 +109,22 @@ write(Opts, Req, _NodeOpts) when is_map(Req) ->
         Req
     ).
 
-%% @doc Read a value. Group paths return `{composite, Children}` with the
-%% immediate child names.
+%% @doc Read a value. Group paths hold no value of their own, so reading one
+%% returns `not_found`.
 read(Opts, #{ <<"read">> := RawKey }, _NodeOpts) ->
     Key = hb_path:to_binary(RawKey),
     case lookup_entry(Opts, Key) of
         {raw, Value} ->
             ?event(store_volatile, {hit, {key, Key}}),
             {ok, Value};
-        group ->
-            ?event(store_volatile, {hit, {key, Key}}),
-            {composite, immediate_children(Opts, Key)};
         _ ->
             ?event(store_volatile, {miss, {key, Key}}),
             {error, not_found}
     end.
 
-%% @doc List immediate child names under a group path.
+%% @doc List immediate child names under a group path. If the request sets
+%% `values` to `true`, each child that holds a value is listed with it, as
+%% `{Name, Value}`.
 list(Opts, Req = #{ <<"list">> := RawPath }, _NodeOpts) ->
     list_path(Opts, hb_path:to_binary(RawPath), Req).
 
@@ -135,12 +134,27 @@ list_path(Opts, Path, Req) ->
     case lookup_entry(Opts, Path) of
         group ->
             Children = immediate_children(Opts, Path),
-            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
+            Listed = hb_store_utils:apply_list_bounds(Children, Req, Opts),
+            case maps:get(<<"values">>, Req, false) of
+                true ->
+                    Table = table(Opts),
+                    {ok, [ child(Table, Path, Name) || Name <- Listed ]};
+                false ->
+                    {ok, Listed}
+            end;
         _ ->
             % A path that holds a value has no children to list. An empty
             % store returns `not_found` for the root too, so that a chained
             % store can serve the request.
             {error, not_found}
+    end.
+
+%% @doc Return a listed child with its value if it holds one, or its name if
+%% it is a group.
+child(Table, Path, Name) ->
+    case lookup_entry(Table, next_group_path(Path, Name)) of
+        {raw, Value} -> {Name, Value};
+        _ -> Name
     end.
 
 %% @doc Install an entry at Key, purging any prior group subtree and
@@ -376,7 +390,7 @@ implicit_group_conversion_test() ->
     ok = hb_store:write(S, #{ <<"a">> => <<"raw_val">> }, #{}),
     ?assertEqual({ok, <<"raw_val">>}, hb_store:read(S, <<"a">>, #{})),
     ok = hb_store:write(S, #{ <<"a/b">> => <<"child_val">> }, #{}),
-    ?assertEqual({composite, [<<"b">>]}, hb_store:read(S, <<"a">>, #{})),
+    ?assertEqual({error, not_found}, hb_store:read(S, <<"a">>, #{})),
     {ok, Children} = hb_store:list(S, <<"a">>, #{}),
     ?assertEqual([<<"b">>], Children),
     ok = hb_store:stop(S).

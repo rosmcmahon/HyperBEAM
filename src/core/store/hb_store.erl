@@ -21,9 +21,9 @@
 %%%                   `local', `remote', `arweave', etc. Used in order to allow
 %%%                   node operators to prioritize their stores for search.
 %%%     read/3:       Read the data at the given location, returning a binary
-%%%                   if it holds a value, or its children if it has keys
-%%%                   below it, using a request map of the form
-%%%                   `#{ <<"read">> => Path }`.
+%%%                   if it holds a value, using a request map of the form
+%%%                   `#{ <<"read">> => Path }`. A location with only keys
+%%%                   below it holds no value, so it is `not_found'.
 %%%     write/3:      Write a request map of the form `#{ Path => Value }`.
 %%%     list/3:       For a path with keys below it, return child keys using a
 %%%                   request map of the form `#{ <<"list">> => Path }`:
@@ -33,9 +33,10 @@
 %%%                   `desc'), and `limit' the most children returned.
 %%%                   `limit' can also be `batch' for every child the store
 %%%                   finds without further work (store determined).
-%%%                   Composite read results may also return children as
-%%%                   `{Key, Value}' pairs when the store can provide a child
-%%%                   value without an additional read.
+%%%                   A request may also set `values' to `true': each child
+%%%                   that holds a value is then returned with it, as a
+%%%                   `{Key, Value}' pair, and each child with keys below it
+%%%                   as `Key'.
 %%% '''
 %%% Each function takes a `store' message first, containing an arbitrary set
 %%% of its necessary configuration keys, as well as the `store-module' key which
@@ -379,9 +380,8 @@ reset(Store, Opts) ->
 reset(Stores, Req, Opts) ->
     admin_call(Stores, reset, Req, Opts).
 
-%% @doc List the keys in a group in the store. Use only in debugging.
-%% The hyperbeam model assumes that stores are built as efficient hash-based
-%% structures, so this is likely to be very slow for most stores.
+%% @doc List the keys in a group in the store. If the request sets `values' to
+%% `true', each key that holds a value is returned with it, as `{Key, Value}'.
 list(Path, Opts) ->
     list(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
 list(Modules, Req = #{ <<"list">> := _ }, Opts) ->
@@ -462,8 +462,6 @@ do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, 
         ok ->
             ok;
         {ok, _} = Result ->
-            Result;
-        {composite, _} = Result ->
             Result;
         {failure, _} = Result ->
             do_call_function(
@@ -591,15 +589,9 @@ must_strip_prefix(Store) ->
     hb_util:bool(maps:get(<<"prefix-strip">>, Store, true)).
 
 %% @doc Normalize an answer from a store: the value of a read, and the
-%% children that a `list' or a composite read returns. Any other answer is
-%% returned unchanged.
+%% children that a `list' returns. Any other answer is returned unchanged.
 from_store(Store, read, {ok, Value}, Opts) ->
     execute_normalizer(<<"from-value">>, Store, Value, Opts);
-from_store(Store, read, {composite, Children}, Opts) ->
-    maybe
-        {ok, Norm} ?= from_children(Store, Children, Opts),
-        {composite, Norm}
-    end;
 from_store(Store = #{ <<"from-list">> := _ }, list, {ok, Children}, Opts) ->
     execute_normalizer(<<"from-list">>, Store, Children, Opts);
 from_store(Store, list, {ok, Children}, Opts) ->
@@ -726,9 +718,7 @@ admin_call([Store | Rest], Function, Req, Opts) ->
         {error, _} = Error ->
             Error;
         {failure, _} = Failure ->
-            Failure;
-        {composite, _} = Composite ->
-            Composite
+            Failure
     end.
 
 admin_post_process(stop, Store) ->
@@ -824,7 +814,6 @@ normalize_result({ok, Result}) when Result =:= ok -> ok;
 normalize_result({ok, _} = Result) -> Result;
 normalize_result({error, _} = Result) -> Result;
 normalize_result({failure, _} = Result) -> Result;
-normalize_result({composite, _} = Result) -> Result;
 normalize_result(not_found) -> {error, not_found};
 normalize_result(failure) -> {failure, failure};
 normalize_result(retry) -> retry;
@@ -920,6 +909,17 @@ implicit_children_test_() ->
         {"implicit children", fun(Store) ->
             ok = write(Store, #{ <<"parent/child/value">> => <<"data">> }, #{}),
             ?assertEqual({ok, [<<"child">>]}, list(Store, <<"parent">>, #{})),
+            % The parent holds no value of its own, so reading it is a miss.
+            ?assertEqual({error, not_found}, read(Store, <<"parent">>, #{})),
+            % A list with `values' returns each child with the value it holds.
+            ?assertEqual(
+                {ok, [{<<"value">>, <<"data">>}]},
+                list(
+                    Store,
+                    #{ <<"list">> => <<"parent/child">>, <<"values">> => true },
+                    #{}
+                )
+            ),
             ?assertEqual([<<"child">>], hb_cache:list(<<"parent">>, Store)),
             ?assertEqual(
                 {ok, []},
@@ -1484,9 +1484,9 @@ normalize_children_test() ->
 %% @doc Test that `to-key' and `to-value' rewrite a request's paths and
 %% values ahead of the store -- for writes and reads alike -- and that
 %% `from-key' and `from-value' normalize its answers: the value of a read, and
-%% the children that a list or a composite read returns. A path that the
-%% normalization cannot decode, or an answer that fails its normalization,
-%% falls through to the next store with the caller's original request.
+%% the children that a list returns. A path that the normalization cannot
+%% decode, or an answer that fails its normalization, falls through to the
+%% next store with the caller's original request.
 normalize_pipeline_test() ->
     Store =
         (hb_test_utils:test_store(hb_store_fs, <<"pipeline-normalize">>))#{
@@ -1551,7 +1551,7 @@ normalize_pipeline_test() ->
             {<<"key">>, true, <<"alternate">>}]
     ),
     ?event(testing, {normalized_write_and_read_passed}),
-    % The children that a list or a composite read returns are encoded.
+    % The children that a list returns are encoded.
     EncodedChild = hb_util:encode(<<"g/a">>),
     ?assertEqual(
         ok,
@@ -1566,10 +1566,6 @@ normalize_pipeline_test() ->
     ?assertEqual(
         {ok, [<<"a">>]},
         list([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
-    ),
-    ?assertEqual(
-        {composite, [hb_util:encode(<<"a">>)]},
-        read([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
     ),
     % An undecodable key skips the store for writes and reads alike, so the
     % fallback both receives and serves the original request.

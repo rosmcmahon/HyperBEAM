@@ -12,6 +12,11 @@ stop(_) -> ok.
 %% @doc The scope of a GraphQL store is always remote, due to performance.
 scope(_) -> remote.
 
+%% @doc List the keys of the message at a path. A read of the path answers with
+%% the whole message, so a list that asks for values is `not_found': it would
+%% only fetch the message again.
+list(_StoreOpts, #{ <<"values">> := true }, _NodeOpts) ->
+    {error, not_found};
 list(StoreOpts, #{ <<"list">> := Key }, NodeOpts) ->
     ?event(store_gateway, executing_list),
     case read(StoreOpts, #{ <<"read">> => Key }, NodeOpts) of

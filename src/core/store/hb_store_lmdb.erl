@@ -14,7 +14,7 @@
 %%
 %% The module implements a dual-flush strategy: writes are accumulated in memory
 %% and flushed either after an idle timeout or when explicitly requested during
-%% read operations that encounter cache misses.
+%% list operations.
 -module(hb_store_lmdb).
 
 %% Public API exports
@@ -27,7 +27,7 @@
 
 %% Configuration constants with reasonable defaults
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
--define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
+-define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every list or
                                                 % every 5,000 write operations.
 -define(DEFAULT_FLUSH_EVERY, 1_000).            % Commit buffered writes at
                                                 % least every second.
@@ -122,48 +122,22 @@ ensure_dir(DataDirPath) ->
     % dummy one, else the final directory will not be created.
     filelib:ensure_dir(filename:join(DataDirPath, "dummy.mdb")).
 
-%% @doc Write a key-value pair to the database asynchronously.
-%%
-%% Request maps are folded into individual writes and each entry is sent to the
-%% database server process immediately without waiting for the write to be
-%% committed to disk. The server accumulates writes in a transaction that is
-%% periodically flushed based on timing constraints or explicit flush requests.
-%%
-%% The asynchronous nature provides better performance for write-heavy workloads
-%% while the batching strategy ensures data consistency and reduces I/O overhead.
-%% However, recent writes may not be immediately visible to readers until the
-%% next flush occurs.
-%%
-%% @param Opts Database configuration map
-%% @param Req Either a request map of `Path => Value` pairs or an internal
-%%            `Path, Value` pair used while folding that map.
-%% @returns `ok` immediately on success, or an error tuple on failure
-write(#{ <<"read-only">> := true }, _Req, _NodeOpts) when is_map(_Req) ->
+%% @doc Write a request map of `Path => Value' pairs to the database as one
+%% batch. `elmdb' refuses the whole batch if a key is empty or longer than
+%% `?MAX_KEY_SIZE' bytes, and a read-only store refuses every write.
+write(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
     {error, not_found};
-write(Opts, Req, _NodeOpts) when is_map(Req) ->
-    maps:fold(
-        fun(Path, Value, ok) when is_binary(Path) ->
-            write(Opts, Path, Value);
-           (Path, Value, ok) ->
-            write(Opts, hb_path:to_binary(Path), Value);
-           (_Path, _Value, Error) ->
-            Error
-        end,
-        ok,
-        Req
-    );
-write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
-    {error, not_found};
-write(Opts, PathParts, Value) when is_list(PathParts) ->
-    write(Opts, hb_store_utils:to_path(PathParts), Value);
-write(_Opts, Path, _Value) when byte_size(Path) > ?MAX_KEY_SIZE ->
-    % elmdb accepts a longer key, fails to flush it, and then refuses every
-    % later write to the database.
-    {error, 'key-too-long'};
-write(Opts, Path, Value) ->
+write(Opts, Req, _NodeOpts) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
-    ?event_debug({elmdb_write, {db, DBInstance}, {path, Path}, {value, Value}}),
-    case elmdb:put(DBInstance, Path, Value) of
+    Pairs =
+        maps:fold(
+            fun(Path, Value, Acc) when is_binary(Path) -> [{Path, Value} | Acc];
+               (Path, Value, Acc) -> [{hb_path:to_binary(Path), Value} | Acc]
+            end,
+            [],
+            Req
+        ),
+    case elmdb:put_batch(DBInstance, Pairs) of
         ok -> ok;
         {error, Type, Description} ->
             ?event(
@@ -177,42 +151,39 @@ write(Opts, Path, Value) ->
                 % The database failed to commit earlier writes and refuses
                 % more. A restart would accept this one without committing it.
                 transaction_error -> {error, Type};
+                % `elmdb' refuses a batch with an empty or long key every time.
+                validation_error -> {error, Type};
                 _ -> retry
             end
     end.
 
-%% @doc Read a value from the database by key. If the key holds no value, but
-%% has keys below it, we return the names of those keys.
+%% @doc Read a value from the database by key. A key with only keys below it
+%% holds no value, so we return `not_found' for it.
 %%
 %% @param Opts Database configuration map
 %% @param PathReq Request of the form `#{<<"read">> => Path}`.
-%% @returns `{ok, Value}` on success, `{composite, Keys}` for a key with keys
-%%          below it, or `{error, not_found}` on failure
+%% @returns `{ok, Value}` on success, or `{error, not_found}` on failure
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) when is_binary(Path) ->
     read_result(Opts, Path);
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) ->
     read_result(Opts, hb_path:to_binary(Path)).
 
-%% A single `read_prefix' over the bare `Path' (no trailing slash) returns the
-%% row of `Path' itself alongside every descendant in one cursor scan.
+%% A single `elmdb:get' reads the value of exactly the key.
 read_result(Opts, Path) ->
     EnvOpts = ensure_env(Opts),
     StartTime = erlang:monotonic_time(),
     Result = 
-        case read_prefix_rows(EnvOpts, Path) of
-            {ok, Rows} ->
-                prefix_read_result(Path, Rows);
+        case read_direct(EnvOpts, Path) of
+            {ok, Value} ->
+                {ok, Value};
             not_found ->
                 {error, not_found};
-            {error, _} = Error ->
-                Error;
             {error, Type, _} ->
                 {error, Type}
         end,
     MetricStatus = 
         case Result of
             {ok, _} -> hit;
-            {composite, _} -> hit;
             {error, not_found} -> miss;
             not_found -> miss;
             _ -> unknown
@@ -281,10 +252,8 @@ scope(_) -> scope().
 %%
 %% The implementation returns only the immediate children of the given path,
 %% not the full paths. For example, listing "colors/" will return ["red", "blue"]
-%% not ["colors/red", "colors/blue"].
-%%
-%% If the Path points to a link, the function resolves the link and lists
-%% the contents of the target directory instead.
+%% not ["colors/red", "colors/blue"]. If the request sets `values' to `true',
+%% each child that holds a value is returned with it (see `list_children/3').
 %%
 %% This is particularly useful for implementing hierarchical data organization
 %% and providing tree-like navigation interfaces in applications.
@@ -299,29 +268,37 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
             true -> Path;
             false -> hb_path:to_binary(Path)
         end,
-    case read_direct(EnvOpts, PathBin) of
-        {ok, _Value} ->
-            {error, not_found};
-        _ ->
-            % A path with no row of its own lists the keys written below it.
-            % An empty page with `from' may have started past the last key.
-            case list_children(EnvOpts, PathBin, Req) of
-                {ok, []} when is_map_key(<<"from">>, Req) ->
-                    case list_children(EnvOpts, PathBin, #{ <<"limit">> => 1 }) of
-                        {ok, []} -> {error, not_found};
-                        {ok, _} -> {ok, []};
-                        Error -> Error
-                    end;
+    % An empty page with `from' may have started past the last key.
+    case list_children(EnvOpts, PathBin, Req) of
+        {ok, []} when is_map_key(<<"from">>, Req) ->
+            case list_children(EnvOpts, PathBin, #{ <<"limit">> => 1 }) of
                 {ok, []} -> {error, not_found};
-                Result -> Result
-            end
+                {ok, _} -> {ok, []};
+                Error -> Error
+            end;
+        {ok, []} -> {error, not_found};
+        Result -> Result
     end.
 
 %% @doc List the children of a path through the NIF's cursor: every one, or
 %% those the request names from its `from' in its direction, no more than
 %% its limit. A `batch' uses the store's `list-batch-size' (default 256,
 %% minimum 2 for inclusive cursor progress), independently of the write
-%% flush threshold `batch-size'. An `all' request remains unbounded.
+%% flush threshold `batch-size'. An `all' request remains unbounded. If the
+%% request sets `values' to `true', we read every row below the path with one
+%% `elmdb:read_prefix' instead, and return each child with a row of its own as
+%% `{Child, Value}', and each child with only rows below it as `Child'.
+list_children(Opts, ResolvedPath, Req = #{ <<"values">> := true }) ->
+    Prefix = hb_store_utils:child_prefix(ResolvedPath),
+    case read_prefix_rows(Opts, Prefix) of
+        {ok, Rows} ->
+            Children = hb_store_utils:immediate_children(Prefix, Rows),
+            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
+        not_found ->
+            {ok, []};
+        {error, Type, _Description} ->
+            {error, Type}
+    end;
 list_children(Opts, ResolvedPath, Req) ->
     #{
         <<"from">> := From,
@@ -346,21 +323,6 @@ read_prefix_rows(Opts, Path) ->
         {error, not_found} -> not_found;
         not_found -> not_found;
         {error, _Type, _Description} = Error -> Error
-    end.
-
-%% Classify the rows of a bare-prefix scan. `read_prefix' returns keys in
-%% lexicographic order, so the row whose key equals `Path', when it exists,
-%% always sorts ahead of the `Path/...' descendants and holds the value. When
-%% there is no such row, the descendants give the path's children. A path
-%% with no row and no descendants is a miss.
-prefix_read_result(Path, [{Path, Value} | _]) ->
-    {ok, Value};
-prefix_read_result(Path, Rows) ->
-    Prefix = hb_store_utils:child_prefix(Path),
-    Children = hb_store_utils:immediate_children(Prefix, Rows),
-    case {hb_store_utils:is_data_path(Path), Children} of
-        {false, [_ | _] = Children} -> {composite, Children};
-        _ -> {error, not_found}
     end.
 
 %% @doc Match a series of keys and values against the database. Returns 
@@ -415,8 +377,8 @@ stop_flusher(DataDir) ->
             receive {'DOWN', Ref, process, PID, _} -> ok end
     end.
 
-%% @doc Commit the writes that `elmdb' holds in memory. `elmdb:put/3' returns
-%% before its write is committed: writes are committed in batches of
+%% @doc Commit the writes that `elmdb' holds in memory. `elmdb:put_batch/2'
+%% returns before its writes are committed: writes are committed in batches of
 %% `batch-size', and a halt of the node before then loses them.
 flush(Opts, _Req, _NodeOpts) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
@@ -505,7 +467,7 @@ test_list(StoreOpts, Path) ->
     list_children(StoreOpts, hb_path:to_binary(Path), #{}).
 
 test_write(StoreOpts, Path, Value) ->
-    ok = write(StoreOpts, Path, Value),
+    ok = write(StoreOpts, #{ Path => Value }, #{}),
     ok.
 
 %% @doc Basic store test - verifies fundamental read/write functionality.
@@ -530,10 +492,10 @@ basic_test() ->
 long_key_test() ->
     StoreOpts = hb_test_utils:test_store(?MODULE),
     MaxKey = binary:copy(<<"k">>, ?MAX_KEY_SIZE),
-    ?assertEqual(ok, write(StoreOpts, MaxKey, <<"held">>)),
+    ?assertEqual(ok, write(StoreOpts, #{ MaxKey => <<"held">> }, #{})),
     ?assertEqual(
-        {error, 'key-too-long'},
-        write(StoreOpts, <<MaxKey/binary, "k">>, <<"refused">>)
+        {error, validation_error},
+        write(StoreOpts, #{ <<MaxKey/binary, "k">> => <<"refused">> }, #{})
     ),
     ?assertEqual({ok, <<"held">>}, test_read(StoreOpts, MaxKey)),
     ok = test_stop(StoreOpts).
@@ -613,14 +575,22 @@ cache_style_test() ->
     ?assertEqual({ok, <<"test-value">>}, Result),
     hb_store:stop(StoreOpts).
 
-read_prefix_composite_test() ->
+list_values_test() ->
     StoreOpts = hb_test_utils:test_store(?MODULE),
     test_reset(StoreOpts),
     test_write(StoreOpts, <<"root/a">>, <<"1">>),
     test_write(StoreOpts, <<"root/b/c">>, <<"2">>),
     ?assertEqual(
-        {composite, [{<<"a">>, <<"1">>}, <<"b">>]},
+        {error, not_found},
         read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
+    ),
+    ?assertEqual(
+        {ok, [{<<"a">>, <<"1">>}, <<"b">>]},
+        list(
+            StoreOpts,
+            #{ <<"list">> => <<"root">>, <<"values">> => true },
+            #{}
+        )
     ),
     ?assertEqual({ok, [<<"a">>, <<"b">>]}, test_list(StoreOpts, <<"root">>)),
     test_stop(StoreOpts).

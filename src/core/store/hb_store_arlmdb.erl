@@ -6,8 +6,8 @@
 %%% A main database in LMDB's default mode -- keys with values -- holds
 %%% paths as `hb_store_lmdb' writes them. We serve such a file read-only, in
 %%% the same way as that store serves its own: a read returns the value of a
-%%% path, or the values of its children, and a list returns the children of
-%%% a path. A main database in DUP mode
+%%% path, and a list returns the children of a path, with their values if the
+%%% request asks for them. A main database in DUP mode
 %%% (`MDB_DUPSORT bor MDB_DUPFIXED') -- fixed-width keys, each holding a
 %%% sorted set of fixed-width duplicate values -- takes a request that is
 %%% a key, or a key followed by value bits:
@@ -238,71 +238,58 @@ classify(Bits, _Meta, _StoreOpts) ->
 
 %%% Paths, as `hb_store_lmdb' writes them.
 
-%% @doc Read a path's value. A path with no value of its own, but with
-%% children, returns its children. Any other path is a miss.
+%% @doc Read a path's value: the row whose key is the path itself. A path with
+%% no row of its own is a miss, even if it has children.
 path_read(Path, Meta, Opts) ->
+    Read =
+        fun(Leaf, Node = #{ key := Key }, Miss) ->
+            case Key of
+                Path ->
+                    maybe
+                        {ok, Value} ?= node_value(Leaf, Node, Meta, Opts),
+                        {stop, {ok, Value}}
+                    end;
+                _ ->
+                    {stop, Miss}
+            end
+        end,
     maybe
-        {ok, Rows} ?= rows(Path, Meta, Opts),
-        path_result(Path, Rows)
-    end.
-
-%% @doc Classify the rows of a path's scan. The row of the path itself sorts
-%% ahead of its descendants, and holds its value. A path with descendants but
-%% no row of its own returns its immediate children.
-path_result(Path, [{Path, Value} | _]) ->
-    {ok, Value};
-path_result(Path, Rows) ->
-    Prefix = hb_store_utils:child_prefix(Path),
-    Children = hb_store_utils:immediate_children(Prefix, Rows),
-    case {hb_store_utils:is_data_path(Path), Children} of
-        {false, [_ | _]} -> {composite, Children};
-        _ -> {error, not_found}
+        {ok, Result} ?= fold_nodes(Path, Read, {error, not_found}, Meta, Opts),
+        Result
     end.
 
 %% @doc List a path's children, bounded by the request. A path without
 %% children is a miss.
 path_list(Path, Req, Meta, Opts) ->
-    case children(Path, Meta, Opts) of
+    case children(Path, maps:get(<<"values">>, Req, false), Meta, Opts) of
         {ok, []} -> {error, not_found};
         {ok, Children} -> {ok, hb_store_utils:apply_list_bounds(Children, Req)};
         Error -> Error
     end.
 
-%% @doc Every row whose key begins with the prefix, in key order.
-rows(Prefix, Meta, Opts) ->
-    Collect =
-        fun(Leaf, Node = #{ key := Key }, Rows) ->
-            case begins_with(Key, Prefix) of
-                true ->
-                    maybe
-                        {ok, Value} ?= node_value(Leaf, Node, Meta, Opts),
-                        {ok, [{Key, Value} | Rows]}
-                    end;
-                false ->
-                    {stop, Rows}
-            end
-        end,
-    maybe
-        {ok, Rows} ?= fold_nodes(Prefix, Collect, [], Meta, Opts),
-        {ok, lists:reverse(Rows)}
-    end.
-
 %% @doc A group's children: each key beneath it gives one, its next path
 %% component, and a component with descendants of its own is seen once,
-%% the read seeking past its subtree.
-children(Path, Meta, Opts) ->
+%% the read seeking past its subtree. If `Values' is `true', a child with a
+%% row of its own is returned with its value, as `{Child, Value}'.
+children(Path, Values, Meta, Opts) ->
     Prefix = hb_store_utils:child_prefix(Path),
     Size = byte_size(Prefix),
     Collect =
-        fun(_Leaf, #{ key := Key }, Children) ->
+        fun(Leaf, Node = #{ key := Key }, Children) ->
             case Key of
                 <<Prefix:Size/binary, Rest/binary>> when Rest =/= <<>> ->
                     case binary:split(Rest, <<"/">>) of
+                        [Child] when Values ->
+                            maybe
+                                {ok, Value} ?=
+                                    node_value(Leaf, Node, Meta, Opts),
+                                {ok, [{Child, {Child, Value}} | Children]}
+                            end;
                         [Child] ->
-                            {ok, [Child | Children]};
+                            {ok, [{Child, Child} | Children]};
                         [Child, _Below] ->
                             Past = <<Prefix/binary, Child/binary, ($/ + 1)>>,
-                            {seek, Past, [Child | Children]}
+                            {seek, Past, [{Child, Child} | Children]}
                     end;
                 _ ->
                     {stop, Children}
@@ -310,7 +297,10 @@ children(Path, Meta, Opts) ->
         end,
     maybe
         {ok, Children} ?= fold_nodes(Prefix, Collect, [], Meta, Opts),
-        {ok, lists:usort(Children)}
+        % A child's own row sorts before the rows below it, so we keep the
+        % first entry of each name.
+        Named = lists:ukeysort(1, lists:reverse(Children)),
+        {ok, [ Child || {_Name, Child} <- Named ]}
     end.
 
 %% @doc Fold a function over the main tree's nodes from the target key

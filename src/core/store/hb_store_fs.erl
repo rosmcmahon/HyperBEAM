@@ -44,8 +44,8 @@ reset(#{ <<"name">> := DataDir }, _Req, _Opts) ->
     os:cmd(binary_to_list(<< "rm -Rf ", DataDir/binary >>)),
     ?event({reset_store, {path, DataDir}}).
 
-%% @doc Read a key from the store: the file's value, or the names in the
-%% directory.
+%% @doc Read a key from the store. A directory holds no value, so reading one
+%% returns `not_found'.
 read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
     read_path(add_prefix(Opts, hb_path:to_binary(Key))).
 read_path(Path) ->
@@ -53,13 +53,6 @@ read_path(Path) ->
 	case file:read_file_info(Path) of
 		{ok, #file_info{type = regular}} ->
 			{ok, _} = file:read_file(Path);
-        {ok, #file_info{type = directory}} ->
-            case file:list_dir_all(Path) of
-                {ok, Files} ->
-                    {composite, lists:map(fun name/1, Files)};
-                {error, _} ->
-                    {error, not_found}
-            end;
 		_ ->
 			{error, not_found}
 	end.
@@ -96,13 +89,26 @@ holds_value(Path, Value) ->
             false
     end.
 
-%% @doc List contents of a directory in the store.
+%% @doc List contents of a directory in the store. If the request sets `values'
+%% to `true', each file is listed with its value, as `{Name, Value}'.
 list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
-    case file:list_dir_all(add_prefix(Opts, hb_path:to_binary(Path))) of
+    Dir = add_prefix(Opts, hb_path:to_binary(Path)),
+    case file:list_dir_all(Dir) of
         {ok, Files} ->
-            Children = lists:map(fun name/1, Files),
+            Children =
+                case maps:get(<<"values">>, Req, false) of
+                    true -> [ child(Dir, File) || File <- Files ];
+                    false -> lists:map(fun name/1, Files)
+                end,
             {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
         {error, _} -> {error, not_found}
+    end.
+
+%% @doc Return a listed file with its value, or a listed directory by its name.
+child(Dir, File) ->
+    case file:read_file(filename:join(Dir, File)) of
+        {ok, Value} -> {name(File), Value};
+        {error, _} -> name(File)
     end.
 
 %% @doc Convert a name listed by `file:list_dir_all/1' to the key it was

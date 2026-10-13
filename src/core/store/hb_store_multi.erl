@@ -230,8 +230,6 @@ collect(Count, Refs) ->
             case Result of
                 ok -> collect(Count - 1, maps:put(Ref, ok, Refs));
                 {ok, Res} -> collect(Count - 1, maps:put(Ref, {ok, Res}, Refs));
-                {composite, _} = Composite ->
-                    collect(Count - 1, maps:put(Ref, Composite, Refs));
                 _ -> collect(Count, maps:remove(Ref, Refs))
             end
     end.
