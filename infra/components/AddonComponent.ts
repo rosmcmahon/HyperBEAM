@@ -59,9 +59,9 @@ export class AddonComponent extends pulumi.ComponentResource {
             'include-block-index=true',
         ].join('&')
         /* shepherd-feed@1.0 reports bundler uploads and copycat items to shepherd. its start hook rebuilds the
-         * default `on` hooks, which setting `on` here replaces. */
-        const feedUrl = extConfig.SHEPHERD_FEED_URL
-        /* JSON keeps option types; the node falls back to defaults if this fails to load */
+         * default `on` hooks, which setting `on` here replaces. defaults to this stack's indexer-next; '' turns it off */
+        const feedUrl = extConfig.SHEPHERD_FEED_URL ?? (config.services.indexer ? 'http://indexer-next:85/feed' : '')
+        /* JSON keeps option types; the node refuses to start if this fails to load */
         const nodeConfig = JSON.stringify(feedUrl ? {
             'on': { 'start': { 'device': 'shepherd-feed@1.0', 'path': 'install' } },
             'shepherd-feed-url': feedUrl,
