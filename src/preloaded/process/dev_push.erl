@@ -250,7 +250,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                 <<"message">> => Msg
                             }
                     end,
-                    hb_util:lower_case_keys(
+                    hb_cache:ensure_all_loaded(
                         hb_ao:normalize_keys(hb_private:reset(Outbox)),
                         Opts
                     ),
@@ -769,7 +769,7 @@ apply_security(default, Msg, TargetProcess, Codec, Opts) ->
     ?event(push, {default_policy, {target, TargetProcess}}, Opts),
     commit_result(
         Msg,
-        [hb_util:human_id(hb_opts:get(priv_wallet, no_viable_wallet, Opts))],
+        [hb_opts:address(Opts)],
         Codec,
         Opts
     ).
@@ -1088,6 +1088,15 @@ test_multi_process_push() ->
             Opts
         ),
     ?event(push, {push_result, PushResult}),
+    % The pushed message holds the AOS `Tags' as keys, not as a `tags' list.
+    ?assertEqual(
+        not_found,
+        hb_ao:get(
+            <<"tags">>,
+            hb_util:deep_get(<<"1/id">>, PushResult, Opts),
+            Opts
+        )
+    ),
     ?assertEqual(
         {ok, <<"GOT PONG">>},
         hb_ao:resolve(Sender, <<"now/results/data">>, Opts)

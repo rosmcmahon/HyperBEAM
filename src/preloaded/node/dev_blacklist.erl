@@ -340,8 +340,7 @@ refresh_loop(Opts) ->
 
 %% @doc Calculate the name of the cache table given the `Opts`.
 cache_table_name(Opts) ->
-    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
-    Address = hb_util:human_id(Wallet),
+    Address = hb_opts:address(hb:wallet(), Opts),
     binary_to_atom(<<"~blacklist@1.0/cache/", Address/binary>>).
 
 %%% Tests

@@ -38,16 +38,7 @@ is_authorized(Type, Role, Msg, Opts) when Role == operator; Role == admin ->
 role(admin, Opts) ->
     addresses(hb_opts:get(admin, role(operator, Opts), Opts));
 role(operator, Opts) ->
-    addresses(
-        hb_opts:get(
-            operator,
-            case hb_opts:get(priv_wallet, unclaimed, Opts) of
-                unclaimed -> unclaimed;
-                Wallet -> ar_wallet:to_address(Wallet)
-            end,
-            Opts
-        )
-    ).
+    addresses(hb_opts:get(operator, hb_opts:address(Opts), Opts)).
 
 %% @doc Accept a role address or list of addresses in native or human form.
 addresses(Address) when ?IS_ID(Address) -> [hb_util:human_id(Address)];

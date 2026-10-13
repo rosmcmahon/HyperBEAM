@@ -24,7 +24,7 @@ graphql(Base, Req, Opts) ->
         {ok, Query} ->
             Node = maps:get(<<"node">>, Opts, undefined),
             OpName =
-                case hb_maps:get(<<"operationName">>, Req, undefined, Opts) of
+                case hb_maps:get(<<"operationname">>, Req, undefined, Opts) of
                     Name when is_binary(Name) -> Name;
                     _ -> undefined
                 end,

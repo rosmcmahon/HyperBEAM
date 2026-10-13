@@ -245,7 +245,9 @@ do_resolve_many([Res], Opts) ->
     hb_cache:ensure_loaded(maybe_force_message(Res, Opts), Opts);
 do_resolve_many([Base, Req | MsgList], Opts) ->
     ?event_debug(debug_ao_core, {stage, 0, resolve_many, {base, Base}, {req, Req}}),
-    case resolve_stage(1, Base, Req, Opts) of
+    % `hb_ao_errors' turns a throw from any stage of the step into an error.
+    % This call is not a tail call, so the catch adds no frame to the stages.
+    try resolve_stage(1, Base, Req, Opts) of
         {ok, Res} ->
             ?event_debug(debug_ao_core,
                 {
@@ -262,6 +264,8 @@ do_resolve_many([Base, Req | MsgList], Opts) ->
             % The result is not a resolvable message. Return it.
             ?event_debug(debug_ao_core, {stage, 12, resolve_many_terminating_early, Res}),
             maybe_force_message(Res, Opts)
+    catch throw:Reason:Stacktrace ->
+        hb_ao_errors:from_throw(Reason, Stacktrace, Base, Req, Opts)
     end.
 
 resolve_stage(1, Link, Req, Opts) when ?IS_LINK(Link) ->
@@ -432,20 +436,21 @@ resolve_stage(2, Base, Req, Opts = #{ <<"resolve-mode">> := raw }) ->
     % Raw mode: apply the device function directly, skipping the cache,
     % validation, persistence, linking, and worker stages.
     raw(Base, Req, Opts);
-resolve_stage(2, Base, Req, Opts) ->
+resolve_stage(2, RawBase, RawReq, Opts) ->
     ?event_debug(debug_ao_core, {stage, 2, vary_inputs}, Opts),
+    % Devices receive their inputs in `structured@1.0' form: `to' decodes the
+    % base and the request here.
+    {ok, Base} = raw(<<"structured@1.0">>, <<"to">>, RawBase, #{}, Opts),
+    {ok, Req} = raw(<<"structured@1.0">>, <<"to">>, RawReq, #{}, Opts),
     % Vary the inputs by the schema of the function that will execute them
     % before the cache lookup, such that every execution the schema deems
     % equivalent shares one cached result. If the function's schema declares
     % it to be a patch, the `VariedResult` of the execution is overlaid on the
     % appropriate input message before return.
-    try vary_loaded(ensure_message_loaded(Base, Opts), Req, Opts) of
-        {Func, VariedBase, VariedReq, Overlay} ->
-            Original = {Base, Req, Overlay},
-            resolve_stage(3, Func, VariedBase, VariedReq, Original, Opts)
-    catch throw:Reason:Stacktrace ->
-        hb_ao_errors:from_throw(Reason, Stacktrace, Base, Req, Opts)
-    end.
+    {Func, VariedBase, VariedReq, Overlay} =
+        vary_loaded(ensure_message_loaded(Base, Opts), Req, Opts),
+    Original = {Base, Req, Overlay},
+    resolve_stage(3, Func, VariedBase, VariedReq, Original, Opts).
 resolve_stage(3, Func, Base, Req, Original, Opts) ->
     ?event_debug(debug_ao_core, {stage, 3, validation_check}, Opts),
     % Validation checks: If `paranoid_message_verification' is enabled, we should
@@ -1236,6 +1241,16 @@ deep_set(Msg, [Key], Value, Opts) ->
     device_set(Msg, Key, Value, Opts);
 deep_set(Msg, [Key|Rest], Value, Opts) ->
     case resolve(Msg, Key, Opts) of 
+        {ok, Literal} when not is_map(Literal), not is_list(Literal) ->
+            % A literal on the path is replaced with a message, as
+            % `hb_util:deep_set/4' replaces it.
+            device_set(
+                Msg,
+                Key,
+                deep_set(#{}, Rest, Value, Opts),
+                <<"explicit">>,
+                Opts
+            );
         {ok, SubMsg} ->
             ?event_debug(debug_set,
                 {traversing_deeper_to_set,

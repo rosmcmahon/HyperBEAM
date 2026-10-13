@@ -105,25 +105,45 @@ handle(_Base, RawReq, Opts) ->
             {ok, _} -> RawReq;
             error ->
                 % Parse the query, assuming that the request body is a JSON
-                % object with the necessary fields.
-                hb_json:decode(hb_maps:get(<<"body">>, RawReq, <<>>, Opts))
+                % object with the necessary fields. Any other body carries
+                % no query.
+                Body = hb_maps:get(<<"body">>, RawReq, <<>>, Opts),
+                try hb_json:decode(Body) of
+                    Object when is_map(Object) ->
+                        {ok, Decoded} =
+                            hb_ao:raw(
+                                <<"structured@1.0">>,
+                                <<"to">>,
+                                Object,
+                                #{},
+                                Opts
+                            ),
+                        Decoded;
+                    _ -> #{}
+                catch error:_ -> #{}
+                end
         end,
     ?event({request, {processed, Req}}),
-    Query = hb_maps:get(<<"query">>, Req, <<>>, Opts),
+    Query =
+        case hb_maps:get(<<"query">>, Req, <<>>, Opts) of
+            QueryBin when is_binary(QueryBin) -> QueryBin;
+            _ -> <<>>
+        end,
     OpName = 
-        case hb_maps:get(<<"operationName">>, Req, undefined, Opts) of
+        case hb_maps:get(<<"operationname">>, Req, undefined, Opts) of
             Name when is_binary(Name) -> Name;
             _ -> undefined
         end,
     % The `graphql' library takes the variables as Erlang terms without links.
     Vars = 
-        hb_message:uncommitted_deep(
-            hb_cache:ensure_all_loaded(
-                hb_maps:get(<<"variables">>, Req, #{}, Opts),
-                Opts
-            ),
-            Opts
-        ),
+        case hb_maps:get(<<"variables">>, Req, #{}, Opts) of
+            RawVars when is_map(RawVars) ->
+                hb_message:uncommitted_deep(
+                    hb_cache:ensure_all_loaded(RawVars, Opts),
+                    Opts
+                );
+            _ -> #{}
+        end,
     ?event(
         {graphql_run_called,
             {query, Query},
@@ -141,7 +161,12 @@ handle(_Base, RawReq, Opts) ->
                 ?event(graphql_type_checked_successfully),
                 ok = graphql:validate(AST2),
                 ?event(graphql_validated),
-                Coerced = graphql:type_check_params(FunEnv, OpName, Vars),
+                Coerced =
+                    graphql:type_check_params(
+                        FunEnv,
+                        OpName,
+                        declared_variables(FunEnv, Vars)
+                    ),
                 ?event(graphql_type_checked_params),
                 Ctx =
                     #{
@@ -179,8 +204,24 @@ handle(_Base, RawReq, Opts) ->
                 throw:Error:Stacktrace ->
                     ?event({graphql_error, {error, Error}, {trace, Stacktrace}}),
                     {error, Error}
-            end
+            end;
+        {error, Error} ->
+            ?event({graphql_error, {error, Error}}),
+            {error, Error}
     end.
+
+%% @doc The variables of a request under the names the document declares: the
+%% request has them lowercase, and GraphQL variable names are case-sensitive.
+declared_variables(FunEnv, Vars) ->
+    maps:from_list(
+        [
+            {Name, Value}
+        ||
+            VarEnv <- maps:values(FunEnv),
+            Name <- maps:keys(VarEnv),
+            {ok, Value} <- [maps:find(hb_util:lowercase_key(Name), Vars)]
+        ]
+    ).
 
 %% @doc Give each binary in a GraphQL response that is not UTF-8 text as its
 %% base64url, typed `binary' in the `ao-types' of the object that holds it, as
@@ -463,9 +504,9 @@ lookup_with_vars_test() ->
                 hb_json:encode(#{
                     <<"query">> => 
                         <<""" 
-                            query GetMessage($keys: [KeyInput]) { 
+                            query GetMessage($Keys: [KeyInput]) { 
                                 message(
-                                    keys: $keys
+                                    keys: $Keys
                                 ) {
                                     id
                                     keys {
@@ -477,7 +518,7 @@ lookup_with_vars_test() ->
                         """>>,
                     <<"operationName">> => <<"GetMessage">>,
                     <<"variables">> => #{
-                        <<"keys">> => 
+                        <<"Keys">> => 
                             [
                                 #{
                                     <<"name">> => <<"basic">>,

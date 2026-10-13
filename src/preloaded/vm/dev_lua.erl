@@ -6,6 +6,7 @@
 -export([encode/2, decode/2]).
 -export([pure_lua_process_benchmark/1]).
 -include("include/hb.hrl").
+-include_lib("luerl/include/luerl.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%% Utility macro to check if a binary is a Lua script content-type.
@@ -402,12 +403,15 @@ process_response({lua_error, RawError, State}, _Priv, Opts) ->
         <<"trace">> => hb_ao:normalize_keys(StackTrace, Opts)
     }};
 process_response({error, Reason, Trace}, _Priv, _Opts) ->
-    % An Erlang error occurred while calling the Lua function. Return it.
+    % An Erlang exception occurred while the Lua call ran, for example
+    % inside a library call into the node. It depends on this node, so it
+    % is a failure, not a result of the computation: a script's own error
+    % arrives as a `lua_error', and stays an `error'.
     ?event(lua_error, {trace, Trace}),
     TraceBin = iolist_to_binary(hb_format:trace(Trace)),
     ?event(lua_error, {formatted, {string, TraceBin}}),
     ReasonBin = iolist_to_binary(io_lib:format("~p", [Reason])),
-    {error, #{
+    {failure, #{
         <<"status">> => 500,
         <<"body">> =>
             << "Erlang error while running Lua: ", ReasonBin/binary >>,
@@ -415,7 +419,8 @@ process_response({error, Reason, Trace}, _Priv, _Opts) ->
     }}.
 
 %% @doc Snapshot the Lua state from a live computation. Removes the node message
-%% from the private data of the state, then serializes the state to a binary.
+%% from the private data of the state and clears Luerl's `tag', then serializes
+%% the state to a binary.
 -spec snapshot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ body := binary(), _ => _ }} | {error, binary()}.
 snapshot(Base, _Req, Opts) ->
@@ -423,8 +428,12 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         RawState ->
+            % Luerl sets the `tag' of a state to a reference made by the VM
+            % that created it, and never reads it. Without it, equal states
+            % give equal snapshots.
             State = luerl:delete_private(<<"node-message">>, RawState),
-            {ok, #{ <<"body">> => term_to_binary(luerl:externalize(State)) }}
+            Snapshot = luerl:externalize(State#luerl{ tag = undefined }),
+            {ok, #{ <<"body">> => term_to_binary(Snapshot) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
@@ -663,6 +672,18 @@ error_response_test() ->
     ?assertEqual(
         {error, <<"Very bad, but Lua caught it.">>},
         hb_ao:resolve(Base, <<"error_response">>, #{})
+    ),
+    % An exception inside the library call into the node -- here, reading a
+    % message this node does not have -- depends on this node, so it is a
+    % failure, not a result of the computation.
+    ?assertMatch(
+        {failure,
+            #{
+                <<"status">> := 500,
+                <<"body">> := <<"Erlang error while running Lua: ", _/binary>>
+            }
+        },
+        hb_ao:resolve(Base, <<"ao_get_as_missing">>, #{})
     ).
 
 sandboxed_failure_test() ->

@@ -7,6 +7,7 @@
 -export([start/0]).
 -export([get/2, get/3, post/3, post/4, request/2, request/4, request/5]).
 -export([message_to_request/2, reply/4, accept_to_codec/2, http_status/2]).
+-export([only_result/2]).
 -export([req_to_tabm_singleton/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -206,6 +207,13 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             Body,
             Opts
         ),
+    % The result may be a link to a message that the peer holds.
+    only_result(add_peer_stores({ResponseStatus, Msg}, Peer, Opts), Opts).
+
+%% @doc Return the value that a reply names in its `ao-result' key, if the
+%% caller asks for the result alone (`http-only-result', the default). Return
+%% any other reply as it is.
+only_result({ResponseStatus, Msg}, Opts) ->
     ReturnAOResult =
         hb_opts:get(http_only_result, true, Opts) andalso
         is_map(Msg) andalso
@@ -219,29 +227,20 @@ request_response(Method, Peer, Path, Response, Duration, Opts) ->
             ),
             case {Key, hb_maps:get(Key, Msg, undefined, Opts)} of
                 {<<"body">>, undefined} ->
-                    {hb_http_client:response_status_to_atom(Status), <<>>};
+                    {ResponseStatus, <<>>};
                 {_, undefined} ->
                     {failure,
                         <<
                             "Result key '",
                             Key/binary,
-                            "' not found in response from '",
-                            Peer/binary,
-                            "' for path '",
-                            Path/binary,
-                            "': ",
-                            Body/binary
+                            "' not found in response."
                         >>
                     };
                 {_, Value} ->
-                    add_peer_stores(
-                        {hb_http_client:response_status_to_atom(Status), Value},
-                        Peer,
-                        Opts
-                    )
+                    {ResponseStatus, Value}
             end;
         false ->
-            add_peer_stores({ResponseStatus, Msg}, Peer, Opts)
+            {ResponseStatus, Msg}
     end.
 
 %% @doc Give every link in a response the stores needed to resolve it: the
@@ -941,10 +940,9 @@ req_to_tabm_singleton(Req, Body, Opts) ->
         >>,
     Headers = cowboy_req:headers(Req),
     {ok, _Path, QueryKeys} = hb_singleton:from_path(FullPath),
-    % The query is parsed once, here. The query parameters override the
-    % request's headers, except for the keys that its signatures cover: a
-    % signature covers its keys' values, so the query never replaces signed
-    % content.
+    % The query parameters override the request's headers, except for the
+    % keys that its signatures cover: a signature is verified over the values
+    % that were signed.
     SignedKeys = signed_keys(Headers, Opts),
     PrimitiveMsg = maps:merge(Headers, maps:without(SignedKeys, QueryKeys)),
     Codec =
@@ -1058,9 +1056,7 @@ signed_keys(Headers, Opts) ->
 %% `content-length').
 %% The precidence order for finding the path is:
 %% 1. The path in the message
-%% 2. The path of the request
-%% The path carries no query string: the request's query parameters are already
-%% merged into the message, so `hb_singleton' does not parse them a second time.
+%% 2. The path and query of the request URI
 normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
     ?event(debug_http, {adding_method_and_path_from_request, {explicit, Req}}),
     Method = cowboy_req:method(Req),
@@ -1071,7 +1067,16 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
             hb_maps:get(
                 <<"path">>, 
                 RawHeaders,
-                cowboy_req:path(Req),
+                iolist_to_binary(
+                    cowboy_req:uri(
+                        Req,
+                        #{
+                            host => undefined,
+                            port => undefined,
+                            scheme => undefined
+                        }
+                    )
+                ),
                 Opts
             ),
             Opts
@@ -1900,9 +1905,8 @@ query_overrides_header_test() ->
         ),
     ?assertEqual(<<"from-query">>, Res).
 
-%% @doc A signed request's query parameters do not reach its execution, and a
-%% query key that shares a signed key's name does not replace the signed header
-%% value: a signature covers its keys' values.
+%% @doc A signed request's query keys apply over its signed content after its
+%% signature is verified. Its uncommitted headers do not reach its execution.
 signed_request_query_riders_test() ->
     Opts = test_opts(),
     Node = hb_http_server:start_node(),
@@ -1912,22 +1916,27 @@ signed_request_query_riders_test() ->
             Opts,
             #{ <<"committed">> => [<<"x">>] }
         ),
-    % A query key that the request does not carry is not added to it, so the
-    % step resolves `y' on a message that does not hold it.
-    ?assertMatch(
-        {error, _},
+    % A query key that the request does not carry is added to it.
+    ?assertEqual(
+        {ok, <<"1">>},
         request(<<"GET">>, Node, <<"/y?y=1">>, Signed, Opts)
     ),
-    % The same key sent as an uncommitted header is dropped likewise.
+    % The same key sent as an uncommitted header is dropped.
     ?assertMatch(
         {error, _},
         request(<<"GET">>, Node, <<"/y">>, Signed#{ <<"y">> => <<"7">> }, Opts)
     ),
-    % A query key that shares a signed key's name does not replace the signed
-    % value, so the signature holds and the committed key resolves.
+    % A query key that shares a signed key's name replaces the signed value,
+    % and the signature, verified over the signed value, holds.
     ?assertEqual(
-        {ok, <<"original">>},
-        request(<<"GET">>, Node, <<"/x?x=evil">>, Signed, Opts)
+        {ok, <<"test">>},
+        request(<<"GET">>, Node, <<"/x?x=test">>, Signed, Opts)
+    ),
+    % A query key is lowercase, so one that differs only in case replaces it
+    % too.
+    ?assertEqual(
+        {ok, <<"test">>},
+        request(<<"GET">>, Node, <<"/x?X=test">>, Signed, Opts)
     ).
 
 %% Test parallel requests

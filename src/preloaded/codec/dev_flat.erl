@@ -11,13 +11,17 @@
 %% @doc Route commitments through `httpsig@1.0'.
 -spec commit(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 commit(Msg, Req, Opts) ->
-    {ok,
-        hb_message:commit(
-            Msg,
-            Opts,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> }
-        )
-    }.
+    % `hb_message:commit/3' without its first line, which takes the node key:
+    % a client can call this.
+    {ok, Structured} =
+        hb_ao:raw(<<"structured@1.0">>, <<"to">>, Msg, #{}, Opts),
+    hb_ao:raw(
+        <<"message@1.0">>,
+        <<"commit">>,
+        Structured,
+        Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
+        Opts
+    ).
 
 %% @doc Route verification through `httpsig@1.0'.
 -spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
@@ -117,16 +121,17 @@ serialize(Map, Opts) when is_map(Map) ->
 
 deserialize(Bin) when is_binary(Bin) ->
     Flat = lists:foldl(
-        fun(Line, Acc) ->
+        fun({_, <<>>}, Acc) -> Acc;
+           ({N, Line}, Acc) ->
             case binary:split(Line, <<": ">>, [global]) of
                 [Key, Value] ->
                     Acc#{ Key => Value };
                 _ ->
-                    Acc
+                    error({invalid_line, N})
             end
         end,
         #{},
-        binary:split(Bin, <<"\n">>, [global])
+        lists:enumerate(binary:split(Bin, <<"\n">>, [global]))
     ),
     {ok, hb_message:convert(Flat, <<"structured@1.0">>, <<"flat@1.0">>, #{})}.
 

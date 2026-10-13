@@ -3,7 +3,7 @@
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
 -export([verify_committed_keys/5]).
--export([enforce_tag_names/3]).
+-export([add_commitment/4]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/3, tags/5, excluded_tags/3]).
 -export([signed_children_hint/3]).
@@ -97,19 +97,26 @@ tag_count(TX, TABM) when length(TX#tx.tags) > ?MAX_TAG_COUNT ->
 tag_count(TX, _TABM) ->
     TX.
 
-%% @doc Throw `invalid_tag_name' if a key of a message names a tag of its item
-%% that decoding gives another key, as decoding lowercases tag names: a
-%% commitment to the item would list the decoded key in place of the message's.
-enforce_tag_names(TX, TABM, Opts) ->
-    case lists:search(
-            fun({Name, _}) ->
-                hb_maps:is_key(Name, TABM, Opts) andalso
-                normalize_key(Name) =/= Name
-            end,
-            TX#tx.tags) of
-        false -> ok;
-        {value, {Name, _}} -> throw({invalid_tag_name, Name})
-    end.
+%% @doc Return `Signed', the message of an item signed from `Msg', with the
+%% commitments of `Msg' and its own. The item replaces an unsigned commitment
+%% of `Msg' by the same device, whose tags and fields it carries.
+add_commitment(Device, Msg, Signed, Opts) ->
+    Kept =
+        hb_message:without_commitments(
+            #{
+                <<"commitment-device">> => Device,
+                <<"type">> => <<"unsigned-sha256">>
+            },
+            Msg,
+            Opts
+        ),
+    Signed#{
+        <<"commitments">> =>
+            maps:merge(
+                maps:get(<<"commitments">>, Kept, #{}),
+                maps:get(<<"commitments">>, Signed)
+            )
+    }.
 
 %% @doc Return a TABM message containing the fields of the given decoded
 %% ANS-104 data item that should be included in the base message.
@@ -144,22 +151,8 @@ tags(Item, Opts) ->
     ),
     ao_types(Tags, Opts).
 
-%% @doc Normalize tag keys while preserving IDs, their link forms and names
-%% that are not UTF-8 text.
-normalize_key(Key) ->
-    case hb_link:remove_link_specifier(Key) of
-        ID when ?IS_ID(ID) -> Key;
-        _ ->
-            NormKey = hb_ao:normalize_key(Key),
-            case is_text(NormKey) of
-                true -> hb_util:to_lower(NormKey);
-                false -> NormKey
-            end
-    end.
-
-%% @doc Check whether a tag name is UTF-8 text.
-is_text(Name) ->
-    unicode:characters_to_binary(Name) =:= Name.
+%% @doc Normalize a tag name as `structured@1.0' normalizes a key.
+normalize_key(Key) -> hb_util:lowercase_key(hb_ao:normalize_key(Key)).
 
 %% @doc Ensure the encoded keys in the `ao-types' field are lowercased and
 %% normalized like the other keys in the tags field.
@@ -263,6 +256,8 @@ data_keys(Data, Opts) ->
 %% a key on the TABM, it will be interpreted as the message's actual data.
 %% Instead if a user has provided a `data` tag, we'll preserve it in
 %% `original-tags` but will strip it from the top-level message keys.
+%% Tags with private names (`hb_private:is_private/1`) are kept in
+%% `original-tags` the same way, as `structured@1.0` drops private keys.
 tag_keys(Item, _Opts) ->
     MetaTags = [
         <<"bundle-format">>,
@@ -274,7 +269,8 @@ tag_keys(Item, _Opts) ->
     lists:filtermap(
         fun({Tag, _}) ->
             NormalizedTag = normalize_key(Tag),
-            case lists:member(NormalizedTag, MetaTags) of
+            case lists:member(NormalizedTag, MetaTags) orelse
+                    hb_private:is_private(NormalizedTag) of
                 true -> false;
                 false -> {true, NormalizedTag}
             end
@@ -456,16 +452,17 @@ bundle_commitment_key(Tags, Opts) ->
             )
     ).
 
-%% @doc Check whether tags contain only normalized UTF-8 keys. Other tag names
-%% need `original-tags' to keep their bytes and order.
+%% @doc Check whether every tag name is a key as `structured@1.0' reads it, and
+%% no name repeats. Other tags need `original-tags' to keep their bytes and
+%% order.
 normal_tags(BaseFields, Tags) ->
     ReservedFields = [<<"ao-data-key">>, <<"ao-types">>, <<"data">> | BaseFields],
     Keys = [Key || {Key, _} <- Tags],
     length(Keys) =:= length(lists:usort(Keys)) andalso
         lists:all(
             fun({Key, _}) ->
-                is_text(Key) andalso
-                hb_util:to_lower(hb_ao:normalize_key(Key)) =:= Key andalso
+                normalize_key(Key) =:= Key andalso
+                not hb_private:is_private(Key) andalso
                 not lists:member(Key, ReservedFields)
             end,
             Tags

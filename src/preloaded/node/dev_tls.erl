@@ -62,7 +62,8 @@ csr(_Base, Request, Opts) ->
             fun(Domain) -> is_binary(Domain) andalso byte_size(Domain) > 0 end,
             Domains
         ),
-        DER = hb_tls:csr(hb_opts:get(priv_wallet, no_viable_wallet, Opts), Domains),
+        NodeOpts = hb_http_server:with_node_key(Opts),
+        DER = hb_tls:csr(hb_opts:get(priv_wallet, no_viable_wallet, NodeOpts), Domains),
         {ok, #{
             <<"status">> => 200,
             <<"content-type">> => <<"text/plain">>,
@@ -142,7 +143,7 @@ dns_resolve(_Base, Request, Opts) ->
         <<"in">> ->
             Name = hb_util:to_lower(hb_maps:get(<<"name">>, Request, <<>>, Opts)),
             Type = hb_maps:get(<<"type">>, Request, <<"txt">>, Opts),
-            ServerID = hb:address(hb_opts:get(priv_wallet, no_viable_wallet, Opts)),
+            ServerID = hb_opts:address(Opts),
             case call(hb_name:lookup(runtime_name(ServerID)),
                     {dns, Name, Type}, ?CALL_TIMEOUT) of
                 {error, not_authorized} -> {error, not_authorized};

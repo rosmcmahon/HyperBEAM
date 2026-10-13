@@ -194,7 +194,6 @@ from_message(hashpath, Msg, Opts) -> hashpath(Msg, Opts);
 from_message(request, #{ <<"path">> := Path }, _Opts) when is_list(Path) -> Path;
 from_message(request, #{ path := Path }, Opts) -> term_to_path_parts(Path, Opts);
 from_message(request, #{ <<"path">> := Path }, Opts) -> term_to_path_parts(Path, Opts);
-from_message(request, #{ <<"Path">> := Path }, Opts) -> term_to_path_parts(Path, Opts);
 from_message(request, _, _Opts) -> undefined.
 
 %% @doc Convert a term into an executable path. Supports binaries, lists, and

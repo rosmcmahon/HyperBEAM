@@ -31,6 +31,7 @@ write_test_message(Opts) ->
                 <<"variant">> => <<"ao.N.1">>,
                 <<"type">> => <<"Message">>,
                 <<"action">> => <<"Eval">>,
+                <<"Émoji-Tag"/utf8>> => <<"v">>,
                 <<"data">> => <<"test data">>
             },
             Opts,
@@ -519,6 +520,17 @@ transactions_query_tags_test_parallel() ->
             }
         } when ?IS_ID(ExpectedID),
         Res
+    ),
+    % A filter by a tag name with a non-ASCII capital finds the message.
+    EmojiQuery =
+        <<"query { transactions(tags: [{name: \"Émoji-Tag\", "/utf8,
+            "values: [\"v\"]}]) { edges { node { id } } } }">>,
+    ?assertEqual(
+        [ExpectedID],
+        transaction_ids(
+            dev_query_graphql:test_query(Node, EmojiQuery, Opts),
+            Opts
+        )
     ).
 
 %% @doc Test transactions query with owners filter

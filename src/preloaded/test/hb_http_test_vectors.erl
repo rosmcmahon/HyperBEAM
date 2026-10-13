@@ -19,7 +19,8 @@
 %% @doc The messages that the primary node serves. A message given as a
 %% function is built with the primary's options, so that it can be signed.
 %% A message given as a pair is written as its first element and read back as
-%% its second: a message written with explicit types or links.
+%% its second: a message written with explicit types or links, or with keys
+%% that `structured@1.0' reads in lowercase.
 messages() ->
     [
         {"basic", #{ <<"hello">> => <<"world">> }},
@@ -200,7 +201,13 @@ messages() ->
         }
     ] ++
     [
-        {Name ++ Suffix, Wrap(#{ Key => <<"literal">> })}
+        {
+            Name ++ Suffix,
+            {
+                Wrap(#{ Key => <<"literal">> }),
+                Wrap(#{ hb_util:lowercase_key(Key) => <<"literal">> })
+            }
+        }
     ||
         {Name, Key} <-
             [
@@ -727,14 +734,10 @@ exercise(Path, {Host, PrimaryOpts}, {ID, _} = Message, Expected, Transport,
     ).
 
 %% @doc A request hook for the node that receives a POST: cache the posted
-%% message, then reply with its ID.
+%% message as it was sent, without loading its links, then reply with its ID.
 receive_post(_, #{ <<"request">> := #{ <<"method">> := <<"POST">> } = Request },
         Opts) ->
-    Msg =
-        hb_cache:ensure_all_loaded(
-            hb_maps:get(<<"body">>, Request, Opts),
-            Opts
-        ),
+    Msg = hb_maps:get(<<"body">>, Request, Opts),
     ?assertEqual(true, hb_message:deep_verify(Msg, Opts)),
     {ok, _} = hb_cache:write(Msg, Opts),
     {ok, #{ <<"body">> => [#{ <<"id">> => hb_message:id(Msg, all, Opts) }] }};

@@ -16,6 +16,8 @@
 -define(AO_CORE_KEYS, [<<"path">>, <<"hashpath">>, <<"priv">>]).
 %% @doc Keys that can be regenerated losslessly.
 -define(REGEN_KEYS, [<<"unsigned_id">>]).
+%% @doc Node options that hold the node's key material.
+-define(NODE_KEY_OPTS, [<<"priv-wallet">>, <<"identities">>]).
 %% @doc Prefix for ans104 and tx fields that are committed.
 -define(FIELD_PREFIX, <<"field-">>).
 

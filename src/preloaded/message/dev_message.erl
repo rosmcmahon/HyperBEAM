@@ -2,12 +2,12 @@
 %%% from the message as it is found in the message's underlying Erlang map. 
 %%% Private keys (`priv[.*]') are not included.
 %%% Reserved keys are: `id', `commitments', `committers', `keys', `path', 
-%%% `set', `remove', `get', and `verify'. Their function comments describe the 
+%%% `set', `remove', and `verify'. Their function comments describe the 
 %%% behaviour of the device when these keys are set.
 -module(dev_message).
 %%% Base AO-Core reserved keys:
 -export([info/0, keys/1, keys/2]).
--export([set/3, set_path/3, remove/3, get/3, get/4]).
+-export([set/3, set_path/3, remove/3, get/4]).
 %%% Commitment-specific keys:
 -export([id/1, id/2, id/3]).
 -export([commit/3, committed/3, committers/1, committers/2, committers/3, verify/3]).
@@ -471,17 +471,7 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
                         {commitment_id, CommitmentID},
                         {res, Res}
                     }),
-                % A signed commitment that covers no key of the message does
-                % not verify: its signature base holds no component of it.
-                % The `commitments' and `priv' keys never reach a signature
-                % base, so they cannot be the keys a commitment covers.
-                Unsigned = not maps:is_key(<<"committer">>, Commitment),
-                CoversKeys =
-                    hb_util:list_without(
-                        [<<"commitments">>, <<"priv">>],
-                        committed_keys(Commitment, Opts)
-                    ),
-                Res andalso (Unsigned orelse CoversKeys =/= [])
+                Res
             end,
             IDsToVerify
         ),
@@ -572,7 +562,9 @@ read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
             }
     end.
 
-%% @doc Return the list of committed keys from a message.
+%% @doc Return the list of committed keys from a message. With `ids' set to
+%% `any', the keys that any selected commitment covers; otherwise the keys
+%% that every one covers.
 -spec committed(
     #{ _ => _ },
     #{ raw => boolean(), committers => _, ids => _, _ => _ },
@@ -620,15 +612,19 @@ committed(Self, Req, Opts) ->
     % Next, we filter the list of all committed keys to only include those that
     % are present in every committer's list.
     OnlyCommittedKeys =
-        lists:filter(
-            fun(Key) ->
-                lists:all(
-                    fun(CommittedKeys) -> lists:member(Key, CommittedKeys) end,
-                    CommitmentKeys
+        case maps:get(<<"ids">>, Req, <<"none">>) of
+            <<"any">> -> AllCommittedKeys;
+            _ ->
+                lists:filter(
+                    fun(Key) ->
+                        lists:all(
+                            fun(CommittedKeys) -> lists:member(Key, CommittedKeys) end,
+                            CommitmentKeys
+                        )
+                    end,
+                    AllCommittedKeys
                 )
-            end,
-            AllCommittedKeys
-        ),
+        end,
     % Remove any `+link` suffixes from TABM-form committed keys if the `raw` flag
     % is not set. This means that callers to `committed/3' will receive a list of
     % keys that they can match  against the 'normal' representation of the message
@@ -657,7 +653,8 @@ with_relevant_commitments(Base, Req, Opts) ->
 %% message request. The caller may specify a list of committers (by address)
 %% or a list of commitment IDs directly. They may specify both, in which case
 %% the returned list will be the union of the two lists. In each case, they
-%% may specify `all' or `none' for each group. If no specifiers are provided,
+%% may specify `all' or `none' for each group. `any' selects every
+%% commitment, as `all' does. If no specifiers are provided,
 %% the default is `all' for commitments -- also implying `all' for committers.
 commitment_ids_from_request(Base, Req, Opts) ->
     Commitments = maps:get(<<"commitments">>, Base, #{}),
@@ -682,6 +679,7 @@ commitment_ids_from_request(Base, Req, Opts) ->
         case ReqCommitments of
             <<"none">> -> [];
             <<"all">> -> hb_maps:keys(Commitments, Opts);
+            <<"any">> -> hb_maps:keys(Commitments, Opts);
             CommitmentIDs ->
                 if is_list(CommitmentIDs) -> CommitmentIDs;
                 true -> [CommitmentIDs]
@@ -811,13 +809,6 @@ set(Base, NewValuesMsg, Opts) ->
 			end,
 			NewValuesKeys
 		),
-	% Find keys in the message that are already set (case-insensitive), and 
-	% note them for removal.
-	_ConflictingKeys =
-		lists:filter(
-			fun(Key) -> lists:member(Key, KeysToSet) end,
-			hb_maps:keys(Base, Opts)
-		),
     UnsetKeys =
         lists:filter(
             fun(Key) ->
@@ -832,18 +823,22 @@ set(Base, NewValuesMsg, Opts) ->
     BaseValues = hb_maps:without(UnsetKeys, Base, Opts),
     ?event_debug(debug_message_set,
         {performing_set,
-            {conflicting_keys, _ConflictingKeys},
             {keys_to_unset, UnsetKeys},
             {new_values, NewValuesMsg},
             {original_message, Base}
         }
     ),
-    % Create the map of new values
+    SetMode = maps:get(<<"set-mode">>, NewValuesMsg, <<"deep">>),
+    % Create the map of new values. A deep set keeps an `unset' value whose
+    % path the base still holds: a nested key, which the deep merge removes.
     NewValues = hb_maps:from_list(
         lists:filtermap(
             fun(Key) ->
                 case hb_maps:get(Key, NewValuesMsg, undefined, Opts) of
                     undefined -> false;
+                    unset when SetMode =/= <<"explicit">> ->
+                        hb_util:deep_get(Key, BaseValues, Opts) =/= not_found
+                            andalso {true, {Key, unset}};
                     unset -> false;
                     Value -> {true, {Key, Value}}
                 end
@@ -857,11 +852,12 @@ set(Base, NewValuesMsg, Opts) ->
             maps:keys(NewValues)
         ),
     % Calculate if the keys to be set conflict with any committed keys.
+    % A key that any commitment covers is signed.
     {ok, CommittedKeys} =
         committed(
             Base,
             #{
-                <<"committers">> => <<"all">>
+                <<"ids">> => <<"any">>
             },
             Opts
         ),
@@ -889,7 +885,7 @@ set(Base, NewValuesMsg, Opts) ->
     % Combine with deep merge or if `set-mode` is `explicit' then just merge.
     Merged =
         hb_private:set_priv(
-            case maps:get(<<"set-mode">>, NewValuesMsg, <<"deep">>) of
+            case SetMode of
                 <<"explicit">> -> maps:merge(BaseValues, NewValues);
                 _ -> do_deep_merge(BaseValues, NewValues, Opts)
             end,
@@ -1058,28 +1054,16 @@ keys(Msg, Opts) ->
     }.
 
 %% @doc Return the value associated with the key as it exists in the message's
-%% underlying Erlang map. First check the public keys, then check case-
-%% insensitively if the key is a binary.
-get(Key, Msg, Opts) -> get(Key, Msg, #{ <<"path">> => <<"get">> }, Opts).
+%% underlying Erlang map, if the key is public. The key is lowercased once, as
+%% the keys of a message in `structured@1.0' form are, then matched exactly.
 get(Key, Msg, _Req, Opts) ->
     case hb_private:is_private(Key) of
         true -> {error, not_found};
         false ->
-            case hb_maps:find(Key, Msg, Opts) of
-                error -> case_insensitive_get(Key, Msg, Opts);
+            case hb_maps:find(hb_util:lowercase_key(Key), Msg, Opts) of
+                error -> {error, not_found};
                 {ok, Value} -> {ok, Value}
             end
-    end.
-
-%% @doc Key matching should be case insensitive, following RFC-9110, so we 
-%% implement a case-insensitive key lookup rather than delegating to
-%% `hb_maps:get/2'. Encode the key to a binary if it is not already.
-case_insensitive_get(Key, Msg, Opts) ->
-    NormKey = hb_util:to_lower(hb_util:bin(Key)),
-    NormMsg = hb_ao:normalize_keys(Msg, Opts),
-    case hb_maps:find(NormKey, NormMsg, Opts) of
-        error -> {error, not_found};
-        {ok, Value} -> {ok, Value}
     end.
 
 %%% Tests
@@ -1121,12 +1105,6 @@ is_private_mod_test() ->
 keys_from_device_test() ->
     ?assertEqual({ok, [<<"a">>]}, hb_ao:resolve(#{ <<"a">> => 1 }, keys, #{})).
 
-case_insensitive_get_test() ->
-	?assertEqual({ok, 1}, case_insensitive_get(<<"a">>, #{ <<"a">> => 1 }, #{})),
-%	?assertEqual({ok, 1}, case_insensitive_get(<<"a">>, #{ <<"A">> => 1 }, #{})),
-	?assertEqual({ok, 1}, case_insensitive_get(<<"A">>, #{ <<"a">> => 1 }, #{})).
-	%?assertEqual({ok, 1}, case_insensitive_get(<<"A">>, #{ <<"A">> => 1 }, #{})).
-
 private_keys_are_filtered_test() ->
     ?assertEqual(
         {ok, [<<"a">>]},
@@ -1153,7 +1131,16 @@ key_from_device_test() ->
         {ok, not_found},
         hb_ao:resolve(ID, <<"a">>, #{})
     ),
-    ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})).
+    ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})),
+    % A key named `get' is read like any other.
+    ?assertEqual({ok, 2}, hb_ao:resolve(#{ <<"get">> => 2 }, <<"get">>, #{})),
+    % A key named `with-commitments' is computed, as with `no-cache'.
+    Msg = #{ <<"with-commitments">> => 3 },
+    NoCache = #{ <<"cache-control">> => [<<"no-cache">>] },
+    ?assertEqual(
+        hb_ao:resolve(Msg, <<"with-commitments">>, NoCache),
+        hb_ao:resolve(Msg, <<"with-commitments">>, #{})
+    ).
 
 remove_test() ->
 	Msg = #{ <<"key1">> => <<"Value1">>, <<"key2">> => <<"Value2">> },
@@ -1250,7 +1237,32 @@ set_new_key_drops_commitments_test() ->
     ),
     ?assertEqual([], hb_message:signers(Updated, Opts)),
     {ok, Canonical} = hb_message:with_only_committed(Updated, Opts),
-    ?assertEqual(<<"2">>, maps:get(<<"b">>, Canonical)).
+    ?assertEqual(<<"2">>, maps:get(<<"b">>, Canonical)),
+    % Setting or removing a key that only one commitment covers drops both.
+    PartiallySigned =
+        hb_message:commit(
+            hb_message:commit(#{ <<"a">> => <<"1">>, <<"b">> => <<"2">> }, Opts),
+            Opts,
+            #{ <<"committed">> => [<<"a">>] }
+        ),
+    ?assertEqual(
+        [<<"a">>, <<"b">>],
+        lists:sort(
+            hb_message:committed(PartiallySigned, #{ <<"ids">> => <<"any">> }, Opts)
+        )
+    ),
+    {ok, Set} = hb_ao:resolve(
+        PartiallySigned,
+        #{ <<"path">> => <<"set">>, <<"b">> => <<"3">> },
+        Opts
+    ),
+    ?assert(hb_message:verify(Set, all, Opts)),
+    {ok, Removed} = hb_ao:resolve(
+        PartiallySigned,
+        #{ <<"path">> => <<"remove">>, <<"item">> => <<"b">> },
+        Opts
+    ),
+    ?assert(hb_message:verify(Removed, all, Opts)).
 
 unset_with_set_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },
@@ -1397,34 +1409,19 @@ verify_without_committed_test() ->
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assertEqual([], hb_message:committed(Decoded, all, Opts)).
 
-%% @doc A signed commitment that covers no key of the message does not verify:
-%% grafting it onto a message with arbitrary content leaves that content
-%% unsigned, however it changes.
+%% @doc A signed commitment over no keys commits none of the keys of a message
+%% that it is grafted onto.
 vacuous_signed_commitment_test_() ->
     [
         {binary_to_list(Device), fun() ->
             Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
             Committed = hb_message:commit(#{}, Opts, Device),
-            [{ID, Commitment}] =
-                maps:to_list(maps:get(<<"commitments">>, Committed)),
-            ?assertEqual([], hb_maps:get(<<"committed">>, Commitment)),
             Grafted =
                 #{
                     <<"data">> => <<"unsigned content">>,
                     <<"commitments">> => maps:get(<<"commitments">>, Committed)
                 },
-            ?assertEqual(
-                hb_util:human_id(ID),
-                hb_message:id(Grafted, signed, Opts)
-            ),
-            ?assertNot(hb_message:verify(Grafted, all, Opts)),
-            ?assertNot(
-                hb_message:verify(
-                    Grafted#{ <<"data">> => <<"changed later">> },
-                    all,
-                    Opts
-                )
-            )
+            ?assertEqual([], hb_message:committed(Grafted, all, Opts))
         end}
     ||
         Device <- [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>]

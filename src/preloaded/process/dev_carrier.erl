@@ -359,7 +359,7 @@ credit(Base, Address, Amount, Opts) ->
     Base#{
         ?BALANCES =>
             hb_maps:put(
-                Address,
+                hb_util:lowercase_key(Address),
                 balance(Base, Address, Opts) + Amount,
                 state(?BALANCES, Base, #{}, Opts),
                 Opts
@@ -705,7 +705,10 @@ malformed_actions_do_not_block_transfer_test() ->
     Opts = (test_opts())#{ <<"hashpath">> => ignore },
     {Owner, OwnerAddr} = party(),
     {_, BuyerAddr} = party(),
-    Base = (name_held_by(OwnerAddr))#{ <<"device">> => <<"carrier@1.0">> },
+    % The state is in `structured@1.0' form, as `compute' returns it.
+    Base = (name_held_by(hb_util:lowercase_key(OwnerAddr)))#{
+        <<"device">> => <<"carrier@1.0">>
+    },
     Unchanged = lists:foldl(
         fun(Action, State) ->
             {ok, Next} = hb_ao:resolve(

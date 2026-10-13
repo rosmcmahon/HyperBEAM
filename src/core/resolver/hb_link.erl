@@ -2,7 +2,6 @@
 -module(hb_link).
 -export([is_link_key/1, remove_link_specifier/1]).
 -export([normalize/2, normalize/3]).
--export([decode_all_links/1]).
 -export([format/1, format/2, format/3]).
 -export([format_unresolved/1, format_unresolved/2, format_unresolved/3]).
 -include("include/hb.hrl").
@@ -107,35 +106,6 @@ normalize_pair(Key, V, _Mode, _Opts) ->
     % The value is a primitive type. We do not need to do
     % anything.
     {Key, V}.
-
-%% @doc Decode links embedded in the headers of a message.
-decode_all_links(Msg) when is_map(Msg) ->
-    maps:from_list(
-        lists:map(
-            fun({Key, MaybeID}) ->
-                case is_link_key(Key) of
-                    true ->
-                        NewKey = binary:part(Key, 0, byte_size(Key) - 5),
-                        {NewKey, 
-                            {
-                                link,
-                                MaybeID,
-                                #{
-                                    <<"type">> => <<"link">>,
-                                    <<"lazy">> => false
-                                }
-                            }
-                        };
-                    _ -> {Key, MaybeID}
-                end
-            end,
-            maps:to_list(Msg)
-        )
-    );
-decode_all_links(List) when is_list(List) ->
-    lists:map(fun(X) -> decode_all_links(X) end, List);
-decode_all_links(OtherVal) ->
-    OtherVal.
 
 %% @doc Determine if a key is an encoded link.
 is_link_key(Key) when byte_size(Key) >= 5 ->

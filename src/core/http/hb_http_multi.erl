@@ -89,7 +89,7 @@ request(Config, Method, Path, Message, Opts) ->
             )
         end,
     ?event(debug_http, {multirequest_results, {admissible_results, AdmissibleResults}, {all_responses, AllResponses}}),
-    case AdmissibleResults of
+    case [hb_http:only_result(Res, Opts) || Res <- AdmissibleResults] of
         [] -> {error, {no_viable_responses, AllResponses}};
         Results -> if Responses == 1 -> hd(Results); true -> Results end
     end.
@@ -123,13 +123,13 @@ multirequest_opt(Key, Config, Message, Default, Opts) ->
         Opts#{ <<"hashpath">> => ignore }
     ).
 
-%% @doc Check if a response is admissible, according to the configuration. First,
-%% we check the Erlang response status to check for `ok'. If the response is
-%% not `ok', it is not admissible.
-%% 
-%% If the response is `ok', we check the status and the response message against
-%% the configuration.
-is_admissible(ok, Res, Admissible, Statuses, Opts) ->
+%% @doc Check if a response is admissible, according to the configuration. A
+%% reply is admissible if its status is one of the configured statuses and it
+%% satisfies the `admissible' message. With the statuses `All', a reply that
+%% is not `ok' is not admissible. A request that fails without a reply is not
+%% admissible.
+is_admissible(ErlStatus, Res, Admissible, Statuses, Opts)
+        when ErlStatus == ok; is_map(Res), Statuses =/= <<"All">> ->
     ?event(debug_multi,
         {is_admissible,
             {response, Res},
@@ -152,7 +152,7 @@ is_admissible(_, _, _, _, _) -> false.
 serial_multirequest(_Nodes, 0, _Method, _Path, _Message, _Admissible, _Statuses, _Opts) -> {[], []};
 serial_multirequest([], _, _Method, _Path, _Message, _Admissible, _Statuses, _Opts) -> {[], []};
 serial_multirequest([Node|Nodes], Remaining, Method, Path, Message, Admissible, Statuses, Opts) ->
-    {ErlStatus, Res} = hb_http:request(Method, Node, Path, Message, Opts),
+    {ErlStatus, Res} = node_request(Method, Node, Path, Message, Opts),
     case is_admissible(ErlStatus, Res, Admissible, Statuses, Opts) of
         true ->
             ?event(debug_http, {admissible_status, {response, Res}}),
@@ -200,10 +200,7 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
             fun(Node) ->
                 spawn(
                     fun() ->
-                        Res =
-                            try hb_http:request(Method, Node, Path, Message, Opts)
-                            catch C:R -> {error, {worker_crash, C, R}}
-                            end,
+                        Res = node_request(Method, Node, Path, Message, Opts),
                         receive no_reply -> stopping
                         after 0 -> Parent ! {Ref, self(), Res}
                         end
@@ -215,9 +212,26 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
         NewRemainingNodes
     }.
 
+%% @doc Request a message from one node. A request that raises is a failure,
+%% which is not admissible. The reply is whole: the admissibility checks read
+%% its `status', and `request/5' takes the value that it names in `ao-result'.
+node_request(Method, Node, Path, Message, Opts) ->
+    ReplyOpts = Opts#{ <<"http-only-result">> => false },
+    try hb_http:request(Method, Node, Path, Message, ReplyOpts)
+    catch Class:Exception:Stacktrace ->
+        {failure,
+            #{
+                <<"node">> => Node,
+                <<"class">> => Class,
+                <<"exception">> => Exception,
+                <<"trace">> => Stacktrace
+            }
+        }
+    end.
+
 %% @doc Check if a status is allowed, according to the configuration. Statuses
-%% can be a single integer, a comma-separated list of integers, or the string
-%% `All'.
+%% can be a single integer, a list of integers, a comma-separated list of
+%% integers, or the string `All'. Integers may be given as binaries.
 admissible_status(_, <<"All">>, _Opts) -> true;
 admissible_status(ResponseMsg = #{ <<"status">> := _ }, Statuses, Opts) ->
     admissible_status(hb_http:http_status(ResponseMsg, Opts), Statuses, Opts);
@@ -226,14 +240,9 @@ admissible_status(Status, Statuses, Opts) when is_integer(Statuses) ->
 admissible_status(Status, Statuses, Opts) when is_binary(Status) ->
     admissible_status(binary_to_integer(Status), Statuses, Opts);
 admissible_status(Status, Statuses, Opts) when is_binary(Statuses) ->
-    % Convert the statuses to a list of integers.
-    admissible_status(
-        Status,
-        lists:map(fun binary_to_integer/1, binary:split(Statuses, <<",">>)),
-        Opts
-    );
+    admissible_status(Status, hb_util:binary_to_strings(Statuses), Opts);
 admissible_status(Status, Statuses, _Opts) when is_list(Statuses) ->
-    lists:member(Status, Statuses).
+    lists:member(Status, lists:map(fun hb_util:int/1, Statuses)).
 
 %% @doc If an `admissable` message is set for the request, check if the response
 %% adheres to it. Else, return `true'.

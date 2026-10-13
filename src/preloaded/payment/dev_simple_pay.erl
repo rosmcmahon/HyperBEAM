@@ -143,7 +143,7 @@ price_from_count(Messages, NodeMsg) ->
 %% will be
 -spec charge(
     #{ _ => _ },
-    #{ request => #{ _ => _ }, quantity => integer(), _ => _ },
+    #{ request => #{ _ => _ }, quantity => non_neg_integer(), _ => _ },
     #{ _ => _ }
 ) ->
     {ok, boolean()}
@@ -211,20 +211,21 @@ charge(_, RawReq, NodeMsg) ->
     #{ _ => _ }
 ) -> {ok, integer()}.
 balance(_, RawReq, NodeMsg) ->
+    Req =
+        hb_ao:get(
+            <<"request">>,
+            RawReq,
+            RawReq,
+            NodeMsg#{ <<"hashpath">> => ignore }
+        ),
     Target =
-        case
-            hb_ao:get(
-                <<"request">>,
-                RawReq,
-                NodeMsg#{ <<"hashpath">> => ignore }
-            )
-        of
-            not_found ->
-                case hb_message:signers(RawReq, NodeMsg) of
-                    [] -> hb_ao:get(<<"target">>, RawReq, undefined, NodeMsg);
-                    [Signer] -> Signer
+        case hb_ao:get(<<"target">>, RawReq, undefined, NodeMsg) of
+            undefined ->
+                case hb_message:signers(Req, NodeMsg) of
+                    [] -> undefined;
+                    [Signer | _] -> Signer
                 end;
-            Req -> hd(hb_message:signers(Req, NodeMsg))
+            Explicit -> Explicit
         end,
     {ok, get_balance(Target, NodeMsg)}.
 
@@ -245,7 +246,9 @@ ledger(NodeMsg) ->
         <<"balances">> => hb_opts:get(simple_pay_ledger, #{}, NodeMsg)
     }.
 
-%% @doc Get the balance of a user in the ledger.
+%% @doc Get the balance of a user in the ledger. A request with no signer and
+%% no `target' names no user, and has a balance of 0.
+get_balance(undefined, _NodeMsg) -> 0;
 get_balance(Signer, NodeMsg) ->
     lib_volatile_ledger:balance(
         ledger(NodeMsg),
@@ -320,7 +323,9 @@ test_opts(Ledger) ->
 get_balance_and_top_up_test() ->
     ClientWallet = ar_wallet:new(),
     ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
-    {HostAddress, HostWallet, Opts} = test_opts(#{ ClientAddress => 100 }),
+    % The ledger keys the client lowercase, as a config file loads it.
+    {HostAddress, HostWallet, Opts} =
+        test_opts(#{ hb_util:lowercase_key(ClientAddress) => 100 }),
     Node = hb_http_server:start_node(Opts),
     ?event({host_address, HostAddress}),
     ?event({client_address, ClientAddress}),
@@ -355,6 +360,22 @@ get_balance_and_top_up_test() ->
     % not have generated a charge in itself. The top-up did not generate a charge
     % because it is the operator that performed it, and not a user.
     ?assertEqual(180, NewBalance),
+    % A charge of a negative quantity is refused, even from the operator.
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"key">> := <<"quantity">> }},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/charge">>,
+                    <<"quantity">> => -1000,
+                    <<"request">> => Req
+                },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
     {ok, Res2} =
         hb_http:get(
             Node,

@@ -677,7 +677,7 @@ parse_controllers(default, Opts) ->
         undefined -> 
             case hb_opts:get(operator, undefined, Opts) of
                 undefined ->
-                    [hb_util:human_id(hb_opts:get(priv_wallet, undefined, Opts))];
+                    [hb_opts:address(Opts)];
                 Op -> [hb_util:human_id(Op)]
             end;
         Admin -> [Admin]

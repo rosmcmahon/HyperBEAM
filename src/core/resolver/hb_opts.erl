@@ -14,6 +14,7 @@
 %%% with a refusal to execute.
 -module(hb_opts).
 -export([get/1, get/2, get/3, as/2, identities/1, load/1, load/2, load_bin/2]).
+-export([address/1, address/2]).
 -export([default_message/0, default_message_with_env/0, mimic_default_types/3]).
 -export([ensure_node_history/2]).
 -export([check_required_opts/2]).
@@ -169,7 +170,7 @@ preloaded_store_from_env(Path) ->
 lua_tests_from_env(tests) -> tests;
 lua_tests_from_env(Spec) -> hb_util:bin(Spec).
 
-%% @doc Convert an opts key to lower-case binary dash form.
+%% @doc Convert an opts key to binary dash form.
 canonical_key(Key) when is_atom(Key) ->
     canonical_key(atom_to_binary(Key, utf8));
 canonical_key(Key) when is_list(Key) ->
@@ -177,13 +178,7 @@ canonical_key(Key) when is_list(Key) ->
         true -> canonical_key(list_to_binary(Key));
         false -> Key
     end;
-canonical_key(Key) when is_binary(Key) ->
-    case hb_util_string:canon_chars(Key) of
-        non_ascii ->
-            hb_util:to_lower(binary:replace(Key, <<"_">>, <<"-">>, [global]));
-        Chars ->
-            Chars
-    end;
+canonical_key(Key) when is_binary(Key) -> hb_util_string:dash_chars(Key);
 canonical_key(Key) -> Key.
 
 %% @doc The node's resolved global configuration: the static `default_message/0'
@@ -691,11 +686,10 @@ load(Path, Opts) ->
 
 %% @doc Load a single configuration source from disk.
 load_path(Path, Opts) ->
-    {ok, Device} = path_to_device(Path),
-    case file:read_file(Path) of
-        {ok, Bin} ->
-            load_bin(Device, Bin, Opts);
-        _ -> {error, not_found}
+    maybe
+        {ok, Device} ?= path_to_device(Path),
+        {ok, Bin} ?= file:read_file(Path),
+        load_bin(Device, Bin, Opts)
     end.
 
 %% @doc Load each configuration source in turn, deep-merging the results in
@@ -825,12 +819,22 @@ coerce_value(_DefaultValue, Value) ->
 %% @doc Find a given identity from the `identities' map, and return the options
 %% merged with the sub-options for that identity.
 as(Identity, Opts) ->
-    case identities(Opts) of
+    case identities(hb_http_server:with_node_key(Opts)) of
         #{ Identity := SubOpts } ->
             ?event({found_identity_sub_opts_are, SubOpts}),
             {ok, maps:merge(Opts, mimic_default_types(SubOpts, false, Opts))};
         _ ->
             {error, not_found}
+    end.
+
+%% @doc Return the address of the `priv-wallet' in `Opts', else the `address'
+%% option, which request execution `Opts' hold in its place, else the address
+%% of `Default'.
+address(Opts) -> address(undefined, Opts).
+address(Default, Opts) ->
+    case ?MODULE:get(priv_wallet, ?MODULE:get(address, Default, Opts), Opts) of
+        undefined -> undefined;
+        WalletOrAddress -> hb_util:human_id(WalletOrAddress)
     end.
 
 %% @doc Find all known IDs and their sub-options from the `priv_ids' map. Allows
@@ -1033,6 +1037,13 @@ global_preference_test() ->
     ?assertNotEqual(undefined, ?MODULE:get(mode, undefined, Global)).
 
 load_flat_test() ->
+    % A path that cannot be read returns its read error.
+    ?assertEqual({error, eisdir}, load("test")),
+    % A line that is not blank or `key: value' is an error.
+    ?assertEqual(
+        {error, {invalid_line, 3}},
+        load_bin(<<"port: 1234\n\ncompute-mode aggressive">>, #{})
+    ),
     % File contents:
     % port: 1234
     % node-host: https://ao.computer

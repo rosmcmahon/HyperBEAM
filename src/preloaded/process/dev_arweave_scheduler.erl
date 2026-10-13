@@ -147,13 +147,12 @@ sync(_Base, _Req, Opts) ->
 
 %% @doc Report the global covered interval without scanning every process.
 status(_Base, _Req, Opts) ->
-    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
+    Address = hb_opts:address(hb:wallet(), Opts),
     case dev_arweave_scheduler_cache:read_global(Opts) of
         {ok, Global} ->
             {ok,
                 #{
-                    <<"address">> =>
-                        hb_util:human_id(ar_wallet:to_address(Wallet)),
+                    <<"address">> => Address,
                     <<"sync">> => Global,
                     <<"cache-control">> => <<"no-store">>
                 }
@@ -161,8 +160,7 @@ status(_Base, _Req, Opts) ->
         _ ->
             {ok,
                 #{
-                    <<"address">> =>
-                        hb_util:human_id(ar_wallet:to_address(Wallet)),
+                    <<"address">> => Address,
                     <<"cache-control">> => <<"no-store">>
                 }
             }

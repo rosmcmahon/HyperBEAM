@@ -390,8 +390,9 @@ result_to_message(Item, Opts) ->
         _ ->
             result_to_message(undefined, Item, Opts)
     end.
-%% @doc Load an L1 transaction in its native form.
-result_to_message(ExpectedID, #{ <<"bundledIn">> := null }, Opts) ->
+%% @doc Load an L1 transaction in its native form. The node is read through
+%% `hb_ao:get/3', so its keys are in `structured@1.0' form.
+result_to_message(ExpectedID, #{ <<"bundledin">> := null }, Opts) ->
     hb_ao:resolve(
         #{ <<"device">> => <<"arweave@2.9">> },
         #{ <<"path">> => <<"tx">>, <<"tx">> => ExpectedID },

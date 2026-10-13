@@ -32,7 +32,6 @@ to(Msg, _Req, _Opts) when is_binary(Msg); is_number(Msg);
 to(Msg, Req, Opts) ->
     ConvOpts = Opts#{ <<"hashpath">> => ignore },
     HintedReq = hb_util:ok(to_hint(Msg, Req, Opts)),
-    Bundle = hb_maps:get(<<"bundle">>, HintedReq, false, Opts),
     % The input to this function will be a TABM message, so we:
     % 1. Convert it to a structured message.
     % 2. Load any linked items if we are in `bundle' mode.
@@ -46,6 +45,9 @@ to(Msg, Req, Opts) ->
             tabm,
             ConvOpts
         ),
+    Bundle =
+        is_list(Restructured) orelse
+            hb_maps:get(<<"bundle">>, HintedReq, false, Opts),
     Loaded =
         case Bundle of
             true -> hb_cache:ensure_all_loaded(Restructured, Opts);
@@ -147,13 +149,17 @@ from(JSON, Req, Opts) ->
 %% @doc Route commitments through `httpsig@1.0'.
 -spec commit(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 commit(Msg, Req, Opts) ->
-    {ok,
-        hb_message:commit(
-            Msg,
-            Opts,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> }
-        )
-    }.
+    % `hb_message:commit/3' without its first line, which takes the node key:
+    % a client can call this.
+    {ok, Structured} =
+        hb_ao:raw(<<"structured@1.0">>, <<"to">>, Msg, #{}, Opts),
+    hb_ao:raw(
+        <<"message@1.0">>,
+        <<"commit">>,
+        Structured,
+        Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
+        Opts
+    ).
 
 %% @doc Route verification through `httpsig@1.0'.
 -spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
@@ -329,4 +335,25 @@ deeply_nested_typed_keys_test() ->
             Opts
         ),
     ?event(debug_json, {decoded, Decoded}, Opts),
-    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)),
+    % Unbundled lists with maps survive round-trip without dropping elements.
+    ListMsg = [42, #{ <<"a">> => 1 }, 99],
+    ListJSON = hb_message:convert(ListMsg, <<"json@1.0">>, Opts),
+    ListDecoded =
+        hb_message:convert(
+            ListJSON,
+            <<"structured@1.0">>,
+            <<"json@1.0">>,
+            Opts
+        ),
+    ?assertEqual(ListMsg, hb_cache:ensure_all_loaded(ListDecoded, Opts)),
+    SingleListMsg = [#{ <<"a">> => 1 }],
+    SingleListJSON = hb_message:convert(SingleListMsg, <<"json@1.0">>, Opts),
+    SingleListDecoded =
+        hb_message:convert(
+            SingleListJSON,
+            <<"structured@1.0">>,
+            <<"json@1.0">>,
+            Opts
+        ),
+    ?assertEqual(SingleListMsg, hb_cache:ensure_all_loaded(SingleListDecoded, Opts)).

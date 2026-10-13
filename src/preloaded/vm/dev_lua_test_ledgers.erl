@@ -291,7 +291,12 @@ apply_names(Map, EnvNames, Opts) ->
                 maps:to_list(EnvNames)
             )
         ),
-    do_apply_names(Map, maps:merge(IDs, EnvNames), Opts).
+    % Balances and ledgers are keyed by the lowercase form of an ID.
+    LowerIDs =
+        maps:from_list(
+            [{hb_util:lowercase_key(K), V} || {K, V} <- maps:to_list(IDs)]
+        ),
+    do_apply_names(Map, maps:merge(maps:merge(IDs, LowerIDs), EnvNames), Opts).
 do_apply_names(Map, EnvNames, Opts) when is_map(Map) ->
     maps:from_list(
         lists:map(

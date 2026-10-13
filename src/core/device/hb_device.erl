@@ -12,13 +12,15 @@
 %%% All keys in the `message@1.0` device that are not resolved to underlying
 %%% data in the their Erlang map representations.
 -define(MESSAGE_KEYS, [
-    <<"get">>,
+    <<"index">>,
     <<"set">>,
+    <<"set-path">>,
     <<"remove">>,
     <<"keys">>,
     <<"id">>,
     <<"commit">>,
     <<"verify">>,
+    <<"with-commitments">>,
     <<"committers">>,
     <<"committed">>
 ]).
@@ -167,15 +169,15 @@ info_handler_to_fun(HandlerMap, Msg, Key, Opts) ->
 %% and try again.
 find_exported_function(Msg, Mod, Key, Arity, Opts) ->
     find_exported_function(Msg, Mod, Key, Arity, 0, Opts).
-find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) when not is_atom(Key) ->
-	try hb_util:key_to_atom(Key, false) of
-		KeyAtom -> find_exported_function(Msg, Mod, KeyAtom, Arity, MinArity, Opts)
-	catch _:_ -> not_found
-	end;
 find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev) ->
     NormKey = hb_ao:normalize_key(Key),
     NormDev = hb_ao:normalize_keys(Dev, Opts),
 	case hb_maps:get(NormKey, NormDev, not_found, Opts) of
+		not_found when not is_atom(Key) ->
+			try hb_util:key_to_atom(Key, false) of
+				KeyAtom -> find_exported_function(Msg, Dev, KeyAtom, MaxArity, MinArity, Opts)
+			catch _:_ -> not_found
+			end;
 		not_found -> not_found;
 		Fun when is_function(Fun) ->
 			case erlang:fun_info(Fun, arity) of
@@ -186,6 +188,11 @@ find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev)
 					end;
 				_ -> not_found
 			end
+	end;
+find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) when not is_atom(Key) ->
+	try hb_util:key_to_atom(Key, false) of
+		KeyAtom -> find_exported_function(Msg, Mod, KeyAtom, Arity, MinArity, Opts)
+	catch _:_ -> not_found
 	end;
 find_exported_function(_Msg, _Mod, _Key, Arity, MinArity, _Opts) when Arity < MinArity ->
     not_found;
@@ -281,7 +288,7 @@ fallback_direct_key_access(Store, Base, Req, Opts) ->
     end.
 
 do_is_direct_key_access(DevRes, #{ <<"path">> := Key }, Opts) ->
-    do_is_direct_key_access(DevRes, Key, Opts);
+    do_is_direct_key_access(DevRes, hb_util:lowercase_key(Key), Opts);
 do_is_direct_key_access({_Status, DevRes}, Key, Opts) ->
     do_is_direct_key_access(DevRes, Key, Opts);
 do_is_direct_key_access(not_found, Key, Opts) ->

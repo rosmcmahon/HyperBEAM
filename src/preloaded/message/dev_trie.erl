@@ -87,7 +87,8 @@ get(TrieNode, Req, Opts) ->
     case hb_maps:find(<<"key">>, Req, Opts) of
         error -> {error, <<"'key' parameter is required for trie lookup.">>};
         {ok, Key} ->
-            case retrieve(TrieNode, Key, Opts) of
+            % A key is stored lowercase, as keys are in `structured@1.0' form.
+            case retrieve(TrieNode, hb_util:lowercase_key(Key), Opts) of
                 {error, not_found} -> {error, not_found};
                 Value -> {ok, Value}
             end
@@ -480,6 +481,8 @@ basic_retrievability_test() ->
     {ok, Path} = hb_cache:write(Trie, Opts),
     ?event(debug_trie, {basic_retrievability_test, {trie, Trie}}),
     ?assertEqual(31337, hb_ao:get(<<"car">>, Trie, Opts)),
+    % A key is read as `structured@1.0' reads keys: in lowercase.
+    ?assertEqual(31337, hb_ao:get(<<"Car">>, Trie, Opts)),
     ?assertEqual(90210, hb_ao:get(<<"card">>, Trie, Opts)),
     ?assertEqual(666, hb_ao:get(<<"cardano">>, Trie, Opts)),
     ?assertEqual(8675309, hb_ao:get(<<"carmex">>, Trie, Opts)),
@@ -537,7 +540,9 @@ reserved_edge_labels_test_() ->
             lists:foldl(
                 fun({Key, Value}, {Trie, Expected}) ->
                     New = hb_ao:set(Trie, #{Key => Value}, Opts),
-                    NextExpected = Expected#{Key => Value},
+                    % `set' reads a key as `structured@1.0' does: in lowercase.
+                    NextExpected =
+                        Expected#{hb_util:lowercase_key(Key) => Value},
                     {ok, ID} = hb_cache:write(New, Opts),
                     {ok, Loaded} = hb_cache:read(ID, Opts),
                     lists:foreach(
