@@ -32,14 +32,18 @@
 -define(SOLANA_MAINNET, <<"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp">>).
 
 %% @doc Read the committer of a `did:pkh:' URI. `hb_uri' gives the account as
-%% the `body' of the message, which is already the committer.
+%% the `body' of the message, which is already the committer. We refuse an
+%% account that `to' does not give for any key.
 -spec from(
     #{ body := binary(), _ => _ },
     #{ type := binary(), _ => _ },
     #{ _ => _ }
-) -> {ok, #{ body := binary(), _ => _ }}.
+) -> {ok, #{ body := binary(), _ => _ }} | {error, _}.
 from(Committer, #{ <<"type">> := <<"uri">> }, _Opts) ->
-    {ok, Committer}.
+    case is_account(maps:get(<<"body">>, Committer)) of
+        true -> {ok, Committer};
+        false -> {error, #{ <<"error">> => <<"invalid-account">> }}
+    end.
 
 %% @doc Write the `did:pkh:' URI of a committer, from its account.
 -spec to(
@@ -130,6 +134,25 @@ key_account(Owner, ?SOLANA_KEY_TYPE) ->
     {ok, <<"solana:", ?SOLANA_MAINNET/binary, ":", Address/binary>>};
 key_account(_Owner, _KeyType) ->
     {error, #{ <<"error">> => <<"unsupported-key-type">> }}.
+
+%% @doc Check that an account is one that `key_account/2' returns for a key. The
+%% address of an Arweave account is a human-readable ID, the address of an
+%% Ethereum account carries its EIP-55 checksum, and the address of a Solana
+%% account is the base58 encoding of 32 bytes.
+is_account(<<"arweave:7wIU:", Address/binary>>) ->
+    hb_util:is_human_id(Address);
+is_account(Account = <<"eip155:1:0x", Hex:40/binary>>) ->
+    re:run(Hex, <<"\\A[0-9a-fA-F]+\\z">>, [{capture, none}]) =:= match andalso
+        key_account(<<"0x", Hex/binary>>, ?TYPED_ETHEREUM_KEY_TYPE) =:=
+            {ok, Account};
+is_account(<<"solana:", Reference:32/binary, ":", Address/binary>>)
+        when Reference =:= ?SOLANA_MAINNET ->
+    case hb_util:base58_decode(Address) of
+        {ok, Key} -> byte_size(Key) == 32;
+        error -> false
+    end;
+is_account(_Account) ->
+    false.
 
 %% @doc Convert a signature type to the type of key that signs with it. The
 %% signature type is either `rsa-pss-sha512', from HTTP message signatures,

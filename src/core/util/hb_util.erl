@@ -4,6 +4,7 @@
 -export([safe_int/1]).
 -export([ceil_int/2, floor_int/2]).
 -export([id/1, id/2, native_id/1, human_id/1, human_int/1, to_hex/1]).
+-export([is_human_id/1]).
 -export([secret_key_to_committer/1, remove_scheme_prefix/1]).
 -export([key_to_atom/1, key_to_atom/2, binary_to_strings/1]).
 -export([encode/1, decode/1, decode/2, safe_encode/1, safe_decode/1]).
@@ -28,11 +29,15 @@
 -export([check_size/2, check_value/2, check_type/2, ok_or_throw/3]).
 -export([all_atoms/0, binary_is_atom/1]).
 -export([lowercase_key/1]).
--export([base58_encode/1, atom_to_dashed_binary/1]).
+-export([base58_encode/1, base58_decode/1, atom_to_dashed_binary/1]).
 -export([committer/1, committer_address/1]).
 -include("include/hb.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
+
+%%% The alphabet of base58, in the order of its digits.
+-define(BASE58_ALPHABET,
+    <<"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz">>).
 
 %%% Simple type coercion functions, useful for quickly turning inputs from the
 %%% HTTP API into the correct types for the HyperBEAM runtime, if they are not
@@ -297,12 +302,22 @@ human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
 
 %% @doc Convert a committer given by a node's configuration, a process
 %% definition or Lua code to its URI. An Arweave address has no URI scheme, so
-%% it becomes the URI of its `did:pkh:' committer. A URI or any other term is
-%% returned as it is.
+%% it becomes the URI of its `did:pkh:' committer. A query after the address,
+%% such as the `?hint=' of a scheduler, is kept. Any other binary without a URI
+%% scheme is not a committer. We return it as it is, so that it matches no
+%% signer, and log it as an `invalid_committer' event. A URI or any other term
+%% is returned as it is.
 committer(Value) when is_binary(Value) ->
     case hb_uri:scheme(Value) of
         {ok, _Scheme, _Rest} -> Value;
-        _ -> ?ARWEAVE_COMMITTER(Value)
+        _ ->
+            [Address | _] = binary:split(Value, <<"?">>),
+            case is_human_id(Address) of
+                true -> ?ARWEAVE_COMMITTER(Value);
+                false ->
+                    ?event(committer, {invalid_committer, Value}),
+                    Value
+            end
     end;
 committer(Value) ->
     Value.
@@ -312,6 +327,16 @@ committer(Value) ->
 %% committer is returned as it is.
 committer_address(?ARWEAVE_COMMITTER(Address)) -> Address;
 committer_address(Committer) -> Committer.
+
+%% @doc Check whether a binary is a human-readable ID: the base64url encoding
+%% of 32 bytes, as `human_id/1' returns it.
+is_human_id(Bin) when byte_size(Bin) == 43 ->
+    case safe_decode(Bin) of
+        {ok, ID} -> encode(ID) =:= Bin;
+        {error, invalid} -> false
+    end;
+is_human_id(_Value) ->
+    false.
 
 %% @doc Add `,' characters to a number every 3 digits to make it human readable.
 human_int(Float) when is_float(Float) ->
@@ -977,11 +1002,30 @@ base58_encode(Bin) when is_binary(Bin) ->
 base58_encode_int(0) ->
     <<>>;
 base58_encode_int(N) ->
-    Alphabet = <<"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz">>,
     Rem = N rem 58,
-    Char = binary:at(Alphabet, Rem),
+    Char = binary:at(?BASE58_ALPHABET, Rem),
     Rest = base58_encode_int(N div 58),
     <<Rest/binary, Char>>.
+
+%% @doc Decode a base58 binary, as `base58_encode/1' encodes it. Returns
+%% `error' for a binary with a character that is not in the alphabet.
+base58_decode(<<$1, Rest/binary>>) ->
+    maybe
+        {ok, Decoded} ?= base58_decode(Rest),
+        {ok, <<0, Decoded/binary>>}
+    end;
+base58_decode(Bin) when is_binary(Bin) ->
+    base58_decode_int(Bin, 0).
+
+base58_decode_int(<<>>, 0) ->
+    {ok, <<>>};
+base58_decode_int(<<>>, N) ->
+    {ok, binary:encode_unsigned(N)};
+base58_decode_int(<<Char, Rest/binary>>, N) ->
+    case binary:match(?BASE58_ALPHABET, <<Char>>) of
+        {Digit, 1} -> base58_decode_int(Rest, N * 58 + Digit);
+        nomatch -> error
+    end.
 
 %% @doc Convert an atom with underscope to dashed binary form.
 atom_to_dashed_binary(Key) when is_atom(Key) ->

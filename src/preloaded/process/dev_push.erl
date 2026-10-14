@@ -1009,12 +1009,14 @@ test_push_as_identity() ->
         }
     },
     % Create a new test AOS process, which will use the given identities as
-    % its authority and scheduler.
+    % its authority and scheduler. Its first scheduler is an Ethereum address,
+    % which is not a committer.
+    EthAddress = <<"0xb9c5714089478a327f09197987f16f9e5d936e8a">>,
     Base =
         hb_process_test_vectors:aos_process(
             Opts#{
                 <<"authority">> => ComputeID,
-                <<"scheduler">> => [SchedulingID, ComputeID]
+                <<"scheduler">> => [EthAddress, SchedulingID, ComputeID]
             }
         ),
     ?event({base, Base}),
@@ -1066,6 +1068,20 @@ test_push_as_identity() ->
     ?assertEqual(
         [hb_test_utils:committer(ComputeWallet)],
         hb_ao:get(<<"schedule/assignments/2/body/committers">>, Base, Opts)
+    ),
+    % A push skips an authority that is not a committer, and signs with the
+    % process's other authorities.
+    ?assertEqual(
+        [hb_test_utils:committer(ComputeWallet)],
+        hb_message:signers(
+            apply_security(
+                #{ <<"body">> => <<"pushed">> },
+                Base#{ <<"authority">> => [EthAddress, ComputeID] },
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            Opts
+        )
     ).
 
 test_multi_process_push() ->

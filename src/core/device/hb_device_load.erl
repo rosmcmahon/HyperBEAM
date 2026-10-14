@@ -416,8 +416,8 @@ signers(Msg, Opts) ->
         Opts
     ).
 
-%% @doc Trusted signers, defaulting to the node's own address.
-%% Computed lazily so the default config need not call `hb:address/0'.
+%% @doc Return the trusted signers, defaulting to the node's own committer.
+%% Computed lazily so the default config need not read the node's key.
 trusted_signers(Ref, SpecID, Opts) ->
     [
         Address
@@ -440,7 +440,7 @@ trusted_signer_entries(Ref, SpecID, Signers, Opts) ->
 
 trusted_signer_entries(Opts) ->
     case hb_opts:get(trusted_device_signers, [], Opts) of
-        [] -> [hb:address()];
+        [] -> [hb_opts:committer(Opts)];
         Signers when is_list(Signers) -> Signers
     end.
 
@@ -467,34 +467,50 @@ trusted_signer_address(_Signer, _Opts) ->
 trusted_signer_devices_test() ->
     Ref = <<"copycat@1.0">>,
     SpecID = <<"SPEC_ID">>,
+    [Plain, Unscoped, ByRef, BySpec, Other] =
+        [hb_util:human_id(<<N:256>>) || N <- lists:seq(1, 5)],
     ?assertEqual(
         [
             ?ARWEAVE_COMMITTER(Address)
         ||
-            Address <-
-                [<<"plain">>, <<"unscoped">>, <<"by-ref">>, <<"by-spec">>]
+            Address <- [Plain, Unscoped, ByRef, BySpec]
         ],
         trusted_signers(
             Ref,
             SpecID,
             #{
                 <<"trusted-device-signers">> => [
-                    <<"plain">>,
-                    #{<<"address">> => <<"unscoped">>},
-                    #{<<"address">> => <<"by-ref">>, <<"devices">> => [Ref]},
-                    #{<<"address">> => <<"by-spec">>, <<"devices">> => [SpecID]},
+                    Plain,
+                    #{<<"address">> => Unscoped},
+                    #{<<"address">> => ByRef, <<"devices">> => [Ref]},
+                    #{<<"address">> => BySpec, <<"devices">> => [SpecID]},
                     #{
-                        <<"address">> => <<"other">>,
+                        <<"address">> => Other,
                         <<"devices">> => [<<"arweave@2.9">>]
                     }
                 ]
             }
         )
     ),
-    % With no signers configured, the committer of `hb:address()' is trusted.
+    % A signer that is neither an Arweave address nor a URI is not a
+    % committer, and is kept as it is.
     ?assertEqual(
-        [?ARWEAVE_COMMITTER(hb:address())],
-        trusted_signers(Ref, SpecID, #{ <<"trusted-device-signers">> => [] })
+        [<<"plain">>],
+        trusted_signers(
+            Ref,
+            SpecID,
+            #{ <<"trusted-device-signers">> => [<<"plain">>] }
+        )
+    ),
+    % With no signers configured, the node's committer is trusted.
+    NodeOpts =
+        #{
+            <<"priv-wallet">> => ar_wallet:new(?ETHEREUM_KEY_TYPE),
+            <<"trusted-device-signers">> => []
+        },
+    ?assertEqual(
+        [hb_opts:committer(NodeOpts)],
+        trusted_signers(Ref, SpecID, NodeOpts)
     ).
 
 %% @doc Every `requires-*' key must match this machine's `system_info'.

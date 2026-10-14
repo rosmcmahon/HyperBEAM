@@ -30,7 +30,7 @@ to(Msg, Req = #{ <<"type">> := <<"uri">> }, Opts) ->
 
 %% @doc A DID is read by the device of its method: `did:pkh:...' by
 %% `did-pkh@1.0', and `did:web:...' by `did-web@1.0', which this node does
-%% not have.
+%% not have. `did-pkh@1.0' refuses an account that it does not give for any key.
 method_device_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
     ?assertMatch(
@@ -38,9 +38,16 @@ method_device_test() ->
             #{
                 <<"device">> := <<"did-pkh@1.0">>,
                 <<"body">> :=
-                    <<"eip155:1:0xb9c5714089478a327f09197987f16f9e5d936e8a">>
+                    <<"eip155:1:0xB9C5714089478a327F09197987f16f9E5d936E8a">>
             }
         },
+        hb_ao:resolve_many(
+            [<<"did:pkh:eip155:1:0xB9C5714089478a327F09197987f16f9E5d936E8a">>],
+            Opts
+        )
+    ),
+    ?assertMatch(
+        {error, #{ <<"error">> := <<"invalid-account">> }},
         hb_ao:resolve_many(
             [<<"did:pkh:eip155:1:0xb9c5714089478a327f09197987f16f9e5d936e8a">>],
             Opts
