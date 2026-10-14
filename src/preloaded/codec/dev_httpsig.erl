@@ -451,7 +451,7 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
     MsgWithOnlyInputs =
         with_types(
             maps:with(
-                Inputs ++ lists:map(fun hb_escape:encode/1, Inputs),
+                Inputs,
                 Msg
             ),
             Inputs,
@@ -830,7 +830,16 @@ committed_id_test() ->
     UnsignedID = hb_message:id(Signed, none),
     SignedID = hb_message:id(Signed, all),
     ?event_debug({ids, {unsigned_id, UnsignedID}, {signed_id, SignedID}}),
-    ?assertNotEqual(UnsignedID, SignedID).
+    ?assertNotEqual(UnsignedID, SignedID),
+    % A commitment covers only the keys that it is asked to cover, and not a
+    % key that is the escaped form of one of them.
+    Committed =
+        hb_message:commit(
+            #{ <<"a b">> => <<"1">>, <<"a%20b">> => <<"2">> },
+            Opts,
+            #{ <<"committed">> => [<<"a b">>] }
+        ),
+    ?assert(hb_message:verify(Committed#{ <<"a%20b">> => <<"3">> }, all, Opts)).
 
 commit_secret_key_test() ->
     Msg = #{ <<"basic">> => <<"value">> },
