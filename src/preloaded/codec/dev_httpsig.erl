@@ -805,6 +805,21 @@ commitment_identity_test() ->
             maps:get(<<"signature-input">>, PathWire),
             <<"\"@path\"">>
         )
+    ),
+    % A key that no commitment covers is not sent in the body, which the
+    % commitment covers in full, so the message still verifies.
+    Extended = Signed#{ <<"big">> => binary:copy(<<"x">>, 5000) },
+    ?assert(
+        hb_message:verify(
+            hb_message:convert(
+                hb_message:convert(Extended, <<"httpsig@1.0">>, Opts),
+                <<"structured@1.0">>,
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            all,
+            Opts
+        )
     ).
 
 %% @doc Ensure that a publicly known RSA key cannot authenticate an HMAC

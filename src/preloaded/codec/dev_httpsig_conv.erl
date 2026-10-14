@@ -404,10 +404,16 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
             {ok, EncOriginal}
     end;
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
+    CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
     Stripped =
         encode_keys(
             without_unsigned_commitments(
-                hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts),
+                hb_maps:without(
+                    [<<"commitments">>, <<"priv">>] ++
+                        uncovered_body_keys(TABM, CommitmentsMap, Opts),
+                    TABM,
+                    Opts
+                ),
                 Opts
             )
         ),
@@ -421,7 +427,6 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
     % Finally, add the signatures to the encoded HTTP message with the
     % commitments from the original message. A `signature' key of the message
     % itself is data, not a commitment.
-    CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
     ?event_debug({converting_commitments_to_siginfo, TABM}),
     {ok,
         maps:merge(
@@ -433,6 +438,37 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
             )
         )
     }.
+
+%% @doc Return the keys of a message with commitments that no commitment
+%% covers and that would be sent in the body. We do not send them: a commitment
+%% that covers the body covers all of it with its `content-digest', and a
+%% reader of a message with commitments keeps only the keys that they cover. A
+%% key that no commitment covers is still sent if it fits in a header.
+uncovered_body_keys(_TABM, Commitments, _Opts)
+        when map_size(Commitments) == 0 ->
+    [];
+uncovered_body_keys(TABM, Commitments, Opts) ->
+    Covered =
+        lists:append(
+            [
+                hb_util:message_to_ordered_list(
+                    maps:get(<<"committed">>, Commitment, []),
+                    Opts
+                )
+            ||
+                Commitment <- maps:values(Commitments)
+            ]
+        ),
+    {_, InlineKey} = inline_key(TABM),
+    [
+        Key
+    ||
+        {Key, Value} <- maps:to_list(TABM),
+        not lists:member(Key, Covered),
+        Key == <<"body">> orelse Key == InlineKey orelse
+            lists:member(Key, ?RESERVED_HEADERS) orelse
+            default_where(Value) == body
+    ].
 
 do_to(Binary, _FormatOpts, _Opts) when is_binary(Binary) -> Binary;
 do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
@@ -868,22 +904,25 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     %
     % Note that a "where" Opts may force the location of the encoded
     % value -- this is only a default location if not specified in Opts 
-    DefaultWhere =
-        case {maps:get(where, Opts, headers), byte_size(Value)} of
-            {headers, Fits} when Fits =< ?MAX_HEADER_LENGTH ->
-                case edge_whitespace(Value) of
-                    true -> body;
-                    false -> headers
-                end;
-            _ -> body
-        end,
-    case maps:get(where, Opts, DefaultWhere) of
+    case maps:get(where, Opts, default_where(Value)) of
         headers ->
             Httpsig#{ NormalizedName => hb_escape:encode_header(Value) };
         body ->
             OldBody = hb_maps:get(<<"body">>, Httpsig, #{}, Opts),
             Httpsig#{ <<"body">> => OldBody#{ NormalizedName => Value } }
     end.
+
+%% @doc Return where a value is sent by default: in a header if it is a
+%% binary that fits in one, and does not start or end with a space or tab.
+%% Any other value is sent in the body.
+default_where(Value)
+        when is_binary(Value), byte_size(Value) =< ?MAX_HEADER_LENGTH ->
+    case edge_whitespace(Value) of
+        true -> body;
+        false -> headers
+    end;
+default_where(_Value) ->
+    body.
 
 %% @doc Whether a value starts or ends with a space or tab. HTTP strips them
 %% from a header value, so such a value is not sent as one.
