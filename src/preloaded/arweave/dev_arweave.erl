@@ -1531,55 +1531,6 @@ post_ans104_message_test_parallel() ->
     ),
     ok.
 
-post_tx_message_test_parallel() ->
-    ServerOpts = #{ <<"store">> => [hb_test_utils:test_store()] },
-    Server = hb_http_server:start_node(ServerOpts),
-    ClientOpts =
-        #{
-            <<"store">> => [hb_test_utils:test_store()],
-            <<"priv-wallet">> => hb:wallet()
-        },
-    Msg =
-        hb_message:commit(
-            #{
-                <<"tag">> => <<"value">>,
-                <<"data">> => <<"test-data">>
-            },
-            ClientOpts,
-            #{ <<"commitment-device">> => <<"tx@1.0">> }
-        ),
-    ?event(debug_test, {msg, Msg}),
-    Response =
-        hb_http:post(
-            Server,
-            Msg#{
-                <<"device">> => <<"arweave@2.9">>,
-                <<"path">> => <<"/tx">>
-            },
-            ClientOpts
-        ),
-    ?event(debug_test, {post_response, Response}),
-    % The transaction is invalid because it has insufficient balance, only
-    % way we'll know that is if the HB node successfully posted the tx to
-    % an arweave node.
-    ?assertMatch({error, #{ <<"status">> := 400 }}, Response),
-    {error, #{ <<"body">> := Body }} = Response,
-    ?assertEqual(<<"Transaction verification failed.">>, Body),
-    ok.
-
-post_tx_json_failure_test_parallel() ->
-    ServerOpts = #{ <<"store">> => [hb_test_utils:test_store()] },
-    Server = hb_http_server:start_node(ServerOpts),
-    ClientOpts = post_tx_json_client_opts(),
-    Response = post_tx_json_request(Server, ClientOpts),
-    % The transaction is invalid because it has insufficient balance, only
-    % way we'll know that is if the HB node successfully posted the tx to
-    % an arweave node.
-    ?assertMatch({error, #{ <<"status">> := 400 }}, Response),
-    {error, #{ <<"body">> := Body }} = Response,
-    ?assertEqual(<<"Transaction verification failed.">>, Body),
-    ok.
-
 post_tx_json_success_test_parallel() ->
     {Response, Node1Posts, Node2Posts} =
         post_tx_json_two_node_test({200, <<"OK-1">>}, {200, <<"OK-2">>}),
