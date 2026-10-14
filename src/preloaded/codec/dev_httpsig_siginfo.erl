@@ -421,9 +421,10 @@ linkify(Msg, Commitment, Opts) ->
 
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
 %% format. Replace `content-digest' with the body keys, in alphabetical order,
-%% remove component prefixes, and restore the body's original key. A multipart
-%% `content-type' header is not a message key; the message's own `content-type'
-%% may be in the body instead.
+%% remove component prefixes, and restore the body's original key. A
+%% `multipart/' `content-type' header with a `boundary' gives the encoding of
+%% the body, and is not a message key. The message's own `content-type' may be
+%% in the body instead.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     % 1. Replace the `content-digest' component with the body keys, then remove
     %    specifiers from the other keys and decode them. A `content-digest'
@@ -432,9 +433,11 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     %    covers by its link, keeps the place of that component.
     ComponentKeys =
         fun(<<"content-type">>) ->
-                case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
-                    <<"multipart/", _/binary>> -> [];
-                    _ -> [<<"content-type">>]
+                ContentType =
+                    maps:get(<<"content-type">>, HTTPEncMsg, undefined),
+                case dev_httpsig_conv:boundary(ContentType) of
+                    false -> [<<"content-type">>];
+                    _ -> []
                 end;
            (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
            (Key) -> [hb_escape:decode(Key)]

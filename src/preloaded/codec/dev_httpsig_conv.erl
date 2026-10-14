@@ -26,7 +26,7 @@
 %%%         - Otherwise encode the value as a part in the multipart response
 %%% 
 -module(dev_httpsig_conv).
--export([to/3, from/3, encode_http_msg/2, encode_key/1]).
+-export([to/3, from/3, encode_http_msg/2, encode_key/1, boundary/1]).
 %%% Helper utilities
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -84,11 +84,19 @@ from(HTTP, _Req, Opts) ->
     % parts, and add them to the TABM.
     {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
     % Merge the body keys with the headers, other than the reserved headers. A
-    % key of the message that shares one of their names is carried in a body
-    % part.
+    % `multipart/' `content-type' header with a `boundary' gives the encoding
+    % of the body, so we leave it out as well. A key of the message that shares
+    % the name of one of these headers is carried in a body part.
     WithBodyKeys =
         maps:merge(
-            hb_maps:without(?RESERVED_HEADERS, Headers, Opts),
+            hb_maps:without(
+                case boundary(maps:get(<<"content-type">>, HTTP, undefined)) of
+                    false -> ?RESERVED_HEADERS;
+                    _ -> [<<"content-type">> | ?RESERVED_HEADERS]
+                end,
+                Headers,
+                Opts
+            ),
             BodyTABM
         ),
     % Reconstruct the commitments from the signature headers.
@@ -113,10 +121,6 @@ from(HTTP, _Req, Opts) ->
         hb_maps:without(
             Removed =
                 hb_maps:keys(Commitments) ++
-                case maps:get(<<"content-type">>, MsgWithSigs, undefined) of
-                    <<"multipart/", _/binary>> -> [<<"content-type">>];
-                    _ -> []
-                end ++
                 case hb_message:is_signed_key(<<"ao-body-key">>, MsgWithSigs, Opts) of
                     true -> [];
                     false -> [<<"ao-body-key">>]
@@ -192,21 +196,12 @@ body_to_parts(ContentType, Body, _Opts) ->
             {body, Body}
         }
     ),
-    % Only a multipart type has a `boundary'. A `content-type' is not a
-    % structured field: RFC 9110 gives it its own grammar.
-    Params =
-        case ContentType of
-            <<"multipart/", _/binary>> ->
-                {_, _, XParams} = cow_http_hd:parse_content_type(ContentType),
-                XParams;
-            _ -> []
-        end,
-    case lists:keyfind(<<"boundary">>, 1, Params) of
+    case boundary(ContentType) of
         false ->
             % The body is not a multipart, so just set as is to the Inlined key on
             % the TABM.
             {normal, Body};
-        {_, Boundary} ->
+        Boundary ->
             % We need to manually parse the multipart body into key/values on the
             % TABM.
             % 
@@ -234,6 +229,20 @@ body_to_parts(ContentType, Body, _Opts) ->
                 [global]
             )}
     end.
+
+%% @doc Return the `boundary' of a `multipart/' `content-type', or `false' if
+%% it has none. Any other `content-type' gives `false'. A `content-type' is not
+%% a structured field, so we parse it with the grammar of RFC 9110. A
+%% `multipart/' value that is not valid HTTP raises.
+boundary(ContentType = <<"multipart/", _/binary>>) ->
+    {_, _, Params} = cow_http_hd:parse_content_type(ContentType),
+    proplists:get_value(<<"boundary">>, Params, false);
+boundary(_ContentType) -> false.
+
+%% @doc Check whether a key is `content-type' and its value starts with
+%% `multipart/'.
+is_multipart(<<"content-type">>, <<"multipart/", _/binary>>) -> true;
+is_multipart(_Key, _Value) -> false.
 
 %% @doc Parse a single part of a multipart body into a TABM.
 from_body_part(InlinedKey, Part, Opts) ->
@@ -467,6 +476,7 @@ uncovered_body_keys(TABM, Commitments, Opts) ->
         not lists:member(Key, Covered),
         Key == <<"body">> orelse Key == InlineKey orelse
             lists:member(Key, ?RESERVED_HEADERS) orelse
+            is_multipart(Key, Value) orelse
             default_where(Value) == body
     ].
 
@@ -488,9 +498,13 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                     AccMap#{ <<"body">> => OldBody#{ InlineKey => Value } };
                (Key, Value, AccMap) ->
                     % A key of the message that shares the name of a reserved
-                    % header is carried in a body part.
+                    % header is carried in a body part. A `multipart/'
+                    % `content-type' of the message is also carried in a body
+                    % part, because the decoder parses such a header for the
+                    % `boundary' of the body.
                     Where =
-                        case lists:member(Key, ?RESERVED_HEADERS) of
+                        case lists:member(Key, ?RESERVED_HEADERS) orelse
+                                is_multipart(Key, Value) of
                             true -> #{ where => body };
                             false -> #{}
                         end,
@@ -1043,6 +1057,27 @@ multipart_content_type_test() ->
             },
             <<"structured@1.0">>,
             <<"httpsig@1.0">>,
+            Opts
+        )
+    ),
+    % A message's own `multipart/' `content-type' is kept and committed.
+    Multipart =
+        hb_message:commit(
+            #{
+                <<"content-type">> => <<"multipart/mixed; boundary=\"zz\"">>,
+                <<"x">> => <<"1">>
+            },
+            Opts
+        ),
+    ?assert(
+        hb_message:verify(
+            hb_message:convert(
+                hb_message:convert(Multipart, <<"httpsig@1.0">>, Opts),
+                <<"structured@1.0">>,
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            all,
             Opts
         )
     ).
