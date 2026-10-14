@@ -889,11 +889,12 @@ binary_to_strings(Bin) when is_binary(Bin) ->
         end
     end.
 
-%% @doc Unquote a binary string.
-unquote(<<"\"", Inner/binary>>) ->
+%% @doc Unquote a binary string. A string that does not both start and end
+%% with a quote is returned as it is.
+unquote(Bin = <<"\"", Inner/binary>>) when byte_size(Inner) > 0 ->
     case binary:last(Inner) of
         $" -> binary:part(Inner, 0, byte_size(Inner) - 1);
-        _ -> Inner
+        _ -> Bin
     end;
 unquote(Bin) -> Bin.
 

@@ -1338,7 +1338,12 @@ inlined_quoted_key_test() ->
     },
     MsgsB = from(ReqB, #{}),
     [_, Msg2b] = MsgsB,
-    ?assertEqual(<<"~meta@1.0/info">>, hb_maps:get(<<"eval">>, Msg2b)).
+    ?assertEqual(<<"~meta@1.0/info">>, hb_maps:get(<<"eval">>, Msg2b)),
+    % A value that starts with a quote, but does not end with one, keeps it.
+    ?assertMatch(
+        [_, #{ <<"k">> := <<"\"v">> }],
+        from(#{ <<"path">> => <<"/a&k=%22v">> }, #{})
+    ).
 
 inlined_assumed_key_test() ->
     Req = #{
