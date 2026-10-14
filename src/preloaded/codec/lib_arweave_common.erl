@@ -314,13 +314,16 @@ committer(Item, Opts) ->
 
 %% @doc Sign the item or transaction of a message with the committer of the
 %% request, using the signature type of the request's `type'. The committer's
-%% public key becomes the owner of the item, which the signature covers.
-sign(Msg, TX, #{ <<"committer">> := Committer, <<"type">> := Type }, Opts) ->
+%% public key becomes the owner of the item, which the signature covers. The
+%% tags are signed in the order of the request's `committed' keys.
+sign(Msg, TX, Req = #{ <<"committer">> := Committer, <<"type">> := Type },
+        Opts) ->
     Owner = hb_maps:get(<<"owner">>, Committer, ?DEFAULT_OWNER, Opts),
     Unsigned =
         TX#tx{
             owner = Owner,
-            signature_type = ar_tx:deserialize_sig_type(Type)
+            signature_type = ar_tx:deserialize_sig_type(Type),
+            tags = order_tags(TX#tx.tags, Req, Opts)
         },
     CommitRes =
         hb_ao:raw(
@@ -337,6 +340,31 @@ sign(Msg, TX, #{ <<"committer">> := Committer, <<"type">> := Type }, Opts) ->
             ar_tx:reset_ids(Unsigned#tx{ signature = Sig });
         CommitError -> throw({cannot_commit, CommitError, Msg})
     end.
+
+%% @doc Order the tags of an item as a request lists its `committed' keys. The
+%% tags of a bundle come first, and the tags that the request does not list
+%% follow the listed ones, in the order they had. A request without a
+%% `committed' list leaves the tags as they are.
+order_tags(Tags, #{ <<"committed">> := Committed }, Opts) ->
+    Order =
+        [
+            normalize_key(Key)
+        ||
+            Key <-
+                ?BUNDLE_KEYS ++ hb_util:message_to_ordered_list(Committed, Opts)
+        ],
+    Rank =
+        fun({Name, _}) ->
+            length(
+                lists:takewhile(
+                    fun(Key) -> Key =/= normalize_key(Name) end,
+                    Order
+                )
+            )
+        end,
+    lists:sort(fun(A, B) -> Rank(A) =< Rank(B) end, Tags);
+order_tags(Tags, _Req, _Opts) ->
+    Tags.
 
 %% @doc Check that a commitment's committed keys are the keys of the item
 %% encoded from the message, and that the message gives those keys the types the

@@ -393,7 +393,11 @@ decode_param(Bin) ->
 to_siginfo_keys(Msg, Commitment = #{
         <<"commitment-device">> := <<"httpsig@1.0">> }, Opts) ->
     {ok, _EncMsg, EncComm, _} =
-        dev_httpsig:normalize_for_encoding(Msg, Commitment, Opts),
+        dev_httpsig:normalize_for_encoding(
+            linkify(Msg, Commitment, Opts),
+            Commitment,
+            Opts
+        ),
     maps:get(<<"committed">>, EncComm);
 to_siginfo_keys(_Msg, Commitment, Opts) ->
     lists:map(
@@ -404,24 +408,45 @@ to_siginfo_keys(_Msg, Commitment, Opts) ->
         )
     ).
 
+%% @doc Replace the messages nested in a message with their links, unless the
+%% commitment is made over a bundle. A commitment that is not made over a
+%% bundle covers the nested messages by their links, even when the message
+%% carries them in full.
+linkify(Msg, Commitment, Opts) ->
+    case hb_util:atom(maps:get(<<"bundle">>, Commitment, false)) of
+        true -> Msg;
+        false -> hb_link:normalize(Msg, discard, Opts)
+    end.
+
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
-%% format. Replace `content-digest' with the body keys, remove component prefixes,
-%% and restore the body's original key. A multipart `content-type' header is not
-%% a message key; the message's own `content-type' may be in the body instead.
+%% format. Replace `content-digest' with the body keys, in alphabetical order,
+%% remove component prefixes, and restore the body's original key. A multipart
+%% `content-type' header is not a message key; the message's own `content-type'
+%% may be in the body instead.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     % 1. Replace the `content-digest' component with the body keys, then remove
-    %    specifiers from the other keys and decode them. A key of the message
-    %    named `content-digest' is one of the body keys.
+    %    specifiers from the other keys and decode them. A `content-digest'
+    %    key of the message is one of the body keys. A key of the body that
+    %    is also a component of its own, such as a message that a commitment
+    %    covers by its link, keeps the place of that component.
+    ComponentKeys =
+        fun(<<"content-type">>) ->
+                case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
+                    <<"multipart/", _/binary>> -> [];
+                    _ -> [<<"content-type">>]
+                end;
+           (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
+           (Key) -> [hb_escape:decode(Key)]
+        end,
+    Listed =
+        lists:flatmap(
+            ComponentKeys,
+            SigInfoCommitted -- [<<"content-digest">>]
+        ),
     WithBody =
         lists:flatmap(
-            fun(<<"content-digest">>) -> BodyKeys;
-               (<<"content-type">>) ->
-                    case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
-                        <<"multipart/", _/binary>> -> [];
-                        _ -> [<<"content-type">>]
-                    end;
-               (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
-               (Key) -> [hb_escape:decode(Key)]
+            fun(<<"content-digest">>) -> lists:sort(BodyKeys -- Listed);
+               (Component) -> ComponentKeys(Component)
             end,
             SigInfoCommitted
         ),

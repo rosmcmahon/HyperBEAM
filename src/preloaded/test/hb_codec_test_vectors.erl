@@ -1009,7 +1009,31 @@ specific_order_signed_message_test(RawCodec, Opts) ->
             Codec#{ <<"committed">> => [<<"key-3">>, <<"key-1">>, <<"key-2">>] }
         ),
     ?event({signed_msg, SignedMsg}),
-    ?assert(hb_message:verify(SignedMsg, all, Opts)).
+    ?assert(hb_message:verify(SignedMsg, all, Opts)),
+    % The commitment lists its keys in the order requested, and keeps that
+    % order through `httpsig@1.0'.
+    Roundtrip =
+        hb_message:convert(
+            hb_message:convert(SignedMsg, <<"httpsig@1.0">>, Opts),
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>,
+            Opts
+        ),
+    ?assertEqual(
+        [[<<"key-3">>, <<"key-1">>, <<"key-2">>]],
+        lists:usort(
+            [
+                hb_util:message_to_ordered_list(
+                    maps:get(<<"committed">>, Commitment),
+                    Opts
+                )
+            ||
+                Committed <- [SignedMsg, Roundtrip],
+                Commitment <-
+                    maps:values(maps:get(<<"commitments">>, Committed))
+            ]
+        )
+    ).
 
 specific_order_deeply_nested_signed_message_test(RawCodec, Opts) ->
     Msg = #{

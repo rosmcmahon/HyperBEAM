@@ -230,7 +230,12 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
             Opts
         ),
     {ok, EncMsg, EncComm, ModCommittedKeys} =
-        normalize_for_encoding(MsgToSign, UnsignedCommitment, Opts),
+        normalize_for_encoding(
+            MsgToSign,
+            UnsignedCommitment,
+            is_map_key(<<"committed">>, Req),
+            Opts
+        ),
     ?event_debug({encoded_to_httpsig_for_commitment, MsgToSign}),
     % Generate the signature base
     SignatureBase = signature_base(EncMsg, EncComm, Opts),
@@ -317,7 +322,12 @@ commit(BaseMsg, Req = #{ <<"type">> := <<"hmac-sha256">> }, RawOpts) ->
             Opts
         ),
     {ok, EncMsg, EncComm, ModCommittedKeys} =
-        normalize_for_encoding(Msg, UnauthedCommitment, Opts),
+        normalize_for_encoding(
+            Msg,
+            UnauthedCommitment,
+            is_map_key(<<"committed">>, Req),
+            Opts
+        ),
     SigBase = signature_base(EncMsg, EncComm, Opts),    
     {ok, #{ <<"signature">> := Signature }} =
         hb_ao:raw(
@@ -421,13 +431,18 @@ add_content_digest(Msg, _Opts) ->
     end.
 
 %% @doc Given a base message and a commitment, derive the message and commitment
-%% normalized for encoding.
+%% normalized for encoding. The components of the signature follow the order
+%% of the keys that the commitment lists. When `Ordered' is false, as for a
+%% commitment made without a `committed' list in its request, they follow the
+%% order of the keys of the encoded message.
 -spec normalize_for_encoding(
     #{ _ => _ },
     #{ committed => [_], _ => _ },
     #{ _ => _ }
 ) -> {ok, #{ _ => _ }, #{ committed := [_], _ => _ }, [_]}.
 normalize_for_encoding(Msg, Commitment, Opts) ->
+    normalize_for_encoding(Msg, Commitment, true, Opts).
+normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
     % Extract the requested keys to include in the signature base.
     RawInputs = committed_keys(Commitment, Opts),
     Inputs = input_keys(RawInputs),
@@ -507,16 +522,21 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
             end,
             RawInputs
         ),
+    Components =
+        case Ordered of
+            true -> order_components(KeysForEncoding, RawInputs, BodyKeys);
+            false -> KeysForEncoding
+        end,
     KeysForCommitment =
         dev_httpsig_siginfo:from_siginfo_keys(
             EncodedWithSigInfo,
             BodyKeys,
-            KeysForEncoding
+            Components
         ),
     ?event_debug(debug_httpsig,
         {normalized_for_encoding,
             {raw_inputs, Inputs},
-            {inputs_for_encoding, KeysForEncoding},
+            {inputs_for_encoding, Components},
             {final_for_commitment_message, KeysForCommitment},
             {encoded_message, Encoded}
         }
@@ -524,9 +544,40 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
     {
         ok,
         Encoded,
-        Commitment#{ <<"committed">> => KeysForEncoding },
+        Commitment#{ <<"committed">> => Components },
         KeysForCommitment
     }.
+
+%% @doc Order the components of a signature as a commitment lists its keys. The
+%% keys of the body are covered together by `content-digest', at the place of
+%% the first of them. A component that the commitment does not list, such as
+%% the `ao-types' of its values, keeps its place.
+order_components(Components, Keys, BodyKeys) ->
+    Listed =
+        hb_util:unique(
+            dev_httpsig_siginfo:add_derived_specifiers(
+                [
+                    case lists:member(Key, BodyKeys) of
+                        true -> <<"content-digest">>;
+                        false -> dev_httpsig_conv:encode_key(Key)
+                    end
+                ||
+                    Key <- Keys
+                ]
+            )
+        ),
+    {Ordered, []} =
+        lists:mapfoldl(
+            fun(Component, Rest) ->
+                case lists:member(Component, Listed) of
+                    true -> {hd(Rest), tl(Rest)};
+                    false -> {Component, Rest}
+                end
+            end,
+            [Key || Key <- Listed, lists:member(Key, Components)],
+            Components
+        ),
+    Ordered.
 
 %% @doc The keys a commitment lists as committed, in order.
 committed_keys(Commitment, Opts) ->
