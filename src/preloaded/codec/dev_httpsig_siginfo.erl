@@ -4,7 +4,7 @@
 -export([commitments_to_siginfo/3, siginfo_to_commitments/3]).
 -export([committed_keys_to_siginfo/1, to_siginfo_keys/3, from_siginfo_keys/3]).
 -export([add_derived_specifiers/1, remove_derived_specifiers/1]).
--export([keyid_to_committer/1, derived_commitment_id/1]).
+-export([keyid_to_committer/1, derived_commitment_id/1, signature_input/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -55,12 +55,6 @@ commitments_to_siginfo(Msg, Comms, Opts) ->
 %% @doc Generate a `signature' and `signature-input' key pair from a given
 %% commitment.
 commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
-    % Generate the `alg' key from the commitment.
-    Alg = commitment_to_alg(Commitment, Opts),
-    % Find the public key from the commitment, which we will use as the
-    % `keyid' in the `signature-input' keys. Absent in the commitment =>
-    % absent on the wire (permitted by RFC 9421 §1.4.2.3).
-    KeyID = maps:get(<<"keyid">>, Commitment, undefined),
     % Extract the signature from the commitment. A commitment of another
     % device without one, such as that of an unsigned item, is sent with an
     % empty signature.
@@ -68,12 +62,6 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
     % Extract the keys present in the commitment.
     CommittedKeys = to_siginfo_keys(Msg, Commitment, Opts),
     ?event_debug({normalized_for_enc, CommittedKeys, {commitment, Commitment}}),
-    % Extract the hashpath, used as a tag, from the commitment.
-    Tag = maps:get(<<"tag">>, Commitment, undefined),
-    % Extract other permissible values, if present.
-    Nonce = maps:get(<<"nonce">>, Commitment, undefined),
-    Created = maps:get(<<"created">>, Commitment, undefined),
-    Expires = maps:get(<<"expires">>, Commitment, undefined),
     % Generate the name of the signature. A commitment without a signature is
     % named by its ID.
     NameSource =
@@ -87,55 +75,17 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
     % (e.g. `~ipfs@1.0') key on a CID that is not a function of `Sig'; HMAC,
     % RSA-PSS, and other `h(Sig)'-keyed devices never pay this cost.
     DerivedID = derived_commitment_id(Signature),
-    IDParam =
+    WithID =
         case CommID of
-            undefined -> [];
-            DerivedID -> [];
-            _         -> [{<<"id">>, {string, CommID}}]
+            undefined -> Commitment;
+            DerivedID -> Commitment;
+            _         -> Commitment#{ <<"id">> => CommID }
         end,
     % Generate the signature input and signature structured-fields. These can
     % then be placed into a dictionary with other commitments and transformed
     % into their binary representations.
     SFSig = {item, {binary, Signature}, []},
-    AdditionalParams = get_additional_params(Commitment),
-    KeyIDItem =
-        case KeyID of
-            undefined -> undefined;
-            _         -> {string, KeyID}
-        end,
-    RawParams =
-        lists:filter(
-            fun({_Key, undefined}) ->
-                false;
-               ({_Key, {_, Val}}) ->
-                Val =/= undefined
-            end,
-            [
-                {<<"alg">>, {string, Alg}},
-                {<<"keyid">>, KeyIDItem},
-                {<<"tag">>, {string, Tag}},
-                {<<"created">>, Created},
-                {<<"expires">>, Expires},
-                {<<"nonce">>, {string, Nonce}}
-            ] ++ IDParam ++ AdditionalParams
-        ),
-    Params =
-        lists:map(
-            fun({Key, {string, Value}}) ->
-                {Key, {string, encode_param(Value)}};
-               (Param) -> Param
-            end,
-            RawParams
-        ),
-    SFSigInput =
-        {list,
-            [
-                {item, {string, Key}, []}
-            ||
-                Key <- CommittedKeys
-            ],
-            Params
-        },
+    SFSigInput = signature_input(CommittedKeys, WithID, Opts),
     ?event_debug(
         {sig_input,
             {string,
@@ -157,37 +107,49 @@ derived_commitment_id(Sig) when byte_size(Sig) == 32 ->
 derived_commitment_id(Sig) ->
     hb_util:human_id(crypto:hash(sha256, Sig)).
 
-%% @doc HTTPSig derives its committer; other codecs transport theirs explicitly.
-get_additional_params(Commitment = #{
-        <<"commitment-device">> := <<"httpsig@1.0">>, <<"committer">> := _ }) ->
-    get_additional_params(maps:remove(<<"committer">>, Commitment));
-get_additional_params(Commitment) ->
-    AdditionalParams =
-        sets:to_list(
-            sets:subtract(
-                sets:from_list(maps:keys(Commitment)),
-                sets:from_list(
+%% @doc Generate the `signature-input' of a commitment: the inner list of its
+%% components, with the other keys of the commitment as its parameters, sorted.
+%% The `alg' parameter holds the `commitment-device' and `type' of the
+%% commitment. The `@signature-params' line of a signature base is this list,
+%% so the signature covers every parameter that is sent. HTTPSig derives the
+%% committer of a commitment from its `keyid', so it does not send it.
+signature_input(Components, Commitment = #{
+        <<"commitment-device">> := <<"httpsig@1.0">>, <<"committer">> := _ },
+        Opts) ->
+    signature_input(Components, maps:remove(<<"committer">>, Commitment), Opts);
+signature_input(Components, Commitment, Opts) ->
+    Params = Commitment#{ <<"alg">> => commitment_to_alg(Commitment, Opts) },
+    {ok, [SignatureInput]} =
+        hb_structured_fields:to_list(
+            [
+                {
+                    list,
+                    Components,
                     [
-                        <<"alg">>,
-                        <<"keyid">>,
-                        <<"tag">>,
-                        <<"created">>,
-                        <<"expires">>,
-                        <<"nonce">>,
-                        <<"committed">>,
-                        <<"signature">>,
-                        <<"type">>,
-                        <<"id">>,
-                        <<"commitment-device">>
+                        {Key, param_value(maps:get(Key, Params))}
+                    ||
+                        Key <-
+                            lists:sort(
+                                maps:keys(Params) --
+                                    [
+                                        <<"committed">>,
+                                        <<"signature">>,
+                                        <<"type">>,
+                                        <<"commitment-device">>
+                                    ]
+                            ),
+                        not hb_private:is_private(Key)
                     ]
-                )
-            )
+                }
+            ]
         ),
-    [
-        {Param, {string, maps:get(Param, Commitment)}}
-    ||
-        Param <- AdditionalParams
-    ].
+    SignatureInput.
+
+%% @doc Convert the value of a parameter for `hb_structured_fields'. Integers,
+%% such as `created', are sent as integers, and other values as the text that
+%% `encode_param/1' returns for them.
+param_value(Value) when is_integer(Value) -> Value;
+param_value(Value) -> encode_param(Value).
 
 %% @doc Lists start with a comma and a colon per element. Maps start with a
 %% colon and contain comma-separated key:value pairs. Nested values are escaped.

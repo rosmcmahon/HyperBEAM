@@ -703,45 +703,22 @@ signature_params_line(RawCommitment, Opts) ->
 	hb_util:bin(
         hb_structured_fields:list(
             [
-                {
-                    list,
-                    lists:map(
-                        fun(Key) -> {item, {string, Key}, []} end,
-                        hb_util:message_to_ordered_list(
-                            maps:get(<<"committed">>, RawCommitment),
-                            Opts
-                        )
+                % We build the line from the parameters that `httpsig@1.0'
+                % sends, even if the commitment is of another device that
+                % signs in this format, such as `json@1.0'.
+                dev_httpsig_siginfo:signature_input(
+                    hb_util:message_to_ordered_list(
+                        maps:get(<<"committed">>, RawCommitment),
+                        Opts
                     ),
-                    signature_params(RawCommitment)
-                }
+                    RawCommitment#{
+                        <<"commitment-device">> => <<"httpsig@1.0">>
+                    },
+                    Opts
+                )
             ]
         )
     ).
-
-signature_params(Commitment) ->
-    lists:filtermap(
-        fun(Name) ->
-            case signature_param(Name, Commitment) of
-                undefined -> false;
-                Param when is_binary(Param) -> {true, {Name, {string, Param}}};
-                Param when is_integer(Param) -> {true, {Name, Param}}
-            end
-        end,
-        [
-            <<"alg">>,
-            <<"bundle">>,
-            <<"created">>,
-            <<"expires">>,
-            <<"keyid">>,
-            <<"nonce">>,
-            <<"tag">>
-        ]
-    ).
-
-signature_param(<<"alg">>, Commitment) ->
-    maps:get(<<"type">>, Commitment);
-signature_param(Name, Commitment) ->
-    maps:get(Name, Commitment, undefined).
 
 %%%
 %%% TESTS
@@ -852,6 +829,38 @@ commitment_identity_test() ->
         hb_message:verify(
             hb_message:convert(
                 hb_message:convert(Extended, <<"httpsig@1.0">>, Opts),
+                <<"structured@1.0">>,
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            all,
+            Opts
+        )
+    ),
+    % A message that the RFC 9421 library `http-message-signatures' signed,
+    % with the key as its `public-key' parameter, verifies.
+    {ok, External} =
+        file:read_file(<<"test/http-message-signatures.js/signed.json">>),
+    ?assert(
+        hb_message:verify(
+            hb_message:convert(
+                hb_json:decode(External),
+                <<"structured@1.0">>,
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            all,
+            Opts
+        )
+    ),
+    % A request that the library signed over `@path', the path of its URL,
+    % verifies with that path as its `path' key.
+    {ok, ExternalPath} =
+        file:read_file(<<"test/http-message-signatures.js/signed-path.json">>),
+    ?assert(
+        hb_message:verify(
+            hb_message:convert(
+                (hb_json:decode(ExternalPath))#{ <<"path">> => <<"/x">> },
                 <<"structured@1.0">>,
                 <<"httpsig@1.0">>,
                 Opts
