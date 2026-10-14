@@ -61,11 +61,16 @@ export class AddonComponent extends pulumi.ComponentResource {
         /* shepherd-feed@1.0 reports bundler uploads and copycat items to shepherd. its start hook rebuilds the
          * default `on` hooks, which setting `on` here replaces. defaults to this stack's indexer-next; '' turns it off */
         const feedUrl = extConfig.SHEPHERD_FEED_URL ?? (config.services.indexer ? 'http://indexer-next:85/feed' : '')
-        /* JSON keeps option types; the node refuses to start if this fails to load */
-        const nodeConfig = JSON.stringify(feedUrl ? {
-            'on': { 'start': { 'device': 'shepherd-feed@1.0', 'path': 'install' } },
-            'shepherd-feed-url': feedUrl,
-        } : {}, null, 2)
+        /* JSON keeps option types; the node refuses to start if this fails to load.
+         * indexer-next calls this node through the published port, so HyperBEAM
+         * sees the shepherd bridge gateway pinned in infra/index.ts. */
+        const nodeConfig = JSON.stringify({
+            ...(feedUrl ? {
+                'on': { 'start': { 'device': 'shepherd-feed@1.0', 'path': 'install' } },
+                'shepherd-feed-url': feedUrl,
+            } : {}),
+            'rate-limit-exempt': ['10.89.0.1'],
+        }, null, 2)
         const startScript = fs.readFileSync(path.join(import.meta.dirname, '../start.sh'), 'utf-8')
 
         const volume = new docker.Volume(`${name}-data`, {
