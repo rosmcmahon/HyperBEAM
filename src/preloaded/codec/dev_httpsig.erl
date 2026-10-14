@@ -118,10 +118,11 @@ strong_key(#{ <<"type">> := <<"hmac-sha256">> }) ->
 strong_key(_Req) ->
     false.
 
-%% @doc Ask the committer named by a `keyid' to verify the signature of a
-%% signature base. The request is the commitment. Its `priv' message is given
+%% @doc Load the committer from a `keyid' and ask it to verify the signature of
+%% a signature base. The request is the commitment. Its `priv' message is given
 %% to the committer, as it holds the verifier's key material, such as a
-%% secret.
+%% secret. The `keyid' must be the URI of the committer. A `keyid' in any
+%% other form does not verify.
 committer_verifies(KeyID, SigBase, Req, Opts) ->
     case committer(#{ <<"committer">> => KeyID }, Opts) of
         {ok, Committer, KeyID} ->
@@ -146,7 +147,9 @@ committer_verifies(KeyID, SigBase, Req, Opts) ->
     end.
 
 %% @doc Find the committer of a request, returning it as a message along with
-%% the URI that names it. The request's `committer' may be a message or a URI.
+%% its URI. The request's `committer' may be a message or a URI. We load a
+%% committer that is given as a URI, and return the committer's own URI, so
+%% that each committer has one URI.
 %% We never load the committer of unsigned commitments by its URI, because
 %% loading a URI makes an unsigned commitment to its inputs, which would call
 %% this function again.
@@ -160,7 +163,7 @@ committer(#{ <<"committer">> := ?UNSIGNED_COMMITTER }, _Opts) ->
 committer(#{ <<"committer">> := URI }, Opts) when is_binary(URI) ->
     maybe
         {ok, Committer} ?= hb_uri:from(URI, Opts),
-        {ok, Committer, URI}
+        committer(#{ <<"committer">> => Committer }, Opts)
     end;
 committer(#{ <<"committer">> := Committer }, Opts) ->
     maybe
@@ -752,6 +755,19 @@ commitment_identity_test() ->
     ?assertMatch(
         [#{ <<"keyid">> := ?UNSIGNED_COMMITTER }],
         maps:values(maps:get(<<"commitments">>, Unsigned))
+    ),
+    % The committer of unsigned commitments, given as `HMAC:constant:ao',
+    % makes the same unsigned commitment.
+    ?assertEqual(
+        Unsigned,
+        hb_message:commit(
+            Msg,
+            Opts,
+            #{
+                <<"type">> => <<"unsigned">>,
+                <<"committer">> => <<"HMAC:constant:ao">>
+            }
+        )
     ),
     % A signed commitment is named by the `did:pkh:' URI of its key, and it
     % carries the key as its `owner'.
