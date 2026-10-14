@@ -98,8 +98,9 @@
 %%% and remote policy as transaction block bounds. Bundle and ingestion-time
 %%% filters and ingestion-time ordering are not implemented. `networkInfo.height'
 %%% reads the configured Arweave node's status. `parent { id }' and `bundledIn { id }'
-%%% return empty IDs. Other unsupported fields may return a placeholder
-%%% or a GraphQL type error. Schema acceptance does not imply filter support.
+%%% return null for an L1 transaction and an empty ID for a bundled item.
+%%% Other unsupported fields may return a placeholder or a GraphQL type error.
+%%% Schema acceptance does not imply filter support.
 -module(dev_query_arweave).
 %%% AO-Core API:
 -export([query/4]).
@@ -348,9 +349,13 @@ query(Msg, <<"size">>, _Args, Opts) ->
     end;
 query(Msg, <<"type">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"content-type">>, Msg, null, Opts)};
-query(_Msg, Field, _Args, _Opts)
+query(Msg, Field, _Args, Opts)
         when Field =:= <<"bundledIn">>; Field =:= <<"parent">> ->
-    {ok, #{}};
+    L1 = #{ <<"commitment-device">> => <<"tx@1.0">> },
+    case hb_maps:values(hb_message:commitments(L1, Msg, Opts), Opts) of
+        [] -> {ok, #{}};
+        _ -> {ok, null}
+    end;
 query(Obj, Field, Args, _Opts) ->
     ?event({unimplemented_transactions_query,
         {object, Obj},

@@ -1121,6 +1121,7 @@ transactions_header_only_test_parallel() ->
     Result = dev_query_graphql:test_query(Node,
         <<"query($id: ID!) { transaction(id: $id) { id anchor recipient",
             " owner { address } tags { name value } data { size }",
+            " bundledIn { id } parent { id }",
             " quantity { winston } fee { winston } } }">>,
         #{ <<"id">> => ID }, Opts),
     ?assertMatch(#{ <<"data">> := #{ <<"transaction">> := #{
@@ -1128,6 +1129,7 @@ transactions_header_only_test_parallel() ->
     }}}, Result),
     ?assertEqual({error, not_found}, hb_cache:read(ID, hb_store:scope(Opts, local))),
     #{ <<"data">> := #{ <<"transaction">> := Projected }} = Result,
+    ?assertMatch(#{ <<"bundledIn">> := null, <<"parent">> := null }, Projected),
     ?assertEqual(hb_util:encode(TX#tx.anchor), maps:get(<<"anchor">>, Projected)),
     ?assertEqual(hb_util:encode(TX#tx.target), maps:get(<<"recipient">>, Projected)),
     ?assertEqual(#{ <<"winston">> => hb_util:bin(TX#tx.quantity) },
