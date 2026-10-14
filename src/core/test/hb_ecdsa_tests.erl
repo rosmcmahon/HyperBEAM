@@ -366,7 +366,9 @@ wallet_new_shape_contract_test() ->
     {{KeyType1, _Priv, Pub1}, {KeyType2, Pub2}} = Wallet,
     ?assertEqual(KeyType1, {?ECDSA_SIGN_ALG, secp256k1}),
     ?assertEqual(KeyType2, {?ECDSA_SIGN_ALG, secp256k1}),
-    ?assertEqual(Pub1, Pub2).
+    ?assertEqual(Pub1, Pub2),
+    % The JSON (JWK) form of the wallet loads back as the same wallet.
+    ?assertEqual(Wallet, ar_wallet:from_json(ar_wallet:to_json(Wallet))).
 
 different_keys_produce_different_pubkeys_test() ->
     Wallet1 = ar_wallet:new_ecdsa(),

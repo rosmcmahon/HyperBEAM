@@ -307,13 +307,13 @@ to_json({{?RSA_SIGN_ALG, PublicExpnt}, Priv, Pub}) when PublicExpnt =:= 65537 ->
         d => hb_util:encode(Priv)
     });
 to_json({{?ECDSA_SIGN_ALG, secp256k1}, Priv, CompressedPub}) ->
-    % For ECDSA, we need to expand the compressed pubkey to get X,Y coordinates
-    % This is a simplified version - ideally we'd implement pubkey expansion
+    <<4:8, X:32/binary, Y:32/binary>> = decompress_ecdsa_pubkey(CompressedPub),
     hb_json:encode(#{
         kty => <<"EC">>,
         crv => <<"secp256k1">>,
+        x => hb_util:encode(X),
+        y => hb_util:encode(Y),
         d => hb_util:encode(Priv)
-        % TODO: Add x and y coordinates from expanded pubkey
     });
 to_json({{?EDDSA_SIGN_ALG, ed25519}, Priv, Pub}) ->
     hb_json:encode(#{
