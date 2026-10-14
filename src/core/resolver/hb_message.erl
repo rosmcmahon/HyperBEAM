@@ -434,7 +434,7 @@ without_unless_signed(Keys, Msg, Opts) ->
         Msg
     ).
 
-%% @doc Sign a message with the given wallet.
+%% @doc Sign a message with the `priv-wallet' of `Opts', else of the node.
 commit(Msg, Opts) ->
     commit(
         Msg,
@@ -490,14 +490,14 @@ commit(Msg, GivenOpts, Spec) ->
     Signed.
 
 %% @doc Add a committer to a commitment request, if it does not have one. The
-%% committer is made from the `priv-wallet' in `Opts'. Requests for unsigned
-%% commitments are returned unchanged.
+%% committer is the `priv-wallet' in `Opts'. Requests for unsigned commitments
+%% are returned unchanged.
 with_committer(Spec = #{ <<"committer">> := _ }, _Opts) -> Spec;
 with_committer(Spec = #{ <<"type">> := <<"unsigned">> }, _Opts) -> Spec;
 with_committer(Spec, Opts) ->
     case hb_opts:get(priv_wallet, no_viable_wallet, Opts) of
         no_viable_wallet -> Spec;
-        Wallet -> Spec#{ <<"committer">> => hb_opts:wallet_committer(Wallet) }
+        Wallet -> Spec#{ <<"committer">> => Wallet }
     end.
 
 %% @doc Return the list of committed keys from a message.

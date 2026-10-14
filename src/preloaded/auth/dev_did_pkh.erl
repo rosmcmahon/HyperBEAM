@@ -14,8 +14,8 @@
 %%%
 %%% A committer that is read from its URI holds its account as its `body'. A
 %%% committer that holds a key has the public key as its `owner', the
-%%% signature type of the key as its `type', and the key itself as the
-%%% `wallet' in its `priv' message. The `commit' key signs the request's
+%%% signature type of the key as its `type', and the private key as `d' in
+%%% its `priv' message. The `commit' key signs the request's
 %%% `body' with the algorithm of the request's `type', and returns the
 %%% `signature' and the `owner'. The `verify' key checks that the request's
 %%% `owner' is a key of the committer's account, and that the `signature' of
@@ -57,19 +57,19 @@ to(Committer, #{ <<"type">> := <<"uri">> }, _Opts) ->
 %% algorithm of the request's `type'. If the key is of another type, we return
 %% an error.
 -spec commit(
-    #{ priv := #{ wallet := tuple() }, _ => _ },
+    #{ owner := binary(), type := binary(), priv := #{ d := binary() }, _ => _ },
     #{ body := binary(), type := binary(), _ => _ },
     #{ _ => _ }
 ) -> {ok, #{ signature := binary(), owner := binary() }} | {error, _}.
-commit(Committer, #{ <<"body">> := Base, <<"type">> := Type }, Opts) ->
-    Wallet = {{KeyType, _, Owner}, _} =
-        hb_private:get(<<"wallet">>, Committer, not_found, Opts),
+commit(Committer, #{ <<"body">> := Base, <<"type">> := Type }, _Opts) ->
+    #{ <<"owner">> := Owner, <<"type">> := CommitterType } = Committer,
+    KeyType = key_type(CommitterType),
     case key_type(Type) of
         KeyType ->
             {
                 ok,
                 #{
-                    <<"signature">> => ar_wallet:sign(Wallet, Base, digest(Type)),
+                    <<"signature">> => ar_wallet:sign(Committer, Base, digest(Type)),
                     <<"owner">> => Owner
                 }
             };
@@ -95,7 +95,12 @@ verify(Committer, Req = #{ <<"owner">> := Owner, <<"type">> := Type }, _Opts) ->
     case {account(Committer), key_account(Owner, KeyType)} of
         {{ok, Account}, {ok, Account}} ->
             #{ <<"body">> := Base, <<"signature">> := Sig } = Req,
-            {ok, ar_wallet:verify({KeyType, Owner}, Base, Sig, digest(Type))};
+            Wallet =
+                #{
+                    <<"type">> => ar_tx:serialize_sig_type(KeyType),
+                    <<"owner">> => Owner
+                },
+            {ok, ar_wallet:verify(Wallet, Base, Sig, digest(Type))};
         _ -> {ok, false}
     end;
 verify(_Committer, _Req, _Opts) ->
@@ -139,25 +144,12 @@ digest(_Type) -> sha256.
 
 %%% Tests
 
-%% @doc Generate a committer that holds a new key of the given type.
-committer(KeyType) ->
-    Wallet = {{KeyType, _, Owner}, _} = ar_wallet:new(KeyType),
-    {
-        #{
-            <<"device">> => <<"did-pkh@1.0">>,
-            <<"owner">> => Owner,
-            <<"type">> => ar_tx:serialize_sig_type(KeyType),
-            <<"priv">> => #{ <<"wallet">> => Wallet }
-        },
-        Wallet
-    }.
-
 %% @doc Ensure that a committer's URI is `did:pkh:' followed by its account,
 %% and that it reads back as a committer with the same URI.
 uri_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
-    {Committer, Wallet} = committer(?RSA_KEY_TYPE),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Committer = ar_wallet:new(?RSA_KEY_TYPE),
+    Address = hb_util:human_id(ar_wallet:to_address(Committer)),
     {ok, URI} = hb_uri:to(Committer, #{ <<"scheme">> => <<"did">> }, Opts),
     ?assertEqual(<<"did:pkh:arweave:7wIU:", Address/binary>>, URI),
     {ok, Read} = hb_uri:from(URI, Opts),
@@ -165,10 +157,16 @@ uri_test() ->
         {ok, URI},
         hb_uri:to(Read, #{ <<"scheme">> => <<"did">> }, Opts)
     ),
-    {Ethereum, _} = committer(?ETHEREUM_KEY_TYPE),
+    Ethereum = ar_wallet:new(?ETHEREUM_KEY_TYPE),
     ?assertMatch(
         {ok, <<"did:pkh:eip155:1:0x", _:40/binary>>},
         hb_uri:to(Ethereum, #{ <<"scheme">> => <<"did">> }, Opts)
+    ),
+    % Check that an Ed25519 node's address is the one its committer names.
+    Ed25519 = #{ <<"priv-wallet">> => ar_wallet:new(?EDDSA_KEY_TYPE) },
+    ?assertEqual(
+        hb_opts:committer(Ed25519),
+        hb_util:committer(hb_opts:address(Ed25519))
     ),
     % Check the URI of the CAIP-10 example account on Solana mainnet.
     Solana =
@@ -190,14 +188,14 @@ uri_test() ->
 %% from its URI, and that a signature by the key of another account does not.
 commit_verify_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
-    {Committer, _} = committer(?RSA_KEY_TYPE),
+    Committer = ar_wallet:new(?RSA_KEY_TYPE),
     {ok, URI} = hb_uri:to(Committer, #{ <<"scheme">> => <<"did">> }, Opts),
     {ok, Read} = hb_uri:from(URI, Opts),
     Req = #{ <<"body">> => <<"base">>, <<"type">> => <<"rsa-pss-sha512">> },
     {ok, Signed} = hb_ao:raw(Committer, Req#{ <<"path">> => <<"commit">> }, Opts),
     Verify = Req#{ <<"path">> => <<"verify">> },
     ?assertEqual({ok, true}, hb_ao:raw(Read, maps:merge(Verify, Signed), Opts)),
-    {Other, _} = committer(?RSA_KEY_TYPE),
+    Other = ar_wallet:new(?RSA_KEY_TYPE),
     {ok, OtherSigned} =
         hb_ao:raw(Other, Req#{ <<"path">> => <<"commit">> }, Opts),
     ?assertEqual(

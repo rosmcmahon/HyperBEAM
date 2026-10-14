@@ -604,8 +604,8 @@ transactions_query_recipients_test_parallel() ->
         },
     Node = hb_http_server:start_node(Opts),
     Alice = ar_wallet:new(),
-    ?event({alice, Alice, {explicit, hb_util:human_id(Alice)}}),
-    AliceAddress = hb_util:human_id(Alice),
+    ?event({alice, Alice, {explicit, hb:address(Alice)}}),
+    AliceAddress = hb:address(Alice),
     {ok, WrittenMsg} = write_test_message_with_recipient(AliceAddress, Opts),
     TagOnly = ar_bundles:sign_item(#tx{ tags = [
         {<<"Target">>, AliceAddress}, {<<"field-target">>, AliceAddress}
@@ -1469,9 +1469,9 @@ transaction_query_full_test_parallel() ->
         },
     Node = hb_http_server:start_node(Opts),
     Alice = ar_wallet:new(),
-    ?event({alice, Alice, {explicit, hb_util:human_id(Alice)}}),
-    AliceAddress = hb_util:human_id(Alice),
-    SenderAddress = hb_util:human_id(SenderKey),
+    ?event({alice, Alice, {explicit, hb:address(Alice)}}),
+    AliceAddress = hb:address(Alice),
+    SenderAddress = hb:address(SenderKey),
     SenderPubKey = hb_util:encode(ar_wallet:to_pubkey(SenderKey)),
     {ok, WrittenMsg} = write_test_message_with_recipient(AliceAddress, Opts),
     ExpectedID = hb_message:id(WrittenMsg, all, Opts),

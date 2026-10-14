@@ -531,13 +531,13 @@ hyper_token_ledger_test_() ->
 hyper_token_ledger() ->
     % Create the wallets necessary and read the files containing the scripts.
     HostWallet = ar_wallet:new(),
-    HostAddress = hb_util:human_id(HostWallet),
+    HostAddress = hb:address(HostWallet),
     OperatorWallet = ar_wallet:new(),
-    OperatorAddress = hb_util:human_id(OperatorWallet),
+    OperatorAddress = hb:address(OperatorWallet),
     AliceWallet = ar_wallet:new(),
-    AliceAddress = hb_util:human_id(AliceWallet),
+    AliceAddress = hb:address(AliceWallet),
     BobWallet = ar_wallet:new(),
-    BobAddress = hb_util:human_id(BobWallet),
+    BobAddress = hb:address(BobWallet),
     LedgerName =
         <<"ledger-",
             (integer_to_binary(erlang:unique_integer([positive])))/binary

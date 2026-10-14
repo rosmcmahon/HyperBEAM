@@ -12,7 +12,7 @@ certificate_file() ->
     E = Key#'RSAPrivateKey'.publicExponent,
     N = binary:encode_unsigned(Key#'RSAPrivateKey'.modulus),
     D = binary:encode_unsigned(Key#'RSAPrivateKey'.privateExponent),
-    Wallet = {{{rsa, E}, D, N}, {{rsa, E}, N}},
+    Wallet = ar_wallet:new({rsa, E}, D, N),
     ServerID = hb:address(Wallet),
     Store = [hb_test_utils:test_store()],
     Opts = #{
@@ -108,7 +108,8 @@ certificate_file() ->
     end.
 
 %% @doc Independently check the public key, signature and requested SANs.
-verify_csr(PEM, {{{rsa, E}, _D, N}, _}) ->
+verify_csr(PEM, #{ <<"type">> := Type, <<"owner">> := N }) ->
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     [{'CertificationRequest', DER, not_encrypted}] = public_key:pem_decode(PEM),
     CSR = public_key:der_decode('CertificationRequest', DER),
     Info = CSR#'CertificationRequest'.certificationRequestInfo,

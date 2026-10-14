@@ -474,7 +474,7 @@ commit_request_test() ->
                         <<"strategy">> => <<"Nearest">>,
                         <<"nodes">> => [
                             #{
-                                <<"wallet">> => hb_util:human_id(Wallet),
+                                <<"wallet">> => hb:address(Wallet),
                                 <<"prefix">> => Executor
                             }
                         ]

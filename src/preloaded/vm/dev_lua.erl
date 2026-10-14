@@ -1044,7 +1044,7 @@ pure_lua_restore_test() ->
 %% @doc Snapshots of a Lua state do not contain the wallet of the node, and
 %% restore to a state whose AO-Core library functions still resolve.
 snapshot_excludes_node_wallet_test() ->
-    Wallet = {{_, PrivKey, _}, _} = ar_wallet:new(),
+    Wallet = #{ <<"priv">> := #{ <<"d">> := PrivKey } } = ar_wallet:new(),
     Opts = #{
         <<"priv-wallet">> => Wallet,
         <<"store">> => [hb_test_utils:test_store()]

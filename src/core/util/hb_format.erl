@@ -141,24 +141,6 @@ term(X, Opts, Indent) ->
         end
     end.
 
-do_term(
-    { { {rsa, _PublicExpnt1}, _Priv1, _Priv2 },
-      { {rsa, _PublicExpnt2}, Pub }
-    },
-    Opts, Indent
-) ->
-    address(Pub, Opts, Indent);
-do_term(
-    { AtomValue,
-      {
-        { {rsa, _PublicExpnt1}, _Priv1, _Priv2 },
-        { {rsa, _PublicExpnt2}, Pub }
-      }
-    },
-    Opts, Indent
-) ->
-    AddressString = address(Pub, Opts, Indent),
-    indent("~p: ~s", [AtomValue, AddressString], Opts, Indent);
 do_term({explicit, X}, Opts, Indent) ->
     indent("[Explicit:] ~p", [X], Opts, Indent);
 do_term({string, X}, Opts, Indent) ->
@@ -229,14 +211,6 @@ do_term(MsgList, Opts, Indent) when is_list(MsgList) ->
     list(MsgList, Opts, Indent);
 do_term(X, Opts, Indent) ->
     indent("~80p", [X], Opts, Indent).
-
-%% @doc If the user attempts to print a wallet, format it as an address.
-address(Wallet, Opts, Indent) ->
-    indent("Wallet [Addr: ~s]",
-        [short_id(hb_util:human_id(ar_wallet:to_address(Wallet)))], 
-        Opts, 
-        Indent
-    ).
 
 %% @doc Helper function to format tuples with arity greater than 2.
 tuple(Tuple, Opts, Indent) ->

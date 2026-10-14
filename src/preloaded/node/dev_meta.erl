@@ -115,7 +115,7 @@ add_dynamic_keys(NodeMsg) ->
                 NodeMsg;
             Wallet ->
                 %% Create a new map with address and merge it (overwriting existing)
-                Address = hb_util:id(ar_wallet:to_address(Wallet)),
+                Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
                 NodeMsg#{
                     <<"address">> => Address,
                     <<"committer">> => hb_opts:committer(NodeMsg)
@@ -127,7 +127,7 @@ add_identity_addresses(NodeMsg) ->
     Identities = hb_opts:get(identities, #{}, NodeMsg),
     NewIdentities = maps:map(fun(_, Identity) ->
         Identity#{
-            <<"address">> => hb_util:human_id(
+            <<"address">> => hb:address(
                 hb_opts:get(priv_wallet, hb:wallet(), Identity)
             )
         }
@@ -230,6 +230,11 @@ unread_request_link_test() ->
     ?assertEqual(
         {ok, hb_test_utils:committer(Wallet)},
         hb_http:get(Node, <<"/~meta@1.0/info/committer">>, #{})
+    ),
+    % The node's wallet is the message of that committer.
+    ?assertEqual(
+        {ok, hb_test_utils:committer(Wallet)},
+        hb_uri:to(Wallet, #{ <<"scheme">> => <<"did">> }, #{})
     ).
 
 %% @doc Test that we can't set the node message if the request is not signed by
@@ -359,7 +364,7 @@ typed_authorization_test() ->
     % An operator given as an address is its `did:pkh:' committer.
     ?assertMatch({ok, _},
         lib_meta:is_authorized(<<"node-message">>, operator, Signed,
-            #{ <<"operator">> => hb_util:human_id(Owner) })).
+            #{ <<"operator">> => hb:address(Owner) })).
 
 %% @doc A signed child ID authorizes its committed fields, not extensions.
 nested_authorization_test() ->

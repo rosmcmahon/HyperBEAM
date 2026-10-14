@@ -281,9 +281,7 @@ native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 32 ->
     Bin;
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
-    Bin;
-native_id(Wallet = {_Priv, _Pub}) ->
-    native_id(ar_wallet:to_address(Wallet)).
+    Bin.
 
 %% @doc Convert a native binary ID to a human readable ID. If the ID is already
 %% a human readable ID, it is returned as is. If it is an ethereum address, it
@@ -295,9 +293,7 @@ human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 44 ->
 human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
     Bin;
 human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
-    Bin;
-human_id(Wallet = {_Priv, _Pub}) ->
-    human_id(ar_wallet:to_address(Wallet)).
+    Bin.
 
 %% @doc Convert a committer given by a node's configuration, a process
 %% definition or Lua code to its URI. An Arweave address has no URI scheme, so

@@ -259,10 +259,10 @@ wallet(Location, Opts) ->
 
 %% @doc Get the address of a wallet. Defaults to the address of the wallet
 %% specified by the `priv_key_location' configuration key. It can also take a
-%% wallet tuple as an argument.
+%% wallet as an argument.
 address() -> address(wallet()).
-address(Wallet) when is_tuple(Wallet) ->
-    hb_util:encode(ar_wallet:to_address(Wallet));
+address(Wallet) when is_map(Wallet) ->
+    hb_util:human_id(ar_wallet:to_address(Wallet));
 address(Location) -> address(wallet(Location)).
 
 %% @doc Debugging function to read a message from the cache.

@@ -88,15 +88,15 @@ new_item(Target, Anchor, Tags, Data) ->
 
 %% @doc Sign a data item.
 sign_item(_, undefined) -> throw(wallet_not_found);
-sign_item(RawItem, {PrivKey, {KeyType, Owner}}) ->
+sign_item(RawItem, Wallet = #{ <<"owner">> := Owner, <<"type">> := Type }) ->
     Item =
         (ar_tx:normalize(RawItem))#tx{
             format = ans104,
             owner = Owner,
-            signature_type = KeyType
+            signature_type = ar_tx:deserialize_sig_type(Type)
         },
     % Generate the signature from the data item's data segment in 'signed'-ready mode.
-    Sig = ar_wallet:sign(PrivKey, data_item_signature_data(Item)),
+    Sig = ar_wallet:sign(Wallet, data_item_signature_data(Item)),
     ar_tx:reset_ids(Item#tx{signature = Sig}).
 
 %% @doc Verify the validity of a data item.
@@ -218,7 +218,12 @@ verify_data_item_id(DataItem) ->
 verify_data_item_signature(DataItem) ->
     SignatureData = data_item_signature_data(DataItem),
     ar_wallet:verify(
-        {DataItem#tx.signature_type, DataItem#tx.owner}, SignatureData, DataItem#tx.signature
+        #{
+            <<"type">> => ar_tx:serialize_sig_type(DataItem#tx.signature_type),
+            <<"owner">> => DataItem#tx.owner
+        },
+        SignatureData,
+        DataItem#tx.signature
     ).
 
 %% @doc Verify the validity of the data item's tags.
@@ -774,12 +779,12 @@ residue_in_tag_section_test() ->
     ?assertThrow({invalid_ans104_tags, residue_in_tag_section}, decode_tags(Wrapped)).
 
 no_tags_test() ->
-    {Priv, Pub} = ar_wallet:new(),
-    {KeyType, Owner} = Pub,
+    Wallet = #{ <<"owner">> := Owner } = ar_wallet:new(),
+    KeyType = ?RSA_KEY_TYPE,
     Target = crypto:strong_rand_bytes(32),
     Anchor = crypto:strong_rand_bytes(32),
     DataItem = new_item(Target, Anchor, [], <<"data">>),
-    SignedDataItem = sign_item(DataItem, {Priv, Pub}),
+    SignedDataItem = sign_item(DataItem, Wallet),
     ?assertEqual(true, verify_item(SignedDataItem)),
     assert_data_item(KeyType, Owner, Target, Anchor, [], <<"data">>, SignedDataItem),
     SignedDataItem2 = deserialize(serialize(SignedDataItem)),
@@ -788,13 +793,13 @@ no_tags_test() ->
     assert_data_item(KeyType, Owner, Target, Anchor, [], <<"data">>, SignedDataItem2).
 
 with_tags_test() ->
-    {Priv, Pub} = ar_wallet:new(),
-    {KeyType, Owner} = Pub,
+    Wallet = #{ <<"owner">> := Owner } = ar_wallet:new(),
+    KeyType = ?RSA_KEY_TYPE,
     Target = crypto:strong_rand_bytes(32),
     Anchor = crypto:strong_rand_bytes(32),
     Tags = [{<<"tag1">>, <<"value1">>}, {<<"tag2">>, <<"value2">>}],
     DataItem = new_item(Target, Anchor, Tags, <<"taggeddata">>),
-    SignedDataItem = sign_item(DataItem, {Priv, Pub}),
+    SignedDataItem = sign_item(DataItem, Wallet),
     ?assertEqual(true, verify_item(SignedDataItem)),
     assert_data_item(KeyType, Owner, Target, Anchor, Tags, <<"taggeddata">>, SignedDataItem),
     SignedDataItem2 = deserialize(serialize(SignedDataItem)),

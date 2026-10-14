@@ -1,6 +1,7 @@
 -module(ar_wallet).
 -export([sign/2, sign/3, hmac/1, hmac/2, verify/3, verify/4]).
 -export([to_pubkey/1, to_pubkey/2, to_address/1, to_address/2, new/0, new_ecdsa/0, new/1]).
+-export([new/3]).
 -export([new_keyfile/2, load_keyfile/1, load_keyfile/2, load_key/1, load_key/2]).
 -export([to_json/1, from_json/1, from_json/2]).
 -export([recover_key/3]).
@@ -9,6 +10,12 @@
 -include_lib("public_key/include/public_key.hrl").
 
 %%% @doc Utilities for manipulating wallets.
+%%%
+%%% A wallet is the `did-pkh@1.0' committer message of a key. Its `owner' is
+%%% the public key, its `type' is the signature type of the key, and `d' in its
+%%% `priv' message is the private key, which no ID or encoding of the wallet
+%%% includes. `verify' needs only the `owner' and the `type'. Key files hold
+%%% the key in the JWK format.
 
 -define(WALLET_DIR, ".").
 -define(WALLET_POOL_TARGET, 6).
@@ -33,22 +40,31 @@ new(KeyType = {?ECDSA_SIGN_ALG, secp256k1}) ->
 new_ecdsa() ->
     new({?ECDSA_SIGN_ALG, secp256k1}).
 
+%% @doc Make the wallet of a key from its type, private key and public key.
+new(KeyType, Priv, Pub) ->
+    #{
+        <<"device">> => <<"did-pkh@1.0">>,
+        <<"type">> => ar_tx:serialize_sig_type(KeyType),
+        <<"owner">> => Pub,
+        <<"priv">> => #{ <<"d">> => Priv }
+    }.
+
 generate_wallet(KeyType = {KeyAlg, PublicExpnt}) when KeyType =:= {rsa, 65537} ->
     {[_, Pub], [_, Pub, Priv|_]} = {[_, Pub], [_, Pub, Priv|_]}
         = crypto:generate_key(KeyAlg, {4096, PublicExpnt}),
-    {{KeyType, Priv, Pub}, {KeyType, Pub}};
+    new(KeyType, Priv, Pub);
 generate_wallet(KeyType = {KeyAlg, KeyCrv}) when KeyAlg =:= ?ECDSA_SIGN_ALG andalso KeyCrv =:= secp256k1 ->
     {OrigPub, Priv} = crypto:generate_key(ecdh, KeyCrv),
     Pub = compress_ecdsa_pubkey(OrigPub),
-    {{KeyType, Priv, Pub}, {KeyType, Pub}};
+    new(KeyType, Priv, Pub);
 generate_wallet(ethereum)  ->
     {Pub, Priv} = crypto:generate_key(ecdh, secp256k1),
-    {{ethereum, Priv, Pub}, {ethereum, Pub}};
+    new(ethereum, Priv, Pub);
 generate_wallet(solana) ->
     generate_wallet({eddsa, ed25519});
 generate_wallet(KeyType = {KeyAlg, Curve}) when KeyType =:= {?EDDSA_SIGN_ALG, ed25519} ->
     {Pub, Priv} = crypto:generate_key(KeyAlg, Curve),
-    {{KeyType, Priv, Pub}, {KeyType, Pub}}.
+    new(KeyType, Priv, Pub).
 
 request_pooled_wallet(KeyType) ->
     Pool = ensure_wallet_pool(KeyType),
@@ -118,13 +134,15 @@ wallet_pool_name(solana) ->
 wallet_pool_name(ethereum) ->
     ar_wallet_pool_ethereum.
 
-%% @doc Sign some data with a private key.
-sign(Key, Data) ->
-    sign(Key, Data, sha256).
+%% @doc Sign some data with a wallet.
+sign(Wallet, Data) ->
+    sign(Wallet, Data, sha256).
 
 %% @doc sign some data, hashed using the provided DigestType.
 %% RSA and ECDSA signatures use wallet-level wrappers.
-sign({{rsa, PublicExpnt}, Priv, Pub}, Data, DigestType) when PublicExpnt =:= 65537 ->
+sign(Wallet = #{ <<"type">> := Type = ?RSA_SIGN_TYPE }, Data, DigestType) ->
+    #{ <<"owner">> := Pub, <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
+    {rsa, PublicExpnt} = ar_tx:deserialize_sig_type(Type),
     rsa_pss:sign(
         Data,
         DigestType,
@@ -134,26 +152,29 @@ sign({{rsa, PublicExpnt}, Priv, Pub}, Data, DigestType) when PublicExpnt =:= 655
             privateExponent = binary:decode_unsigned(Priv)
         }
     );
-sign({{KeyAlg, KeyCrv}, Priv, _Pub}, Data, _DigestType)
-        when KeyAlg =:= ?ECDSA_SIGN_ALG andalso KeyCrv =:= secp256k1 ->
+sign(Wallet = #{ <<"type">> := ?ECDSA_SIGN_TYPE }, Data, _DigestType) ->
+    #{ <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
     secp256k1_nif:sign(Data, Priv);
-sign({KeyType = {KeyAlg, Curve}, Priv, _Pub}, Data, _DigestType) when KeyType =:= {?EDDSA_SIGN_ALG, ed25519} ->
-    crypto:sign(KeyAlg, none, Data, [Priv, Curve]);
-sign({ethereum, Priv, Pub}, Data, _DigestType) ->
-    secp256k1_nif:sign(Data, Priv, ethereum);
-sign({{KeyType, Priv, Pub}, {KeyType, Pub}}, Data, DigestType) ->
-    sign({KeyType, Priv, Pub}, Data, DigestType).
+sign(Wallet = #{ <<"type">> := ?EDDSA_SIGN_TYPE }, Data, _DigestType) ->
+    #{ <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
+    crypto:sign(eddsa, none, Data, [Priv, ed25519]);
+sign(Wallet = #{ <<"type">> := ?ETHEREUM_SIGN_TYPE }, Data, _DigestType) ->
+    #{ <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
+    secp256k1_nif:sign(Data, Priv, ethereum).
 
 hmac(Data) ->
     hmac(Data, sha256).
 
 hmac(Data, DigestType) -> crypto:mac(hmac, DigestType, <<"ar">>, Data).
 
-%% @doc Verify that a signature is correct.
-verify(Key, Data, Sig) ->
-    verify(Key, Data, Sig, sha256).
+%% @doc Verify that a signature is correct, using the `owner' and `type' of a
+%% wallet.
+verify(Wallet, Data, Sig) ->
+    verify(Wallet, Data, Sig, sha256).
 
-verify({{rsa, PublicExpnt}, Pub}, Data, Sig, DigestType) when PublicExpnt =:= 65537 ->
+verify(#{ <<"type">> := Type = ?RSA_SIGN_TYPE, <<"owner">> := Pub },
+        Data, Sig, DigestType) ->
+    {rsa, PublicExpnt} = ar_tx:deserialize_sig_type(Type),
     rsa_pss:verify(
         Data,
         DigestType,
@@ -166,46 +187,52 @@ verify({{rsa, PublicExpnt}, Pub}, Data, Sig, DigestType) when PublicExpnt =:= 65
 %% NOTE: We will not write pubkey for ECDSA signature. So don't use verify function 
 %% for ECDSA directly, use ecrecover pattern. This function will return always false 
 %% if called with no Pub.
-verify({{KeyAlg, KeyCrv}, Pub}, Data, Sig, _DigestType)
-        when KeyAlg =:= ?ECDSA_SIGN_ALG andalso KeyCrv =:= secp256k1 ->
+verify(#{ <<"type">> := ?ECDSA_SIGN_TYPE, <<"owner">> := Pub },
+        Data, Sig, _DigestType) ->
     {Pass, PubExtracted} = secp256k1_nif:ecrecover(Data, Sig),
     Pass andalso PubExtracted =:= Pub;
-verify({{KeyAlg, Curve}, Pub}, Data, Sig, _DigestType) when
-      byte_size(Pub) == 32 andalso byte_size(Sig) == 64 andalso Curve =:= ed25519 andalso KeyAlg =:= ?EDDSA_SIGN_ALG ->
-    crypto:verify(eddsa, none, Data, Sig, [Pub, Curve]);
-verify({ethereum, Pub}, Data, Sig, _DigestType) ->
+verify(#{ <<"type">> := ?EDDSA_SIGN_TYPE, <<"owner">> := Pub },
+        Data, Sig, _DigestType)
+        when byte_size(Pub) == 32 andalso byte_size(Sig) == 64 ->
+    crypto:verify(eddsa, none, Data, Sig, [Pub, ed25519]);
+verify(#{ <<"type">> := ?ETHEREUM_SIGN_TYPE, <<"owner">> := Pub },
+        Data, Sig, _DigestType) ->
     {Pass, PubExtracted} = secp256k1_nif:ecrecover(Data, Sig, ethereum),
     Pass andalso PubExtracted =:= compress_ecdsa_pubkey(Pub);
-verify({typed_ethereum, Address}, Data, Sig, _DigestType) ->
+verify(#{ <<"type">> := ?TYPED_ETHEREUM_SIGN_TYPE, <<"owner">> := Address },
+        Data, Sig, _DigestType) ->
     {Pass, PubExtracted} =
         secp256k1_nif:ecrecover(Data, Sig, {typed_ethereum, Address}),
     Pass andalso
         to_address(Address, typed_ethereum) =:=
             to_ethereum_address(decompress_ecdsa_pubkey(PubExtracted));
-verify({solana, Pub}, Data, Sig, _DigestType) when
-      byte_size(Pub) == 32 andalso byte_size(Sig) == 64 ->
+verify(#{ <<"type">> := ?SOLANA_SIGN_TYPE, <<"owner">> := Pub },
+        Data, Sig, _DigestType)
+        when byte_size(Pub) == 32 andalso byte_size(Sig) == 64 ->
     HexData = hb_util:to_hex(Data),
     crypto:verify(eddsa, none, HexData, Sig, [Pub, ed25519]).
 
 %% @doc Find a public key from a wallet.
+to_pubkey(#{ <<"owner">> := Owner }) ->
+    Owner;
 to_pubkey(Pubkey) ->
     to_pubkey(Pubkey, ?DEFAULT_KEY_TYPE).
 to_pubkey(PubKey, {rsa, 65537}) when bit_size(PubKey) == 256 ->
     % Small keys are not secure, nobody is using them, the clause
     % is for backwards-compatibility.
     PubKey;
-to_pubkey({{_, _, PubKey}, {_, PubKey}}, {rsa, 65537}) ->
-    PubKey;
 to_pubkey(PubKey, {rsa, 65537}) ->
     PubKey.
 
-%% @doc Generate an address from a public key.
+%% @doc Generate an address from a wallet, or from a public key. A wallet's
+%% address is the address of its `owner' for its key type. It is the account
+%% that the wallet's `did:pkh:' URI names.
+to_address(#{ <<"owner">> := Owner, <<"type">> := Type }) ->
+    to_address(Owner, ar_tx:deserialize_sig_type(Type));
 to_address(Pubkey) ->
     to_address(Pubkey, ?DEFAULT_KEY_TYPE).
 to_address(PubKey, {rsa, 65537}) when bit_size(PubKey) == 256 ->
     PubKey;
-to_address({{_, _, PubKey}, {_, PubKey}}, _) ->
-    to_address(PubKey);
 to_address(PubKey, {rsa, 65537}) ->
     to_rsa_address(PubKey);
 to_address(PubKey, {?ECDSA_SIGN_ALG, secp256k1}) ->
@@ -226,35 +253,11 @@ to_address(Address, typed_ethereum) ->
 new_keyfile(KeyType, WalletName) when is_list(WalletName) ->
     new_keyfile(KeyType, list_to_binary(WalletName));
 new_keyfile(KeyType, WalletName) ->
-    {Pub, Priv, Key} =
-        case KeyType of
-            {?RSA_SIGN_ALG, PublicExpnt} ->
-                {[Expnt, Pb], [Expnt, Pb, Prv, P1, P2, E1, E2, C]} =
-                    crypto:generate_key(rsa, {?RSA_PRIV_KEY_SZ, PublicExpnt}),
-                PrivKey = {KeyType, Prv, Pb},
-                Ky = to_json(PrivKey),
-                {Pb, Prv, Ky};
-            {?ECDSA_SIGN_ALG, secp256k1} ->
-                {OrigPub, Prv} = crypto:generate_key(ecdh, secp256k1),
-                CompressedPub = compress_ecdsa_pubkey(OrigPub),
-                PrivKey = {KeyType, Prv, CompressedPub},
-                Ky = to_json(PrivKey),
-                {CompressedPub, Prv, Ky};
-            {?EDDSA_SIGN_ALG, ed25519} ->
-                {{_, Prv, Pb}, _} = new(KeyType),
-                PrivKey = {KeyType, Prv, Pb},
-                Ky = to_json(PrivKey),
-                {Pb, Prv, Ky};
-            ethereum ->
-                {Pb, Prv} = crypto:generate_key(ecdh, secp256k1),
-                PrivKey = {KeyType, Prv, Pb},
-                Ky = to_json(PrivKey),
-                {Pb, Prv, Ky}
-        end,
+    Wallet = #{ <<"owner">> := Pub } = new(KeyType),
     Filename = wallet_filepath(WalletName, Pub, KeyType),
     filelib:ensure_dir(Filename),
-    file:write_file(Filename, Key),
-    {{KeyType, Priv, Pub}, {KeyType, Pub}}.
+    file:write_file(Filename, to_json(Wallet)),
+    Wallet.
 
 wallet_filepath(Wallet) ->
     filename:join([?WALLET_DIR, binary_to_list(Wallet)]).
@@ -295,10 +298,10 @@ load_keyfile(File, Opts) ->
     {ok, Body} = file:read_file(File),
     from_json(Body, Opts).
 
-%% @doc Convert a wallet private key to JSON (JWK) format
-to_json({PrivKey, _PubKey}) ->
-    to_json(PrivKey);
-to_json({{?RSA_SIGN_ALG, PublicExpnt}, Priv, Pub}) when PublicExpnt =:= 65537 ->
+%% @doc Convert a wallet to JSON (JWK) format
+to_json(Wallet = #{ <<"type">> := Type = ?RSA_SIGN_TYPE }) ->
+    #{ <<"owner">> := Pub, <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
+    {?RSA_SIGN_ALG, PublicExpnt} = ar_tx:deserialize_sig_type(Type),
     hb_json:encode(#{
         kty => <<"RSA">>,
         ext => true,
@@ -306,7 +309,8 @@ to_json({{?RSA_SIGN_ALG, PublicExpnt}, Priv, Pub}) when PublicExpnt =:= 65537 ->
         n => hb_util:encode(Pub),
         d => hb_util:encode(Priv)
     });
-to_json({{?ECDSA_SIGN_ALG, secp256k1}, Priv, CompressedPub}) ->
+to_json(Wallet = #{ <<"type">> := ?ECDSA_SIGN_TYPE }) ->
+    #{ <<"owner">> := CompressedPub, <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
     <<4:8, X:32/binary, Y:32/binary>> = decompress_ecdsa_pubkey(CompressedPub),
     hb_json:encode(#{
         kty => <<"EC">>,
@@ -315,7 +319,8 @@ to_json({{?ECDSA_SIGN_ALG, secp256k1}, Priv, CompressedPub}) ->
         y => hb_util:encode(Y),
         d => hb_util:encode(Priv)
     });
-to_json({{?EDDSA_SIGN_ALG, ed25519}, Priv, Pub}) ->
+to_json(Wallet = #{ <<"type">> := ?EDDSA_SIGN_TYPE }) ->
+    #{ <<"owner">> := Pub, <<"priv">> := #{ <<"d">> := Priv } } = Wallet,
     hb_json:encode(#{
         kty => <<"OKP">>,
         alg => <<"EdDSA">>,
@@ -358,7 +363,7 @@ from_json(JsonBinary, Opts) ->
                 KyType = {?RSA_SIGN_ALG, 65537},
                 {Pb, Prv, KyType}
         end,
-    {{KeyType, Priv, Pub}, {KeyType, Pub}}.
+    new(KeyType, Priv, Pub).
 
 %% @doc Recover the public key from a signature (for ECDSA).
 %% For ECDSA transactions, the public key is not included in the transaction,

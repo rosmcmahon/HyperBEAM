@@ -275,7 +275,6 @@ wallet_from_key(Key) ->
 %% @doc Register a wallet on the node.
 register_wallet(Wallet, Base, Request, Opts) ->
     % Find the wallet's address.
-    {PrivKey, _} = Wallet,
     Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
     % Determine how to persist the wallet.
     PersistMode = hb_ao:get(<<"persist">>, Request, <<"in-memory">>, Opts),
@@ -330,7 +329,7 @@ register_wallet(Wallet, Base, Request, Opts) ->
             % Store wallet details.
             WalletDetails =
                 #{
-                    <<"wallet">> => ar_wallet:to_json(PrivKey),
+                    <<"wallet">> => ar_wallet:to_json(Wallet),
                     <<"address">> => hb_util:human_id(Address),
                     <<"persist">> => PersistMode,
                     <<"access-control">> => hb_private:reset(InitializedAuthMsg),
@@ -482,13 +481,11 @@ request_to_wallets(Base, Request, Opts) ->
 load_and_verify({wallet, WalletKey}, _Base, _Request, _Opts) ->
     % Return the wallet key.
     Wallet = ar_wallet:from_json(WalletKey),
-    PubKey = ar_wallet:to_pubkey(Wallet),
-    Address = ar_wallet:to_address(PubKey),
     {ok, #{
         <<"wallet">> => WalletKey,
-        <<"address">> => hb_util:human_id(Address),
+        <<"address">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
         <<"persist">> => <<"client">>,
-        <<"committer">> => << "publickey:", (hb_util:encode(PubKey))/binary >>
+        <<"committer">> => hb_opts:committer(#{ <<"priv-wallet">> => Wallet })
     }};
 load_and_verify({secret, KeyID, _}, _Base, Request, Opts) ->
     % Get the wallet from the node's options.
@@ -575,7 +572,7 @@ wallets_from_cookie(Msg, Opts) ->
 commit_message(Message, NonMap, Opts) when not is_map(NonMap) ->
     commit_message(Message, #{ <<"wallet">> => NonMap }, Opts);
 commit_message(Message, #{ <<"wallet">> := Key }, Opts) when is_binary(Key) ->
-    commit_message(Message, ar_wallet:from_json(Key), Opts);
+    commit_message(Message, #{ <<"wallet">> => ar_wallet:from_json(Key) }, Opts);
 commit_message(Message, #{ <<"wallet">> := Key }, Opts) ->
     ?event({committing_with_proxy, {priv_message, Message}, {priv_wallet, Key}}),
     hb_message:commit(Message, Opts#{ <<"priv-wallet">> => Key }).
@@ -1074,14 +1071,14 @@ export_individual_batch_wallets_test() ->
         hb_http:get(
             Node,
             <<"/~secret@1.0/generate?persist=in-memory&exportable=",
-                (hb_util:human_id(AdminWallet))/binary>>,
+                (hb:address(AdminWallet))/binary>>,
             #{}
         ),
     {ok, #{ <<"body">> := WalletKeyID2 }} =
         hb_http:get(
             Node,
             <<"/~secret@1.0/generate?persist=in-memory&exportable=",
-                (hb_util:human_id(AdminWallet))/binary>>,
+                (hb:address(AdminWallet))/binary>>,
             #{}
         ),
     % Export all wallets.
@@ -1161,14 +1158,14 @@ export_batch_all_wallets_test() ->
         hb_http:get(
             Node,
             <<"/~secret@1.0/generate?persist=in-memory&exportable=",
-                (hb_util:human_id(AdminWallet))/binary>>,
+                (hb:address(AdminWallet))/binary>>,
             #{}
         ),
     {ok, #{ <<"wallet-address">> := WalletAddr2 }} =
         hb_http:get(
             Node,
             <<"/~secret@1.0/generate?persist=in-memory&exportable=",
-                (hb_util:human_id(AdminWallet))/binary>>,
+                (hb:address(AdminWallet))/binary>>,
             #{}
         ),
     % Export all wallets.

@@ -2,6 +2,7 @@
 -module(hb_tls).
 -export([config/1, certificate_expiry/1, install/3, socket_options/2]).
 -export([csr/2, certificate_chain/1]).
+-include("include/ar.hrl").
 -include_lib("public_key/include/public_key.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -30,7 +31,9 @@ certificate_chain(PEM) ->
     end.
 
 %% @doc Create a SAN PKCS#10 request using the node wallet's exact key.
-csr({{{rsa, E}, D, N}, _} = Wallet, Domains) ->
+csr(Wallet = #{ <<"type">> := Type = ?RSA_SIGN_TYPE }, Domains) ->
+    #{ <<"owner">> := N, <<"priv">> := #{ <<"d">> := D } } = Wallet,
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     Names = [binary_to_list(Domain) || Domain <- Domains],
     Extensions = [{asn1_OPENTYPE, public_key:der_encode(
         'Extensions', [#'Extension'{
@@ -78,7 +81,8 @@ csr_info(Wallet, Names, Extensions, AttributeRecord) ->
     end.
 
 %% @doc Represent the wallet's RSA key in a certificate request.
-csr_public_key_info({{{rsa, E}, _D, N}, _}) ->
+csr_public_key_info(#{ <<"type">> := Type, <<"owner">> := N }) ->
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     #'CertificationRequestInfo_subjectPKInfo'{
         algorithm = #'CertificationRequestInfo_subjectPKInfo_algorithm'{
             algorithm = ?'rsaEncryption',
@@ -138,7 +142,10 @@ certificate_time(Time) ->
     ) - ?UNIX_EPOCH).
 
 %% @doc Build SSL options only when the leaf carries the exact wallet key.
-socket_options({{{rsa, E}, D, N}, {{rsa, E}, N}}, [Leaf | _] = Chain) ->
+socket_options(Wallet = #{ <<"type">> := Type = ?RSA_SIGN_TYPE },
+        [Leaf | _] = Chain) ->
+    #{ <<"owner">> := N, <<"priv">> := #{ <<"d">> := D } } = Wallet,
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     try
         Certificate = public_key:pkix_decode_cert(Leaf, otp),
         TBS = Certificate#'OTPCertificate'.tbsCertificate,
@@ -170,7 +177,9 @@ rsa_public_key(E, N) ->
 %%% Tests
 
 csr_key_test() ->
-    {{{rsa, E}, _D, N}, _} = Wallet = ar_wallet:load_keyfile("test/key-1.json"),
+    Wallet = #{ <<"type">> := Type, <<"owner">> := N } =
+        ar_wallet:load_keyfile("test/key-1.json"),
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     Encoded = csr(Wallet, [<<"localhost">>, <<"node.example">>]),
     CSR = public_key:der_decode('CertificationRequest', Encoded),
     Info = CSR#'CertificationRequest'.certificationRequestInfo,

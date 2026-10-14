@@ -739,7 +739,7 @@ commitment_identity_test() ->
 %% signer. A commitment that uses the key as its secret is made by its own
 %% `hmac:secret:' committer, not by the key's address.
 public_key_hmac_is_not_authority_test() ->
-    {_, {_, Pub}} = ar_wallet:new(),
+    #{ <<"owner">> := Pub } = ar_wallet:new(),
     Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
     ID = hb_util:secret_key_to_committer(Pub),
     Committed = hb_message:commit(
@@ -766,11 +766,11 @@ rsa_minimum_modulus_test() ->
             {[_, Pub], [_, Pub, Priv | _]} = crypto:generate_key(rsa, {Bits, 65537}),
             lists:foreach(
                 fun(Key) ->
-                    Wallet = {{{rsa, 65537}, Priv, Key}, {{rsa, 65537}, Key}},
+                    Wallet = ar_wallet:new({rsa, 65537}, Priv, Key),
                     Opts = #{ <<"priv-wallet">> => Wallet },
                     Data = <<"rsa-size">>,
                     Signature = ar_wallet:sign(Wallet, Data),
-                    ?assert(ar_wallet:verify({{rsa, 65537}, Key}, Data, Signature)),
+                    ?assert(ar_wallet:verify(Wallet, Data, Signature)),
                     Signed = hb_message:commit(#{ <<"body">> => Data }, Opts),
                     ?assertEqual(Bits >= 2048, hb_message:verify(Signed, all, Opts))
                 end,

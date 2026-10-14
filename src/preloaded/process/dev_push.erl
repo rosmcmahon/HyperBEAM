@@ -990,9 +990,9 @@ test_push_as_identity() ->
     % Create a new identity for the scheduler.
     DefaultWallet = hb:wallet(),
     SchedulingWallet = ar_wallet:new(),
-    SchedulingID = hb_util:human_id(SchedulingWallet),
+    SchedulingID = hb:address(SchedulingWallet),
     ComputeWallet = ar_wallet:new(),
-    ComputeID = hb_util:human_id(ComputeWallet),
+    ComputeID = hb:address(ComputeWallet),
     TestStore = [hb_test_utils:test_store(hb_store_lmdb)],
     Opts = #{
         <<"priv-wallet">> => DefaultWallet,
@@ -1319,8 +1319,8 @@ test_remote_routed_push() ->
     SetAuthoritiesCommand =
         <<
             "ao.authorities = { ",
-                "\"", (hb_util:human_id(N1Wallet))/binary, "\",",
-                "\"", (hb_util:human_id(N2Wallet))/binary, "\"",
+                "\"", (hb:address(N1Wallet))/binary, "\",",
+                "\"", (hb:address(N2Wallet))/binary, "\"",
             " }; ",
             "ao.addAssignable('foobar', function (msg) return true end); "
             "ao.isAssignable = function(m) return true end"
@@ -1397,8 +1397,8 @@ test_cron_depth_zero_push() ->
     ReadOnlyShared = SharedStore#{ <<"access">> => [<<"read">>] },
     Wallet1 = ar_wallet:new(),
     Wallet2 = ar_wallet:new(),
-    Address1 = hb_util:human_id(Wallet1),
-    Address2 = hb_util:human_id(Wallet2),
+    Address1 = hb:address(Wallet1),
+    Address2 = hb:address(Wallet2),
     UserWallet = ar_wallet:new(),
     Opts = #{
         <<"priv-wallet">> => UserWallet,

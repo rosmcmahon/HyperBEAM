@@ -615,7 +615,7 @@ chained_preprocess_test() ->
     % Start a node with the `~http-auth@1.0' device as the secret-provider, with
     % a router chained afterwards in the request hook.
     RelayWallet = ar_wallet:new(),
-    RelayAddress = hb_util:human_id(RelayWallet),
+    RelayAddress = hb:address(RelayWallet),
     RelayURL = hb_http_server:start_node(#{ <<"priv-wallet">> => RelayWallet }),
     Node =
         hb_http_server:start_node(

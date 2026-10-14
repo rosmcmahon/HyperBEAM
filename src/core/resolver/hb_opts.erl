@@ -14,7 +14,7 @@
 %%% with a refusal to execute.
 -module(hb_opts).
 -export([get/1, get/2, get/3, as/2, identities/1, load/1, load/2, load_bin/2]).
--export([address/1, address/2, committer/1, committer/2, wallet_committer/1]).
+-export([address/1, address/2, committer/1, committer/2]).
 -export([default_message/0, default_message_with_env/0, mimic_default_types/3]).
 -export([ensure_node_history/2]).
 -export([check_required_opts/2]).
@@ -834,13 +834,13 @@ address(Opts) -> address(undefined, Opts).
 address(Default, Opts) ->
     case ?MODULE:get(priv_wallet, ?MODULE:get(address, Default, Opts), Opts) of
         undefined -> undefined;
-        WalletOrAddress -> hb_util:human_id(WalletOrAddress)
+        Address when is_binary(Address) -> hb_util:human_id(Address);
+        Wallet -> hb_util:human_id(ar_wallet:to_address(Wallet))
     end.
 
-%% @doc Return the URI of the committer of the `priv-wallet' in `Opts'.
-%% Request execution `Opts' hold no wallet, so for them we return the
-%% `committer' option. If neither is set, we return the URI of the committer
-%% of `Default'.
+%% @doc Return the URI of the `priv-wallet' in `Opts'. Request execution `Opts'
+%% hold no wallet, so for them we return the `committer' option. If neither is
+%% set, we return the URI of `Default'.
 committer(Opts) -> committer(undefined, Opts).
 committer(Default, Opts) ->
     Given = ?MODULE:get(committer, Default, Opts),
@@ -850,20 +850,10 @@ committer(Default, Opts) ->
         Wallet -> uri(Wallet, Opts)
     end.
 
-%% @doc Generate the `did-pkh@1.0' committer of a wallet's key. The committer
-%% holds the wallet in its `priv' message, so that it can sign.
-wallet_committer(Wallet = {{KeyType, _, Owner}, _}) ->
-    #{
-        <<"device">> => <<"did-pkh@1.0">>,
-        <<"owner">> => Owner,
-        <<"type">> => ar_tx:serialize_sig_type(KeyType),
-        <<"priv">> => #{ <<"wallet">> => Wallet }
-    }.
-
-%% @doc Return the URI of the committer of a wallet.
+%% @doc Return the URI of a wallet.
 uri(Wallet, Opts) ->
     ToURI = #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
-    {ok, URI} = hb_ao:raw(wallet_committer(Wallet), ToURI, Opts),
+    {ok, URI} = hb_ao:raw(Wallet, ToURI, Opts),
     URI.
 
 %% @doc Find all known IDs and their sub-options from the `priv_ids' map. Allows
@@ -893,8 +883,8 @@ identities(Default, Opts) ->
         maps:map(
             fun(_NameOrID, SubOpts) ->
                 case maps:find(<<"priv-wallet">>, SubOpts) of
-                    {ok, Wallet} ->
-                        SubOpts#{ <<"address">> => hb_util:human_id(Wallet) };
+                    {ok, _} ->
+                        SubOpts#{ <<"address">> => address(SubOpts) };
                     error -> SubOpts
                 end
             end,

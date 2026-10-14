@@ -868,8 +868,8 @@ get_opts(NodeMsg) ->
     end.
 
 %% @doc Return `Opts' with the node message's key material if they hold no
-%% wallet, as request execution `Opts' do not. The node's committer is made
-%% from this key material.
+%% wallet, as request execution `Opts' do not. The node's `priv-wallet' is its
+%% committer.
 with_node_committer(Opts) ->
     case hb_opts:get(priv_wallet, undefined, Opts#{ <<"only">> => local }) of
         undefined ->

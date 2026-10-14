@@ -632,9 +632,9 @@ relay_schedule_ans104_test() ->
     RelayWallet = ar_wallet:new(),
     ?event(debug_test,
         {wallets,
-            {scheduler, hb_util:human_id(SchedulerWallet)},
-            {compute, hb_util:human_id(ComputeWallet)},
-            {relay, hb_util:human_id(RelayWallet)}
+            {scheduler, hb:address(SchedulerWallet)},
+            {compute, hb:address(ComputeWallet)},
+            {relay, hb:address(RelayWallet)}
         }
     ),
     Scheduler =
@@ -704,7 +704,7 @@ relay_schedule_ans104_test() ->
                         <<"strategy">> => <<"Nearest">>,
                         <<"nodes">> => [
                             #{
-                                <<"wallet">> => hb_util:human_id(SchedulerWallet),
+                                <<"wallet">> => hb:address(SchedulerWallet),
                                 <<"prefix">> => Scheduler
                             }
                         ]
@@ -714,7 +714,7 @@ relay_schedule_ans104_test() ->
                         <<"strategy">> => <<"Nearest">>,
                         <<"nodes">> => [
                             #{
-                                <<"wallet">> => hb_util:human_id(ComputeWallet),
+                                <<"wallet">> => hb:address(ComputeWallet),
                                 <<"prefix">> => Compute
                             }
                         ]
@@ -731,9 +731,9 @@ relay_schedule_ans104_test() ->
         }),
     ?event(debug_test,
         {nodes,
-            {scheduler, {url, Scheduler}, {wallet, hb_util:human_id(SchedulerWallet)}},
-            {compute, {url, Compute}, {wallet, hb_util:human_id(ComputeWallet)}},
-            {relay, {url, Relay}, {wallet, hb_util:human_id(RelayWallet)}}
+            {scheduler, {url, Scheduler}, {wallet, hb:address(SchedulerWallet)}},
+            {compute, {url, Compute}, {wallet, hb:address(ComputeWallet)}},
+            {relay, {url, Relay}, {wallet, hb:address(RelayWallet)}}
         }
     ),
     ClientOpts =
@@ -749,7 +749,7 @@ relay_schedule_ans104_test() ->
                 <<"device">> => <<"process@1.0">>,
                 <<"execution-device">> => <<"test-device@1.0">>,
                 <<"push-device">> => <<"push@1.0">>,
-                <<"scheduler">> => hb_util:human_id(SchedulerWallet),
+                <<"scheduler">> => hb:address(SchedulerWallet),
                 <<"scheduler-device">> => <<"scheduler@1.0">>,
                 <<"type">> => <<"Process">>,
                 <<"module">> => <<"URgYpPQzvxxfYQtjrIQ116bl3YBfcImo3JEnNo8Hlrk">>
