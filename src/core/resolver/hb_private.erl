@@ -134,7 +134,14 @@ opts(Opts) ->
 %% non-message terms to ensure that `priv` elements can _never_ pass through.
 reset(Msg) when is_map(Msg) ->
     maps:map(
-        fun(_Key, Val) -> reset(Val) end,
+        fun(<<"commitments">>, Commitments) when is_map(Commitments) ->
+            % The keys of `commitments' are IDs: only its values are reset.
+            maps:map(
+                fun(_ID, Commitment) -> reset(Commitment) end,
+                Commitments
+            );
+           (_Key, Val) -> reset(Val)
+        end,
         maps:without(
             lists:filter(fun is_private/1, maps:keys(Msg)),
             Msg
@@ -167,7 +174,12 @@ get_private_key_test() ->
     {ok, [<<"a">>]} = hb_ao:resolve(M1, <<"keys">>, #{}),
     ?assertEqual(2, get(<<"b">>, M1, #{})),
     {error, _} = hb_ao:resolve(M1, <<"priv/a">>, #{}),
-    {error, _} = hb_ao:resolve(M1, <<"priv">>, #{}).
+    {error, _} = hb_ao:resolve(M1, <<"priv">>, #{}),
+    % `reset/1' keeps a commitment whose ID starts with `priv', in any case.
+    M2 =
+        #{<<"commitments">> =>
+            #{<<"prIv0NzMyShQBtm7vqDkulync-fOFCWLsAzqCVwcEH0">> => #{}}},
+    ?assertEqual(M2, reset(M2)).
 
 get_deep_key_test() ->
     M1 = #{<<"a">> => 1, <<"priv">> => #{<<"b">> => #{<<"c">> => 3}}},
