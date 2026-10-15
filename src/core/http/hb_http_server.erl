@@ -74,6 +74,14 @@
 %%% The router uses an `Opts' message as its Cowboy initial state, 
 %%% such that changing it on start of the router server allows for
 %%% the execution parameters of all downstream requests to be controlled.
+%%%
+%%% A node with `http-proxy-protocol' set to `true' requires each connection to
+%%% start with a PROXY protocol header, and takes the caller's address from it.
+%%% Only a node that is reached through a trusted proxy should set it. Without
+%%% it, the caller's address is the address of the socket's peer. A node behind
+%%% an HTTP proxy, which sends the caller's address only as a header, lists the
+%%% proxy's address in `http-trusted-proxies': a request from a listed address
+%%% takes the caller's address from its `x-real-ip' header.
 -module(hb_http_server).
 -export([start/0, start/1, start_application/0, allowed_methods/2, init/2]).
 -export([set_opts/1, set_opts/2, get_opts/0, get_opts/1, with_node_committer/1]).
@@ -463,6 +471,7 @@ challenge_node(ACME, ServerID, NodeMsg) ->
         (hb_private:reset(NodeMsg))#{
             <<"port">> => hb_maps:get(<<"http-port">>, ACME, 80, NodeMsg),
             <<"force-signed">> => false,
+            <<"http-proxy-protocol">> => false,
             <<"http-server">> => ChallengeRef,
             <<"on">> => #{
                 <<"request">> => #{ <<"device">> => <<"tls@1.0">> }
@@ -479,6 +488,7 @@ listener_protocol_options(ServerID, NodeMsg) ->
         stream_handlers => [cowboy_stream_h],
         max_connections => infinity,
         idle_timeout => hb_opts:get(idle_timeout, 300000, NodeMsg),
+        proxy_header => hb_opts:get(http_proxy_protocol, false, NodeMsg),
         % `httpsig@1.0' sends a header for each key of a message whose value
         % is at most 4096 bytes. Percent-encoding can triple the length of
         % its name, escaping can double the length of its value, and the
@@ -1577,7 +1587,11 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
     WithPeer = case hb_maps:get(<<"ao-peer-port">>, NormalBody, undefined, Opts) of
         undefined -> NormalBody;
         P2PPort ->
-            Peer = <<RealIP/binary, ":", (hb_util:bin(P2PPort))/binary>>,
+            Address = case binary:match(RealIP, <<":">>) of
+                nomatch -> RealIP;
+                _ -> <<"[", RealIP/binary, "]">>
+            end,
+            Peer = <<Address/binary, ":", (hb_util:bin(P2PPort))/binary>>,
             (hb_message:without_unless_signed(<<"ao-peer-port">>, NormalBody, Opts))#{
                 <<"ao-peer">> => Peer
             }
@@ -1592,18 +1606,17 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
     WithDevice#{<<"host">> => Host}.
 
 
-%% @doc Determine the caller, honoring the `x-real-ip' header if present.
-real_ip(Req = #{ headers := RawHeaders }, Opts) ->
-    case hb_maps:get(<<"x-real-ip">>, RawHeaders, undefined, Opts) of
-        undefined ->
-            {{A, B, C, D}, _} = cowboy_req:peer(Req),
-            hb_util:bin(
-                io_lib:format(
-                    "~b.~b.~b.~b",
-                    [A, B, C, D]
-                )
-            );
-        IP -> IP
+%% @doc Return the caller's IP address: the source address of the connection's
+%% PROXY header, if the listener reads one; else the `x-real-ip' header, if the
+%% socket's peer is in `http-trusted-proxies'; else the socket's peer address.
+real_ip(Req, Opts) ->
+    {PeerIP, _} = cowboy_req:peer(Req),
+    Peer = hb_util:bin(inet:ntoa(PeerIP)),
+    Trusted = hb_opts:get(http_trusted_proxies, [], Opts),
+    case {maps:get(proxy_header, Req, #{}), lists:member(Peer, Trusted)} of
+        {#{ src_address := Source }, _} -> hb_util:bin(inet:ntoa(Source));
+        {_, true} -> cowboy_req:header(<<"x-real-ip">>, Req, Peer);
+        {_, false} -> Peer
     end.
 
 %% @doc Find the hostname from either the inbound TABM request form,
@@ -1750,6 +1763,61 @@ tls_http3_rejected_before_start_test() ->
             <<"protocol">> => http3,
             <<"tls">> => #{}
         })
+    ).
+
+%% @doc Check that a listener reads a PROXY header only if the node sets
+%% `http-proxy-protocol', and that the ACME challenge listener never does.
+proxy_protocol_options_test() ->
+    ?assertEqual(false,
+        maps:get(proxy_header, listener_protocol_options(test, #{}))),
+    Opts = #{ <<"http-proxy-protocol">> => true },
+    ?assertEqual(true,
+        maps:get(proxy_header, listener_protocol_options(test, Opts))),
+    Challenge = challenge_node(#{}, test, Opts),
+    ?assertEqual(false,
+        maps:get(proxy_header, listener_protocol_options(test, Challenge))).
+
+%% @doc Check that the caller's IP is the PROXY header's source address or the
+%% socket's peer address, never an `x-real-ip' header, and that `ao-peer'
+%% gives an IPv6 address in brackets.
+caller_address_test() ->
+    Req = #{
+        method => <<"GET">>, path => <<"/body">>, qs => <<>>,
+        scheme => <<"http">>, host => <<"localhost">>, port => 80,
+        peer => {{127, 0, 0, 1}, 1234},
+        headers => #{
+            <<"x-real-ip">> => <<"198.51.100.99">>,
+            <<"ao-peer-port">> => <<"12345">>
+        }
+    },
+    lists:foreach(
+        fun({Request, IP, Peer}) ->
+            Msg = req_to_tabm_singleton(Request, <<>>, #{}),
+            ?assertEqual(IP, hb_private:get(<<"ip">>, Msg, #{})),
+            ?assertEqual(Peer, hb_maps:get(<<"ao-peer">>, Msg))
+        end,
+        [
+            {Req, <<"127.0.0.1">>, <<"127.0.0.1:12345">>},
+            {Req#{ proxy_header => #{ command => local } },
+                <<"127.0.0.1">>, <<"127.0.0.1:12345">>},
+            {Req#{ proxy_header => #{ src_address => {192, 0, 2, 1} } },
+                <<"192.0.2.1">>, <<"192.0.2.1:12345">>},
+            {Req#{ proxy_header => #{
+                src_address => {16#2001, 16#db8, 0, 0, 0, 0, 0, 1}
+            } }, <<"2001:db8::1">>, <<"[2001:db8::1]:12345">>},
+            {Req#{ peer => {{0, 0, 0, 0, 0, 0, 0, 1}, 1234} },
+                <<"::1">>, <<"[::1]:12345">>}
+        ]
+    ),
+    % The `x-real-ip' of a request from a listed proxy is the caller's address.
+    Trusted = #{ <<"http-trusted-proxies">> => [<<"127.0.0.1">>] },
+    ?assertEqual(
+        <<"198.51.100.99">>,
+        hb_private:get(
+            <<"ip">>,
+            req_to_tabm_singleton(Req, <<>>, Trusted),
+            #{}
+        )
     ).
 
 restart_server_test() ->
