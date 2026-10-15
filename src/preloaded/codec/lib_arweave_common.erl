@@ -2,7 +2,7 @@
 -module(lib_arweave_common).
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/3]).
--export([sign/4]).
+-export([sign/4, order_tags/3]).
 -export([verify_committed_keys/5]).
 -export([add_commitment/4]).
 -export([with_commitments/8]).

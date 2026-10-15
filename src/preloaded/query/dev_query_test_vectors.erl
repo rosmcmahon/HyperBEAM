@@ -1585,10 +1585,12 @@ transaction_tags_exclude_fields_test_parallel() ->
                         Actual
                     );
                 false ->
+                    % The query gives the tags in the order they were signed.
                     ?assertEqual(
-                        lists:sort([#{ <<"name">> => Name, <<"value">> => Value }
-                            || {Name, Value} <- Expected]),
-                        lists:sort(Actual)
+                        [#{ <<"name">> => Name, <<"value">> => Value }
+                            || {Name, Value} <- Tags,
+                                lists:member({Name, Value}, Expected)],
+                        Actual
                     )
             end
         end,

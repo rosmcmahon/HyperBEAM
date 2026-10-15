@@ -236,24 +236,28 @@ query(Msg, <<"tags">>, Args, Opts) ->
         {ok, [{ok, Tag} || Tag <- hb_util:message_to_ordered_list(Tags, Opts)]}
     else
         _ ->
-            Fields = case Native of
-                [C | _] ->
-                    [Key || <<"field-", Key/binary>> <- hb_maps:keys(C, Opts)];
-                [] -> []
-            end,
-            BundleTags = case Native of
-                [BundleCommitment | _] ->
-                    hb_maps:with(?BUNDLE_KEYS, BundleCommitment, Opts);
-                [] -> #{}
-            end,
-            dev_query_graphql:execute(
-                #{opts => Opts},
-                hb_maps:merge(
-                    hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
-                    BundleTags, Opts),
-                <<"keys">>,
-                Args
-            )
+            Comm = case Native of [C | _] -> C; [] -> #{} end,
+            Fields = [Key || <<"field-", Key/binary>> <- hb_maps:keys(Comm, Opts)],
+            BundleTags = hb_maps:with(?BUNDLE_KEYS, Comm, Opts),
+            {ok, Keys} =
+                dev_query_graphql:execute(
+                    #{opts => Opts},
+                    hb_maps:merge(
+                        hb_maps:without(
+                            Fields, hb_message:uncommitted(Msg, Opts), Opts),
+                        BundleTags, Opts),
+                    <<"keys">>,
+                    Args
+                ),
+            % We give the tags in the order of the commitment's `committed'
+            % keys, because the item's signature covers them in that order.
+            Ordered =
+                lib_arweave_common:order_tags(
+                    [{Name, Tag} || Tag = {ok, #{ <<"name">> := Name }} <- Keys],
+                    Comm,
+                    Opts
+                ),
+            {ok, [Tag || {_, Tag} <- Ordered]}
     end;
 query(Msg, <<"signature">>, _Args, Opts) ->
     % Return the signature of the transaction.
