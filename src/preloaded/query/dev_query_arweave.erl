@@ -282,7 +282,12 @@ query(Msg, <<"owner">>, _Args, Opts) ->
                     {ok, #{
                         <<"address">> => hb_util:committer_address(Committer),
                         <<"key">> =>
-                            hb_maps:get(<<"owner">>, Commitment, null, Opts)
+                            hb_maps:get(
+                                <<"public-key">>,
+                                Commitment,
+                                hb_maps:get(<<"owner">>, Commitment, null, Opts),
+                                Opts
+                            )
                     }}
             end
     end;

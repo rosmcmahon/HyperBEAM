@@ -138,7 +138,15 @@ message_to_json_struct(RawMsg, Features, Opts) ->
                     hb_message:commitment(Signer, RawMsg, Opts),
                 CommitmentSignature =
                     hb_ao:get(<<"signature">>, Commitment, <<>>, Opts),
-                CommitmentKey = hb_ao:get(<<"owner">>, Commitment, <<>>, Opts),
+                CommitmentKey =
+                    hb_ao:get_first(
+                        [
+                            {Commitment, <<"public-key">>},
+                            {Commitment, <<"owner">>}
+                        ],
+                        <<>>,
+                        Opts
+                    ),
                 case lists:member(owner_as_address, Features) of
                     true -> 
                         {
@@ -151,6 +159,7 @@ message_to_json_struct(RawMsg, Features, Opts) ->
                             hb_ao:get_first(
                                 [
                                     {Commitment, <<"key">>},
+                                    {Commitment, <<"public-key">>},
                                     {Commitment, <<"owner">>}
                                 ],
                                 no_signing_public_key_found_in_commitment,

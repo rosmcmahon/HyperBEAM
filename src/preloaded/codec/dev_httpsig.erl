@@ -110,9 +110,10 @@ do_verify(Base, Req, Opts) ->
     }.
 
 %% @doc Check that a commitment uses one of this device's algorithms. An
-%% `rsa-pss-sha512' commitment must also have a key of at least 2048 bits.
-strong_key(#{ <<"type">> := <<"rsa-pss-sha512">>, <<"owner">> := Owner }) ->
-    binary:decode_unsigned(hb_util:decode(Owner)) >= (1 bsl 2047);
+%% `rsa-pss-sha512' commitment must also have a `public-key' of at least 2048
+%% bits.
+strong_key(#{ <<"type">> := <<"rsa-pss-sha512">>, <<"public-key">> := Key }) ->
+    binary:decode_unsigned(hb_util:decode(Key)) >= (1 bsl 2047);
 strong_key(#{ <<"type">> := <<"hmac-sha256">> }) ->
     true;
 strong_key(_Req) ->
@@ -127,18 +128,22 @@ committer_verifies(KeyID, SigBase, Req, Opts) ->
     case committer(#{ <<"committer">> => KeyID }, Opts) of
         {ok, Committer, KeyID} ->
             % The signature and the public key are base64url encoded in a
-            % commitment, so we decode them before verification.
+            % commitment, so we decode them before verification. The
+            % committer checks the public key as the `owner' of the signature.
             Raw =
-                maps:map(
-                    fun(_Key, Value) -> hb_util:decode(Value) end,
-                    maps:with([<<"signature">>, <<"owner">>], Req)
-                ),
+                case Req of
+                    #{ <<"public-key">> := Key } ->
+                        #{ <<"owner">> => hb_util:decode(Key) };
+                    _ -> #{}
+                end,
             {ok, Verified} =
                 hb_ao:raw(
                     hb_private:set_priv(Committer, hb_private:from_message(Req)),
                     (maps:merge(Req, Raw))#{
                         <<"path">> => <<"verify">>,
-                        <<"body">> => SigBase
+                        <<"body">> => SigBase,
+                        <<"signature">> =>
+                            hb_util:decode(maps:get(<<"signature">>, Req))
                     },
                     Opts
                 ),
@@ -201,7 +206,7 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
         {generating_rsa_pss_sha512_commitment, {msg, MsgToSign}, {req, Req}}
     ),
     Opts = opts(RawOpts),
-    % Find the committer of the request. Its public key, the `owner', is a
+    % Find the committer of the request. Its public key is the `public-key'
     % parameter of the signature.
     {CommitterMsg, KeyID} =
         case committer(Req, Opts) of
@@ -225,7 +230,7 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
                 <<"type">> => <<"rsa-pss-sha512">>,
                 <<"keyid">> => KeyID,
                 <<"committer">> => KeyID,
-                <<"owner">> => hb_util:encode(Owner),
+                <<"public-key">> => hb_util:encode(Owner),
                 <<"committed">> => ToCommit
             },
             MsgToSign,
@@ -769,18 +774,36 @@ commitment_identity_test() ->
             }
         )
     ),
-    % A signed commitment is named by the `did:pkh:' URI of its key, and it
-    % carries the key as its `owner'.
+    % The `keyid' of a signed commitment is the `did:pkh:' URI of its key. The
+    % commitment carries the key as its `public-key', and has no `owner'.
     Committer = hb_test_utils:committer(maps:get(<<"priv-wallet">>, Opts)),
+    [SignedCommitment] = maps:values(maps:get(<<"commitments">>, Signed)),
     ?assertMatch(
-        [
-            #{
-                <<"keyid">> := Committer,
-                <<"committer">> := Committer,
-                <<"owner">> := _
-            }
-        ],
-        maps:values(maps:get(<<"commitments">>, Signed))
+        #{
+            <<"keyid">> := Committer,
+            <<"committer">> := Committer,
+            <<"public-key">> := _
+        },
+        SignedCommitment
+    ),
+    ?assertNot(maps:is_key(<<"owner">>, SignedCommitment)),
+    % A signed commitment whose `public-key' is not the key of the committer in
+    % its `keyid' does not verify.
+    #{ <<"owner">> := OtherKey } = ar_wallet:new(),
+    ?assertNot(
+        hb_message:verify(
+            Signed#{
+                <<"commitments">> =>
+                    maps:map(
+                        fun(_, C) ->
+                            C#{ <<"public-key">> => hb_util:encode(OtherKey) }
+                        end,
+                        maps:get(<<"commitments">>, Signed)
+                    )
+            },
+            all,
+            Opts
+        )
     ),
     lists:foreach(
         fun(Committed) ->
