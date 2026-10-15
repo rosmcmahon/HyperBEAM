@@ -810,7 +810,7 @@ ensure_loaded(Base, Req, Opts) ->
             LoadRes =
                 lib_process_cache:latest(
                     ProcID,
-                    [<<"snapshot+link">>],
+                    [<<"snapshot">>],
                     TargetSlot,
                     Opts
                 ),

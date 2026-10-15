@@ -62,12 +62,15 @@ info() ->
     }.
 
 %% @doc General utility functions that are available to other modules.
-parse_schedulers(SchedLoc) when is_list(SchedLoc) -> SchedLoc;
+parse_schedulers(SchedLoc) when is_list(SchedLoc) ->
+    lists:map(fun hb_util:committer/1, SchedLoc);
 parse_schedulers(SchedLoc) when is_binary(SchedLoc) ->
-    binary:split(
-        binary:replace(SchedLoc, <<"\"">>, <<"">>, [global]),
-        <<",">>,
-        [global, trim_all]
+    parse_schedulers(
+        binary:split(
+            binary:replace(SchedLoc, <<"\"">>, <<"">>, [global]),
+            <<",">>,
+            [global, trim_all]
+        )
     ).
 
 %% @doc The default handler for the scheduler device.
@@ -366,7 +369,7 @@ status(_M1, _M2, _Opts) ->
     Wallet = dev_scheduler_registry:get_wallet(),
     {ok,
         #{
-            <<"address">> => hb_util:id(ar_wallet:to_address(Wallet)),
+            <<"address">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
             <<"processes">> =>
                 lists:map(
                     fun hb_util:id/1,
@@ -766,7 +769,7 @@ slot(M1, M2, Opts) ->
                 <<"block-height">> => Height,
                 <<"block-hash">> => Hash,
                 <<"cache-control">> => <<"no-store">>,
-                <<"addresses">> => lists:map(fun hb_util:human_id/1, Wallets)
+                <<"addresses">> => lists:map(fun hb:address/1, Wallets)
             }};
         {redirect, Redirect} ->
             case hb_opts:get(scheduler_follow_redirects, true, Opts) of

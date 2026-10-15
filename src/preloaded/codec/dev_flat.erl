@@ -67,7 +67,7 @@ to(Bin, _, _Opts) when is_binary(Bin) -> {ok, Bin};
 to(List, Req, Opts) when is_list(List) ->
     to(
         (hb_util:list_to_numbered_message(List))#{
-            <<"ao-types">> => <<".=\"list\"">>
+            <<"ao-types">> => <<"list=(\".\")">>
         },
         Req,
         Opts

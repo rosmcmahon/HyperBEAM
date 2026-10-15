@@ -139,7 +139,7 @@ node(Base, RawReq, RawOpts) ->
         Opts
     ),
     Signers = hb_message:signers(OnlyCommitted, Opts),
-    Self = hb_opts:address(hb:wallet(), Opts),
+    Self = hb_opts:committer(hb:wallet(), Opts),
     IsOperator = lists:member(Self, Signers),
     ExistingNonce = latest_known_nonce(Self, Opts),
     RequestedNonce = hb_maps:get(<<"nonce">>, OnlyCommitted, not_found, Opts),
@@ -477,7 +477,7 @@ unsigned_get_node_is_idempotent_test() ->
     Node = hb_http_server:start_node(Opts),
     {ok, FirstRes} = hb_http:get(Node, <<"/~location@1.0/node">>, #{}),
     FirstLocation = hb_ao:get(<<"body">>, FirstRes, FirstRes, #{}),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     {ok, CachedAfterFirst} = dev_location_cache:read(Address, Opts),
     timer:sleep(10),
     {ok, SecondRes} = hb_http:get(Node, <<"/~location@1.0/node">>, #{}),

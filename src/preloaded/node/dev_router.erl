@@ -24,6 +24,7 @@
 %%%                map or a path regex.
 %%% </pre>
 -module(dev_router).
+-device_libraries([lib_meta]).
 -export([info/1, info/3, routes/3, route/2, route/3, preprocess/3]).
 -export([match/3, register/3]).
 -export([field_distance/2]).
@@ -154,18 +155,13 @@ routes(M1, M2, Opts) ->
             case hb_maps:get(<<"registrar">>, RouterOpts, not_found, Opts) of
                 not_found ->
                     % There is no registrar; register if and only if the message
-                    % is signed by an authorized operator.
+                    % is signed by an authorized operator. The new route holds
+                    % only the keys that the route owner signed.
                     ?event(debug_route_reg, no_registrar),
                     Owner = hb_opts:get(operator, undefined, Opts),
                     RouteOwners = hb_opts:get(route_owners, [Owner], Opts),
-                    Signers = hb_message:signers(M2, Opts),
-                    IsTrusted =
-                        lists:any(
-                            fun(Signer) -> lists:member(Signer, Signers) end,
-                            RouteOwners
-                        ),
-                    case IsTrusted of
-                        true ->
+                    case lib_meta:authorized(RouteOwners, M2, Opts) of
+                        {ok, Route} ->
                             % Minimize the work performed by AO-Core to make the sort
                             % more efficient.
                             SortOpts = Opts#{ <<"hashpath">> => ignore },
@@ -175,11 +171,11 @@ routes(M1, M2, Opts) ->
                                         hb_ao:get(<<"priority">>, X, SortOpts)
                                             < hb_ao:get(<<"priority">>, Y, SortOpts)
                                     end,
-                                    [M2|Routes]
+                                    [Route|Routes]
                                 ),
                             ok = hb_http_server:set_opts(Opts#{ <<"routes">> => NewRoutes }),
                             {ok, <<"Route added.">>};
-                        false -> {error, not_authorized}
+                        {error, _} -> {error, not_authorized}
                     end;
                 Registrar ->
                     % Parse the registrar message and execute the route 
@@ -1343,7 +1339,7 @@ dynamic_router() ->
     LiveProxyOpts = hb_http_server:get_opts(#{ <<"http-server">> => ProxyServerID }),
     ok = hb_http_server:set_opts(LiveProxyOpts#{ <<"on">> => RouterHook }),
     ProxyWalletAddr = hb_util:human_id(ar_wallet:to_address(ProxyWallet)),
-    ExecNodeAddr = hb_util:human_id(ar_wallet:to_address(ExecWallet)),
+    ExecNodeAddr = hb_test_utils:committer(ExecWallet),
     % Ensure that the `~meta@1.0/info/address' response is produced by the
     % proxy wallet.
     ?event(debug_dynrouter,
@@ -1374,7 +1370,7 @@ dynamic_routing_by_performance() ->
     BenchRoutes = 16,
     TestPath = <<"/worker">>,
     % Start the main node for the test, loading the `dynamic-router' script and
-    % the http-monitor to generate performance messages.
+    % the HTTP client receipt hook to generate performance messages.
     {ok, Script} = file:read_file(<<"scripts/dynamic-router.lua">>),
     Node = hb_http_server:start_node(Opts = #{
         <<"relay-http-client">> => gun,
@@ -1405,11 +1401,23 @@ dynamic_routing_by_performance() ->
             }
         },
         % Define the request that should be called in order to record performance
-        % information into the process. The `body' of the `http-monitor' message
-        % is filled with the signed performance report.
-        <<"http-monitor">> => #{
-            <<"method">> => <<"POST">>,
-            <<"path">> => <<"/perf-router~node-process@1.0/schedule">>
+        % information into the process. The hook receives the signed report
+        % in its `body'.
+        <<"on">> => #{
+            <<"http-client-receipt">> => #{
+                <<"device">> => #{
+                    http_client_receipt => fun(_Base, Req, HookOpts) ->
+                        hb_ao:resolve(
+                            Req#{
+                                <<"method">> => <<"POST">>,
+                                <<"path">> =>
+                                    <<"/perf-router~node-process@1.0/schedule">>
+                            },
+                            HookOpts
+                        )
+                    end
+                }
+            }
         }
     }),
     % Start and add a series of nodes with decreasing performance, via lag 
@@ -1846,7 +1854,7 @@ add_route() ->
                     <<"priority">> => 10
                 }
             ],
-            <<"operator">> => hb_util:encode(ar_wallet:to_address(Owner))
+            <<"operator">> => hb_test_utils:committer(Owner)
         }
     ),
     Res =
@@ -1868,7 +1876,26 @@ add_route() ->
     GetRes = hb_http:get(Node, <<"/~router@1.0/routes/2/node">>, #{}),
     ?event({get_res, GetRes}),
     {ok, Recvd} = GetRes,
-    ?assertMatch(<<"new">>, Recvd).
+    ?assertMatch(<<"new">>, Recvd),
+    % A query parameter does not change the route that its owner signed.
+    {ok, _} =
+        hb_http:post(
+            Node,
+            <<"/~router@1.0/routes?node=query">>,
+            hb_message:commit(
+                #{
+                    <<"template">> => <<"/other/path">>,
+                    <<"node">> => <<"signed">>,
+                    <<"priority">> => 20
+                },
+                #{ <<"priv-wallet">> => Owner }
+            ),
+            #{}
+        ),
+    ?assertEqual(
+        {ok, <<"signed">>},
+        hb_http:get(Node, <<"/~router@1.0/routes/3/node">>, #{})
+    ).
 
 %% @doc Test that the `preprocess/3' function re-routes a request to remote
 %% peers via `~relay@1.0', according to the node's routing table.

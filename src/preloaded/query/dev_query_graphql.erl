@@ -360,8 +360,9 @@ message_query(_Obj, _Field, _, _) ->
 %% @doc Submessages as IDs, resolving lazy value or ID holders alone.
 field_value({link, _, #{ <<"lazy">> := true }} = Link, Opts) ->
     [Value] = maps:values(hb_link:normalize(#{ <<"value">> => Link }, discard, Opts)),
-    field_value(Value, Opts);
-field_value({link, ID, _}, _Opts) -> ID;
+    field_value(hb_link:decode(Value), Opts);
+field_value({link, <<"ao:", ID/binary>>, _}, _Opts) when ?IS_ID(ID) -> ID;
+field_value({link, URI, _}, _Opts) -> URI;
 field_value(Value, Opts) when is_map(Value); is_list(Value) ->
     hb_message:id(Value, all, Opts#{ <<"linkify-mode">> => discard });
 field_value(Value, _Opts) -> Value.
@@ -419,7 +420,11 @@ lookup_test() ->
                 execute(#{opts => Opts}, #{ <<"value">> => Value }, <<"keys">>, #{})
             )
         end,
-        [{42, 42}, {Nested, NestedID}, {{link, NestedID, #{}}, NestedID}]
+        [
+            {42, 42},
+            {Nested, NestedID},
+            {{link, <<"ao:", NestedID/binary>>, #{}}, NestedID}
+        ]
     ),
     Node = hb_http_server:start_node(Opts),
     Query =

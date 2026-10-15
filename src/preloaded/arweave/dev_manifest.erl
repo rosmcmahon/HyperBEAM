@@ -160,6 +160,15 @@ load(ID, Opts) when ?IS_ID(ID) ->
             ?event(debug_maybe_cast_manifest, {message_load_failed, {id, ID}}),
             {error, not_found}
     end;
+load(URI, Opts) when is_binary(URI) ->
+    case hb_uri:maybe_from(URI, Opts) of
+        {ok, Msg} when is_map(Msg) -> {ok, Msg};
+        {ok, _} -> skip;
+        {error, not_found} ->
+            ?event(debug_maybe_cast_manifest, {message_load_failed, {uri, URI}}),
+            {error, not_found};
+        Error -> Error
+    end;
 load(Msg, Opts) when ?IS_LINK(Msg) ->
     try load(hb_cache:ensure_loaded(Msg, Opts), Opts)
     catch
@@ -237,7 +246,7 @@ decode_manifest(JSON, Path, Opts) ->
 %% structured) manifest.
 linkify(#{ <<"id">> := ID }, Opts) when is_binary(ID) ->
     LinkOptsBase = (maps:with([<<"store">>], Opts))#{ <<"scope">> => [local, remote]},
-    {link, ID, LinkOptsBase#{ <<"type">> => <<"link">>, <<"lazy">> => false }};
+    {link, <<"ao:", ID/binary>>, LinkOptsBase};
 linkify(Manifest, Opts) when is_map(Manifest) ->
     hb_maps:map(
         fun(_Key, Val) -> linkify(Val, Opts) end,
@@ -312,6 +321,11 @@ resolve_test_parallel() ->
     ?assertMatch(
         {ok, #{ <<"body">> := <<"Page 2">>}}, 
         hb_http:get(Node, << LegacyManifestID/binary, "/nested/page2" >>, Opts)),
+    % A legacy manifest named by an `ao:' URI is cast in the same way.
+    ?assertMatch(
+        {ok, #{ <<"body">> := <<"Page 1">> }},
+        hb_http:get(Node, << "/ao:", LegacyManifestID/binary, "/index" >>, Opts)
+    ),
     ok.
 
 manifest_default_fallback_test_parallel() ->

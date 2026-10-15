@@ -211,11 +211,27 @@ trim_ascii_right(Bin, Len) ->
 %% @doc Collect all IDs found as elements of a given message.
 collect_ids(Msg, Opts) -> lists:usort(collect_ids(Msg, [], Opts)).
 collect_ids(Bin, Acc, _Opts) when ?IS_ID(Bin) -> [hb_util:human_id(Bin) | Acc];
+collect_ids(<<Scheme:2/binary, ":", Rest/binary>>, Acc, _Opts)
+        when Scheme =:= <<"ao">>; Scheme =:= <<"ni">> ->
+    % The binary is an `ao:' URI or a `ni:' name. We percent-decode it as
+    % `hb_singleton' decodes the path of an `ao://' URI, then collect every ID
+    % that it contains, wherever it appears. A URI that cannot be decoded
+    % cannot be read either, so we scan it as it is.
+    Decoded =
+        case catch uri_string:unquote(Rest) of
+            DecodedBin when is_binary(DecodedBin) -> DecodedBin;
+            _ -> Rest
+        end,
+    lists:foldl(
+        fun collect_path_id/2,
+        Acc,
+        re:split(Decoded, <<"[^A-Za-z0-9_-]+">>, [{return, binary}])
+    );
 collect_ids(Bin, Acc, _Opts) when is_binary(Bin) -> Acc;
 collect_ids({as, _, Msg}, Acc, Opts) -> collect_ids(Msg, Acc, Opts);
 collect_ids({resolve, Msgs}, Acc, Opts) -> collect_ids(Msgs, Acc, Opts);
-collect_ids({link, Path, _}, Acc, _Opts) ->
-    collect_path_id(Path, Acc);
+collect_ids({link, Path, _}, Acc, Opts) ->
+    collect_path_id(Path, collect_ids(Path, Acc, Opts));
 collect_ids(Msg, Acc, Opts) when is_map(Msg) ->
     Acc1 = collect_ids(maps:get(<<"path">>, Msg, undefined), Acc, Opts),
     Acc2 = collect_commitment_ids(maps:get(<<"commitments">>, Msg, #{}), Acc1, Opts),
@@ -411,6 +427,24 @@ basic_test() ->
     ?assertMatch(
         {error, #{ <<"status">> := 451 }},
         hb_http:get(Node, <<"/(/", SignedID1/binary, ")/body">>, Opts1)
+    ),
+    % A blocked ID inside an `ao:' URI or a `ni:' name is blocked too, whether
+    % it is given as a path part or as the value of a link.
+    lists:foreach(
+        fun(Req) ->
+            ?assertMatch(
+                {error, #{ <<"status">> := 451 }},
+                hb_http:get(Node, Req, Opts1)
+            )
+        end,
+        [
+            <<"/ao:", SignedID1/binary, "/body">>,
+            <<"/ni:%2f%2f%2fsha-256;", SignedID1/binary>>,
+            #{
+                <<"path">> => <<"/x/body">>,
+                <<"x">> => <<"ao:", SignedID1/binary>>
+            }
+        ]
     ),
     ok.
 

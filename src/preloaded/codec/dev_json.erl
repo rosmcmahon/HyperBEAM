@@ -76,7 +76,7 @@ safe_numbers(List, Opts) when is_list(List) ->
         true ->
             safe_numbers(
                 (hb_util:list_to_numbered_message(List))#{
-                    <<"ao-types">> => <<".=\"list\"">>
+                    <<"ao-types">> => <<"list=(\".\")">>
                 },
                 Opts
             );
@@ -295,7 +295,7 @@ decode_with_atom_test() ->
             {
                 "store-module": "hb_store_fs",
                 "name": "cache-TEST/json-test-store",
-                "ao-types": "store-module=\"atom\""
+                "ao-types": "atom=(\"store-module\")"
             }
         ]
         """>>,

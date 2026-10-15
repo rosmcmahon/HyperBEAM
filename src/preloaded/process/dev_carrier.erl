@@ -115,7 +115,7 @@ compute(Base, Assignment, Opts) ->
 %%
 %% This is a `~stack@1.0' written out by hand, and deliberately so. A process
 %% spawned as an Arweave transaction can only carry flat, scalar tags: the
-%% codec turns a submessage or a list into a `+link' to content that is not on
+%% codec turns a submessage or a list into a link to content that is not on
 %% the weave, so nothing else can read it back. `device-stack' is a list, so a
 %% stack cannot survive the spawn -- but `swap-device' is one word.
 swap(Base, Assignment, Opts) ->
@@ -368,12 +368,12 @@ credit(Base, Address, Amount, Opts) ->
 
 debit(Base, Address, Amount, Opts) -> credit(Base, Address, -Amount, Opts).
 
-%% @doc The single signer of a message. A message with any other number of
-%% signers is not attributable to one party, so it can neither move the unit nor
-%% speak for the name.
+%% @doc Return the Arweave address of the single signer of a message. A
+%% message with any other number of signers is not attributable to one party,
+%% so it can neither move the unit nor speak for the name.
 signer(Body, Opts) ->
     case hb_message:signers(Body, Opts) of
-        [Signer] -> {ok, hb_util:human_id(Signer)};
+        [?ARWEAVE_COMMITTER(Address)] -> {ok, Address};
         _ -> not_found
     end.
 

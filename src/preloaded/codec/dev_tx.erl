@@ -21,9 +21,8 @@ deserialize(#{ <<"body">> := Body }, Req, Opts) ->
 deserialize(Body, Req, Opts) when is_binary(Body) ->
     from(ar_tx:json_struct_to_tx(hb_json:decode(Body)), Req, Opts).
 
-%% @doc Sign a message using the `priv-wallet' key in the options. Supports both
-%% the `hmac-sha256' and `rsa-pss-sha256' algorithms, offering unsigned and
-%% signed commitments.
+%% @doc Sign a message with the committer of the request, or give it an
+%% unsigned commitment.
 -spec commit(#{ _ => _ }, #{ type := binary(), _ => _ }, #{ _ => _ }) ->
     {ok, #{ _ => _ }}.
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
@@ -35,8 +34,7 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
     % Convert the given message to an L1 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
-    Wallet = hb_opts:get(priv_wallet, no_viable_wallet, Opts),
-    Signed = ar_tx:sign(TX, Wallet),
+    Signed = lib_arweave_common:sign(Msg, TX, Req, Opts),
     SignedStructured =
         hb_message:convert(
             Signed,
@@ -88,7 +86,7 @@ do_verify(OnlyWithCommitment, Req, Opts) ->
     ?event({verify, {encoded, {explicit, TX}}}),
     Res =
         tx_verifies(TX, Req, OnlyWithCommitment) andalso
-            lib_arweave_common:verify_identity(TX, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment, Opts) andalso
             lib_arweave_common:verify_committed_keys(
                 ?BASE_FIELDS, TX, fun dev_tx_from:fields/3,
                 OnlyWithCommitment, Opts),
@@ -1535,10 +1533,9 @@ do_signed_tx_roundtrip(UnsignedTX, UnsignedTABM, Commitment, Req) ->
     % TX -> TABM
     TABM = hb_util:ok(from(DeserializedTX, Req, #{})),
     SignedCommitment = Commitment#{
-        <<"committer">> => hb_util:human_id(SignedTX#tx.owner_address),
+        <<"committer">> => hb_test_utils:committer(hb:wallet()),
         <<"signature">> => hb_util:encode(SignedTX#tx.signature),
-        <<"keyid">> =>
-            <<"publickey:", (hb_util:encode(SignedTX#tx.owner))/binary>>
+        <<"owner">> => hb_util:encode(SignedTX#tx.owner)
     },
     SignedTABM = UnsignedTABM#{
         <<"commitments">> => 
@@ -1594,10 +1591,9 @@ do_signed_tabm_roundtrip(UnsignedTX, UnsignedTABM, Commitment, Device, Req) ->
         #{}
     ),
     ExpectedCommitment = Commitment#{
-        <<"committer">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
+        <<"committer">> => hb_test_utils:committer(Wallet),
         <<"signature">> => maps:get(<<"signature">>, SignedCommitment),
-        <<"keyid">> =>
-            <<"publickey:", (hb_util:encode(ar_wallet:to_pubkey(Wallet)))/binary>>
+        <<"owner">> => hb_util:encode(ar_wallet:to_pubkey(Wallet))
     },
     ?event(debug_test, {signed_tabm_roundtrip,
         {expected_commitment, ExpectedCommitment},

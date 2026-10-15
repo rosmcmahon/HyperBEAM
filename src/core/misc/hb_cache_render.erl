@@ -54,15 +54,14 @@ cache_path_to_graph(Store, GraphOpts, RootKeys, Opts) ->
 traverse_store(Store, Path, Parent, Graph, Opts) ->
     % Get the path and check if we've already visited it
     JoinedPath = hb_path:to_binary(Path),
+    Resolved = hb_util:ok(hb_store:resolve(Store, Path, Opts)),
+    % A value that is a link to a message is drawn as the message.
     ResolvedPath =
-        case hb_link:is_link_key(JoinedPath) of
-            true ->
-                ?event({is_link_key, {path, Path}, {res_path, JoinedPath}}),
-                {ok, ResolvedLink} = hb_store:resolve(Store, JoinedPath, Opts),
-                {ok, Link} = hb_store:read(Store, ResolvedLink, Opts),
-                ?event({resolved_link, {read, Link}}),
-                hb_util:ok(hb_store:resolve(Store, Link, Opts));
-            false -> hb_util:ok(hb_store:resolve(Store, Path, Opts))
+        case hb_store:read(Store, Resolved, Opts) of
+            {ok, <<"ao:", ID/binary>>} when ?IS_ID(ID) ->
+                ?event({resolved_link, {path, Path}, {id, ID}}),
+                hb_util:ok(hb_store:resolve(Store, ID, Opts));
+            _ -> Resolved
         end,
     ?event({traverse_store, {path, Path}, {joined_path, JoinedPath}, {resolved_path, ResolvedPath}, {parent, Parent}}),
     % Skip if we've already processed this node
@@ -102,10 +101,6 @@ process_simple_node(_Store, _Key, Parent, ResolvedPath, JoinedPath, Graph, Opts)
     end.
 
 %% @doc Process a composite (directory) node
-process_composite_node(_Store, <<"data">>, _Parent, _ResolvedPath, _JoinedPath, Graph, _Opts) ->
-    % Data is a special case: It contains every binary item in the store.
-    % We don't need to render it.
-    Graph;
 process_composite_node(Store, _Key, Parent, ResolvedPath, JoinedPath, Graph, Opts) ->
     % Add the node to the graph
     Graph1 = add_node(Graph, ResolvedPath, "lightcoral", Opts),

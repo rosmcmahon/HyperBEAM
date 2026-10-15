@@ -16,7 +16,7 @@ below is an example, not a migration destination.
 {
   "arweave-block-store": {
     "store-module": "hb_store_lmdb",
-    "ao-types": "store-module=\"atom\"",
+    "ao-types": "atom=(\"store-module\")",
     "name": "/var/lib/hyperbeam/arweave-blocks"
   },
   "arweave-index-blocks": true,
@@ -59,7 +59,7 @@ start with `"list-batch-size": 256`; retain its name and other settings:
 ```json
 {
   "store-module": "hb_store_lmdb",
-  "ao-types": "store-module=\"atom\"",
+  "ao-types": "atom=(\"store-module\")",
   "name": "/var/lib/hyperbeam/match-index",
   "list-batch-size": 256,
   "from-list": "~match@1.0/entries"

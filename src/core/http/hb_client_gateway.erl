@@ -130,10 +130,13 @@ data(ID, Opts) ->
     end.
 
 %% @doc Find the location of the scheduler based on its ID, through GraphQL.
+%% The `did:pkh:' committer of an Arweave address is found by the address.
 %% Current AO location records use lowercase tags. Nodes may disable the
 %% fallback to legacy capitalized tags with `scheduler-legacy-locations'.
 location(Address, Opts) ->
     location(Address, undefined, Opts).
+location(?ARWEAVE_COMMITTER(Address), Variant, Opts) ->
+    location(Address, Variant, Opts);
 location(Address, Variant, Opts) ->
     maybe
         % Fallback to legacy capitalized tags if a lower-case result is not
@@ -259,8 +262,10 @@ device_queries(SpecID, TrustedSigners, Opts) ->
             {Address, signer_valid_until_height(Signer, Opts)}
         ||
             Signer <- TrustedSigners,
-            Address <- [trusted_signer_address(Signer, Opts)],
-            Address =/= undefined
+            % GraphQL finds the items of a `did:pkh:' committer of an Arweave
+            % address by the address.
+            ?ARWEAVE_COMMITTER(Address) <-
+                [trusted_signer_address(Signer, Opts)]
         ],
     case lists:any(fun({_Signer, Height}) -> Height =/= undefined end, SignerPolicies) of
         false ->
@@ -275,9 +280,9 @@ device_queries(SpecID, TrustedSigners, Opts) ->
     end.
 
 trusted_signer_address(Signer, _Opts) when is_binary(Signer) ->
-    Signer;
+    hb_util:committer(Signer);
 trusted_signer_address(Signer, Opts) when is_map(Signer) ->
-    hb_maps:get(<<"address">>, Signer, undefined, Opts);
+    hb_util:committer(hb_maps:get(<<"address">>, Signer, undefined, Opts));
 trusted_signer_address(_Signer, _Opts) ->
     undefined.
 
@@ -550,13 +555,22 @@ device_valid_until_height_query_test() ->
     SpecID = <<"spec">>,
     Alice = <<"alice">>,
     Bob = <<"bob">>,
-    [{BaseQuery, BaseVars}] = device_queries(SpecID, [Alice, Bob], #{}),
+    AliceCommitter = ?ARWEAVE_COMMITTER(Alice),
+    BobCommitter = ?ARWEAVE_COMMITTER(Bob),
+    [{BaseQuery, BaseVars}] =
+        device_queries(SpecID, [AliceCommitter, BobCommitter], #{}),
     ?assertEqual([Alice, Bob], maps:get(<<"trusted">>, BaseVars)),
     ?assertEqual(nomatch, binary:match(BaseQuery, <<"validUntilHeight">>)),
     [{AliceQuery, AliceVars}, {BobQuery, BobVars}] =
         device_queries(
             SpecID,
-            [#{ <<"address">> => Alice, <<"valid-until-height">> => 1543210 }, Bob],
+            [
+                #{
+                    <<"address">> => AliceCommitter,
+                    <<"valid-until-height">> => 1543210
+                },
+                BobCommitter
+            ],
             #{}
         ),
     ?assertEqual([Alice], maps:get(<<"trusted">>, AliceVars)),
@@ -695,7 +709,7 @@ anchor_verification_test() ->
     {ok, Verified} = result_to_message(Item, #{}),
     ?assert(hb_message:verify(Verified, all, #{})),
     ?assertEqual(
-        [<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>],
+        [?ARWEAVE_COMMITTER(<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>)],
         hb_message:signers(Verified, #{})
     ),
     Unanchored = Item#{ <<"anchor">> => <<>> },

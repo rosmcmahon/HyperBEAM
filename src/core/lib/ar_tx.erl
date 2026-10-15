@@ -27,26 +27,17 @@
 %% @doc Cryptographically sign (claim ownership of) a v2 transaction.
 %% Used in tests and by the handler of the POST /unsigned_tx endpoint, which is
 %% disabled by default.
-sign(TX, {PrivKey, PubKey = {KeyType, Owner}}) ->
-    TX2 = TX#tx{ owner = Owner, signature_type = KeyType },
+sign(TX, Wallet = #{ <<"owner">> := Owner, <<"type">> := Type }) ->
+    TX2 = TX#tx{ owner = Owner, signature_type = deserialize_sig_type(Type) },
     TX3 = TX2#tx{ owner_address = get_owner_address(TX2) },
     SignatureDataSegment = generate_signature_data_segment(TX3),
-    sign(TX3, PrivKey, PubKey, SignatureDataSegment).
-
-sign(TX, PrivKey, PubKey = {KeyType, Owner}) ->
-    TX2 = TX#tx{ owner = Owner, signature_type = KeyType },
-    TX3 = TX2#tx{ owner_address = get_owner_address(TX2) },
-    SignatureDataSegment = generate_signature_data_segment(TX3),
-    sign(TX3, PrivKey, PubKey, SignatureDataSegment).
+    sign(TX3, Wallet, SignatureDataSegment).
 
 %% @doc Cryptographically sign (claim ownership of) a v1 transaction.
 %% Used in tests and by the handler of the POST /unsigned_tx endpoint, which is
 %% disabled by default.
-sign_v1(TX, {PrivKey, PubKey = {_, Owner}}) ->
-    sign(TX, PrivKey, PubKey, signature_data_segment_v1(TX#tx{ owner = Owner })).
-
-sign_v1(TX, PrivKey, PubKey = {_, Owner}) ->
-    sign(TX, PrivKey, PubKey, signature_data_segment_v1(TX#tx{ owner = Owner })).
+sign_v1(TX, Wallet = #{ <<"owner">> := Owner }) ->
+    sign(TX, Wallet, signature_data_segment_v1(TX#tx{ owner = Owner })).
 
 %% @doc Verify whether a transaction is valid.
 %% 
@@ -333,7 +324,14 @@ verify_signature(TX = #tx{ signature_type = SigType }) ->
         error ->
             false;
         SignatureDataSegment ->
-            ar_wallet:verify({SigType, TX#tx.owner}, SignatureDataSegment, TX#tx.signature)
+            ar_wallet:verify(
+                #{
+                    <<"type">> => serialize_sig_type(SigType),
+                    <<"owner">> => TX#tx.owner
+                },
+                SignatureDataSegment,
+                TX#tx.signature
+            )
     end.
 
 %% @doc Generate the data segment to be signed for a given TX.
@@ -449,11 +447,12 @@ verify_v2(#tx{ format = 2 } = TX) ->
 verify_v2(_) ->
     [].
 
-sign(TX, PrivKey, {KeyType, Owner}, SignatureDataSegment) ->
+sign(TX, Wallet = #{ <<"owner">> := Owner, <<"type">> := Type },
+        SignatureDataSegment) ->
     NewTX = TX#tx{ 
         owner = Owner, 
-        signature_type = KeyType,
-        signature = ar_wallet:sign(PrivKey, SignatureDataSegment)
+        signature_type = deserialize_sig_type(Type),
+        signature = ar_wallet:sign(Wallet, SignatureDataSegment)
     },
     NewTX#tx{
         id = generate_id(NewTX, signed),
@@ -770,19 +769,19 @@ chunk_binary_arweavejs_standard_test() ->
 sign_tx_test_() ->
     {timeout, 30, fun test_sign_tx/0}.
 
-sign_tx_v1(TX, {Priv, Pub}) ->
-    sign_v1(generate_chunk_tree(TX), Priv, Pub).
+sign_tx_v1(TX, Wallet) ->
+    sign_v1(generate_chunk_tree(TX), Wallet).
 
-sign_tx_v2(TX, {Priv, Pub}) ->
-    sign(generate_chunk_tree(TX), Priv, Pub).
+sign_tx_v2(TX, Wallet) ->
+    sign(generate_chunk_tree(TX), Wallet).
 
 test_sign_tx() ->
     NewTX = new(<<"TEST DATA">>, ?AR(1)),
-    {Priv, Pub} = Wallet = ar_wallet:new(),
+    Wallet = ar_wallet:new(),
 
     ValidTXs = [
-        sign_v1(NewTX, Priv, Pub),
-        sign(generate_chunk_tree(NewTX#tx{ format = 2 }), Priv, Pub)
+        sign_v1(NewTX, Wallet),
+        sign(generate_chunk_tree(NewTX#tx{ format = 2 }), Wallet)
     ],
     lists:foreach(
         fun(TX) ->
@@ -814,7 +813,7 @@ test_sign_tx() ->
         { "tx_data_size_negative",
             sign_tx_v2(NewTX#tx{ data_size = -1, format = 2 }, Wallet) },
         { "tx_data_size_data_root_mismatch", 
-            sign((generate_chunk_tree(NewTX#tx{ format = 2 }))#tx{ data_root = <<>> }, Priv, Pub) }
+            sign((generate_chunk_tree(NewTX#tx{ format = 2 }))#tx{ data_root = <<>> }, Wallet) }
     ],
     lists:foreach(
         fun({Message, TX}) ->
@@ -832,7 +831,7 @@ sign_and_verify_chunked_test_() ->
 
 test_sign_and_verify_chunked() ->
     TXData = crypto:strong_rand_bytes(trunc(?DATA_CHUNK_SIZE * 5.5)),
-    {Priv, Pub} = ar_wallet:new(),
+    Wallet = ar_wallet:new(),
     UnsignedTX =
         generate_chunk_tree(
             #tx{
@@ -842,7 +841,7 @@ test_sign_and_verify_chunked() ->
                 reward = ?AR(100)
             }
         ),
-    SignedTX = sign(UnsignedTX#tx{ data = <<>> }, Priv, Pub),
+    SignedTX = sign(UnsignedTX#tx{ data = <<>> }, Wallet),
     ?assert(verify(SignedTX)).
 
 %% Ensure that a forged transaction does not pass verification.
@@ -852,8 +851,8 @@ forge_test_() ->
 
 test_forge() ->
     NewTX = new(<<"TEST DATA">>, ?AR(10)),
-    {Priv, Pub} = ar_wallet:new(),
-    InvalidSignTX = (sign_v1(NewTX, Priv, Pub))#tx{
+    Wallet = ar_wallet:new(),
+    InvalidSignTX = (sign_v1(NewTX, Wallet))#tx{
         data = <<"FAKE DATA">>
     },
     ?assert(not verify(InvalidSignTX)).

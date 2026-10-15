@@ -161,7 +161,8 @@ resolve({many, Msgs}, ExecState, ExecOpts) ->
     try hb_ao:resolve_many(MaybeAsMsgs, ExecOpts) of
         {Status, Res} ->
             ?event({resolved_msgs, {status, Status}, {res, Res}, {exec_opts, ExecOpts}}),
-            {[Status, Res], ExecState}
+            Key = case Msgs of [] -> undefined; _ -> lists:last(Msgs) end,
+            {[Status, committers(Key, Res)], ExecState}
     catch
         Error ->
             ?event(lua_error, {ao_core_resolver_error, Error}),
@@ -171,9 +172,17 @@ resolve({many, Msgs}, ExecState, ExecOpts) ->
 %% @doc A wrapper for `hb_ao''s `get' functionality.
 get([Key, Base], ExecState, ExecOpts) ->
     ?event({ao_core_get, {base, Base}, {key, Key}}),
-    NewRes = hb_ao:get(convert_as(Key), convert_as(Base), ExecOpts),
+    NewRes =
+        committers(Key, hb_ao:get(convert_as(Key), convert_as(Base), ExecOpts)),
     ?event({ao_core_get_result, {result, NewRes}}),
     {[NewRes], ExecState}.
+
+%% @doc Convert the `committers' of a message to the form that Lua reads. Each
+%% Arweave committer is given as its address.
+committers(<<"committers">>, Committers) when is_list(Committers) ->
+    lists:map(fun hb_util:committer_address/1, Committers);
+committers(_Key, Res) ->
+    Res.
 
 %% @doc Converts any `as' terms from Lua to their HyperBEAM equivalents.
 convert_as([<<"as">>, Device, RawMsg]) ->

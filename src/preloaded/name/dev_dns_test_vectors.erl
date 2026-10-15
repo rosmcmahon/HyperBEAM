@@ -476,10 +476,14 @@ tcp_stream_test() ->
         end
     end).
 
-%% @doc Write real linked values into the test's isolated HyperBEAM store.
+%% @doc Write real linked values into the test's isolated HyperBEAM store. A
+%% message is returned as a link to its ID, and a binary as a lazy link to its
+%% path in the store.
 link(Value, Opts) ->
-    {ok, ID} = hb_cache:write(Value, Opts),
-    {link, ID, #{}}.
+    case hb_cache:write(Value, Opts) of
+        {ok, ID} when is_map(Value) -> {link, <<"ao:", ID/binary>>, #{}};
+        {ok, Name} -> {link, Name, #{ <<"lazy">> => true }}
+    end.
 
 %% @doc Start an isolated listener via AO-Core and always release its sockets.
 with_dns(Handler, Test) ->

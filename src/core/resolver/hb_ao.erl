@@ -30,6 +30,10 @@
 %%% The result of any computation can be either a new message or a raw literal 
 %%% value (a binary, integer, float, atom, or list of such values).
 %%% 
+%%% A base that is an ID or a URI is loaded before the request is resolved on
+%%% it. An ID is read from the cache. A URI is read by the device of its
+%%% scheme (`hb_uri').
+%%% 
 %%% Devices can be expressed as either modules or maps. They can also be 
 %%% referenced by an Arweave ID, which can be used to load a device from 
 %%% the network when `trusted-device-signers' are configured.
@@ -197,7 +201,9 @@ raw(ForcedDevice, ForcedKey, Base, Req, Opts) ->
 %% message as the input for the next message. Once the last message is resolved,
 %% return the result.
 %% A `resolve_many' call with only a single ID will attempt to read the message
-%% directly from the store. No execution is performed.
+%% directly from the store. No execution is performed. A call with only a
+%% binary loads the resource associated with the binary, if it starts with a
+%% URI scheme (`hb_uri:maybe_from/2').
 resolve_many([ID], Opts) when ?IS_ID(ID) ->
     % Note: This case is necessary to place specifically here for two reasons:
     % 1. It is not in `do_resolve_many' because we need to handle the case
@@ -209,6 +215,11 @@ resolve_many([ID], Opts) when ?IS_ID(ID) ->
     ?event_debug(debug_ao_core, {stage, na, resolve_directly_to_id, ID, {opts, Opts}}, Opts),
     try {ok, ensure_message_loaded(ID, Opts)}
     catch _:_:_ -> {error, not_found}
+    end;
+resolve_many([URI], Opts) when is_binary(URI) ->
+    maybe
+        {ok, Msg} ?= hb_uri:maybe_from(URI, Opts),
+        do_resolve_many([Msg], Opts)
     end;
 resolve_many(ListMsg, Opts) when is_map(ListMsg) ->
     % We have been given a message rather than a list of messages, so we should
@@ -344,7 +355,11 @@ resolve_stage(1, RawBase, ReqOuter = #{ <<"path">> := {as, DevID, ReqInner} }, O
             {req, Req}
         }
     ),
-    subresolve(RawBase, DevID, Req, Opts);
+    % A base with a URI scheme is loaded before its device is set.
+    maybe
+        {ok, Base} ?= hb_uri:maybe_from(RawBase, Opts),
+        subresolve(Base, DevID, Req, Opts)
+    end;
 resolve_stage(1, {resolve, Subres}, Req, Opts) ->
     % If the first message is a `{resolve, Subres}' tuple, we should execute it
     % directly, then apply the request to the result.
@@ -412,6 +427,14 @@ resolve_stage(1, Base, NonMapReq, Opts) when not is_map(NonMapReq) ->
 resolve_stage(1, Base, #{ <<"path">> := <<"/">> }, _Opts) ->
     % Resolving `/' returns the base message.
     {ok, Base};
+resolve_stage(1, URI, Req, Opts) when is_binary(URI) ->
+    % `hb_uri:from/2' reads a binary base as a URI before the request is
+    % resolved on it: a binary that starts with a scheme. It returns
+    % `{error, not_found}' for any other binary.
+    maybe
+        {ok, Base} ?= hb_uri:from(URI, Opts),
+        resolve_stage(1, Base, Req, Opts)
+    end;
 resolve_stage(1, Base, _Req, _Opts) when not is_map(Base) ->
     % We cannot resolve anything over the given `Base` Erlang data type. Return
     % `not_found`.

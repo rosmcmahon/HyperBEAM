@@ -275,7 +275,11 @@ avoid_double_read_test() ->
     try
         % The item verifies, so it is cached under its ID with its commitment.
         ?assertEqual(
-            [<<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>],
+            [
+                ?ARWEAVE_COMMITTER(
+                    <<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>
+                )
+            ],
             hb_message:signers(Written, WriteOpts)
         ),
         Loaded = hb_cache:ensure_all_loaded(Read, LocalOpts),

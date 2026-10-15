@@ -1,31 +1,35 @@
 %%% @doc Hashpaths: Succinct executable claims of AO-Core transitions: Their
 %%% results and dependencies, as addressable protocol values.
 %%%
-%%% Hashpaths abide by the following grammar:
-%%%
+%%% A hashpath is `ao://' followed by a path in the grammar of `hb_singleton'
+%%% (see its module doc for the syntax in EBNF). Each request in the path may
+%%% be followed by claims about the result of executing it on the state
+%%% before it:
 %%% <pre>
-%%%     Hashpath     :: "ao://" MessageID Transition*
-%%%     Transition   :: "/" Request Variance? Dependencies? Equivalence?
-%%%     Request      :: MessageID | PathString
-%%%     Variance     :: "" | ">" VariedBaseID "+" VariedReqID
-%%%     Dependencies :: "" | "@" DependenceMessageID
-%%%     Equivalence  :: Normalizer ResultMessageID
-%%%     Normalizer   :: "." | "="
+%%%     ;VB+VR      The IDs of the varied base and request: the inputs of the
+%%%                 execution, as the spec of the executed function selects
+%%%                 them.
+%%%     @D          The ID of the dependencies: the message that names the
+%%%                 origin of each varied input.
+%%%     .R          The ID of the result, which replaces the state.
+%%%     *P          The ID of a patch, which extends the base: the result is
+%%%                 the base with `P' laid over it.
 %%% </pre>
 %%%
-%%% A compact form may omit fields when they are derivable: the vary pair and
-%%% `Dependencies' are omitted when a replacement is reached by the identity
-%%% vary, and the terminal before a result exists. Segments without explicit
-%%% vary syntax are not special: `HP/*=FinalResultID' is an ordinary claim
-%%% that resolving `*' at `HP' yields `FinalResultID'.
+%%% For example, `ao://BaseID/compute.R' claims that executing `compute' on
+%%% the message `BaseID' gives the message `R'.
 %%%
-%%% Every separator of the syntax (`/', `>', `+', `@', `=', `.') is outside
-%%% the base64url alphabet, so the grammar is unambiguous without escaping.
-%%% The request position holds an ID when the request is addressed, or a
-%%% literal key when it is self-describing (e.g. `*').
+%%% `hb_hashpath' writes hashpaths in a compact form, omitting the claims that
+%%% can be derived: the varied pair and the dependencies of a replacement
+%%% reached by the identity vary, and the result of a request whose result
+%%% does not exist yet. A request that is only a key is written as that key,
+%%% and any other request by its ID. A base that is only a device is written
+%%% as `~Device'. A request without a varied pair is not special: `HP/**P' is
+%%% an ordinary claim that resolving the key `*' at `HP' extends its state
+%%% with the patch `P'.
 -module(hb_hashpath).
 %%% Create and parse hashpaths.
--export([format/2, format_request/2, parse/2, context/2]).
+-export([from/3, format/2, format_request/2, parse/2, context/2]).
 -export([generate/8, attach/3, reset/1]).
 %%% Load and execute transition contexts.
 -export([load/2, load/3]).
@@ -33,6 +37,14 @@
 -export([verify_all/2, verify_part/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+%% @doc Parse a singleton, a path or a hashpath with the grammar of
+%% `hb_singleton'. With `requests' we return the messages to execute, and with
+%% `contexts' the contexts of its steps, with their claims. Throws
+%% `{invalid_singleton, Type, Offender}' as `hb_singleton' does.
+-spec from(binary() | #{ _ => _ }, requests | contexts, #{ _ => _ }) -> [_].
+from(Singleton, requests, Opts) -> hb_singleton:from(Singleton, Opts);
+from(Singleton, contexts, Opts) -> hb_singleton:parse(Singleton, Opts).
 
 %% @doc Encode a hashpath from an execution context or a sequence of contexts.
 %%
@@ -83,7 +95,11 @@ format(Ctx, Opts) ->
 
 %% @doc Utilize the `hashpath` of the prior resolution, if it is available,
 %% falling back to the `BaseID` if known, and recomputing it only if necessary.
+%% If the execution input of the base is only a device, we write it as
+%% `~Device', as we do for a request.
 format_base(#{ <<"base-id">> := ID }, _) -> {ok, ID};
+format_base(#{ <<"base">> := Base = {as, _, Msg} }, _) when map_size(Msg) == 0 ->
+    hb_singleton:to_part(Base);
 format_base(Ctx = #{ <<"base">> := Base }, Opts) ->
     case hb_private:from_message(Base) of
         #{ <<"hashpath">> := HP, <<"hashpath-result">> := ID } ->
@@ -91,7 +107,15 @@ format_base(Ctx = #{ <<"base">> := Base }, Opts) ->
                 ID -> {ok, HP};
                 _ -> find_id(<<"base">>, Ctx, Opts)
             end;
-        _ -> find_id(<<"base">>, Ctx, Opts)
+        _ ->
+            case hb_private:reset(hb_ao:execution_input(Base, Opts)) of
+                Input = #{ <<"device">> := _ } when map_size(Input) == 1 ->
+                    case hb_singleton:to_part(Input) of
+                        {ok, Part} -> {ok, Part};
+                        error -> find_id(<<"base">>, Ctx, Opts)
+                    end;
+                _ -> find_id(<<"base">>, Ctx, Opts)
+            end
     end;
 format_base(Ctx, Opts) ->
     find_id(<<"base">>, Ctx, Opts).
@@ -113,19 +137,18 @@ find_id(Name, _Ctx, _Opts) ->
 format_request(Req, Opts) ->
     format_request_context(#{ <<"request">> => Req }, Opts).
 
-%% @doc Use an explicit request ID when supplied by a parsed receipt.
+%% @doc Use an explicit request ID when supplied by a parsed receipt. A request
+%% that has a smallest form (see `hb_singleton:to_part/1') is written in it.
 format_request_context(#{ <<"request-id">> := ID }, _Opts) -> {ok, ID};
 format_request_context(Ctx = #{ <<"request">> := Req }, Opts) ->
-    case hb_private:reset(hb_ao:execution_input(Req, Opts)) of
-        #{ <<"path">> := Key } = Path when map_size(Path) == 1 ->
-            BinKey = hb_ao:normalize_key(Key),
-            case binary:match(BinKey, [<<"/">>, <<">">>, <<"+">>,
-                    <<"@">>, <<"=">>, <<".">>]) of
-                nomatch when byte_size(BinKey) > 0, byte_size(BinKey) =/= 43 ->
-                    {ok, BinKey};
-                _ -> find_id(<<"request">>, Ctx, Opts)
-            end;
-        _ -> find_id(<<"request">>, Ctx, Opts)
+    Input =
+        case Req of
+            {as, _, _} -> Req;
+            _ -> hb_private:reset(hb_ao:execution_input(Req, Opts))
+        end,
+    case hb_singleton:to_part(Input) of
+        {ok, Part} -> {ok, Part};
+        error -> find_id(<<"request">>, Ctx, Opts)
     end;
 format_request_context(Ctx, Opts) -> find_id(<<"request">>, Ctx, Opts).
 
@@ -135,7 +158,7 @@ format_varied(Ctx, Opts) ->
     maybe
         {ok, VBase} ?= find_id(<<"varied-base">>, Ctx, Opts),
         {ok, VReq} ?= find_id(<<"varied-request">>, Ctx, Opts),
-        <<">", VBase/binary, "+", VReq/binary>>
+        <<";", VBase/binary, "+", VReq/binary>>
     else
         {not_found, _} ->
             % Either the base or request is not found, so we omit the varied
@@ -163,7 +186,7 @@ format_equivalence(RawCtx, Opts) ->
     end.
 
 %% @doc Format the normalizer component of the hashpath.
-format_normalizer(#{ <<"normalizer">> := base }, _Opts) -> <<"=">>;
+format_normalizer(#{ <<"normalizer">> := base }, _Opts) -> <<"*">>;
 format_normalizer(_, _) -> <<".">>.
 
 %% @doc A request overlay replaces the base with the fully overlaid request.
@@ -179,53 +202,17 @@ equivalence_context(Ctx = #{ <<"normalizer">> := request }, Opts) ->
     equivalence_context(Ctx#{ <<"result">> => Result }, Opts);
 equivalence_context(Ctx, _) -> Ctx.
 
-%% @doc Decode a hashpath into a list of context segments. The first segment
-%% will have both a base and a request part, while the latter segments will
-%% only have the request part -- the base being inferred from the result of
-%% the prior segments.
-parse(<<"ao://", Hashpath/binary>>, Opts) ->
-    [Base | Reqs] = binary:split(Hashpath, <<"/">>, [global]),
-    maybe
-        true ?= valid_id(Base) orelse {error, <<"Invalid hashpath base.">>},
-        Parts =
-            case Reqs of
-                [] -> [#{ <<"base-id">> => Base }];
-                _ -> parse_parts(Base, Reqs, Opts)
-            end,
-        true ?= is_list(Parts) orelse Parts,
-        true ?= lists:all(fun valid_ids/1, Parts)
-            orelse {error, <<"Invalid hashpath field.">>},
-        Parts
+%% @doc Decode a hashpath into a list of context segments, with the grammar
+%% of `hb_singleton'. The first segment will have both a base and a request
+%% part, while the latter segments will only have the request part -- the base
+%% being inferred from the result of the prior segments.
+parse(<<"ao://", _/binary>> = Hashpath, Opts) ->
+    try hb_singleton:parse(Hashpath, Opts) of
+        [] -> {error, <<"Empty hashpath.">>};
+        Parts -> Parts
+    catch throw:{invalid_singleton, _Type, Offender} -> {error, Offender}
     end;
 parse(_Hashpath, _Opts) -> {error, <<"Invalid hashpath scheme.">>}.
-
-%% @doc Addresses in explicit receipt fields use the base64URL alphabet.
-valid_ids(Ctx) ->
-    lists:all(
-        fun
-            ({<<"request-id">>, Key}) ->
-                byte_size(Key) > 0
-                    andalso binary:match(
-                        Key,
-                        [<<"/">>, <<">">>, <<"+">>, <<"@">>, <<"=">>, <<".">>]
-                    ) =:= nomatch;
-            ({_Name, ID}) -> valid_id(ID)
-        end,
-        maps:to_list(maps:without([<<"normalizer">>], Ctx))
-    ).
-
-valid_id(ID) ->
-    re:run(ID, <<"\\A[A-Za-z0-9_-]{43}\\z">>, [{capture, none}]) =:= match.
-
-%% @doc Parse a sequence, retaining the base only on its first transition.
-parse_parts(_Base, [], _Opts) -> [];
-parse_parts(Base, [Req | Rest], Opts) ->
-    maybe
-        {ok, Ctx} ?= parse_part(Base, Req, Opts),
-        Parts = parse_parts(undefined, Rest, Opts),
-        true ?= is_list(Parts) orelse Parts,
-        [Ctx | Parts]
-    end.
 
 %% @doc Parse the last segment of a hashpath into an executable context that
 %% can be additionally executed upon.
@@ -237,106 +224,6 @@ context(Hashpath, Opts) ->
                 <<"base-id">> => format(lists:droplast(Parts), Opts)
             };
         Error -> Error
-    end.
-
-%% @doc Calculate the context for a hashpath segment. If the base is known
-%% explicitly, add it to the result from parsing the request part. If not,
-%% parse the request part and return as-is.
-parse_part(undefined, ReqPart, Opts) ->
-    parse_request(ReqPart, Opts);
-parse_part(Base, ReqPart, Opts) ->
-    maybe
-        {ok, Ctx} ?= parse_request(ReqPart, Opts),
-        {ok, Ctx#{ <<"base-id">> => Base }}
-    end.
-
-%% @doc Parse a single segment of the hashpath into a context segment.
-parse_request(Part, Opts) ->
-    maybe
-        {next, NextDelim, Part2, Ctx1} ?=
-            parse_request_id(Part, Opts),
-        {next, NextDelim2, Part3, Ctx2} ?=
-            parse_varied(NextDelim, Part2, Ctx1, Opts),
-        {next, NextDelim3, Part4, Ctx3} ?=
-            parse_dependencies(NextDelim2, Part3, Ctx2, Opts),
-        {ok, Ctx4} ?=
-            parse_equivalence(NextDelim3, Part4, Ctx3, Opts),
-        {ok, Ctx4}
-    end.
-
-%% @doc Parse the request ID part of a hashpath segment. If the request ID is
-%% the only part, it is returned as-is and the remainder of the part parsing is
-%% skipped.
-parse_request_id(Part, _Opts) ->
-    case next(Part) of
-        {_, <<>>, _} -> {error, <<"Empty hashpath request.">>};
-        {no_match, Part, <<>>} -> {ok, #{ <<"request-id">> => Part } };
-        {Sep, ReqID, Part2} ->
-            {next, Sep, Part2, #{ <<"request-id">> => ReqID }}
-    end.
-
-%% @doc If the delimiter that starts our segment is `>` we handle the inner
-%% segment as a `VariedBase` and `VariedRequest` pair and get the next delimited
-%% component. If the delimiter is not `>`, we pass the segment forward as-is.
-parse_varied($>, Part, Ctx0, _Opts) ->
-    {NextDelim, Next, After} = next([$@, $., $=], Part),
-    case binary:split(Next, <<"+">>, [global]) of
-        [VBase, VReq] when byte_size(VBase) > 0, byte_size(VReq) > 0 ->
-            {
-                next,
-                NextDelim,
-                After,
-                Ctx0#{
-                    <<"varied-base-id">> => VBase,
-                    <<"varied-request-id">> => VReq
-                }
-            };
-        Malformed ->
-            {error, {'invalid-variance-parts', Malformed}}
-    end;
-parse_varied(NextDelim, Part, Ctx0, _Opts) ->
-    {next, NextDelim, Part, Ctx0}.
-
-%% @doc Parse the dependencies if present. We short-circuit the parser and
-%% return the context early if we have already hit the end of the string.
-parse_dependencies(no_match, <<>>, Ctx, _Opts) -> {ok, Ctx};
-parse_dependencies($@, Part, Ctx0, _Opts) ->
-    {NextDelim, Next, After} = next([$@, $., $=], Part),
-    case Next of
-        <<>> -> {error, <<"Empty hashpath dependencies.">>};
-        _ -> {next, NextDelim, After, Ctx0#{ <<"dependencies-id">> => Next }}
-    end;
-parse_dependencies(Delim, Part, Ctx0, _Opts) ->
-    {next, Delim, Part, Ctx0}.
-
-%% @doc Parse the equivalent relationship if stated in the hashpath.
-parse_equivalence(no_match, <<>>, Ctx, _Opts) -> {ok, Ctx};
-parse_equivalence(Delim, ResultID, Ctx, _Opts)
-        when (Delim == $= orelse Delim == $.), byte_size(ResultID) > 0 ->
-    case next([$=, $., $>, $@, $+], ResultID) of
-        {no_match, _, <<>>} ->
-            ResultCtx = Ctx#{ <<"varied-result-id">> => ResultID },
-            case Delim of
-                $= -> {ok, ResultCtx#{ <<"normalizer">> => base }};
-                $. -> {ok, ResultCtx}
-            end;
-        _ -> {error, <<"Invalid hashpath result.">>}
-    end;
-parse_equivalence(_Delim, _Part, _Ctx, _Opts) ->
-    {error, <<"Invalid hashpath equivalence.">>}.
-
-%% @doc Utility to split at the next syntax delimiter (e.g. `=`, `.`, `>`, `@`).
-%% Returns the syntax element matched, and the rest of the string. Notably, this
-%% utility does not break apart `VBase+VReq` pairs. They are treated as a single
-%% unit and parsed internally in `parse_varied/4`. Quotes and parentheses are
-%% literal key characters, not grouping syntax.
-next(S) -> next([$=, $., $>, $@], S).
-next(Symbols, S) ->
-    case binary:match(S, [<<Symbol>> || Symbol <- Symbols]) of
-        nomatch -> {no_match, S, <<>>};
-        {Position, 1} ->
-            <<Part:Position/binary, Delimiter, Rest/binary>> = S,
-            {Delimiter, Part, Rest}
     end.
 
 %% @doc Challenge a complete hashpath, verifying each part's claims.
@@ -503,7 +390,7 @@ dependency_paths(Varied, Origin) when is_map(Varied) ->
         public_values(Varied)
     );
 dependency_paths(_Varied, Origin) ->
-    {link, Origin, #{ <<"type">> => <<"link">>, <<"lazy">> => false }}.
+    {link, Origin, #{}}.
 
 %% @doc Read a source member only when the source is itself a message.
 source_value(Key, Original, Opts) ->
@@ -615,9 +502,11 @@ execute(Ctx, Opts) ->
         {ok, Req} ?= load_request(Ctx, Opts),
         true ?= verify_all_commitments(Base, Opts),
         true ?= verify_all_commitments(Req, Opts),
-        % A transition is one key. A request whose path has several parts is
-        % refused, as `resolve/3' would apply them in turn.
-        [_] = hb_path:from_message(request, Req, Opts),
+        % A transition is one key. A request message whose path has several
+        % parts is refused, as `resolve/3' would apply them in turn.
+        true =
+            not is_map(Req) orelse
+                length(hb_path:from_message(request, Req, Opts)) == 1,
         hb_ao:resolve(
             Base,
             Req,
@@ -627,22 +516,16 @@ execute(Ctx, Opts) ->
 
 %% @doc Load the minimal executable base for a hashpath or a given part number
 %% within it.
-load(Link = {link, ID, LinkOpts}, Opts) ->
+load(Link = {link, _, LinkOpts}, Opts) ->
     MergedOpts = hb_store:scope(
         hb_util:deep_merge(Opts, LinkOpts, Opts),
         hb_opts:get(scope, local, LinkOpts)
     ),
-    Address =
-        case LinkOpts of
-            #{ <<"type">> := <<"link">> } ->
-                #{ <<"hashpath+link">> := HP } =
-                    hb_link:normalize(
-                        #{ <<"hashpath">> => Link }, discard, MergedOpts),
-                HP;
-            _ -> ID
-        end,
+    #{ <<"hashpath">> := Address } =
+        hb_link:normalize(#{ <<"hashpath">> => Link }, discard, MergedOpts),
     case Address of
         _ when ?IS_HASHPATH(Address) -> load(Address, MergedOpts);
+        <<"ao:", ID/binary>> when ?IS_ID(ID) -> read_id(ID, MergedOpts);
         _ when ?IS_ID(Address) -> read_id(Address, MergedOpts);
         _ ->
             case hb_cache:ensure_loaded(Link, MergedOpts) of
@@ -742,7 +625,7 @@ load_field(Name, Ctx, Opts) ->
 read_id(ID, Opts) ->
     Read =
         case hb_cache:read(ID, Opts) of
-            {error, not_found} -> hb_cache:read(<<"data/", ID/binary>>, Opts);
+            {error, not_found} -> hb_cache:read(?NI_URI(ID), Opts);
             Result -> Result
         end,
     maybe
@@ -958,10 +841,10 @@ full_form_round_trip_test() ->
         <<
             "ao://BQQF7TjcHTPT57eIcABDeIbfHkkOTDPKAQ9tJqScTV4"
             "/tYRVDkT2X7wjYYVaZWuBBWWzZatEsMoR2NBjcJ8CmZk"
-            ">a2Fub25pY2FsLXZhcmllZC1iYXNlLWlkLTAwMDAwMDA"
+            ";a2Fub25pY2FsLXZhcmllZC1iYXNlLWlkLTAwMDAwMDA"
             "+a2Fub25pY2FsLXZhcmllZC1yZXEtaWQtMDAwMDAwMDA"
             "@ZGVwZW5kcy1tZXNzYWdlLWlkLTAwMDAwMDAwMDAwMDA"
-            "=cGF0Y2gtaWQtMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
+            "*cGF0Y2gtaWQtMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
         >>,
     ?assertEqual(HP, format(parse(HP, Opts), Opts)).
 
@@ -978,8 +861,28 @@ compact_form_round_trip_test() ->
             <<"ao://BQQF7TjcHTPT57eIcABDeIbfHkkOTDPKAQ9tJqScTV4"
               "/transfer/balance">>,
             <<"ao://BQQF7TjcHTPT57eIcABDeIbfHkkOTDPKAQ9tJqScTV4/*"
-              "=cGF0Y2gtaWQtMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA">>
+              "*cGF0Y2gtaWQtMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA">>,
+            % A base that is only a device is written as `~Device'.
+            <<"ao://~test-device@1.0/compute">>,
+            % A request that holds only the value of its key is written as
+            % `key=value'.
+            <<"ao://BQQF7TjcHTPT57eIcABDeIbfHkkOTDPKAQ9tJqScTV4/k=v">>,
+            % A request that is only a device is written as `~Device'.
+            <<"ao://BQQF7TjcHTPT57eIcABDeIbfHkkOTDPKAQ9tJqScTV4"
+              "/~test-device@1.0/compute">>
         ]
+    ),
+    % A resolved base that is only a device is written as `~Device'.
+    StoreOpts = Opts#{ <<"store">> => hb_test_utils:test_store() },
+    {ok, Info} =
+        hb_ao:resolve(
+            #{ <<"device">> => <<"test-device@1.0">> },
+            <<"info">>,
+            StoreOpts
+        ),
+    ?assertMatch(
+        <<"ao://~test-device@1.0/info", _/binary>>,
+        hb_path:hashpath(Info, StoreOpts)
     ).
 
 %% @doc Quotes and parentheses in keys do not hide receipt delimiters.
@@ -994,7 +897,10 @@ literal_key_receipt_test() ->
             Path = hb_escape:encode(Key),
             {ok, Result} = hb_ao:resolve(Base, #{ <<"path">> => Path }, Opts),
             HP = hb_path:hashpath(Result, Opts),
-            ?assertEqual(Path, maps:get(<<"request-id">>, context(HP, Opts))),
+            ?assertEqual(
+                #{ <<"path">> => Path },
+                maps:get(<<"request">>, context(HP, Opts))
+            ),
             ?assert(verify_all(HP, Opts)),
             {ok, Loaded} = load(HP, Opts),
             ?assertEqual(7, hb_maps:get(<<"value">>, Loaded, undefined, Opts))
@@ -1032,7 +938,7 @@ failed_load_test() ->
                                 hb_ao:resolve(Link, <<"value">>, Opts))
                     end
                 end,
-                [#{}, #{ <<"type">> => <<"link">>, <<"lazy">> => false }]
+                [#{}]
             )
         end,
         [
@@ -1045,7 +951,8 @@ failed_load_test() ->
         ]
     ).
 
-%% @doc Reject incomplete fields, ambiguous separators, and invalid IDs.
+%% @doc Reject texts that are not hashpaths, and paths that do not follow the
+%% grammar.
 malformed_receipt_test() ->
     ID = hb_message:id(#{}, all, #{}),
     lists:foreach(
@@ -1061,17 +968,12 @@ malformed_receipt_test() ->
             <<ID/binary, "/">>,
             <<ID/binary, "/key">>,
             <<"ao://">>,
-            <<"ao://ao://", ID/binary, "/key">>,
-            <<"ao://", ID/binary, "/">>,
-            <<"ao://", ID/binary, "//key">>,
-            <<"ao://", ID/binary, "/key+extra">>,
-            <<"ao://", ID/binary, "/key>", ID/binary, "+">>,
-            <<"ao://", ID/binary, "/key>", ID/binary, "+", ID/binary, ">extra">>,
-            <<"ao://", ID/binary, "/key@">>,
-            <<"ao://", ID/binary, "/key=not-an-id">>,
-            <<"ao://", ID/binary, "\n/key">>,
-            <<"ao://", ID/binary, "/key=", ID/binary, "\n">>,
-            <<"ao://", ID/binary, "/key=", ID/binary, ".", ID/binary>>
+            <<"ao://", ID/binary, "/(key">>,
+            <<"ao://", ID/binary, "/key)">>,
+            <<"ao://", ID/binary, "/\"key">>,
+            <<"ao://", ID/binary, "/key~">>,
+            <<"ao://", ID/binary, "/key&=value">>,
+            <<"ao://", ID/binary, ".", ID/binary>>
         ]
     ).
 
@@ -1271,14 +1173,14 @@ coerced_dependencies_test() ->
     ReqHP = <<"ao://", ReqID/binary>>,
     ExpectedDeps = #{
         <<"base">> => #{
-            <<"device+link">> => BaseHP,
-            <<"required+link">> => BaseHP,
-            <<"deep">> => #{ <<"slot+link">> => BaseHP }
+            <<"device">> => BaseHP,
+            <<"required">> => BaseHP,
+            <<"deep">> => #{ <<"slot">> => BaseHP }
         },
         <<"request">> => #{
-            <<"path+link">> => ReqHP,
+            <<"path">> => ReqHP,
             <<"deep-request">> => #{
-                <<"slot+link">> => ReqHP
+                <<"slot">> => ReqHP
             }
         }
     },
@@ -1289,7 +1191,7 @@ coerced_dependencies_test() ->
     ?assert(verify_all(HP, Opts)),
     WrongDeps = ExpectedDeps#{ <<"base">> =>
         (maps:get(<<"base">>, ExpectedDeps))#{
-            <<"required+link">> => <<BaseHP/binary, "/omitted">>
+            <<"required">> => <<BaseHP/binary, "/omitted">>
         }
     },
     {ok, WrongID} = hb_cache:write(WrongDeps, Opts),
@@ -1460,7 +1362,7 @@ literal_result_test() ->
             {
                 link,
                 Serialized,
-                #{ <<"type">> => <<"link">>, <<"lazy">> => true }
+                #{ <<"lazy">> => true }
             },
             Opts
         )
@@ -1471,8 +1373,7 @@ literal_result_test() ->
         {ok, 7},
         hb_cache:read(<<"ao://", BaseID/binary, "/value">>, Opts)
     ),
-    Link = {link, <<"ao://", BaseID/binary, "/value">>,
-        #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
+    Link = {link, <<"ao://", BaseID/binary, "/value">>, #{}},
     ?assertEqual({ok, 7}, load(Link, Opts)),
     ?assertEqual(7, hb_cache:ensure_loaded(Link, Opts)),
     {ok, Ctx} = hb_ao:resolve(BaseID, <<"value">>,
@@ -1487,8 +1388,7 @@ store_path_link_test() ->
     {ok, ID} = hb_cache:write(Child, Opts),
     Path = <<(hb_message:id(#{}, all, Opts))/binary, "/child.name">>,
     hb_cache:link(ID, Path, Opts),
-    LinkOpts = #{ <<"type">> => <<"link">>, <<"lazy">> => false },
-    Loaded = hb_cache:ensure_loaded({link, Path, LinkOpts}, Opts),
+    Loaded = hb_cache:ensure_loaded({link, Path, #{}}, Opts),
     ?assertEqual(hb_message:id(Child, all, Opts),
         hb_message:id(Loaded, all, Opts)),
     HP = <<"ao://", ID/binary>>,
@@ -1496,12 +1396,9 @@ store_path_link_test() ->
     ?assertEqual(ID, hb_message:id(Root, all, Opts)),
     {ok, StoredHP} = hb_cache:write(HP, Opts),
     ?assertEqual(
-        #{ <<"value+link">> => HP },
+        #{ <<"value">> => HP },
         hb_link:normalize(
-            #{
-                <<"value">> =>
-                    {link, StoredHP, LinkOpts#{ <<"lazy">> => true }}
-            },
+            #{ <<"value">> => {link, StoredHP, #{ <<"lazy">> => true }} },
             discard,
             Opts
         )
@@ -1522,7 +1419,7 @@ scoped_link_test() ->
             },
             Opts
         ),
-    LinkOpts = #{ <<"type">> => <<"link">>, <<"lazy">> => false },
+    LinkOpts = #{},
     ?assertMatch({error, _}, load({link, HP, LinkOpts}, Opts)),
     ?assertThrow({necessary_message_not_found, _, _},
         hb_cache:ensure_loaded({link, HP, LinkOpts}, Opts)),
@@ -1570,12 +1467,7 @@ http_receipt_test() ->
                 Node,
                 <<"/~message@1.0/value">>,
                 #{
-                    <<"value">> =>
-                        {
-                            link,
-                            HP,
-                            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
-                        }
+                    <<"value">> => {link, HP, #{}}
                 },
                 Opts
             ),

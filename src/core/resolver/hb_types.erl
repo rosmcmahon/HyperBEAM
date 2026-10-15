@@ -943,7 +943,7 @@ unaltered_message_is_identical_test() ->
 %% child's.
 nested_projection_drops_commitments_test() ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = #{
         <<"store">> => hb_test_utils:test_store(),
         <<"priv-wallet">> => Wallet
@@ -993,7 +993,7 @@ wildcard_commitments_test_() ->
 %% @doc Keep signatures only when the admitted message's content is unchanged.
 wildcard_commitments(Operation) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = #{
         <<"store">> => hb_test_utils:test_store(),
         <<"priv-wallet">> => Wallet
@@ -1089,7 +1089,7 @@ list_commitments_test_() ->
 %% @doc Exercise a cached list independently from nested message variation.
 list_commitments(Value, Nested, Preserve) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = #{
         <<"store">> => hb_test_utils:test_store(),
         <<"priv-wallet">> => Wallet
@@ -1142,7 +1142,7 @@ selected_links_are_materialized_without_loading_omitted_keys_test() ->
     Opts = #{ <<"store">> => Store },
     hb_store:reset(Store),
     {ok, SlotPath} = hb_cache:write(<<"7">>, Opts),
-    Missing = {link, <<"data/not-present">>, #{}},
+    Missing = {link, <<"ni:%2f%2f%2fsha-256;not-present">>, #{}},
     Schema =
         required(<<"deep">>, required(<<"slot">>, scalar_type(<<"integer">>))),
     {Varied, _} =
@@ -1185,7 +1185,7 @@ explicit_wildcard_loading(Presence, Type) ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
     {ok, ID} = hb_cache:write(<<"007">>, Opts),
     Link = {link, ID, #{}},
-    Missing = {link, <<"data/not-present">>, #{}},
+    Missing = {link, <<"ni:%2f%2f%2fsha-256;not-present">>, #{}},
     Schema =
         message_type(
             #{

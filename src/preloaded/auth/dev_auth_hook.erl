@@ -216,9 +216,11 @@ is_relevant_from_committers(Base, Request, Opts) ->
         <<"always">> -> true;
         <<"uncommitted">> -> hb_message:signers(Request, Opts) == [];
         RelevantCommitters ->
+            Committers =
+                lists:map(fun hb_util:committer/1, RelevantCommitters),
             lists:any(
                 fun(Signer) ->
-                    lists:member(Signer, RelevantCommitters)
+                    lists:member(Signer, Committers)
                 end,
                 hb_message:signers(Request, Opts)
             )
@@ -516,6 +518,22 @@ cookie_test() ->
     ?assertEqual(
         [CookieAddress],
         signers_from_commitments_response(Response2, ServerWallet)
+    ),
+    % The hook signs a request with the node's commitment device, regardless
+    % of the codec that the client accepts for the reply.
+    {ok, Response3} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"commitments">>,
+                <<"body">> => <<"Test data">>,
+                <<"accept">> => <<"application/ans104">>
+            },
+            #{}
+        ),
+    ?assertMatch(
+        [_],
+        signers_from_commitments_response(Response3, ServerWallet)
     ).
 
 http_auth_test() ->
@@ -597,7 +615,7 @@ chained_preprocess_test() ->
     % Start a node with the `~http-auth@1.0' device as the secret-provider, with
     % a router chained afterwards in the request hook.
     RelayWallet = ar_wallet:new(),
-    RelayAddress = hb_util:human_id(RelayWallet),
+    RelayAddress = hb:address(RelayWallet),
     RelayURL = hb_http_server:start_node(#{ <<"priv-wallet">> => RelayWallet }),
     Node =
         hb_http_server:start_node(

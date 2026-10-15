@@ -88,6 +88,8 @@ do_eval(Fun, Req, Opts) ->
             {error, <<"Unsupported engine `", (hb_util:bin(Unknown))/binary, "`">>};
         {validation_error, disabled} ->
             {error, <<"Profiling is disabled.">>};
+        {validation_error, invalid_signer} ->
+            {error, <<"Invalid signer.">>};
         {validation_error, invalid_request} ->
             {error, <<"Invalid request.">>}
     end.
@@ -130,7 +132,7 @@ validate_return_mode(Req, Opts) ->
     case return_mode(Req, Opts) of
         <<"open">> -> hb_opts:get(mode, prod, Opts) == debug;
         _ -> true
-    end.
+    end orelse {validation_error, invalid_request}.
 
 %% @doc Validate that the request is from a valid signer, if set by the node
 %% operator. If the `profiling' config option is `true', all requests are
@@ -138,8 +140,9 @@ validate_return_mode(Req, Opts) ->
 validate_signer(Req, Opts) ->
     case find_profiling_config(Opts) of
         ValidSigners when is_list(ValidSigners) ->
+            Committers = lists:map(fun hb_util:committer/1, ValidSigners),
             lists:any(
-                fun(Signer) -> lists:member(Signer, ValidSigners) end,
+                fun(Signer) -> lists:member(Signer, Committers) end,
                 hb_message:signers(Req, Opts)
             );
         EnableProfiling -> EnableProfiling
@@ -323,7 +326,19 @@ temp_file(Ext) ->
 %%% Tests.
 
 eprof_fun_test() -> test_engine(function, <<"eprof">>).
-eprof_resolution_test() -> test_engine(resolution, <<"eprof">>).
+eprof_resolution_test() ->
+    test_engine(resolution, <<"eprof">>),
+    % A request from a signer that is not in `profiling' is refused.
+    ?assertEqual(
+        {error, <<"Invalid signer.">>},
+        hb_ao:resolve(
+            hb_message:commit(
+                #{ <<"path">> => <<"/~profile@1.0/run?run=/~meta@1.0/build">> },
+                #{ <<"priv-wallet">> => ar_wallet:new() }
+            ),
+            #{ <<"profiling">> => [] }
+        )
+    ).
 
 -ifdef(ENABLE_EFLAME).
 eflame_fun_test() -> test_engine(function, <<"eflame">>).

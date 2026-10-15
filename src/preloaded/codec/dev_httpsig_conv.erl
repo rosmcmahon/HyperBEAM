@@ -26,7 +26,7 @@
 %%%         - Otherwise encode the value as a part in the multipart response
 %%% 
 -module(dev_httpsig_conv).
--export([to/3, from/3, encode_http_msg/2, encode_key/1]).
+-export([to/3, from/3, encode_http_msg/2, encode_key/1, boundary/1]).
 %%% Helper utilities
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -84,11 +84,19 @@ from(HTTP, _Req, Opts) ->
     % parts, and add them to the TABM.
     {OrderedBodyKeys, BodyTABM} = body_to_tabm(HTTP, Opts),
     % Merge the body keys with the headers, other than the reserved headers. A
-    % key of the message that shares one of their names is carried in a body
-    % part.
+    % `multipart/' `content-type' header with a `boundary' gives the encoding
+    % of the body, so we leave it out as well. A key of the message that shares
+    % the name of one of these headers is carried in a body part.
     WithBodyKeys =
         maps:merge(
-            hb_maps:without(?RESERVED_HEADERS, Headers, Opts),
+            hb_maps:without(
+                case boundary(maps:get(<<"content-type">>, HTTP, undefined)) of
+                    false -> ?RESERVED_HEADERS;
+                    _ -> [<<"content-type">> | ?RESERVED_HEADERS]
+                end,
+                Headers,
+                Opts
+            ),
             BodyTABM
         ),
     % Reconstruct the commitments from the signature headers.
@@ -113,10 +121,6 @@ from(HTTP, _Req, Opts) ->
         hb_maps:without(
             Removed =
                 hb_maps:keys(Commitments) ++
-                case maps:get(<<"content-type">>, MsgWithSigs, undefined) of
-                    <<"multipart/", _/binary>> -> [<<"content-type">>];
-                    _ -> []
-                end ++
                 case hb_message:is_signed_key(<<"ao-body-key">>, MsgWithSigs, Opts) of
                     true -> [];
                     false -> [<<"ao-body-key">>]
@@ -192,20 +196,12 @@ body_to_parts(ContentType, Body, _Opts) ->
             {body, Body}
         }
     ),
-    Params =
-        case ContentType of
-            undefined -> [];
-            _ ->
-                {item, {_, _XT}, XParams} =
-                    hb_structured_fields:parse_item(ContentType),
-                XParams
-        end,
-    case lists:keyfind(<<"boundary">>, 1, Params) of
+    case boundary(ContentType) of
         false ->
             % The body is not a multipart, so just set as is to the Inlined key on
             % the TABM.
             {normal, Body};
-        {_, {_Type, Boundary}} ->
+        Boundary ->
             % We need to manually parse the multipart body into key/values on the
             % TABM.
             % 
@@ -233,6 +229,20 @@ body_to_parts(ContentType, Body, _Opts) ->
                 [global]
             )}
     end.
+
+%% @doc Return the `boundary' of a `multipart/' `content-type', or `false' if
+%% it has none. Any other `content-type' gives `false'. A `content-type' is not
+%% a structured field, so we parse it with the grammar of RFC 9110. A
+%% `multipart/' value that is not valid HTTP raises.
+boundary(ContentType = <<"multipart/", _/binary>>) ->
+    {_, _, Params} = cow_http_hd:parse_content_type(ContentType),
+    proplists:get_value(<<"boundary">>, Params, false);
+boundary(_ContentType) -> false.
+
+%% @doc Check whether a key is `content-type' and its value starts with
+%% `multipart/'.
+is_multipart(<<"content-type">>, <<"multipart/", _/binary>>) -> true;
+is_multipart(_Key, _Value) -> false.
 
 %% @doc Parse a single part of a multipart body into a TABM.
 from_body_part(InlinedKey, Part, Opts) ->
@@ -337,8 +347,8 @@ to(Link, _Req, _FormatOpts, _Opts) when ?IS_LINK(Link) -> {ok, Link};
 to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
     % If the caller has specified that an `index` page is requested, we:
     % 1. Convert the message to HTTPSig as usual.
-    % 2. Check if the `body` and `content-type` keys are set. If either are,
-    %    we return the message as normal.
+    % 2. Check if the `body` and `content-type` keys are set. If either are, we
+    %    return the message as normal.
     % 3. If they are not, we convert the given message back to its original
     %    form and resolve `path = index` upon it.
     % 4. If this yields a result, we convert it to TABM and merge it with the
@@ -346,10 +356,10 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
     %    if conflicts arise.
     % 5. The resulting combined message is returned to the user.
     {ok, EncOriginal} = to(TABM, maps:without([<<"index">>], Req), Opts),
-    OrigBody = hb_maps:get(<<"body">>, EncOriginal, <<>>, Opts),
-    OrigContentType = hb_maps:get(<<"content-type">>, EncOriginal, <<>>, Opts),
-    case {OrigBody, OrigContentType} of
-        {<<>>, <<>>} ->
+    BodyKeys =
+        hb_maps:with([<<"body">>, <<"content-type">>], EncOriginal, Opts),
+    case map_size(BodyKeys) of
+        0 ->
             % The message has no body or content-type set. Resolve the `index`
             % key upon it to derive it.
             Structured = hb_message:convert(TABM, <<"structured@1.0">>, Opts),
@@ -403,10 +413,16 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
             {ok, EncOriginal}
     end;
 to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
+    CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
     Stripped =
         encode_keys(
             without_unsigned_commitments(
-                hb_maps:without([<<"commitments">>, <<"priv">>], TABM, Opts),
+                hb_maps:without(
+                    [<<"commitments">>, <<"priv">>] ++
+                        uncovered_body_keys(TABM, CommitmentsMap, Opts),
+                    TABM,
+                    Opts
+                ),
                 Opts
             )
         ),
@@ -420,7 +436,6 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
     % Finally, add the signatures to the encoded HTTP message with the
     % commitments from the original message. A `signature' key of the message
     % itself is data, not a commitment.
-    CommitmentsMap = maps:get(<<"commitments">>, TABM, #{}),
     ?event_debug({converting_commitments_to_siginfo, TABM}),
     {ok,
         maps:merge(
@@ -432,6 +447,38 @@ to(TABM, _Req, FormatOpts, Opts) when is_map(TABM) ->
             )
         )
     }.
+
+%% @doc Return the keys of a message with commitments that no commitment
+%% covers and that would be sent in the body. We do not send them: a commitment
+%% that covers the body covers all of it with its `content-digest', and a
+%% reader of a message with commitments keeps only the keys that they cover. A
+%% key that no commitment covers is still sent if it fits in a header.
+uncovered_body_keys(_TABM, Commitments, _Opts)
+        when map_size(Commitments) == 0 ->
+    [];
+uncovered_body_keys(TABM, Commitments, Opts) ->
+    Covered =
+        lists:append(
+            [
+                hb_util:message_to_ordered_list(
+                    maps:get(<<"committed">>, Commitment, []),
+                    Opts
+                )
+            ||
+                Commitment <- maps:values(Commitments)
+            ]
+        ),
+    {_, InlineKey} = inline_key(TABM),
+    [
+        Key
+    ||
+        {Key, Value} <- maps:to_list(TABM),
+        not lists:member(Key, Covered),
+        Key == <<"body">> orelse Key == InlineKey orelse
+            lists:member(Key, ?RESERVED_HEADERS) orelse
+            is_multipart(Key, Value) orelse
+            default_where(Value) == body
+    ].
 
 do_to(Binary, _FormatOpts, _Opts) when is_binary(Binary) -> Binary;
 do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
@@ -451,9 +498,13 @@ do_to(TABM, FormatOpts, Opts) when is_map(TABM) ->
                     AccMap#{ <<"body">> => OldBody#{ InlineKey => Value } };
                (Key, Value, AccMap) ->
                     % A key of the message that shares the name of a reserved
-                    % header is carried in a body part.
+                    % header is carried in a body part. A `multipart/'
+                    % `content-type' of the message is also carried in a body
+                    % part, because the decoder parses such a header for the
+                    % `boundary' of the body.
                     Where =
-                        case lists:member(Key, ?RESERVED_HEADERS) of
+                        case lists:member(Key, ?RESERVED_HEADERS) orelse
+                                is_multipart(Key, Value) of
                             true -> #{ where => body };
                             false -> #{}
                         end,
@@ -867,22 +918,25 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     %
     % Note that a "where" Opts may force the location of the encoded
     % value -- this is only a default location if not specified in Opts 
-    DefaultWhere =
-        case {maps:get(where, Opts, headers), byte_size(Value)} of
-            {headers, Fits} when Fits =< ?MAX_HEADER_LENGTH ->
-                case edge_whitespace(Value) of
-                    true -> body;
-                    false -> headers
-                end;
-            _ -> body
-        end,
-    case maps:get(where, Opts, DefaultWhere) of
+    case maps:get(where, Opts, default_where(Value)) of
         headers ->
             Httpsig#{ NormalizedName => hb_escape:encode_header(Value) };
         body ->
             OldBody = hb_maps:get(<<"body">>, Httpsig, #{}, Opts),
             Httpsig#{ <<"body">> => OldBody#{ NormalizedName => Value } }
     end.
+
+%% @doc Return where a value is sent by default: in a header if it is a
+%% binary that fits in one, and does not start or end with a space or tab.
+%% Any other value is sent in the body.
+default_where(Value)
+        when is_binary(Value), byte_size(Value) =< ?MAX_HEADER_LENGTH ->
+    case edge_whitespace(Value) of
+        true -> body;
+        false -> headers
+    end;
+default_where(_Value) ->
+    body.
 
 %% @doc Whether a value starts or ends with a space or tab. HTTP strips them
 %% from a header value, so such a value is not sent as one.
@@ -990,6 +1044,42 @@ multipart_content_type_test() ->
     ?assertEqual(
         Msg,
         hb_message:uncommitted(hb_cache:ensure_all_loaded(Decoded, Opts), Opts)
+    ),
+    % A browser sends the `boundary' unquoted, starting with `-'.
+    ?assertEqual(
+        #{ <<"a">> => <<"x">> },
+        hb_message:convert(
+            #{
+                <<"content-type">> => <<"multipart/form-data; boundary=--b">>,
+                <<"body">> =>
+                    <<"----b\r\ncontent-disposition: form-data; name=\"a\"\r\n"
+                        "\r\nx\r\n----b--\r\n">>
+            },
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>,
+            Opts
+        )
+    ),
+    % A message's own `multipart/' `content-type' is kept and committed.
+    Multipart =
+        hb_message:commit(
+            #{
+                <<"content-type">> => <<"multipart/mixed; boundary=\"zz\"">>,
+                <<"x">> => <<"1">>
+            },
+            Opts
+        ),
+    ?assert(
+        hb_message:verify(
+            hb_message:convert(
+                hb_message:convert(Multipart, <<"httpsig@1.0">>, Opts),
+                <<"structured@1.0">>,
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            all,
+            Opts
+        )
     ).
 
 group_maps_test() ->

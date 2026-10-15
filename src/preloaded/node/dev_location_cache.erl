@@ -1,5 +1,5 @@
 %%% @doc Pseudo-path cache for node location records.
-%%% Writes location records to ~location@1.0/ADDRESS -> LocationRecord.
+%%% Writes location records to ~location@1.0/COMMITTER -> LocationRecord.
 -module(dev_location_cache).
 -export([write/2, read/2, list/1]).
 -include("include/hb.hrl").
@@ -20,14 +20,15 @@ opts(Opts) ->
             )
     }.
 
-%% @doc Read the latest known scheduler location for an address.
+%% @doc Read the latest known scheduler location for a committer. An Arweave
+%% address is read as its `did:pkh:' committer.
 read(Address, RawOpts) ->
     Opts = opts(RawOpts),
     Res =
         hb_cache:read(
             hb_path:to_binary([
                 ?LOCATION_CACHE_PREFIX,
-                hb_util:human_id(Address)
+                hb_util:committer(Address)
             ]),
             Opts
         ),
@@ -61,7 +62,7 @@ write(LocationMsg, RawOpts) ->
                         #{
                             hb_path:to_binary([
                                 ?LOCATION_CACHE_PREFIX,
-                                hb_util:human_id(Signer)
+                                Signer
                             ]) => RootPath
                         },
                         Opts

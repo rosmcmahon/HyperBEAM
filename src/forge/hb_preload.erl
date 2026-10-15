@@ -186,7 +186,7 @@ build_signs_and_indexes_test() ->
             }
         ),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     {ok, Result} =
         build_groups(
             Groups,

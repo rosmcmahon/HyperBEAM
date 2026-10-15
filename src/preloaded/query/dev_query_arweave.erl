@@ -7,7 +7,8 @@
 %%% optional string `count'. Supported filters are `ids', `tags', `owners',
 %%% `recipients' and `block'. Tag names address message keys. Values within a
 %%% tag are ORed; separate tags and other filters are ANDed. Owners are
-%%% committers; indexed recipients use the commitment's `field-target'.
+%%% Arweave addresses, matched by their `did:pkh:' committers; indexed
+%%% recipients use the commitment's `field-target'.
 %%% Without these selecting filters,
 %%% queries enumerate confirmed base-layer TXs from block headers, optionally
 %%% within inclusive `block.min/max' heights. This excludes bundled data items
@@ -97,8 +98,9 @@
 %%% and remote policy as transaction block bounds. Bundle and ingestion-time
 %%% filters and ingestion-time ordering are not implemented. `networkInfo.height'
 %%% reads the configured Arweave node's status. `parent { id }' and `bundledIn { id }'
-%%% return empty IDs. Other unsupported fields may return a placeholder
-%%% or a GraphQL type error. Schema acceptance does not imply filter support.
+%%% return null for an L1 transaction and an empty ID for a bundled item.
+%%% Other unsupported fields may return a placeholder or a GraphQL type error.
+%%% Schema acceptance does not imply filter support.
 -module(dev_query_arweave).
 %%% AO-Core API:
 -export([query/4]).
@@ -234,24 +236,28 @@ query(Msg, <<"tags">>, Args, Opts) ->
         {ok, [{ok, Tag} || Tag <- hb_util:message_to_ordered_list(Tags, Opts)]}
     else
         _ ->
-            Fields = case Native of
-                [C | _] ->
-                    [Key || <<"field-", Key/binary>> <- hb_maps:keys(C, Opts)];
-                [] -> []
-            end,
-            BundleTags = case Native of
-                [BundleCommitment | _] ->
-                    hb_maps:with(?BUNDLE_KEYS, BundleCommitment, Opts);
-                [] -> #{}
-            end,
-            dev_query_graphql:execute(
-                #{opts => Opts},
-                hb_maps:merge(
-                    hb_maps:without(Fields, hb_message:uncommitted(Msg, Opts), Opts),
-                    BundleTags, Opts),
-                <<"keys">>,
-                Args
-            )
+            Comm = case Native of [C | _] -> C; [] -> #{} end,
+            Fields = [Key || <<"field-", Key/binary>> <- hb_maps:keys(Comm, Opts)],
+            BundleTags = hb_maps:with(?BUNDLE_KEYS, Comm, Opts),
+            {ok, Keys} =
+                dev_query_graphql:execute(
+                    #{opts => Opts},
+                    hb_maps:merge(
+                        hb_maps:without(
+                            Fields, hb_message:uncommitted(Msg, Opts), Opts),
+                        BundleTags, Opts),
+                    <<"keys">>,
+                    Args
+                ),
+            % We give the tags in the order of the commitment's `committed'
+            % keys, because the item's signature covers them in that order.
+            Ordered =
+                lib_arweave_common:order_tags(
+                    [{Name, Tag} || Tag = {ok, #{ <<"name">> := Name }} <- Keys],
+                    Comm,
+                    Opts
+                ),
+            {ok, [Tag || {_, Tag} <- Ordered]}
     end;
 query(Msg, <<"signature">>, _Args, Opts) ->
     % Return the signature of the transaction.
@@ -275,12 +281,17 @@ query(Msg, <<"owner">>, _Args, Opts) ->
                 [] -> {ok, #{ <<"address">> => <<>>, <<"key">> => <<>> }};
                 [CommID | _] ->
                     {ok, Commitment} = hb_maps:find(CommID, Commitments, Opts),
-                    {ok, Address} = hb_maps:find(<<"committer">>, Commitment, Opts),
-                    {ok, KeyID} = hb_maps:find(<<"keyid">>, Commitment, Opts),
-                    Key = hb_util:remove_scheme_prefix(KeyID),
+                    {ok, Committer} =
+                        hb_maps:find(<<"committer">>, Commitment, Opts),
                     {ok, #{
-                        <<"address">> => Address,
-                        <<"key">> => Key
+                        <<"address">> => hb_util:committer_address(Committer),
+                        <<"key">> =>
+                            hb_maps:get(
+                                <<"public-key">>,
+                                Commitment,
+                                hb_maps:get(<<"owner">>, Commitment, null, Opts),
+                                Opts
+                            )
                     }}
             end
     end;
@@ -347,9 +358,13 @@ query(Msg, <<"size">>, _Args, Opts) ->
     end;
 query(Msg, <<"type">>, _Args, Opts) ->
     {ok, hb_maps:get(<<"content-type">>, Msg, null, Opts)};
-query(_Msg, Field, _Args, _Opts)
+query(Msg, Field, _Args, Opts)
         when Field =:= <<"bundledIn">>; Field =:= <<"parent">> ->
-    {ok, #{}};
+    L1 = #{ <<"commitment-device">> => <<"tx@1.0">> },
+    case hb_maps:values(hb_message:commitments(L1, Msg, Opts), Opts) of
+        [] -> {ok, #{}};
+        _ -> {ok, null}
+    end;
 query(Obj, Field, Args, _Opts) ->
     ?event({unimplemented_transactions_query,
         {object, Obj},
@@ -1030,20 +1045,15 @@ index_connection(Predicates, Args, Opts) ->
             end}
     end.
 
-%% @doc The query's AND predicates, each with alternative values. Owners and
-%% recipients use `committer' and `field-target'. Explicit IDs, a height or bundle
+%% @doc The query's AND predicates, each with alternative values. Owners use
+%% `committer', and recipients `field-target'. Explicit IDs, a height or bundle
 %% filter are `unservable'. An empty predicate list selects block enumeration.
 index_predicates(Args, Opts) ->
     Get = fun(Filter) -> hb_maps:get(Filter, Args, null, Opts) end,
     Fields =
         [
-            {Pair, Get(Filter)}
-        ||
-            {Pair, Filter} <-
-                [
-                    {<<"committer">>, <<"owners">>},
-                    {<<"field-target">>, <<"recipients">>}
-                ]
+            {<<"committer">>, owner_committers(Get(<<"owners">>))},
+            {<<"field-target">>, Get(<<"recipients">>)}
         ],
     maybe
         true ?= Get(<<"ids">>) =/= [] orelse unservable,
@@ -1514,9 +1524,10 @@ match(<<"tags">>, Tags, Opts) ->
             )
     end;
 match(<<"owners">>, Owners, Opts) ->
-    {ok, matching_commitments(<<"committer">>, Owners, Opts)};
+    {ok, matching_commitments(<<"committer">>, owner_committers(Owners), Opts)};
 match(<<"owner">>, Owner, Opts) ->
-    Res =  matching_commitments(<<"committer">>, Owner, Opts),
+    Res =
+        matching_commitments(<<"committer">>, ?ARWEAVE_COMMITTER(Owner), Opts),
     ?event({match_owner, Owner, Res}),
     {ok, Res};
 match(<<"recipients">>, Recipients, Opts) ->
@@ -1628,6 +1639,11 @@ do_filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
         ),
     ?event({filtered_out_of_range, length(AnnotatedIDs) - length(Filtered)}),
     Filtered.
+
+%% @doc Convert the owners of a GraphQL query, which are Arweave addresses, to
+%% their `did:pkh:' committers.
+owner_committers(null) -> null;
+owner_committers(Owners) -> [?ARWEAVE_COMMITTER(Owner) || Owner <- Owners].
 
 %% @doc Return the IDs of the messages whose commitments carry a field:
 %% their committer, or their target.

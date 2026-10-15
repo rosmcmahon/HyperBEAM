@@ -257,7 +257,8 @@ named_test_descriptor(Mod, Fun, Label, generator) ->
 named_test_descriptor(Mod, Fun, Label, test) ->
     {{Label, Fun, 0}, {test, Mod, Fun}}.
 
-%% @doc Resolve a requested `-t' name, treating matching `_test_' as generator.
+%% @doc Resolve a requested `-t' name. A name that ends in `_', such as
+%% `x_test_' or `x_test_parallel_', is a generator.
 resolve_test_fun(Mod, Fun) ->
     code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, Fun, 0) of
@@ -265,7 +266,7 @@ resolve_test_fun(Mod, Fun) ->
             [
                 {
                     Fun,
-                    case lists:suffix("_test_", atom_to_list(Fun)) of
+                    case lists:suffix("_", atom_to_list(Fun)) of
                         true -> generator;
                         false -> test
                     end

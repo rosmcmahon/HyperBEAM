@@ -180,20 +180,22 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
     % A request `peer' or absolute `relay-path' is checked; a relative
     % `relay-path' names no host and is routed by `hb_http:request/2', which
     % fails closed when no route matches.
-    {RelayPeer, Destination} =
+    {RelayPeer, Destination, RouteOpts} =
         case RelayRoute of
             not_found ->
-                {RequestPeer, relay_destination(RequestPeer, RelayPath)};
+                {RequestPeer, relay_destination(RequestPeer, RelayPath), HTTPOpts};
             _ ->
-                {route_node(RelayRoute, RelayMethod, Opts), undefined}
+                {Node, NodeOpts} = route_node(RelayRoute, RelayMethod, HTTPOpts),
+                {Node, undefined, NodeOpts}
         end,
+    RequestOpts = RouteOpts#{ <<"http-redirects">> => 0 },
     case is_blocked_host(Destination, Opts) of
         true -> {error, blocked_host};
         false ->
             Res =
                 case RelayPeer of
                     not_found ->
-                        hb_http:request(TargetMod5, HTTPOpts);
+                        hb_http:request(TargetMod5, RequestOpts);
                     _ ->
                         ?event(debug_relay, {relaying_to_peer, RelayPeer}),
                         hb_http:request(
@@ -201,14 +203,18 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
                             RelayPeer,
                             RelayPath,
                             TargetMod5,
-                            HTTPOpts
+                            RequestOpts
                         )
                 end,
             case Res of
                 {ok, R} ->
+                    % A reply that carries commitments is the message that the
+                    % peer sent: the result keeps the keys that they cover, so
+                    % the `status' that the client adds to the reply is not one.
+                    {ok, Sent} = hb_message:with_only_committed(R, any, Opts),
                     % The reply's links name messages in the peer's stores, and
                     % a client reads them from this node: load them here.
-                    Loaded = hb_cache:ensure_all_loaded(R, Opts),
+                    Loaded = hb_cache:ensure_all_loaded(Sent, Opts),
                     {ok, strip_cookies(Loaded, Opts)};
                 Err -> Err
             end
@@ -224,15 +230,15 @@ relay_destination(not_found, _RelativePath) -> undefined;
 relay_destination(Peer, _RelayPath) -> Peer.
 
 %% @doc The node that the node's own routes resolve `Route' to: the destination
-%% the node's configuration chose for that path. Returns `not_found' when no
-%% route matches, which leaves the request with no peer to contact.
+%% the node's configuration chose for that path, with its request options.
+%% Returns `{not_found, Opts}' when no route matches, leaving no peer to contact.
 route_node(Route, Method, Opts) ->
     case hb_http:message_to_request(
             #{ <<"path">> => Route, <<"method">> => Method },
             Opts
         ) of
-        {ok, _Method, Node, _Path, _Msg, _NodeOpts} -> Node;
-        {error, _} -> not_found
+        {ok, _Method, Node, _Path, _Msg, NodeOpts} -> {Node, NodeOpts};
+        {error, _} -> {not_found, Opts}
     end.
 
 %% @doc Ensure that cookies are not forwarded either to or from the relayed
@@ -468,7 +474,7 @@ commit_request_test() ->
                         <<"strategy">> => <<"Nearest">>,
                         <<"nodes">> => [
                             #{
-                                <<"wallet">> => hb_util:human_id(Wallet),
+                                <<"wallet">> => hb:address(Wallet),
                                 <<"prefix">> => Executor
                             }
                         ]
@@ -537,7 +543,9 @@ relay_peer_allowed_test() ->
             },
             #{ <<"relay-block-internal">> => false }
         ),
-    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})).
+    ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})),
+    % The result is the peer's message, without the `status' the client adds.
+    ?assertNot(maps:is_key(<<"status">>, Res)).
 
 %% @doc A `call' whose `relay-path' is an absolute URL on an internal host is
 %% refused by default.

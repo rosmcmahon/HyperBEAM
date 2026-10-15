@@ -217,7 +217,7 @@ ensure_server(Opts) ->
         undefined ->
             ItemIDs = dev_bundler_cache:list_item_ids(Opts),
             % The server signs bundles with the node key.
-            ServerOpts = hb_http_server:with_node_key(Opts),
+            ServerOpts = hb_http_server:with_node_committer(Opts),
             hb_name:singleton(Name, fun() -> init(ItemIDs, ServerOpts) end)
     end.
 

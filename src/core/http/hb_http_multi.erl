@@ -18,6 +18,12 @@
 %%% ```
 %%%     resolve(Base, Response#{ <<"path">> => Base/path OR /is-admissible }, Opts)
 %%% '''
+%%%
+%%% Each selected response invokes `on/http-client-admissible-receipt'
+%%% asynchronously, with a signed receipt in `body'. It contains `request',
+%%% `response', the original `request-method' and `request-path', and the peer's
+%%% `reference', if set. Acceptance means the configured checks passed; without
+%%% a content predicate it does not establish that the returned content is valid.
 -module(hb_http_multi).
 -export([request/5]).
 -include("include/hb.hrl").
@@ -139,9 +145,7 @@ is_admissible(ErlStatus, Res, Admissible, Statuses, Opts)
     ),
     AdmissibleStatus = admissible_status(Res, Statuses, Opts),
     ?event(debug_multi, {admissible_status, {result, AdmissibleStatus}}),
-    AdmissibleResponse = admissible_response(Res, Admissible, Opts),
-    ?event(debug_multi, {admissible_response, {result, AdmissibleResponse}}),
-    AdmissibleStatus andalso AdmissibleResponse;
+    AdmissibleStatus andalso admissible_response(Res, Admissible, Opts);
 is_admissible(_, _, _, _, _) -> false.
 
 %% @doc Serially request a message, collecting responses until the required
@@ -155,6 +159,7 @@ serial_multirequest([Node|Nodes], Remaining, Method, Path, Message, Admissible, 
     {ErlStatus, Res} = node_request(Method, Node, Path, Message, Opts),
     case is_admissible(ErlStatus, Res, Admissible, Statuses, Opts) of
         true ->
+            receipt(Node, Method, Path, Message, Res, Opts),
             ?event(debug_http, {admissible_status, {response, Res}}),
             {AdmissibleAcc, AllAcc} = serial_multirequest(
                 Nodes,
@@ -202,7 +207,7 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
                     fun() ->
                         Res = node_request(Method, Node, Path, Message, Opts),
                         receive no_reply -> stopping
-                        after 0 -> Parent ! {Ref, self(), Res}
+                        after 0 -> Parent ! {Ref, self(), {Node, Res}}
                         end
                     end
                 )
@@ -229,12 +234,44 @@ node_request(Method, Node, Path, Message, Opts) ->
         }
     end.
 
+%% @doc Observe a selected response without changing it. Use the same peer
+%% options as the HTTP request, so its reference and hooks remain attributable.
+receipt(Node, Method, Path, Message, Response, Opts) ->
+    PeerOpts =
+        case Node of
+            #{ <<"uri">> := _, <<"opts">> := Extra } ->
+                hb_maps:merge(
+                    Opts,
+                    hb_opts:mimic_default_types(Extra, new_atoms, Opts),
+                    Opts
+                );
+            _ -> Opts
+        end,
+    spawn(
+        fun() ->
+            hb_http_client:receipt(
+                <<"http-client-admissible-receipt">>,
+                #{
+                    <<"request-method">> => Method,
+                    <<"request-path">> => Path,
+                    <<"request">> => Message,
+                    <<"response">> => Response
+                },
+                PeerOpts
+            )
+        end
+    ).
+
 %% @doc Check if a status is allowed, according to the configuration. Statuses
 %% can be a single integer, a list of integers, a comma-separated list of
 %% integers, or the string `All'. Integers may be given as binaries.
 admissible_status(_, <<"All">>, _Opts) -> true;
 admissible_status(ResponseMsg = #{ <<"status">> := _ }, Statuses, Opts) ->
-    admissible_status(hb_http:http_status(ResponseMsg, Opts), Statuses, Opts);
+    admissible_status(
+        hb_http:status_code({ok, ResponseMsg}, Opts),
+        Statuses,
+        Opts
+    );
 admissible_status(Status, Statuses, Opts) when is_integer(Statuses) ->
     admissible_status(Status, [Statuses], Opts);
 admissible_status(Status, Statuses, Opts) when is_binary(Status) ->
@@ -290,11 +327,12 @@ parallel_responses(AdmissibleRes, AllRes, Procs, _, _, Ref, 0, true, _Admissible
     {AdmissibleRes, AllRes};
 parallel_responses(AdmissibleRes, AllRes, Procs, Queue, {Method, Path, Message}, Ref, Awaiting, StopAfter, Admissible, Statuses, Opts) ->
     receive
-        {Ref, Pid, {Status, NewRes}} ->
+        {Ref, Pid, {Node, {Status, NewRes}}} ->
             WorkersWithoutPid = lists:delete(Pid, Procs),
             NewAllRes = [{Status, NewRes} | AllRes],
             case is_admissible(Status, NewRes, Admissible, Statuses, Opts) of
                 true ->
+                    receipt(Node, Method, Path, Message, NewRes, Opts),
                     NewAwaiting = Awaiting - 1,
                     {NewProcs, NewQueue} =
                         case NewAwaiting of
@@ -399,9 +437,15 @@ multirequest_test_() ->
                           <<"stop-after">> => false}))
             end},
             {"parallel crash", fun() ->
+                Self = self(),
+                Admissible = #{ <<"device">> => #{ <<"is-admissible">> =>
+                    fun(_, _, _) -> Self ! admissible_ran, {ok, true} end } },
                 ?assertMatch({error, {no_viable_responses, _}},
                     multi([crash(), crash()],
-                        #{<<"parallel">> => true, <<"stop-after">> => true}))
+                        #{<<"parallel">> => true, <<"stop-after">> => true,
+                          <<"admissible">> => Admissible})),
+                % The `admissible' message does not run on a request that fails.
+                ?assertNot(receive admissible_ran -> true after 0 -> false end)
             end}
         ]} end}.
 
