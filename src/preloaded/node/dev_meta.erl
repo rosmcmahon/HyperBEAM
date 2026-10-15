@@ -279,7 +279,11 @@ unauthorized_set_node_msg_fails_test() ->
             )
         end,
         [<<"httpsig@1.0">>, <<"flat@1.0">>]
-    ).
+    ),
+    % A request to another device does not change the node message.
+    NodeMsg = hb_http_server:get_opts(),
+    hb_http:get(Node, <<"/~test-device@1.0/postprocess?body=x">>, #{}),
+    ?assertEqual(NodeMsg, hb_http_server:get_opts()).
 
 %% @doc Test that we can set the node message if the request is signed by the
 %% owner of the node.
