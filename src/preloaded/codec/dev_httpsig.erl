@@ -499,12 +499,16 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
                     [<<"body">>, <<"ao-body-key">>]
                 )
         end,
-    % The keys to be used in encodings of the message:
+    % The keys to be used in encodings of the message. A key that is an RFC
+    % 9421 derived component, such as `path', is encoded as that component,
+    % `@path':
     KeysForEncoding =
-        hb_util:list_replace(
-            EncodedKeysWithBodyKey,
-            <<"body">>,
-            <<"content-digest">>
+        dev_httpsig_siginfo:add_derived_specifiers(
+            hb_util:list_replace(
+                EncodedKeysWithBodyKey,
+                <<"body">>,
+                <<"content-digest">>
+            )
         ),
     % Calculate the keys that have been removed from the message, as a result
     % of being added to the body. These keys will need to be removed from the
@@ -664,7 +668,8 @@ signature_components_line(Req, Commitment, _Opts) ->
 	ComponentsLines =
         lists:map(
             fun(Name) ->
-                case maps:get(Name, Req, not_found) of
+                [Key] = dev_httpsig_siginfo:remove_derived_specifiers([Name]),
+                case maps:get(Key, Req, not_found) of
                     not_found ->
                         throw(
                             {
@@ -694,11 +699,9 @@ signature_params_line(RawCommitment, Opts) ->
                     list,
                     lists:map(
                         fun(Key) -> {item, {string, Key}, []} end,
-                        dev_httpsig_siginfo:add_derived_specifiers(
-                            hb_util:message_to_ordered_list(
-                                maps:get(<<"committed">>, RawCommitment),
-                                Opts
-                            )
+                        hb_util:message_to_ordered_list(
+                            maps:get(<<"committed">>, RawCommitment),
+                            Opts
                         )
                     ),
                     signature_params(RawCommitment)
@@ -784,7 +787,25 @@ commitment_identity_test() ->
     Roundtrip = hb_message:convert(
         Wire, <<"structured@1.0">>, <<"httpsig@1.0">>, Opts
     ),
-    ?assert(hb_message:verify(Roundtrip, all, Opts)).
+    ?assert(hb_message:verify(Roundtrip, all, Opts)),
+    % A key that is an RFC 9421 derived component, such as `path', is signed as
+    % that component, `@path'.
+    PathWire =
+        hb_message:convert(
+            hb_message:commit(
+                #{ <<"path">> => <<"/x">>, <<"a">> => <<"1">> },
+                Opts
+            ),
+            <<"httpsig@1.0">>,
+            Opts
+        ),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(
+            maps:get(<<"signature-input">>, PathWire),
+            <<"\"@path\"">>
+        )
+    ).
 
 %% @doc Ensure that a publicly known RSA key cannot authenticate an HMAC
 %% signer. A commitment that uses the key as its secret is made by its own

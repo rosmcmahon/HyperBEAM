@@ -9,7 +9,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %%% A list of components that are `derived' in the context of RFC-9421 from the
-%%% request message.
+%%% request message. A key that is one of these components is signed and sent
+%%% as that component: `path' as `@path'. `@query-param' also needs the query
+%%% parameter that it selects, so a `query-param' key is signed as a field.
 -define(DERIVED_COMPONENTS, [
     <<"method">>,
     <<"target-uri">>,
@@ -17,8 +19,7 @@
     <<"scheme">>,
     <<"request-target">>,
     <<"path">>,
-    <<"query">>,
-    <<"query-param">>
+    <<"query">>
     % <<"status">> % Some libraries do not support it
 ]).
 

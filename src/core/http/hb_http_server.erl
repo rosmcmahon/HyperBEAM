@@ -1472,6 +1472,7 @@ req_to_tabm_singleton(Req, Body, Opts) ->
 %% @doc Return the message keys that the request's HTTPSig signatures cover,
 %% from its `signature-input' headers. A signature covers its keys' values, so
 %% the query parameters do not replace the signed header values of these keys.
+%% A derived component, such as `@path', covers the key `path'.
 %% HTTPSig is the only request form that carries signed content in headers:
 %% the other codecs sign the body, which the query parameters do not reach.
 signed_keys(Headers, Opts) ->
@@ -1480,7 +1481,11 @@ signed_keys(Headers, Opts) ->
             lists:usort(
                 lists:append(
                     [
-                        [hb_escape:decode(Key) || {item, {string, Key}, _} <- Fields]
+                        [
+                            hb_escape:decode(string:trim(Key, leading, "@"))
+                        ||
+                            {item, {string, Key}, _} <- Fields
+                        ]
                     ||
                         {_Name, {list, Fields, _Params}} <-
                             hb_structured_fields:parse_dictionary(SigInput)
