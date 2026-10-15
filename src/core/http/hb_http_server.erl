@@ -1894,6 +1894,13 @@ ingress_commitments_test_() ->
             Msg = #{ <<"body">> => <<"original">> },
             Signed = hb_message:commit(Msg, Opts, CommitCodec),
             Unsigned = hb_message:normalize_commitments(Msg, Opts),
+            % A commitment with any constant HMAC key is unsigned.
+            Constant = hb_message:commit(Msg, Opts,
+                #{
+                    <<"type">> => <<"hmac-sha256">>,
+                    <<"committer">> => <<"hmac:constant:x">>
+                }
+            ),
             Invalid = Signed#{ <<"body">> => <<"modified">> },
             WrongMethod = hb_message:commit(
                 Msg#{ <<"method">> => <<"GET">> }, Opts, CommitCodec),
@@ -1913,6 +1920,8 @@ ingress_commitments_test_() ->
                         ingress_request(Node, Codec, Msg, Opts)),
                     ?assertMatch({ok, UnsignedStatus, _, _},
                         ingress_request(Node, Codec, Unsigned, Opts)),
+                    ?assertMatch({ok, UnsignedStatus, _, _},
+                        ingress_request(Node, Codec, Constant, Opts)),
                     ?assertMatch({ok, UnsignedStatus, _, _},
                         ingress_request(Node, Codec,
                             Msg#{ <<"child">> => Child }, Opts)),

@@ -543,10 +543,12 @@ commitment_to_alg(Commitment, _Opts) ->
     <<CommitmentDevice/binary, Type/binary>>.
 
 %% @doc Convert a `keyid' to the committer of a commitment. The `keyid' is the
-%% URI of the committer that made the commitment. Unsigned commitments and
-%% commitments without a `keyid' have no committer, so we return `undefined'.
+%% URI of the committer that made the commitment. The key of an
+%% `hmac:constant:' keyid is known to everyone, so its commitments are unsigned.
+%% Unsigned commitments and commitments without a `keyid' have no committer, so
+%% we return `undefined'.
 keyid_to_committer(<<>>) -> undefined;
-keyid_to_committer(?UNSIGNED_COMMITTER) -> undefined;
+keyid_to_committer(<<"hmac:constant:", _/binary>>) -> undefined;
 keyid_to_committer(KeyID) -> KeyID.
 
 %% @doc Normalize key parameters to ensure their names are correct for inclusion
