@@ -68,8 +68,7 @@ traverse_store(Store, Path, Parent, Graph, Opts) ->
             case Node of
                 {ok, _} ->
                     process_simple_node(Store, Path, Parent, ResolvedPath, JoinedPath, Graph1, Opts);
-                {error, not_found} ->
-                    % A path with no value is drawn with the keys below it.
+                {composite, _} ->
                     process_composite_node(Store, Path, Parent, ResolvedPath, JoinedPath, Graph1, Opts);
                 _ ->
                     ?event({unknown_node_type, {path, Path}, {read, Node}}),

@@ -40,8 +40,7 @@ apply_list_bounds(Children, Req, Store) ->
 %% @doc The children a list request answers with, from every child a store
 %% holds: all of them, in the store's own order, unless the request bounds
 %% the list -- from a child, in a direction, or up to a limit -- when they
-%% are the children within its bounds, sorted by name. A batch is every child.
-%% Each child is a name, or a `{Name, Value}' pair.
+%% are the sorted children within its bounds. A batch is every child.
 apply_list_bounds(Children, Req) ->
     case list_request_bounds(Req) of
         #{ <<"from">> := none, <<"limit">> := all, <<"direction">> := asc } ->
@@ -53,12 +52,12 @@ apply_list_bounds(Children, Req) ->
         } ->
             Ordered =
                 case Direction of
-                    asc -> by_name(Children);
-                    desc -> lists:reverse(by_name(Children))
+                    asc -> lists:sort(Children);
+                    desc -> lists:reverse(lists:sort(Children))
                 end,
             Ahead =
                 lists:dropwhile(
-                    fun(Child) -> behind(Direction, name(Child), From) end,
+                    fun(Child) -> behind(Direction, Child, From) end,
                     Ordered
                 ),
             case Limit of
@@ -66,15 +65,6 @@ apply_list_bounds(Children, Req) ->
                 _ -> Ahead
             end
     end.
-
-%% @doc Sort children by their names.
-by_name(Children) ->
-    lists:sort(fun(Child, Next) -> name(Child) =< name(Next) end, Children).
-
-%% @doc Return the name of a child, whether it is listed alone or with its
-%% value.
-name({Name, _Value}) -> Name;
-name(Name) -> Name.
 
 %% @doc Whether a child lies before the start of a bounded list.
 behind(_Direction, _Child, none) -> false;

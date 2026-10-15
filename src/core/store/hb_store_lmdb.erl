@@ -157,25 +157,28 @@ write(Opts, Req, _NodeOpts) ->
             end
     end.
 
-%% @doc Read a value from the database by key. A key with only keys below it
-%% holds no value, so we return `not_found' for it.
+%% @doc Read a value from the database by key. If the key holds no value, but
+%% has keys below it, we return those keys, each with its value if it holds
+%% one.
 %%
 %% @param Opts Database configuration map
 %% @param PathReq Request of the form `#{<<"read">> => Path}`.
-%% @returns `{ok, Value}` on success, or `{error, not_found}` on failure
+%% @returns `{ok, Value}` on success, `{composite, Children}` for a key with
+%%          keys below it, or `{error, not_found}` on failure
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) when is_binary(Path) ->
     read_result(Opts, Path);
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) ->
     read_result(Opts, hb_path:to_binary(Path)).
 
-%% A single `elmdb:get' reads the value of exactly the key.
 read_result(Opts, Path) ->
     EnvOpts = ensure_env(Opts),
     StartTime = erlang:monotonic_time(),
     Result = 
-        case read_direct(EnvOpts, Path) of
+        case read_key(EnvOpts, Path) of
             {ok, Value} ->
                 {ok, Value};
+            {composite, Children} ->
+                {composite, Children};
             not_found ->
                 {error, not_found};
             {error, Type, _} ->
@@ -184,12 +187,29 @@ read_result(Opts, Path) ->
     MetricStatus = 
         case Result of
             {ok, _} -> hit;
+            {composite, _} -> hit;
             {error, not_found} -> miss;
             not_found -> miss;
             _ -> unknown
         end,
     sample_metrics(EnvOpts, StartTime, MetricStatus),
     Result.
+
+%% @doc Read a key's value, or the rows below it. We read the value with one
+%% `elmdb:get' of the key. For a key that holds no value, we read the rows
+%% below it with one `elmdb:read_prefix' of the key and a `/', and return the
+%% key's immediate children, each with its value if it holds one.
+read_key(EnvOpts, Path) ->
+    case read_direct(EnvOpts, Path) of
+        not_found ->
+            Prefix = <<Path/binary, "/">>,
+            maybe
+                {ok, Rows} ?= read_prefix_rows(EnvOpts, Prefix),
+                {composite, hb_store_utils:immediate_children(Prefix, Rows)}
+            end;
+        Read ->
+            Read
+    end.
 
 %% @doc Unified read function that handles LMDB reads with fallback to the
 %% in-process pending writes, if necessary.
@@ -252,8 +272,7 @@ scope(_) -> scope().
 %%
 %% The implementation returns only the immediate children of the given path,
 %% not the full paths. For example, listing "colors/" will return ["red", "blue"]
-%% not ["colors/red", "colors/blue"]. If the request sets `values' to `true',
-%% each child that holds a value is returned with it (see `list_children/3').
+%% not ["colors/red", "colors/blue"].
 %%
 %% This is particularly useful for implementing hierarchical data organization
 %% and providing tree-like navigation interfaces in applications.
@@ -284,21 +303,7 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
 %% those the request names from its `from' in its direction, no more than
 %% its limit. A `batch' uses the store's `list-batch-size' (default 256,
 %% minimum 2 for inclusive cursor progress), independently of the write
-%% flush threshold `batch-size'. An `all' request remains unbounded. If the
-%% request sets `values' to `true', we read every row below the path with one
-%% `elmdb:read_prefix' instead, and return each child with a row of its own as
-%% `{Child, Value}', and each child with only rows below it as `Child'.
-list_children(Opts, ResolvedPath, Req = #{ <<"values">> := true }) ->
-    Prefix = hb_store_utils:child_prefix(ResolvedPath),
-    case read_prefix_rows(Opts, Prefix) of
-        {ok, Rows} ->
-            Children = hb_store_utils:immediate_children(Prefix, Rows),
-            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
-        not_found ->
-            {ok, []};
-        {error, Type, _Description} ->
-            {error, Type}
-    end;
+%% flush threshold `batch-size'. An `all' request remains unbounded.
 list_children(Opts, ResolvedPath, Req) ->
     #{
         <<"from">> := From,
@@ -575,22 +580,14 @@ cache_style_test() ->
     ?assertEqual({ok, <<"test-value">>}, Result),
     hb_store:stop(StoreOpts).
 
-list_values_test() ->
+read_prefix_composite_test() ->
     StoreOpts = hb_test_utils:test_store(?MODULE),
     test_reset(StoreOpts),
     test_write(StoreOpts, <<"root/a">>, <<"1">>),
     test_write(StoreOpts, <<"root/b/c">>, <<"2">>),
     ?assertEqual(
-        {error, not_found},
+        {composite, [{<<"a">>, <<"1">>}, <<"b">>]},
         read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
-    ),
-    ?assertEqual(
-        {ok, [{<<"a">>, <<"1">>}, <<"b">>]},
-        list(
-            StoreOpts,
-            #{ <<"list">> => <<"root">>, <<"values">> => true },
-            #{}
-        )
     ),
     ?assertEqual({ok, [<<"a">>, <<"b">>]}, test_list(StoreOpts, <<"root">>)),
     test_stop(StoreOpts).

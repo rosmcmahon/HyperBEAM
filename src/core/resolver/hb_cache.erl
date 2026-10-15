@@ -909,7 +909,7 @@ lookup(Target, Path = <<"ni:", _/binary>>, Store, Opts, _Depth) ->
     lookup_result(Target, Path, Result);
 lookup(Target, Path, Store, Opts, Depth) ->
     Local = hb_store:scope(Store, local),
-    case read_local(Local, Path, read_order(Path, Opts), Opts) of
+    case hb_store:read(Local, Path, Opts) of
         {ok, _} = Found ->
             follow(Target, Path, Found, Store, Opts, Depth);
         {composite, _} = Found ->
@@ -919,63 +919,15 @@ lookup(Target, Path, Store, Opts, Depth) ->
                 {ok, Aliased} ->
                     lookup(Target, Aliased, Store, Opts, Depth + 1);
                 {error, not_found} ->
-                    % The other stores answer a read of an ID with its
-                    % message, so we read the path from them first.
                     follow(
                         Target,
                         Path,
-                        read_path(
-                            remote_stores(Store),
-                            Path,
-                            [read, list],
-                            Opts
-                        ),
+                        hb_store:read(remote_stores(Store), Path, Opts),
                         Store,
                         Opts,
                         Depth
                     )
             end
-    end.
-
-%% @doc Read a path from each local store in turn, until one holds it, asking
-%% each store in the given order (see `read_path/4').
-read_local(Store, Path, Order, Opts) when not is_list(Store) ->
-    read_local([Store], Path, Order, Opts);
-read_local([], _Path, _Order, _Opts) ->
-    {error, not_found};
-read_local([Store | Stores], Path, Order, Opts) ->
-    case read_path([Store], Path, Order, Opts) of
-        {ok, _} = Found -> Found;
-        {composite, _} = Found -> Found;
-        _ -> read_local(Stores, Path, Order, Opts)
-    end.
-
-%% @doc Read the value at a path from the stores, or the keys below it, as
-%% `{composite, Children}'. We ask in the given order: `read' for the value,
-%% and `list' for the keys below the path, each with its value if it has one.
-read_path(_Stores, _Path, [], _Opts) ->
-    {error, not_found};
-read_path(Stores, Path, [read | Then], Opts) ->
-    case hb_store:read(Stores, Path, Opts) of
-        {error, not_found} -> read_path(Stores, Path, Then, Opts);
-        Read -> Read
-    end;
-read_path(Stores, Path, [list | Then], Opts) ->
-    Req = #{ <<"list">> => Path, <<"values">> => true },
-    case hb_store:list(Stores, Req, Opts) of
-        {ok, [_ | _] = Children} -> {composite, Children};
-        _ -> read_path(Stores, Path, Then, Opts)
-    end.
-
-%% @doc Return the order in which we ask a local store for a path. An ID names
-%% a message, so we list the keys below it first, and read it only if it has
-%% none: a signed ID holds `ao:' and the unsigned ID of its message. We do the
-%% same for each path that we read in a commitment, which is the commitment or
-%% a message in it. Any other path is read first.
-read_order(Path, Opts) ->
-    case ?IS_ID(Path) orelse hb_opts:get(commitment, undefined, Opts) == true of
-        true -> [list, read];
-        false -> [read, list]
     end.
 
 %% @doc Return the stores in a list that are not local, in their order.
@@ -1030,11 +982,17 @@ link_target(Target, ID) ->
     end.
 
 %% @doc Rewrite a path whose first part is an ID that holds `ao:<ID>', such
-%% that the rest of the path is read under the ID that it names.
+%% that the rest of the path is read under the ID in that value. An ID with
+%% keys below it holds a message, so it is not an alias. We read an ID for its
+%% `ao:' value only if it has no keys.
 alias(Path, Store, Opts) ->
     case binary:split(Path, <<"/">>) of
         [First, Rest] when ?IS_ID(First) ->
-            alias_path(hb_store:read(Store, First, Opts), Rest);
+            OneKey = #{ <<"list">> => First, <<"limit">> => 1 },
+            case hb_store:list(Store, OneKey, Opts) of
+                {ok, [_ | _]} -> {error, not_found};
+                _ -> alias_path(hb_store:read(Store, First, Opts), Rest)
+            end;
         _ ->
             {error, not_found}
     end.
@@ -1102,7 +1060,7 @@ read_message(Target, ResolvedFullPath, Children, Store, Opts) ->
     Msg.
 
 %% @doc Normalize a composite child entry to its subpath name, dropping any
-%% inline value the list supplied alongside it.
+%% inline value the read supplied alongside it.
 child_name({Subpath, _Value}) -> Subpath;
 child_name(Subpath) -> Subpath.
 
@@ -1236,7 +1194,7 @@ apply_type_to_immediate(Value, _LinkOpts, _Opts) ->
     Value.
 
 %% @doc Read and parse the ao-types for a given path if it is in the supplied
-%% list of subpaths, returning a map of keys and their types. Lists with values
+%% list of subpaths, returning a map of keys and their types. Composite reads
 %% already return small inline `ao-types' values, so reuse them when present.
 read_ao_types(Path, Subpaths, Values, Store, Opts) ->
     ?event_debug({reading_ao_types, {path, Path}, {subpaths, {explicit, Subpaths}}}),

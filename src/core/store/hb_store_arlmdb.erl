@@ -6,8 +6,8 @@
 %%% A main database in LMDB's default mode -- keys with values -- holds
 %%% paths as `hb_store_lmdb' writes them. We serve such a file read-only, in
 %%% the same way as that store serves its own: a read returns the value of a
-%%% path, and a list returns the children of a path, with their values if the
-%%% request asks for them. A main database in DUP mode
+%%% path, or the values of its children, and a list returns the children of
+%%% a path. A main database in DUP mode
 %%% (`MDB_DUPSORT bor MDB_DUPFIXED') -- fixed-width keys, each holding a
 %%% sorted set of fixed-width duplicate values -- takes a request that is
 %%% a key, or a key followed by value bits:
@@ -239,7 +239,8 @@ classify(Bits, _Meta, _StoreOpts) ->
 %%% Paths, as `hb_store_lmdb' writes them.
 
 %% @doc Read a path's value: the row whose key is the path itself. A path with
-%% no row of its own is a miss, even if it has children.
+%% no row of its own returns its children, each with its value if it holds
+%% one, and a path with neither is a miss.
 path_read(Path, Meta, Opts) ->
     Read =
         fun(Leaf, Node = #{ key := Key }, Miss) ->
@@ -253,15 +254,21 @@ path_read(Path, Meta, Opts) ->
                     {stop, Miss}
             end
         end,
-    maybe
-        {ok, Result} ?= fold_nodes(Path, Read, {error, not_found}, Meta, Opts),
-        Result
+    case fold_nodes(Path, Read, {error, not_found}, Meta, Opts) of
+        {ok, {error, not_found}} ->
+            case children(Path, true, Meta, Opts) of
+                {ok, []} -> {error, not_found};
+                {ok, Children} -> {composite, Children};
+                Error -> Error
+            end;
+        {ok, Result} -> Result;
+        Error -> Error
     end.
 
 %% @doc List a path's children, bounded by the request. A path without
 %% children is a miss.
 path_list(Path, Req, Meta, Opts) ->
-    case children(Path, maps:get(<<"values">>, Req, false), Meta, Opts) of
+    case children(Path, false, Meta, Opts) of
         {ok, []} -> {error, not_found};
         {ok, Children} -> {ok, hb_store_utils:apply_list_bounds(Children, Req)};
         Error -> Error
