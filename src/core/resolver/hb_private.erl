@@ -190,22 +190,20 @@ priv_opts_store_read_link_test() ->
     PublicStore = [hb_test_utils:test_store()],
     timer:sleep(1),
     OnlyPrivStore = [hb_test_utils:test_store()],
-    ok = hb_store:write(PublicStore, #{ <<"key">> => <<"test-message">> }, #{}),
-    {ok, <<"test-message">>} = hb_store:read(PublicStore, <<"key">>, #{}),
-    % Make a link to the key in the public store.
-    ok = hb_store:link(PublicStore, #{ <<"link">> => <<"key">> }, #{}),
-    {ok, <<"test-message">>} = hb_store:read(PublicStore, <<"link">>, #{}),
+    Opts = #{ <<"store">> => PublicStore, <<"priv-store">> => OnlyPrivStore },
+    {ok, ID} = hb_cache:write(#{ <<"key">> => <<"test-message">> }, Opts),
+    % Make a link to the message in the public store.
+    ok = hb_cache:link(ID, <<"link">>, Opts),
     % Read the link from the private store. First as a simple store read, then
     % as a link.
-    Opts = #{ <<"store">> => PublicStore, <<"priv-store">> => OnlyPrivStore },
     PrivOpts = #{ <<"store">> := PrivStore } = opts(Opts),
-    {ok, <<"test-message">>} = hb_store:read(PrivStore, <<"link">>, #{}),
+    {ok, <<"ao:", ID/binary>>} = hb_store:read(PrivStore, <<"link">>, #{}),
     Loaded =
         hb_cache:ensure_loaded(
             {link, <<"link">>, #{ <<"lazy">> => true }},
             PrivOpts
         ),
-    ?assertEqual(<<"test-message">>, Loaded).
+    ?assertEqual(<<"test-message">>, hb_maps:get(<<"key">>, Loaded, PrivOpts)).
 
 priv_opts_cache_read_message_test() ->
     hb:init(),

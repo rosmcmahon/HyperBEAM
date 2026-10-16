@@ -585,7 +585,7 @@ provider_failure_resilience_test() ->
 %% @doc Test that the blacklist cache is refreshed periodically.
 refresh_periodically_test() ->
     {ok, #{
-        opts := Opts0 = #{ <<"store">> := Store },
+        opts := Opts0,
         signed1 := SignedID1,
         unsigned3 := UnsignedID3
     }} = setup_test_env(),
@@ -596,7 +596,7 @@ refresh_periodically_test() ->
         },
     BlacklistMsg = hb_message:commit(InitialBlacklist, Opts0),
     {ok, InitialBlacklistID} = hb_cache:write(BlacklistMsg, Opts0),
-    ok = hb_store:link(Store, #{ <<"mutable">> => InitialBlacklistID }, Opts0),
+    ok = hb_cache:link(InitialBlacklistID, <<"mutable">>, Opts0),
     UpdatedBlacklist =
         #{
             <<"data-protocol">> => <<"content-policy">>,
@@ -604,7 +604,7 @@ refresh_periodically_test() ->
         },
     UpdatedBlacklistMsg = hb_message:commit(UpdatedBlacklist, Opts0),
     {ok, UpdatedBlacklistID} = hb_cache:write(UpdatedBlacklistMsg, Opts0),
-    ok = hb_store:link(Store, #{ <<"mutable">> => InitialBlacklistID }, Opts0),
+    ok = hb_cache:link(InitialBlacklistID, <<"mutable">>, Opts0),
     Opts1 = Opts0#{
         <<"blacklist-providers">> => [<<"/~cache@1.0/read?read=mutable">>],
         <<"blacklist-refresh-frequency">> => 1
@@ -618,7 +618,7 @@ refresh_periodically_test() ->
         {ok, <<"test-3">>},
         hb_http:get(Node, <<"/", UnsignedID3/binary, "/body">>, Opts1)
     ),
-    ok = hb_store:link(Store, #{ <<"mutable">> => UpdatedBlacklistID }, Opts0),
+    ok = hb_cache:link(UpdatedBlacklistID, <<"mutable">>, Opts0),
     ?assertMatch(
         {ok, <<"test-3">>},
         hb_http:get(Node, <<"/", UnsignedID3/binary, "/body">>, Opts1)

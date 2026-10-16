@@ -19,8 +19,7 @@
 -module(hb_store_fs).
 -behavior(hb_store).
 -export([start/3, stop/3, reset/3, scope/0, scope/1]).
--export([type/3, read/3, write/3, list/3]).
--export([group/3, link/3, resolve/3]).
+-export([read/3, write/3, list/3]).
 -include_lib("kernel/include/file.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
@@ -45,14 +44,10 @@ reset(#{ <<"name">> := DataDir }, _Req, _Opts) ->
     os:cmd(binary_to_list(<< "rm -Rf ", DataDir/binary >>)),
     ?event({reset_store, {path, DataDir}}).
 
-%% @doc Read a key from the store, following symlinks as needed.
-read(Opts, #{ <<"read">> := Key }, NodeOpts) ->
-    case resolve(Opts, #{ <<"resolve">> => Key }, NodeOpts) of
-        {ok, ResolvedPath} ->
-            read_path(add_prefix(Opts, ResolvedPath));
-        {error, _} = Error ->
-            Error
-    end.
+%% @doc Read a key from the store: the file's value, or the entries of the
+%% directory, each file with its value.
+read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
+    read_path(add_prefix(Opts, hb_path:to_binary(Key))).
 read_path(Path) ->
 	?event({read, Path}),
 	case file:read_file_info(Path) of
@@ -61,18 +56,12 @@ read_path(Path) ->
         {ok, #file_info{type = directory}} ->
             case file:list_dir_all(Path) of
                 {ok, Files} ->
-                    {composite, lists:map(fun name/1, Files)};
+                    {composite, [ child(Path, File) || File <- Files ]};
                 {error, _} ->
                     {error, not_found}
             end;
 		_ ->
-			case file:read_link(Path) of
-				{ok, Link} ->
-					?event({link_found, Path, Link}),
-					read_path(Link);
-				_ ->
-					{error, not_found}
-			end
+			{error, not_found}
 	end.
 
 %% @doc Write a value to the specified path in the store.
@@ -107,19 +96,20 @@ holds_value(Path, Value) ->
             false
     end.
 
-%% @doc List contents of a directory in the store, following symlinks as
-%% needed.
-list(Opts, Req = #{ <<"list">> := Path }, NodeOpts) ->
-    case resolve(Opts, #{ <<"resolve">> => Path }, NodeOpts) of
-        {ok, ResolvedPath} ->
-            case file:list_dir_all(add_prefix(Opts, ResolvedPath)) of
-                {ok, Files} ->
-                    Children = lists:map(fun name/1, Files),
-                    {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
-                {error, _} -> {error, not_found}
-            end;
-        {error, _} = Error ->
-            Error
+%% @doc List contents of a directory in the store.
+list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
+    case file:list_dir_all(add_prefix(Opts, hb_path:to_binary(Path))) of
+        {ok, Files} ->
+            Children = lists:map(fun name/1, Files),
+            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
+        {error, _} -> {error, not_found}
+    end.
+
+%% @doc Return a listed file with its value, or a listed directory by its name.
+child(Dir, File) ->
+    case file:read_file(filename:join(Dir, File)) of
+        {ok, Value} -> {name(File), Value};
+        {error, _} -> name(File)
     end.
 
 %% @doc Convert a name listed by `file:list_dir_all/1' to the key it was
@@ -129,129 +119,11 @@ name(File) when is_binary(File) -> hb_escape:decode(File);
 name(File) ->
     name(unicode:characters_to_binary(File, unicode, file:native_name_encoding())).
 
-%% @doc Replace links in a path successively, returning the final path.
-%% Each element of the path is resolved in turn, with the result of each
-%% resolution becoming the prefix for the next resolution. This allows 
-%% paths to resolve across many links. For example, a structure as follows:
-%%
-%%    /a/b/c: "Not the right data"
-%%    /a/b -> /a/alt-b
-%%    /a/alt-b/c: "Correct data"
-%%
-%% will resolve "a/b/c" to "Correct data".
-resolve(Opts, #{ <<"resolve">> := RawPath }, _NodeOpts) ->
-    Result =
-        resolve_parts(
-            Opts,
-            <<>>,
-            hb_path:term_to_path_parts(hb_path:to_binary(RawPath), Opts)
-        ),
-    ?event({resolved, RawPath, Result}),
-    Result.
-resolve_parts(_, CurrPath, []) ->
-    {ok, hb_path:to_binary(CurrPath)};
-resolve_parts(Opts, CurrPath, [Next|Rest]) ->
-    PathPart = hb_path:to_binary([CurrPath, Next]),
-    ?event(
-        {resolving,
-            {accumulated_path, CurrPath},
-            {next_segment, Next},
-            {generated_partial_path_to_test, PathPart}
-        }
-    ),
-    case file:read_link(add_prefix(Opts, PathPart)) of
-        {ok, RawLink} ->
-            Link = remove_prefix(Opts, RawLink),
-            resolve_parts(Opts, Link, Rest);
-        {error, enoent} ->
-            {error, not_found};
-        _ ->
-            resolve_parts(Opts, PathPart, Rest)
-    end.
-
-%% @doc Determine the type of a key in the store.
-type(Opts, #{ <<"type">> := Key }, _NodeOpts) ->
-    type_path(add_prefix(Opts, hb_path:to_binary(Key))).
-type_path(Path) ->
-    ?event({type, Path}),
-    case file:read_file_info(Path) of
-        {ok, #file_info{type = directory}} -> {ok, composite};
-        {ok, #file_info{type = regular}} -> {ok, simple};
-        _ ->
-            case file:read_link(Path) of
-                {ok, Link} ->
-                    type_path(Link);
-                _ ->
-                    {error, not_found}
-            end
-    end.
-
-%% @doc Create a directory (group) in the store.
-group(Opts = #{ <<"name">> := _DataDir }, #{ <<"group">> := Path }, _NodeOpts) ->
-    P = add_prefix(Opts, hb_path:to_binary(Path)),
-    ?event({making_group, P}),
-    % We need to ensure that the parent directory exists, so that we can
-    % make the group.
-    filelib:ensure_dir(P),
-   case file:make_dir(P) of
-        ok -> ok;
-        {error, eexist} -> ok;
-        {error, Reason} -> {error, Reason}
-    end.
-
-%% @doc Create a symlink, handling the case where the link would point to itself.
-%% A failed link does not stop the others: every link of the request is tried,
-%% and the first error is returned.
-link(Opts, Req, _NodeOpts) when is_map(Req) ->
-    maps:fold(
-        fun(New, Existing, ok) ->
-            link_path(Opts, Existing, New);
-           (New, Existing, Error) ->
-            link_path(Opts, Existing, New),
-            Error
-        end,
-        ok,
-        Req
-    ).
-link_path(_, Link, Link) ->
-    ok;
-link_path(Opts, Existing, New) ->
-    ExistingPath = hb_path:to_binary(Existing),
-    NewPath = hb_path:to_binary(New),
-    ?event({symlink,
-		add_prefix(Opts, ExistingPath),
-		P2 = add_prefix(Opts, NewPath)}),
-    filelib:ensure_dir(P2),
-    case file:make_symlink(add_prefix(Opts, ExistingPath), N = add_prefix(Opts, NewPath)) of
-        ok -> ok;
-        {error, eexist} ->
-            % Keep an existing link to the same target; replace any other entry.
-            Target = add_prefix(Opts, ExistingPath),
-            TargetName = unicode:characters_to_list(Target),
-            Make = fun(Temp) -> file:make_symlink(Target, Temp) end,
-            R =
-                case file:read_link(N) of
-                    {ok, TargetName} -> ok;
-                    _ -> replace(Opts, N, Make)
-                end,
-            ?event(debug_fs,
-                {symlink_recreated,
-                    {existing, ExistingPath},
-                    {new, NewPath},
-                    {result, R}
-                }
-            ),
-            R;
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% @doc Replace the entry at `Path' with the file or link that `Make' makes at
-%% a unique path in the store's `~tmp' directory, by renaming it over the
-%% entry. The rename replaces the entry in one step: a concurrent read finds
-%% the old entry or the new one, a crash leaves one of them whole, and a link
-%% at `Path' is replaced, not written through. Escaped keys never contain `~',
-%% so no key names the directory or a path in it.
+%% @doc Replace the entry at `Path' with the file that `Make' makes at a
+%% unique path in the store's `~tmp' directory, by renaming it over the entry.
+%% The rename replaces the entry in one step: a concurrent read finds the old
+%% entry or the new one, and a crash leaves one of them whole. Escaped keys
+%% never contain `~', so no key names the directory or a path in it.
 replace(#{ <<"name">> := DataDir }, Path, Make) ->
     Unique = hb_util:encode(crypto:strong_rand_bytes(16)),
     Temp = <<DataDir/binary, "/~tmp/", Unique/binary>>,
@@ -307,10 +179,6 @@ safe_path(Path) ->
         false -> hb_escape:encode(Path);
         true -> throw({unsafe_store_key, Path})
     end.
-
-%% @doc Remove the directory prefix from a path, and decode the key.
-remove_prefix(#{ <<"name">> := Prefix }, Path) ->
-    hb_escape:decode(hb_util:bin(hb_util:remove_common(Path, Prefix))).
 
 %%% TESTS
 

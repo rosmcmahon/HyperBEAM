@@ -311,11 +311,6 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
                     )
             ]
         ),
-    Groups = lists:uniq([Group || #{ <<"path">> := Group } <- maps:keys(Keys)]),
-    lists:foreach(
-        fun(Group) -> hb_store:group(Stores, Group, Opts) end,
-        Groups
-    ),
     case hb_store:write(Stores, Keys, Opts) of
         ok -> {ok, Req};
         {error, not_found} -> {ok, Req};
@@ -1033,7 +1028,6 @@ weave_order_test() ->
     lists:foreach(
         fun({Name, Value}) ->
             Group = group(Name, Value, Opts),
-            hb_store:group(Stores, Group, Opts),
             ok = hb_store:write(
                 Stores, #{ <<Group/binary, "/", (digits(5))/binary>> => <<>> },
                 Opts

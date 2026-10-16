@@ -998,7 +998,11 @@ wildcard_commitments(Operation) ->
         <<"store">> => hb_test_utils:test_store(),
         <<"priv-wallet">> => Wallet
     },
-    Payload = #{ <<"slot">> => 7, <<"extra">> => 8 },
+    % A value of 60 bytes or more is written under its `ni:' name, so `slot' is
+    % read back as a link.
+    Digits = binary:copy(<<"7">>, 60),
+    Slot = hb_util:int(Digits),
+    Payload = #{ <<"slot">> => Slot, <<"extra">> => 8 },
     Signed = hb_message:commit(Payload, Opts, <<"httpsig@1.0">>),
     SignedID = hb_message:id(Signed, [Signer], Opts),
     {ok, _} = hb_cache:write(Signed, Opts),
@@ -1032,7 +1036,7 @@ wildcard_commitments(Operation) ->
                             Integer#{ <<"type">> => scalar_type(<<"binary">>) }
                     },
                     Lazy,
-                    #{ <<"slot">> => <<"7">>, <<"extra">> => <<"8">> },
+                    #{ <<"slot">> => Digits, <<"extra">> => <<"8">> },
                     false
                 };
             projected ->
@@ -1044,7 +1048,7 @@ wildcard_commitments(Operation) ->
                             }
                     },
                     Signed,
-                    #{ <<"slot">> => 7 },
+                    #{ <<"slot">> => Slot },
                     false
                 };
             optional_absent ->
@@ -1076,13 +1080,16 @@ wildcard_commitments(Operation) ->
 
 %% @doc List loading is identity-preserving; changing an element is not.
 list_commitments_test_() ->
+    % A value of 60 bytes or more is written under its `ni:' name, so a child's
+    % `slot' is read back as a link.
+    Long = binary:copy(<<"7">>, 60),
     [
         {Description, fun() -> list_commitments(Value, Nested, Preserve) end}
     || {Description, Value, Nested, Preserve} <- [
         {"loaded list", 7, false, true},
         {"coerced list element", <<"007">>, false, false},
-        {"loaded child in list", 7, true, true},
-        {"coerced child in list", <<"007">>, true, false}
+        {"loaded child in list", hb_util:int(Long), true, true},
+        {"coerced child in list", <<"00", Long/binary>>, true, false}
     ]
     ].
 
@@ -1110,7 +1117,7 @@ list_commitments(Value, Nested, Preserve) ->
                 [LazyItem] = hb_maps:get(<<"items">>, Lazy, not_found, Opts),
                 ?assertMatch({link, _, _}, maps:get(<<"slot">>, LazyItem)),
                 {(required(<<"slot">>, Integer))#{ <<"wildcard">> => Keep },
-                    #{ <<"slot">> => 7 }};
+                    #{ <<"slot">> => hb_util:int(Value) }};
             false -> {Integer, 7}
         end,
     Schema =

@@ -100,7 +100,6 @@ index(Entry, RawOpts) ->
         hb_maps:get(<<"tx-root">>, Entry, not_found, Opts)
     ]),
     maybe
-        ok ?= hb_store:group(Store, ?BLOCKS, Opts),
         ok ?= hb_store:write(Store, #{ <<?BLOCKS/binary, "/", Key/binary>> => Value }, Opts),
         hb_store:write(Store, #{ index_height(Height) => Key }, Opts)
     end.

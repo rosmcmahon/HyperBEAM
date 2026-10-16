@@ -144,11 +144,12 @@ trusted_device_id_matches(Pkg, Opts, SpecIDs, ImplID) ->
 
 preloaded_index_matches(_Pkg, Opts, _, _) ->
     Store = maps:get(<<"preloaded-store">>, Opts),
+    {ok, <<"ao:", IndexID/binary>>} =
+        hb_store:read(Store, ?PRELOADED_INDEX_KEY, Opts),
     {ok, Got} =
-        hb_store:read(
-            Store,
-            <<?PRELOADED_INDEX_KEY/binary, "/test-pkg@1.0">>,
-            Opts
+        hb_cache:read(
+            <<IndexID/binary, "/test-pkg@1.0">>,
+            Opts#{ <<"store">> => [Store] }
         ),
     ?assert(byte_size(Got) == 43).
 

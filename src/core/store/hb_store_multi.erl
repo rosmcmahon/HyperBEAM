@@ -15,8 +15,8 @@
 -module(hb_store_multi).
 -behaviour(hb_store).
 -export([start/3, stop/3, reset/3, scope/0, scope/1]).
--export([read/3, resolve/3, type/3, list/3, match/3]).
--export([write/3, group/3, link/3]).
+-export([read/3, list/3, match/3]).
+-export([write/3]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(DEFAULT_STORE_WORKERS, 3).
@@ -78,21 +78,6 @@ read(StoreOpts, Req, NodeOpts) ->
         _ -> {error, not_found}
     end.
 
-%% @doc Resolve a path in the stores. Return the first successful result.
-resolve(StoreOpts, Req, NodeOpts) ->
-    #{ <<"stores">> := Stores } = hb_store:find(StoreOpts),
-    case
-        operation(
-            1,
-            Stores,
-            fun(XOpts, XReq, XNodeOpts) -> hb_store:resolve(XOpts, XReq, XNodeOpts) end,
-            [Req, NodeOpts]
-        )
-    of
-        [Res] -> Res;
-        _ -> {error, not_found}
-    end.
-
 %% @doc List the keys in the stores. Return the first successful result.
 list(StoreOpts, Req, NodeOpts) ->
     #{ <<"stores">> := Stores } = hb_store:find(StoreOpts),
@@ -101,21 +86,6 @@ list(StoreOpts, Req, NodeOpts) ->
             1,
             Stores,
             fun(XOpts, XReq, XNodeOpts) -> hb_store:list(XOpts, XReq, XNodeOpts) end,
-            [Req, NodeOpts]
-        )
-    of
-        [Res] -> Res;
-        _ -> {error, not_found}
-    end.
-
-%% @doc Type a key in the stores. Return the first successful result.
-type(StoreOpts, Req, NodeOpts) ->
-    #{ <<"stores">> := Stores } = hb_store:find(StoreOpts),
-    case
-        operation(
-            1,
-            Stores,
-            fun(XOpts, XReq, XNodeOpts) -> hb_store:type(XOpts, XReq, XNodeOpts) end,
             [Req, NodeOpts]
         )
     of
@@ -156,47 +126,6 @@ write(StoreOpts, Req, NodeOpts) ->
             fun(XOpts, XReq, XNodeOpts) -> hb_store:write(XOpts, XReq, XNodeOpts) end,
             [Req, NodeOpts]
         ),
-    case Res of
-        {error, not_enough_results} -> {error, not_found};
-        [_ | _] -> ok;
-        _ -> {error, not_found}
-    end.
-
-%% @doc Make a link in the stores. By default makes a link in all stores, but
-%% consults the `write-confirmations' configuration to determine how many stores
-%% as with `write/2`.
-link(StoreOpts, Req, NodeOpts) ->
-    StoreOptsWithWorkers = hb_store:find(StoreOpts),
-    #{ <<"stores">> := Stores } = StoreOptsWithWorkers,
-    Res =
-        operation(
-            confirmations(StoreOptsWithWorkers),
-            Stores,
-            fun(XOpts, XReq, XNodeOpts) ->
-                hb_store:link(XOpts, XReq, XNodeOpts)
-            end,
-            [Req, NodeOpts]
-        ),
-    case Res of
-        {error, not_enough_results} -> {error, not_found};
-        [_ | _] -> ok;
-        _ -> {error, not_found}
-    end.
-
-%%% Group operations.
-
-%% @doc Make a group in the stores. By default makes a group in all stores, but
-%% consults the `write-confirmations' configuration to determine how many stores
-%% as with `write/2`.
-group(StoreOpts, Req, NodeOpts) ->
-    StoreOptsWithWorkers = hb_store:find(StoreOpts),
-    #{ <<"stores">> := Stores } = StoreOptsWithWorkers,
-    Res = operation(
-        confirmations(StoreOptsWithWorkers),
-        Stores,
-        fun(XOpts, XReq, XNodeOpts) -> hb_store:group(XOpts, XReq, XNodeOpts) end,
-        [Req, NodeOpts]
-    ),
     case Res of
         {error, not_enough_results} -> {error, not_found};
         [_ | _] -> ok;
