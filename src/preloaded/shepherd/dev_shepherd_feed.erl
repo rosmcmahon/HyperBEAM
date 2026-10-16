@@ -21,16 +21,22 @@
 %%%              copycat writes them. A node that runs no copycat reports
 %%%              none.
 %%% '''
-%%% Both pass items to a batching process per node and feed URL, and return
-%%% the hook request unchanged. Their failures are logged and dropped: a failed
+%%% Both pass items to a batching process per node, and return the hook
+%%% request unchanged. Their failures are logged and dropped: a failed
 %%% `response' hook fails the upload's response, and a failed `cache-write'
-%%% hook fails the cache write. A report that the node's HTTP client cannot
-%%% deliver after its retries is dropped.
+%%% hook fails the cache write. The batching process writes each report as a
+%%% page file in the directory `shepherd-feed-dir', which survives the node's
+%%% restart. Its sender sends the pages in order, each until the feed URL
+%%% answers ok, waiting up to `MAX_RETRY_MS' between attempts, then deletes it.
+%%% Only the items of the page being filled, at most `FLUSH_MS' old, are held
+%%% in memory.
 %%%
-%%% `install' is a `start' hook that registers the sources. A node's `on'
-%%% option replaces the default hooks, so `install' rebuilds them: the defaults,
-%%% overridden by the node's own hooks, with the sources appended. Without
-%%% `shepherd-feed-url' it rebuilds the hooks and appends no sources.
+%%% `install' is a `start' hook that registers the sources and starts the
+%%% batching process, which sends the pages that the node held when it
+%%% stopped. A node's `on' option replaces the default hooks, so `install'
+%%% rebuilds them: the defaults, overridden by the node's own hooks, with the
+%%% sources appended. Without `shepherd-feed-url' it rebuilds the hooks and
+%%% appends no sources.
 %%% ```
 %%%     "on": { "start": { "device": "shepherd-feed@1.0", "path": "install" } }
 %%% '''
@@ -45,8 +51,10 @@
 -define(PAGE_BYTES, 200 * 1024).
 %%% The longest that an item waits for its report to fill, in milliseconds.
 -define(FLUSH_MS, 2000).
-%%% Items are dropped while the batching process holds this many messages.
--define(MAX_PENDING, 50000).
+%%% The first and the longest wait between attempts to send a report, in
+%%% milliseconds.
+-define(RETRY_MS, 1000).
+-define(MAX_RETRY_MS, 60000).
 %%% The commitment devices of weave items.
 -define(DEVICES, [<<"ans104@1.0">>, <<"tx@1.0">>]).
 %%% The keys of an item's TABM that are not tags.
@@ -57,7 +65,8 @@
 ]).
 
 %% @doc Rebuild the node's hooks from the defaults and its own hooks, with the
-%% feed's sources appended when `shepherd-feed-url' is set.
+%% feed's sources appended and the batching process started when
+%% `shepherd-feed-url' is set.
 install(_Base, Req = #{ <<"body">> := NodeMsg }, Opts) ->
     Defaults =
         hb_maps:get(<<"on">>, hb_opts:default_message_with_env(), #{}, Opts),
@@ -67,6 +76,7 @@ install(_Base, Req = #{ <<"body">> := NodeMsg }, Opts) ->
         case hb_maps:is_key(<<"shepherd-feed-url">>, NodeMsg, Opts) of
             false -> [];
             true ->
+                batcher(NodeMsg),
                 [
                     {<<"response">>, <<"upload">>},
                     {<<"cache-write">>, <<"copycat">>}
@@ -243,48 +253,63 @@ text(Bin) when is_binary(Bin) ->
 text(_) ->
     not_text.
 
-%%% Batching: one report per page of up to `PAGE_ITEMS' items, sent at most
-%%% `FLUSH_MS' after the page's first item.
+%%% Batching: one report per page of up to `PAGE_ITEMS' items, written at most
+%%% `FLUSH_MS' after the page's first item to the `shepherd-feed-dir' directory
+%%% as `<n>.json'. The sender sends the pages in the directory in order.
 
-%% @doc Send a message to the batching process, dropping it if the process is
-%% too far behind.
+%% @doc Send a message to the batching process.
 cast(Msg, Opts) ->
     case batcher(Opts) of
         not_configured -> ok;
-        Batcher ->
-            case erlang:process_info(Batcher, message_queue_len) of
-                {message_queue_len, Len} when Len >= ?MAX_PENDING ->
-                    ?event(warning, {shepherd_feed_full, {pending, Len}});
-                _ ->
-                    Batcher ! Msg
-            end
+        Batcher -> Batcher ! Msg
     end.
 
-%% @doc The batching process of this node and feed URL, started on first use.
+%% @doc The batching process of this node's page directory, started on first
+%% use.
 batcher(Opts) ->
     case hb_opts:get(<<"shepherd-feed-url">>, not_configured, Opts) of
         not_configured -> not_configured;
         URL ->
-            Server = hb_opts:get(<<"http-server">>, no_server, Opts),
+            Dir =
+                hb_util:list(
+                    hb_opts:get(
+                        <<"shepherd-feed-dir">>,
+                        <<"shepherd-feed">>,
+                        Opts
+                    )
+                ),
             hb_name:singleton(
-                {shepherd_feed, Server, URL},
-                fun() -> collect(URL, Opts, [], 0, 0) end
+                {shepherd_feed, Dir},
+                fun() -> start_batcher(URL, Dir, Opts) end
             )
     end.
 
-%% @doc Collect nodes into a page, in reverse order.
-collect(URL, Opts, Page, Count, Bytes) ->
+%% @doc Start a batching process and the sender of its pages, linked to it. A
+%% page that a stopped batching process left part written is deleted: its items
+%% were in that process's memory only.
+start_batcher(URL, Dir, Opts) ->
+    ok = filelib:ensure_dir(filename:join(Dir, "page")),
+    lists:foreach(
+        fun(N) -> ok = file:delete(page_file(Dir, N, ".tmp")) end,
+        pages(Dir, ".tmp")
+    ),
+    Next = lists:max([0 | pages(Dir, ".json")]) + 1,
+    Sender = spawn_link(fun() -> send_pages(URL, Dir, Opts) end),
+    collect(#{ dir => Dir, next => Next, sender => Sender }, Opts, [], 0, 0).
+
+%% @doc Collect nodes into a page, in reverse order. `Spool' holds the page
+%% directory, the number of its next page, and its sender.
+collect(Spool, Opts, Page, Count, Bytes) ->
     receive
         {upload, ID} ->
             case upload_node(ID, Opts) of
-                skip -> collect(URL, Opts, Page, Count, Bytes);
-                Node -> add(Node, URL, Opts, Page, Count, Bytes)
+                skip -> collect(Spool, Opts, Page, Count, Bytes);
+                Node -> add(Node, Spool, Opts, Page, Count, Bytes)
             end;
         {node, Node} ->
-            add(Node, URL, Opts, Page, Count, Bytes);
+            add(Node, Spool, Opts, Page, Count, Bytes);
         flush ->
-            send(URL, Page, Opts),
-            collect(URL, Opts, [], 0, 0)
+            collect(write(Page, Spool), Opts, [], 0, 0)
     end.
 
 %% @doc Read an uploaded item from the cache and build its node.
@@ -310,14 +335,13 @@ upload_node(ID, Opts) ->
         skip
     end.
 
-%% @doc Add a node to the page, first sending the page if the node's JSON would
-%% take it past `PAGE_BYTES', and sending it once it is full.
-add(Node, URL, Opts, Page, Count, Bytes) ->
+%% @doc Add a node to the page, first writing the page if the node's JSON would
+%% take it past `PAGE_BYTES', and writing it once it is full.
+add(Node, Spool, Opts, Page, Count, Bytes) ->
     Size = byte_size(hb_json:encode(Node)) + 1,
     case Count > 0 andalso Bytes + Size > ?PAGE_BYTES of
         true ->
-            send(URL, Page, Opts),
-            add(Node, URL, Opts, [], 0, 0);
+            add(Node, write(Page, Spool), Opts, [], 0, 0);
         false ->
             case Count of
                 0 -> erlang:send_after(?FLUSH_MS, self(), flush);
@@ -325,29 +349,119 @@ add(Node, URL, Opts, Page, Count, Bytes) ->
             end,
             case Count + 1 of
                 ?PAGE_ITEMS ->
-                    send(URL, [Node | Page], Opts),
-                    collect(URL, Opts, [], 0, 0);
+                    collect(write([Node | Page], Spool), Opts, [], 0, 0);
                 NewCount ->
-                    collect(URL, Opts, [Node | Page], NewCount, Bytes + Size)
+                    collect(Spool, Opts, [Node | Page], NewCount, Bytes + Size)
             end
     end.
 
-%% @doc POST a page to the feed URL as a JSON body, signed with the node's
-%% wallet. The request goes to an explicit URL, so that the node's HTTP client
-%% and its TLS and retry settings apply. Its `method', `path' and
-%% `codec-device' are not signed: the router removes an unsigned `path', and
-%% `codec-device' tells a receiving HyperBEAM node to read the request as the
-%% signed message rather than as a JSON body.
-send(_URL, [], _Opts) ->
-    ok;
-send(URL, Page, Opts) ->
+%% @doc Write a page as the next page of the directory, tell the sender, and
+%% return the spool with the number of the page after it.
+write([], Spool) ->
+    Spool;
+write(Page, Spool = #{ dir := Dir, next := N, sender := Sender }) ->
+    write_page(
+        Dir,
+        N,
+        hb_json:encode(#{ <<"items">> => lists:reverse(Page) }),
+        ?RETRY_MS
+    ),
+    Sender ! page,
+    Spool#{ next => N + 1 }.
+
+%% @doc Write page `N' through a temporary file, so that a page file is whole,
+%% waiting `Wait' milliseconds before the next attempt if the write fails, and
+%% doubling the wait up to `MAX_RETRY_MS'.
+write_page(Dir, N, Body, Wait) ->
+    Temp = page_file(Dir, N, ".tmp"),
+    case file:write_file(Temp, Body) of
+        ok ->
+            ok = file:rename(Temp, page_file(Dir, N, ".json"));
+        {error, Reason} ->
+            ?event(warning,
+                {shepherd_feed_page_unwritten,
+                    {page, N},
+                    {after_ms, Wait},
+                    {reason, Reason}
+                }
+            ),
+            timer:sleep(Wait),
+            write_page(Dir, N, Body, min(2 * Wait, ?MAX_RETRY_MS))
+    end.
+
+%% @doc The file of page `N' of a directory, with an extension.
+page_file(Dir, N, Ext) ->
+    filename:join(Dir, integer_to_list(N) ++ Ext).
+
+%% @doc The numbers of the pages of a directory with an extension, in order.
+pages(Dir, Ext) ->
+    {ok, Files} = file:list_dir(Dir),
+    lists:sort(
+        [
+            list_to_integer(filename:rootname(File))
+        ||
+            File <- Files,
+            filename:extension(File) =:= Ext
+        ]
+    ).
+
+%% @doc Send the pages of a directory in order, then wait for the batching
+%% process to write another. The notices of pages written while the sender
+%% sends are dropped, as the next listing holds their pages.
+send_pages(URL, Dir, Opts) ->
+    lists:foreach(
+        fun(N) -> send_page(URL, Dir, N, Opts) end,
+        pages(Dir, ".json")
+    ),
+    receive page -> ok end,
+    flush_notices(),
+    send_pages(URL, Dir, Opts).
+
+%% @doc Drop the notices of written pages that the sender holds.
+flush_notices() ->
+    receive page -> flush_notices()
+    after 0 -> ok
+    end.
+
+%% @doc Send page `N' of a directory until the feed URL answers ok, then delete
+%% it.
+send_page(URL, Dir, N, Opts) ->
+    File = page_file(Dir, N, ".json"),
+    {ok, Body} = file:read_file(File),
+    send(URL, N, Body, Opts, ?RETRY_MS),
+    ok = file:delete(File).
+
+%% @doc Send page `N', waiting `Wait' milliseconds before the next attempt if
+%% the feed URL does not answer ok, and doubling the wait up to `MAX_RETRY_MS'.
+send(URL, N, Body, Opts, Wait) ->
+    case post(URL, Body, Opts) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            ?event(warning,
+                {shepherd_feed_report_retrying,
+                    {page, N},
+                    {after_ms, Wait},
+                    {reason, Reason}
+                }
+            ),
+            timer:sleep(Wait),
+            send(URL, N, Body, Opts, min(2 * Wait, ?MAX_RETRY_MS))
+    end.
+
+%% @doc POST a report body to the feed URL as JSON, signed with the node's
+%% wallet, returning `ok' if the feed URL answers ok. The request goes to an
+%% explicit URL, so that the node's HTTP client and its TLS and retry settings
+%% apply. Its `method', `path' and `codec-device' are not signed: the router
+%% removes an unsigned `path', and `codec-device' tells a receiving HyperBEAM
+%% node to read the request as the signed message rather than as a JSON body.
+post(URL, Body, Opts) ->
     try
         Report =
             hb_message:commit(
                 #{
                     <<"content-type">> => <<"application/json">>,
-                    <<"body">> =>
-                        hb_json:encode(#{ <<"items">> => lists:reverse(Page) })
+                    <<"body">> => Body
                 },
                 Opts,
                 <<"httpsig@1.0">>
@@ -361,30 +475,22 @@ send(URL, Page, Opts) ->
             Opts
         )
     of
-        {ok, _Res} ->
-            ok;
-        Other ->
-            ?event(warning,
-                {shepherd_feed_report_dropped,
-                    {items, length(Page)},
-                    {response, Other}
-                }
-            )
-    catch Class:Reason ->
-        ?event(warning,
-            {shepherd_feed_report_failed,
-                {items, length(Page)},
-                {class, Class},
-                {reason, Reason}
-            }
-        )
+        {ok, _Res} -> ok;
+        Other -> {error, {response, Other}}
+    catch Class:Reason -> {error, {Class, Reason}}
     end.
 
 %%% Tests
 
 %% @doc Start a node that sends the caller each request it receives.
 start_receiver() ->
-    Self = self(),
+    start_receiver(0).
+
+%% @doc Start a node that answers its first `Refusals' requests with a 503
+%% status and the rest with a 202 status, as the Shepherd server does, and
+%% sends the caller each request that it refuses or receives.
+start_receiver(Refusals) ->
+    Hook = answer_requests(self(), counters:new(1, []), Refusals),
     hb_http_server:start_node(
         #{
             <<"priv-wallet">> => ar_wallet:new(),
@@ -392,26 +498,27 @@ start_receiver() ->
             <<"on">> =>
                 #{
                     <<"request">> =>
-                        #{
-                            <<"device">> =>
-                                #{
-                                    <<"request">> =>
-                                        fun(_, Req, Opts) ->
-                                            Request =
-                                                hb_maps:get(
-                                                    <<"request">>,
-                                                    Req,
-                                                    #{},
-                                                    Opts
-                                                ),
-                                            Self ! {received, Request},
-                                            {ok, Req}
-                                        end
-                                }
-                        }
+                        #{ <<"device">> => #{ <<"request">> => Hook } }
                 }
         }
     ).
+
+%% @doc A `request' hook that counts requests in `Seen', and sends `Caller'
+%% each one: the first `Refusals' as refused, answered with a 503 status, and
+%% the rest as received, answered with a 202 status.
+answer_requests(Caller, Seen, Refusals) ->
+    fun(_, Req, Opts) ->
+        Request = hb_maps:get(<<"request">>, Req, #{}, Opts),
+        counters:add(Seen, 1, 1),
+        case counters:get(Seen, 1) =< Refusals of
+            true ->
+                Caller ! {refused, Request},
+                {error, #{ <<"status">> => 503 }};
+            false ->
+                Caller ! {received, Request},
+                {ok, Req#{ <<"body">> => [#{ <<"status">> => 202 }] }}
+        end
+    end.
 
 %% @doc Wait for a report, returning the signers that the receiving node
 %% verified and the fields of the report's items.
@@ -485,7 +592,8 @@ upload_test() ->
                                     <<"path">> => <<"install">>
                                 }
                         },
-                    <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>
+                    <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>,
+                    <<"shepherd-feed-dir">> => test_dir()
                 }
             ),
         Hooks = node_hooks(NodeWallet),
@@ -613,24 +721,8 @@ install_without_url_test() ->
 %% @doc Through the `copycat' source, an item written at a weave offset is
 %% reported and an item written without one is not.
 copycat_test() ->
-    Receiver = start_receiver(),
-    Wallet = ar_wallet:new(),
-    Opts =
-        #{
-            <<"priv-wallet">> => Wallet,
-            <<"store">> => hb_test_utils:test_store(),
-            <<"on">> =>
-                #{
-                    <<"cache-write">> =>
-                        [
-                            #{
-                                <<"device">> => <<"shepherd-feed@1.0">>,
-                                <<"path">> => <<"copycat">>
-                            }
-                        ]
-                },
-            <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>
-        },
+    Opts = copycat_opts(start_receiver()),
+    Wallet = hb_maps:get(<<"priv-wallet">>, Opts),
     [Unplaced, Placed] =
         [
             hb_message:commit(#{ <<"a">> => Value }, Opts, <<"ans104@1.0">>)
@@ -646,3 +738,85 @@ copycat_test() ->
         [hb_message:id(Placed, signed, Opts)],
         [maps:get(id, Item) || Item <- Report]
     ).
+
+%% @doc A report that the receiver refuses is sent again until the receiver
+%% accepts it, and its page file is then deleted.
+retry_test() ->
+    Opts = copycat_opts(start_receiver(2)),
+    ID = write_placed(<<"1">>, Opts),
+    lists:foreach(
+        fun(_) ->
+            ?assertEqual(
+                refused,
+                receive {refused, _} -> refused after 10000 -> timeout end
+            )
+        end,
+        [first, second]
+    ),
+    {_Signers, Report} = receive_report(),
+    ?assertEqual([ID], [maps:get(id, Item) || Item <- Report]),
+    ?assert(await_no_pages(Opts)).
+
+%% @doc A page that a stopped batching process wrote is sent, before the pages
+%% after it, by the next batching process.
+restart_test() ->
+    Opts = copycat_opts(start_receiver(1)),
+    Dir = hb_util:list(hb_maps:get(<<"shepherd-feed-dir">>, Opts)),
+    First = write_placed(<<"1">>, Opts),
+    ?assertEqual(
+        refused,
+        receive {refused, _} -> refused after 10000 -> timeout end
+    ),
+    % Stop the batching process, and its sender with it, while the receiver
+    % has not accepted the page.
+    Batcher = hb_name:lookup({shepherd_feed, Dir}),
+    Ref = erlang:monitor(process, Batcher),
+    exit(Batcher, kill),
+    receive {'DOWN', Ref, process, Batcher, _} -> ok end,
+    ?assertEqual({ok, ["1.json"]}, file:list_dir(Dir)),
+    Second = write_placed(<<"2">>, Opts),
+    Reports = [element(2, receive_report()) || _ <- [first, second]],
+    ?assertEqual(
+        [[First], [Second]],
+        [[maps:get(id, Item) || Item <- Report] || Report <- Reports]
+    ),
+    ?assert(await_no_pages(Opts)).
+
+%% @doc The options of a node, without a server, whose `copycat' source
+%% reports to a receiver.
+copycat_opts(Receiver) ->
+    #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => hb_test_utils:test_store(),
+        <<"on">> =>
+            #{
+                <<"cache-write">> =>
+                    [
+                        #{
+                            <<"device">> => <<"shepherd-feed@1.0">>,
+                            <<"path">> => <<"copycat">>
+                        }
+                    ]
+            },
+        <<"shepherd-feed-url">> => <<Receiver/binary, "feed">>,
+        <<"shepherd-feed-dir">> => test_dir()
+    }.
+
+%% @doc A new page directory.
+test_dir() ->
+    <<
+        "cache-TEST/shepherd-feed-",
+        (hb_util:encode(crypto:strong_rand_bytes(6)))/binary
+    >>.
+
+%% @doc Write a new item at a weave offset, returning its signed ID.
+write_placed(Value, Opts) ->
+    Item = hb_message:commit(#{ <<"a">> => Value }, Opts, <<"ans104@1.0">>),
+    {ok, _} =
+        hb_cache:write(hb_private:set(Item, <<"offset">>, 1000, Opts), Opts),
+    hb_message:id(Item, signed, Opts).
+
+%% @doc Wait until a node's page directory holds no files.
+await_no_pages(Opts) ->
+    Dir = hb_util:list(hb_maps:get(<<"shepherd-feed-dir">>, Opts)),
+    hb_util:wait_until(fun() -> file:list_dir(Dir) =:= {ok, []} end, 10000).

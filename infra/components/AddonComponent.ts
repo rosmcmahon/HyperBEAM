@@ -59,7 +59,8 @@ export class AddonComponent extends pulumi.ComponentResource {
             'include-block-index=true',
         ].join('&')
         /* shepherd-feed@1.0 reports bundler uploads and copycat items to shepherd. its start hook rebuilds the
-         * default `on` hooks, which setting `on` here replaces. defaults to this stack's indexer-next; '' turns it off */
+         * default `on` hooks, which setting `on` here replaces. defaults to this stack's indexer-next; '' turns it off.
+         * unsent reports wait in shepherd-feed-dir, on the volume and outside the cache that start.sh clears */
         const feedUrl = extConfig.SHEPHERD_FEED_URL ?? (config.services.indexer ? 'http://indexer-next:85/feed' : '')
         /* JSON keeps option types; the node refuses to start if this fails to load.
          * indexer-next calls this node through the published port, so HyperBEAM
@@ -68,6 +69,7 @@ export class AddonComponent extends pulumi.ComponentResource {
             ...(feedUrl ? {
                 'on': { 'start': { 'device': 'shepherd-feed@1.0', 'path': 'install' } },
                 'shepherd-feed-url': feedUrl,
+                'shepherd-feed-dir': '/data/shepherd-feed',
             } : {}),
             'rate-limit-exempt': ['10.89.0.1'],
         }, null, 2)
