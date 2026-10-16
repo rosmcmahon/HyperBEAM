@@ -606,11 +606,25 @@ escape_chars(<<$\\, R/bits>>, Acc) -> escape_chars(R, [$\\, $\\ | Acc]);
 escape_chars(<<$", R/bits>>, Acc) -> escape_chars(R, [$", $\\ | Acc]);
 escape_chars(<<C, R/bits>>, Acc) -> escape_chars(R, [C | Acc]).
 
+%% @doc Reject parameter names that cannot be serialized as RFC 9651 keys.
+validate_param_key(<<C, R/bits>>) when ?IS_LC_ALPHA(C) or (C =:= $*) ->
+    validate_param_key1(R).
+validate_param_key1(<<C, R/bits>>) when
+        ?IS_LC_ALPHA(C) or ?IS_DIGIT(C) or
+        (C =:= $_) or (C =:= $-) or (C =:= $.) or (C =:= $*) ->
+    validate_param_key1(R);
+validate_param_key1(<<>>) ->
+    ok.
+
 params(Params) ->
     [
         case Param of
-            {Key, true} -> [$;, Key];
-            {Key, Value} -> [$;, Key, $=, bare_item(Value)]
+            {Key, true} ->
+                ok = validate_param_key(Key),
+                [$;, Key];
+            {Key, Value} ->
+                ok = validate_param_key(Key),
+                [$;, Key, $=, bare_item(Value)]
         end
     ||
         Param <- Params
@@ -785,3 +799,29 @@ to_list_depth_test() ->
     {too_deep, _} = to_list([1,2,3, #{ foo => bar } ]),
     {too_deep, _} = to_list([1,2,3, [#{ foo => bar }] ]),
     ok.
+
+%% @doc Parameter names must follow the structured-fields key grammar.
+serialize_param_keys_test() ->
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual(
+                <<"?1;", Key/binary>>,
+                iolist_to_binary(item({item, true, [{Key, true}]}))
+            ),
+            ?assertEqual(
+                <<"?1;", Key/binary, "=\"v\"">>,
+                iolist_to_binary(item({item, true, [{Key, {string, <<"v">>}}]}))
+            )
+        end,
+        [<<"a">>, <<"*">>, <<"a0_-.*">>]
+    ),
+    lists:foreach(
+        fun(Key) ->
+            ?assertError(function_clause, item({item, true, [{Key, true}]})),
+            ?assertError(
+                function_clause,
+                item({item, true, [{Key, {string, <<"v">>}}]})
+            )
+        end,
+        [<<>>, <<"A">>, <<"0a">>, <<"a%">>, <<"a/b">>, <<"x\r\nx-injected">>]
+    ).
