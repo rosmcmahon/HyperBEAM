@@ -412,7 +412,7 @@ import(Base, Req, Opts) ->
 
 %% @doc Find the most recent legacy checkpoint for a process.
 latest_checkpoint(ProcID, Opts) ->
-    case hb_opts:get(genesis_wasm_import_authorities, [], Opts) of
+    case import_authorities(Opts) of
         [] -> {error, no_import_authorities};
         TrustedSigners -> latest_checkpoint(ProcID, TrustedSigners, Opts)
     end.
@@ -440,7 +440,10 @@ latest_checkpoint(ProcID, TrustedSigners, Opts) ->
     Variables =
         #{
             <<"ProcID">> => ProcID,
-            <<"TrustedSigners">> => TrustedSigners
+            % GraphQL finds the items of a `did:pkh:' committer of an Arweave
+            % address by the address.
+            <<"TrustedSigners">> =>
+                [Address || ?ARWEAVE_COMMITTER(Address) <- TrustedSigners]
         },
     case hb_client_gateway:query(Query, Variables, Opts) of
         {error, Reason} ->
@@ -452,6 +455,14 @@ latest_checkpoint(ProcID, TrustedSigners, Opts) ->
                 Item -> hb_client_gateway:result_to_message(Item, Opts)
             end
     end.
+
+%% @doc Return the committers named by the `genesis-wasm-import-authorities'
+%% option.
+import_authorities(Opts) ->
+    lists:map(
+        fun hb_util:committer/1,
+        hb_opts:get(genesis_wasm_import_authorities, [], Opts)
+    ).
 
 %% @doc Validate whether a checkpoint message is signed by a trusted snapshot
 %% authority and is for a `ao.TN.1' process or has `execution-device' set to
@@ -469,7 +480,7 @@ do_import(Proc, CheckpointMessage, Opts) ->
         CheckpointSigners = hb_message:signers(CheckpointMessage, Opts),
         % Validate that the checkpoint message is signed by a trusted snapshot
         % authority, and targets this process.
-        TrustedSigners = hb_opts:get(genesis_wasm_import_authorities, [], Opts),
+        TrustedSigners = import_authorities(Opts),
         true ?=
             lists:any(
                 fun(Signer) -> lists:member(Signer, TrustedSigners) end,
@@ -606,7 +617,7 @@ signed_checkpoint_import_test() ->
         <<"store">> => [hb_test_utils:test_store()],
         <<"priv-wallet">> => Wallet,
         <<"genesis-wasm-import-authorities">> =>
-            [hb_util:human_id(ar_wallet:to_address(Wallet))]
+            [hb_test_utils:committer(Wallet)]
     },
     Proc = hb_message:commit(#{
         <<"device">> => <<"process@1.0">>,
@@ -748,10 +759,9 @@ genesis_test(Fun) ->
         Store = hb_test_utils:test_store(),
         Dir = hb_util:list(hb_maps:get(<<"name">>, Store)),
         Wallet = ar_wallet:new(),
-        {Priv, _} = Wallet,
         KeyFile = filename:join(Dir, "wallet.json"),
         ok = filelib:ensure_dir(KeyFile),
-        ok = file:write_file(KeyFile, ar_wallet:to_json(Priv)),
+        ok = file:write_file(KeyFile, ar_wallet:to_json(Wallet)),
         ok = file:change_mode(KeyFile, 8#600),
         {ok, Socket} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
         {ok, GenesisPort} = inet:port(Socket),
@@ -902,8 +912,8 @@ import_legacy_checkpoint() ->
         <<"priv-wallet">> => hb:wallet(),
         <<"genesis-wasm-import-authorities">> =>
             [
-                <<"fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY">>,
-                <<"WjnS-s03HWsDSdMnyTdzB1eHZB2QheUWP_FVRVYxkXk">>
+                ?ARWEAVE_COMMITTER(<<"fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY">>),
+                ?ARWEAVE_COMMITTER(<<"WjnS-s03HWsDSdMnyTdzB1eHZB2QheUWP_FVRVYxkXk">>)
             ]
     },
     % Process with 12 slots

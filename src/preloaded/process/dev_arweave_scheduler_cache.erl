@@ -61,10 +61,9 @@ read_header(TXID, RawOpts) ->
 %% private block-cache module.
 write_block(Height, Block, RawOpts) ->
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
     case hb_cache:write(Block, Opts) of
         {ok, BlockID} ->
-            case hb_store:link(Store, #{ block_path(Height) => BlockID }, Opts) of
+            case hb_cache:link(BlockID, block_path(Height), Opts) of
                 ok -> {ok, BlockID};
                 Error -> Error
             end;
@@ -91,7 +90,10 @@ write_targets(Targets, RawOpts) ->
     write_targets_map(
         maps:from_list(
             [
-                {target_path(Address, Ordinate), hb_util:human_id(TXID)}
+                {
+                    target_path(Address, Ordinate),
+                    <<"ao:", (hb_util:human_id(TXID))/binary>>
+                }
             ||
                 {Address, Ordinate, TXID} <- Targets
             ]
@@ -103,37 +105,28 @@ write_targets_map(Targets, _RawOpts) when map_size(Targets) =:= 0 -> ok;
 write_targets_map(Targets, RawOpts) ->
     Opts = opts(RawOpts),
     Store = hb_opts:get(store, no_viable_store, Opts),
-    hb_store:link(Store, Targets, Opts).
+    hb_store:write(Store, Targets, Opts).
 
-%% @doc Resolve an indexed target's signed TXID and read its cached header.
+%% @doc Read an indexed target's signed TXID and its cached header.
 read_target(Address, Ordinate, RawOpts) ->
     Opts = opts(RawOpts),
     Store = hb_opts:get(store, no_viable_store, Opts),
-    case resolve_target(Store, target_path(Address, Ordinate), Opts) of
-        {ok, TXID} ->
+    case hb_store:read(Store, target_path(Address, Ordinate), Opts) of
+        {ok, <<"ao:", TXID/binary>>} ->
             case hb_cache:read(TXID, Opts) of
                 {ok, Header} -> {ok, TXID, Header};
                 {error, not_found} -> not_found
             end;
-        {error, not_found} -> not_found
-    end.
-
-resolve_target(Store, Path, Opts) when not is_list(Store) ->
-    resolve_target([Store], Path, Opts);
-resolve_target([], _Path, _Opts) -> {error, not_found};
-resolve_target([Store | Rest], Path, Opts) ->
-    case hb_store:resolve(Store, Path, Opts) of
-        {ok, Path} -> resolve_target(Rest, Path, Opts);
-        {ok, TXID} -> {ok, TXID};
-        _ -> resolve_target(Rest, Path, Opts)
+        _ -> not_found
     end.
 
 %% @doc Ensure that listing an address can distinguish no targets from failure.
+%% We write an empty message at the address's path.
 ensure_target_root(Address, RawOpts) ->
     Opts = opts(RawOpts),
-    hb_store:group(
+    hb_store:write(
         hb_opts:get(store, no_viable_store, Opts),
-        target_root(Address),
+        #{ hb_path:to_binary([target_root(Address), <<"ao-types">>]) => <<>> },
         Opts
     ).
 
@@ -147,17 +140,13 @@ list_targets(Address, RawOpts) ->
 %% @doc Write a deterministic assignment and link its process slot to it.
 write_assignment(Assignment, RawOpts) ->
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
     ProcessID = hb_maps:get(<<"process">>, Assignment, not_found, Opts),
     Slot = hb_maps:get(<<"slot">>, Assignment, not_found, Opts),
     case hb_cache:write(Assignment, Opts) of
         {ok, _} ->
-            hb_store:link(
-                Store,
-                #{
-                    assignment_path(ProcessID, Slot) =>
-                        hb_message:id(Assignment, signed, Opts)
-                },
+            hb_cache:link(
+                hb_message:id(Assignment, signed, Opts),
+                assignment_path(ProcessID, Slot),
                 Opts
             );
         Error -> Error
@@ -166,30 +155,25 @@ write_assignment(Assignment, RawOpts) ->
 %% @doc Read an assignment by its contiguous process slot.
 read_assignment(ProcessID, Slot, RawOpts) ->
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
-    case hb_store:resolve(Store, assignment_path(ProcessID, Slot), Opts) of
-        {ok, Resolved} ->
-            case hb_cache:read(Resolved, Opts) of
-                {ok, RawAssignment} ->
-                    Assignment =
-                        hb_message:normalize_commitments(RawAssignment, Opts),
-                    {ok,
-                        case Slot of
-                            0 ->
-                                Assignment#{
-                                    <<"body">> =>
-                                        hb_maps:get(
-                                            <<"body">>,
-                                            Assignment,
-                                            not_found,
-                                            lib_process:execution_opts(Opts)
-                                        )
-                                };
-                            _ -> hb_cache:ensure_all_loaded(Assignment, Opts)
-                        end
-                    };
-                {error, not_found} -> not_found
-            end;
+    case hb_cache:read(assignment_path(ProcessID, Slot), Opts) of
+        {ok, RawAssignment} ->
+            Assignment =
+                hb_message:normalize_commitments(RawAssignment, Opts),
+            {ok,
+                case Slot of
+                    0 ->
+                        Assignment#{
+                            <<"body">> =>
+                                hb_maps:get(
+                                    <<"body">>,
+                                    Assignment,
+                                    not_found,
+                                    lib_process:execution_opts(Opts)
+                                )
+                        };
+                    _ -> hb_cache:ensure_all_loaded(Assignment, Opts)
+                end
+            };
         {error, not_found} -> not_found
     end.
 
@@ -227,22 +211,17 @@ assignments_to_bundle(ProcessID, Assignments, More, RawOpts) ->
 
 read_state(Path, RawOpts) ->
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
-    case hb_store:resolve(Store, Path, Opts) of
-        {ok, Resolved} ->
-            case hb_cache:read(Resolved, Opts) of
-                {ok, State} -> {ok, hb_cache:ensure_all_loaded(State, Opts)};
-                Error -> Error
-            end;
-        {error, not_found} -> not_found
+    case hb_cache:read(Path, Opts) of
+        {ok, State} -> {ok, hb_cache:ensure_all_loaded(State, Opts)};
+        {error, not_found} -> not_found;
+        Error -> Error
     end.
 
 write_state(Path, State, RawOpts) ->
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
     case hb_cache:write(State, Opts) of
         {ok, StateID} ->
-            case hb_store:link(Store, #{ Path => StateID }, Opts) of
+            case hb_cache:link(StateID, Path, Opts) of
                 ok -> {ok, StateID};
                 Error -> Error
             end;
@@ -297,10 +276,9 @@ linked_spawn_uses_process_store_test() ->
             <<"process-store">> => [Process]
         },
     CacheOpts = lib_process:cache_opts(Opts),
-    LinkOpts = #{ <<"type">> => <<"link">>, <<"lazy">> => false },
     Balances = #{ <<"alice">> => <<"100">> },
     {ok, BalancesID} = hb_cache:write(Balances, Opts#{ <<"store">> => [Target] }),
-    Spawn = #{ <<"balances">> => {link, BalancesID, LinkOpts} },
+    Spawn = #{ <<"balances">> => {link, <<"ao:", BalancesID/binary>>, #{}} },
     {ok, ProcessID} = hb_cache:write(Spawn, Opts#{ <<"store">> => [Source] }),
     {ok, LazySpawn} = hb_cache:read(ProcessID, Opts#{ <<"store">> => [Source] }),
     ?assertEqual(
@@ -313,7 +291,7 @@ linked_spawn_uses_process_store_test() ->
             #{
                 <<"process">> => ProcessID,
                 <<"slot">> => 0,
-                <<"body">> => {link, ProcessID, LinkOpts}
+                <<"body">> => {link, <<"ao:", ProcessID/binary>>, #{}}
             },
             Opts
         ),

@@ -1,7 +1,7 @@
 %%% @doc A store module that reads data from the nodes Arweave gateway and 
 %%% GraphQL routes, additionally including additional store-specific routes.
 -module(hb_store_gateway).
--export([scope/1, type/3, read/3, resolve/3, list/3, start/1, stop/1]).
+-export([scope/1, read/3, list/3, start/1, stop/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -11,8 +11,6 @@ stop(_) -> ok.
 
 %% @doc The scope of a GraphQL store is always remote, due to performance.
 scope(_) -> remote.
-resolve(_StoreOpts, #{ <<"resolve">> := Key }, _NodeOpts) ->
-    {ok, Key}.
 
 list(StoreOpts, #{ <<"list">> := Key }, NodeOpts) ->
     ?event(store_gateway, executing_list),
@@ -21,39 +19,16 @@ list(StoreOpts, #{ <<"list">> := Key }, NodeOpts) ->
         Other -> Other
     end.
 
-%% @doc Get the type of the data at the given key. We potentially cache the
-%% result, so that we don't have to read the data from the GraphQL route
-%% multiple times.
-type(StoreOpts, #{ <<"type">> := Key }, NodeOpts) ->
-    ?event(store_gateway, executing_type),
-    case read(StoreOpts, #{ <<"read">> => Key }, NodeOpts) of
-        {ok, Data} ->
-            ?event({type, hb_private:reset(hb_message:uncommitted(Data, StoreOpts))}),
-            IsFlat = lists:all(
-                fun({_, Value}) -> not is_map(Value) end,
-                hb_maps:to_list(
-                    hb_private:reset(
-                        hb_message:uncommitted(Data, StoreOpts)
-                    ),
-                    StoreOpts
-                )
-            ),
-            if
-                IsFlat -> {ok, simple};
-                true -> {ok, composite}
-            end;
-        Other ->
-            Other
-    end.
-
-%% @doc Extract a value from a message, handling sub-paths.
+%% @doc Extract a value from a message, handling sub-paths. A binary is
+%% encoded with `hb_cache:encode_value/1', so that the cache reads it back as
+%% the same binary.
 extract_path_value(Message, Rest, StoreOpts) ->
     case Rest of
         [] -> {ok, Message};
         _ ->
             case hb_util:deep_get(Rest, Message, StoreOpts) of
                 not_found -> {error, not_found};
-                Value -> {ok, Value}
+                Value -> {ok, hb_cache:encode_value(Value)}
             end
     end.
 
@@ -275,7 +250,11 @@ avoid_double_read_test() ->
     try
         % The item verifies, so it is cached under its ID with its commitment.
         ?assertEqual(
-            [<<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>],
+            [
+                ?ARWEAVE_COMMITTER(
+                    <<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>
+                )
+            ],
             hb_message:signers(Written, WriteOpts)
         ),
         Loaded = hb_cache:ensure_all_loaded(Read, LocalOpts),
@@ -568,7 +547,8 @@ remote_hyperbeam_node_ans104_test() ->
     Msg =
         hb_message:commit(
             #{
-                <<"hello">> => <<"world">>
+                <<"hello">> => <<"world">>,
+                <<"niish">> => <<"ni:literal">>
             },
             ServerOpts,
             #{ <<"commitment-device">> => <<"ans104@1.0">> }
@@ -592,4 +572,9 @@ remote_hyperbeam_node_ans104_test() ->
         },
     {ok, Req} = hb_cache:read(PublicID, ClientOpts),
     ?assert(hb_message:verify(Req)),
-    ?assert(hb_message:match(Msg, Req)).
+    ?assert(hb_message:match(Msg, Req)),
+    % A binary that starts with `ni:' is read back as itself, not as a name.
+    ?assertEqual(
+        {ok, <<"ni:literal">>},
+        hb_cache:read(<<PublicID/binary, "/niish">>, ClientOpts)
+    ).

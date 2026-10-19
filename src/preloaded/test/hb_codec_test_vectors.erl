@@ -1009,7 +1009,31 @@ specific_order_signed_message_test(RawCodec, Opts) ->
             Codec#{ <<"committed">> => [<<"key-3">>, <<"key-1">>, <<"key-2">>] }
         ),
     ?event({signed_msg, SignedMsg}),
-    ?assert(hb_message:verify(SignedMsg, all, Opts)).
+    ?assert(hb_message:verify(SignedMsg, all, Opts)),
+    % The commitment lists its keys in the order requested, and keeps that
+    % order through `httpsig@1.0'.
+    Roundtrip =
+        hb_message:convert(
+            hb_message:convert(SignedMsg, <<"httpsig@1.0">>, Opts),
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>,
+            Opts
+        ),
+    ?assertEqual(
+        [[<<"key-3">>, <<"key-1">>, <<"key-2">>]],
+        lists:usort(
+            [
+                hb_util:message_to_ordered_list(
+                    maps:get(<<"committed">>, Commitment),
+                    Opts
+                )
+            ||
+                Committed <- [SignedMsg, Roundtrip],
+                Commitment <-
+                    maps:values(maps:get(<<"commitments">>, Committed))
+            ]
+        )
+    ).
 
 specific_order_deeply_nested_signed_message_test(RawCodec, Opts) ->
     Msg = #{
@@ -1130,8 +1154,8 @@ deep_multisignature_test() ->
     ?assert(hb_message:verify(MsgSignedTwice, all, Opts)),
     Committers = hb_message:signers(MsgSignedTwice, Opts),
     ?event({committers, Committers}),
-    ?assert(lists:member(hb_util:human_id(ar_wallet:to_address(Wallet1)), Committers)),
-    ?assert(lists:member(hb_util:human_id(ar_wallet:to_address(Wallet2)), Committers)).
+    ?assert(lists:member(hb_test_utils:committer(Wallet1), Committers)),
+    ?assert(lists:member(hb_test_utils:committer(Wallet2), Committers)).
 
 deep_typed_message_id_test(Codec, Opts) ->
     Msg = #{
@@ -1677,9 +1701,10 @@ sign_links_test(Codec, Opts) ->
     % Make a message with definitively non-accessible lazy-loadable links. Sign
     % it, ensuring that we can produce signatures and IDs without having the 
     % data directly in memory.
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = #{
         <<"immediate-key">> => <<"immediate-value">>,
-        <<"submap+link">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+        <<"submap">> => {link, <<"ao:", ID/binary>>, #{}}
     },
     Signed = hb_message:commit(Msg, Opts, Codec),
     ?event({signed, Signed}),
@@ -1734,13 +1759,10 @@ bundled_and_unbundled_ids_differ_test(_Codec, _Opts) ->
 id_of_linked_message_test(#{ <<"bundle">> := true }, _Opts) ->
     skip;
 id_of_linked_message_test(Codec, Opts) ->
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = #{
         <<"immediate-key">> => <<"immediate-value">>,
-        <<"link-key">> =>
-            {link, hb_util:human_id(crypto:strong_rand_bytes(32)), #{
-                <<"type">> => <<"link">>,
-                <<"lazy">> => false
-            }}
+        <<"link-key">> => {link, <<"ao:", ID/binary>>, #{}}
     },
     UnsignedID = hb_message:id(Msg, Opts),
     ?event({id, UnsignedID}),

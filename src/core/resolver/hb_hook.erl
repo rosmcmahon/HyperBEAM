@@ -48,6 +48,16 @@
 %%%         Req/request: The raw, unparsed singleton request that was used to
 %%%             generate the response.
 %%%         Result/body: The message to be sent in response to the request.
+%%%     http-client-receipt: An outbound HTTP attempt completes.
+%%%         Req/body: Signed `request-method', `request-path', `status-class',
+%%%             `duration' (native time units), and configured peer `reference'.
+%%%     http-client-admissible-receipt: An HTTP multirequest selects a response
+%%%         after its configured status and response checks pass.
+%%%         Req/body: Signed `request', `response', `request-method',
+%%%             `request-path' and configured peer `reference'.
+%%%         This does not imply content verification unless configured.
+%%%     Both client receipt hooks run asynchronously; their results do not
+%%%         replace the HTTP result.
 %%% 
 -module(hb_hook).
 -export([on/3, find/2, find/3]).

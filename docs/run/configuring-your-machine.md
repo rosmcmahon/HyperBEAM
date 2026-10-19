@@ -19,16 +19,16 @@ port: 8080
 
 priv_key_location: /path/to/your/wallet.json
 
-default_store/lmdb/ao-types: store-module=atom
+default_store/lmdb/ao-types: atom=("store-module")
 default_store/lmdb/store-module: hb_store_lmdb
 default_store/lmdb/name: /tmp/store
 
-store/ao-types: .=list
-store/1/ao-types: store-module=atom
+store/ao-types: list=(".")
+store/1/ao-types: atom=("store-module")
 store/1/store-module: hb_store_lmdb
 store/1/name: /tmp/store
 
-store/2/ao-types: store-module=atom
+store/2/ao-types: atom=("store-module")
 store/2/store-module: hb_store_s3
 store/2/bucket: hb-s3
 store/2/priv_access_key_id: minioadmin
@@ -108,7 +108,7 @@ leaf first. Keep the same node wallet, then restart with:
 
 ```json
 {
-  "ao-types": "protocol=atom",
+  "ao-types": "atom=(\"protocol\")",
   "port": 443,
   "protocol": "http2",
   "tls": {
@@ -140,7 +140,7 @@ Save this as `config.json`, replacing `node.example.com` with your domain:
 
 ```json
 {
-  "ao-types": "protocol=atom",
+  "ao-types": "atom=(\"protocol\")",
   "port": 443,
   "protocol": "http2",
   "tls": {
@@ -187,14 +187,14 @@ For `config.flat`, use the equivalent configuration below and start with
 `HB_CONFIG=config.flat rebar3 shell`:
 
 ```text
-ao-types: protocol=atom
+ao-types: atom=("protocol")
 port: 443
 protocol: http2
 
-tls/domains/ao-types: .=list
+tls/domains/ao-types: list=(".")
 tls/domains/1: node.example.com
 
-tls/acme/ao-types: terms-of-service-agreed=atom, http-port=integer
+tls/acme/ao-types: atom=("terms-of-service-agreed"), integer=("http-port")
 tls/acme/directory-url: https://acme-v02.api.letsencrypt.org/directory
 tls/acme/terms-of-service-agreed: true
 tls/acme/http-port: 80
@@ -226,7 +226,7 @@ Merge these settings into your node configuration, replacing the example names:
 
 ```json
 {
-  "ao-types": "protocol=atom",
+  "ao-types": "atom=(\"protocol\")",
   "port": 443,
   "protocol": "http2",
   "dns": {

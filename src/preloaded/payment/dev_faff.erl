@@ -34,7 +34,11 @@ estimate(_, Msg, NodeMsg) ->
 %% @doc Check whether the request is signed, and all of its signers are in the
 %% allow-list.
 is_admissible(Msg, NodeMsg) ->
-    AllowList = hb_opts:get(faff_allow_list, [], NodeMsg),
+    AllowList =
+        lists:map(
+            fun hb_util:committer/1,
+            hb_opts:get(faff_allow_list, [], NodeMsg)
+        ),
     Req = hb_ao:get(<<"request">>, Msg, NodeMsg),
     Signers = hb_message:signers(Req, NodeMsg),
     ?event(payment, {is_admissible, {signers, Signers}, {allow_list, AllowList}}),

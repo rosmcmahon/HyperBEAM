@@ -20,18 +20,14 @@
 %%%     scope/0:      A tag describing the 'scope' of a stores search: `in_memory',
 %%%                   `local', `remote', `arweave', etc. Used in order to allow
 %%%                   node operators to prioritize their stores for search.
-%%%     group/3:      Create a new group of keys in the store using a request
-%%%                   map of the form `#{ <<"group">> => Path }`.
-%%%     link/3:       Create links using a request map of the form
-%%%                   `#{ NewPath => ExistingPath }`.
-%%%     type/3:       Return whether the value found at the given key is a
-%%%                   `composite' (group) type, or a `simple' direct binary,
-%%%                   using a request map of the form `#{ <<"type">> => Path }`.
-%%%     read/3:       Read the data at the given location, returning a binary
-%%%                   if it is a `simple' value, or a message if it is a complex
-%%%                   term, using a request map of the form `#{ <<"read">> => Path }`.
+%%%     read/3:       Read the data at the given location, using a request map
+%%%                   of the form `#{ <<"read">> => Path }`. A location that
+%%%                   holds a value returns `{ok, Value}'. A location with keys
+%%%                   below it returns `{composite, Children}'. A child that
+%%%                   holds a value is given as a `{Key, Value}' pair, and a
+%%%                   child with keys below it as its `Key'.
 %%%     write/3:      Write a request map of the form `#{ Path => Value }`.
-%%%     list/3:       For `composite' type keys, return child keys using a
+%%%     list/3:       For a path with keys below it, return child keys using a
 %%%                   request map of the form `#{ <<"list">> => Path }`:
 %%%                   every child, in the store's own order. A request may
 %%%                   instead bound the list: `from' is the child it should
@@ -39,9 +35,6 @@
 %%%                   `desc'), and `limit' the most children returned.
 %%%                   `limit' can also be `batch' for every child the store
 %%%                   finds without further work (store determined).
-%%%                   Composite read results may also return children as
-%%%                   `{Key, Value}' pairs when the store can provide a child
-%%%                   value without an additional read.
 %%% '''
 %%% Each function takes a `store' message first, containing an arbitrary set
 %%% of its necessary configuration keys, as well as the `store-module' key which
@@ -68,7 +61,6 @@
 %%%     Pre-normalization ->
 %%%     Store invocation ->
 %%%     Post-normalization ->
-%%%     Re-prefixing (only for `resolve`) ->
 %%%     Return.
 %%% '''
 %%%
@@ -104,16 +96,10 @@
 ]).
 -export([filter/2, scope/2, sort/2]).
 -export([
-    type/2, type/3,
     read/2, read/3,
     write/2, write/3,
     list/2, list/3,
     match/2, match/3
-]).
--export([
-    group/2, group/3,
-    link/2, link/3,
-    resolve/2, resolve/3
 ]).
 -export([find/1]).
 -export([generate_test_suite/1, generate_test_suite/2, test_stores/0]).
@@ -132,9 +118,8 @@
 
 behavior_info(callbacks) ->
     [
-        {start, 3}, {stop, 3}, {reset, 3}, {group, 3}, {link, 3},
-        {type, 3}, {read, 3}, {write, 3}, {list, 3}, {match, 3},
-        {resolve, 3}
+        {start, 3}, {stop, 3}, {reset, 3}, {read, 3}, {write, 3}, {list, 3},
+        {match, 3}
     ].
 
 -define(DEFAULT_SCOPE, local).
@@ -143,8 +128,8 @@ behavior_info(callbacks) ->
 
 %% @doc Store access policies to function names.
 -define(STORE_ACCESS_POLICIES, #{
-    <<"read">> => [read, resolve, list, type, match] ++ ?COMMON_POLICIES,
-    <<"write">> => [write, link, group, reset, flush] ++ ?COMMON_POLICIES,
+    <<"read">> => [read, list, match] ++ ?COMMON_POLICIES,
+    <<"write">> => [write, reset, flush] ++ ?COMMON_POLICIES,
     <<"admin">> => [reset] ++ ?COMMON_POLICIES
 }).
 
@@ -381,21 +366,6 @@ write(Req, Opts) ->
 write(Modules, Req, Opts) ->
     call_function(Modules, write, [Req, Opts]).
 
-%% @doc Make a group in the store. A group can be seen as a namespace or
-%% 'directory' in a filesystem.
-group(Path, Opts) ->
-    group(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
-group(Modules, Req = #{ <<"group">> := _ }, Opts) ->
-    call_function(Modules, group, [Req, Opts]);
-group(Modules, Path, Opts) ->
-    group(Modules, #{ <<"group">> => hb_path:to_binary(Path) }, Opts).
-
-%% @doc Make a link from one path to another in the store.
-link(Req, Opts) ->
-    link(hb_opts:get(<<"store">>, [], Opts), Req, Opts).
-link(Modules, Req, Opts) ->
-    call_function(Modules, link, [Req, Opts]).
-
 %% @doc Delete all of the keys in a store. Should be used with extreme
 %% caution. Lost data can lose money in many/most of hyperbeam's use cases.
 reset(StoreOrOpts) ->
@@ -408,26 +378,7 @@ reset(Store, Opts) ->
 reset(Stores, Req, Opts) ->
     admin_call(Stores, reset, Req, Opts).
 
-%% @doc Get the type of element of a given path in the store. This can be
-%% a performance killer if the store is remote etc. Use only when necessary.
-type(Path, Opts) ->
-    type(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
-type(Modules, Req = #{ <<"type">> := _ }, Opts) ->
-    call_function(Modules, type, [Req, Opts]);
-type(Modules, Path, Opts) ->
-    type(Modules, #{ <<"type">> => hb_path:to_binary(Path) }, Opts).
-
-%% @doc Follow links through the store to resolve a path to its ultimate target.
-resolve(Path, Opts) ->
-    resolve(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
-resolve(Modules, Req = #{ <<"resolve">> := _ }, Opts) ->
-    call_function(Modules, resolve, [Req, Opts]);
-resolve(Modules, Path, Opts) ->
-    resolve(Modules, #{ <<"resolve">> => hb_path:to_binary(Path) }, Opts).
-
-%% @doc List the keys in a group in the store. Use only in debugging.
-%% The hyperbeam model assumes that stores are built as efficient hash-based
-%% structures, so this is likely to be very slow for most stores.
+%% @doc List the keys in a group in the store.
 list(Path, Opts) ->
     list(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
 list(Modules, Req = #{ <<"list">> := _ }, Opts) ->
@@ -561,14 +512,11 @@ has_processing_pipeline(Store) ->
     lists:any(fun(Key) -> is_map_key(Key, Store) end, ?PIPELINE_KEYS).
 
 %% @doc Normalize a request's keys and values to the store: the path a
-%% `read', `list', `type', `group' or `resolve' names, every key and value
-%% of a `write' or `match', and both paths of a `link'. Every other request
-%% carries no key or value and passes through.
+%% `read' or `list' names, and every key and value of a `write' or `match'.
+%% Any other request has no keys or values, so it is returned unchanged.
 to_store(Store, Function, Req, Opts)
         when Function =:= write orelse Function =:= match ->
-    to_pairs(Store, fun to_value/3, Req, Opts);
-to_store(Store, link, Req, Opts) ->
-    to_pairs(Store, fun to_key/3, Req, Opts);
+    to_pairs(Store, Req, Opts);
 to_store(Store, list, Req = #{ <<"from">> := From }, Opts) ->
     % The child a list starts from is a key, as the children it answers
     % with are: it carries no prefix.
@@ -579,9 +527,7 @@ to_store(Store, list, Req = #{ <<"from">> := From }, Opts) ->
         {ok, NormReq#{ <<"from">> => NormFrom }}
     end;
 to_store(Store, Function, Req, Opts)
-        when Function =:= read orelse Function =:= list orelse
-            Function =:= type orelse Function =:= group orelse
-            Function =:= resolve ->
+        when Function =:= read orelse Function =:= list ->
     OpKey = hb_util:bin(Function),
     maybe
         {ok, Path} ?= to_key(Store, maps:get(OpKey, Req), Opts),
@@ -591,16 +537,15 @@ to_store(_Store, _Function, Req, _Opts) ->
     {ok, Req}.
 
 %% @doc Normalize every pair of a request to the store: its keys as paths,
-%% and its values through the given function -- as paths for a `link', as
-%% values for a `write'.
-to_pairs(Store, Values, Req, Opts) ->
+%% and its values as values.
+to_pairs(Store, Req, Opts) ->
     maybe
         {ok, Pairs} ?=
             maybe_each(
                 fun({Path, Value}) ->
                     maybe
                         {ok, NormPath} ?= to_key(Store, Path, Opts),
-                        {ok, NormValue} ?= Values(Store, Value, Opts),
+                        {ok, NormValue} ?= to_value(Store, Value, Opts),
                         {ok, {NormPath, NormValue}}
                     end
                 end,
@@ -642,9 +587,9 @@ to_value(Store, Value, Opts) ->
 must_strip_prefix(Store) ->
     hb_util:bool(maps:get(<<"prefix-strip">>, Store, true)).
 
-%% @doc Normalize a store's answer from it: a read's value, the children a
-%% `list' or a composite read enumerates, and a resolved path, which regains
-%% a stripped prefix. Every other answer passes through.
+%% @doc Normalize an answer from a store: the value of a read, and the
+%% children that a `list' or a composite read returns. Any other answer is
+%% returned unchanged.
 from_store(Store, read, {ok, Value}, Opts) ->
     execute_normalizer(<<"from-value">>, Store, Value, Opts);
 from_store(Store, read, {composite, Children}, Opts) ->
@@ -656,17 +601,6 @@ from_store(Store = #{ <<"from-list">> := _ }, list, {ok, Children}, Opts) ->
     execute_normalizer(<<"from-list">>, Store, Children, Opts);
 from_store(Store, list, {ok, Children}, Opts) ->
     from_children(Store, Children, Opts);
-from_store(Store, resolve, {ok, Path}, Opts) ->
-    Prefix = maps:get(<<"prefix">>, Store, <<>>),
-    maybe
-        {ok, Norm} ?= execute_normalizer(<<"from-key">>, Store, Path, Opts),
-        {ok,
-            case must_strip_prefix(Store) of
-                true -> <<Prefix/bitstring, Norm/bitstring>>;
-                false -> Norm
-            end
-        }
-    end;
 from_store(_Store, _Function, Result, _Opts) ->
     Result.
 
@@ -789,9 +723,7 @@ admin_call([Store | Rest], Function, Req, Opts) ->
         {error, _} = Error ->
             Error;
         {failure, _} = Failure ->
-            Failure;
-        {composite, _} = Composite ->
-            Composite
+            Failure
     end.
 
 admin_post_process(stop, Store) ->
@@ -892,8 +824,6 @@ normalize_result(not_found) -> {error, not_found};
 normalize_result(failure) -> {failure, failure};
 normalize_result(retry) -> retry;
 normalize_result(ok) -> ok;
-normalize_result(simple) -> {ok, simple};
-normalize_result(composite) -> {ok, composite};
 normalize_result(Result) -> {ok, Result}.
 
 terminal_result(undefined, undefined) ->
@@ -983,6 +913,16 @@ implicit_children_test_() ->
         {"implicit children", fun(Store) ->
             ok = write(Store, #{ <<"parent/child/value">> => <<"data">> }, #{}),
             ?assertEqual({ok, [<<"child">>]}, list(Store, <<"parent">>, #{})),
+            % Reading a path with keys below it returns them, with the value of
+            % each key that holds one.
+            ?assertEqual(
+                {composite, [<<"child">>]},
+                read(Store, <<"parent">>, #{})
+            ),
+            ?assertEqual(
+                {composite, [{<<"value">>, <<"data">>}]},
+                read(Store, <<"parent/child">>, #{})
+            ),
             ?assertEqual([<<"child">>], hb_cache:list(<<"parent">>, Store)),
             ?assertEqual(
                 {ok, []},
@@ -1012,54 +952,10 @@ unsupported_operation_test() ->
 write_req(Key, Value) ->
     #{ hb_path:to_binary(Key) => Value }.
 
-link_req(New, Existing) ->
-    #{ hb_path:to_binary(New) => hb_path:to_binary(Existing) }.
-
-%% @doc Test path resolution dynamics.
-simple_path_resolution_test(Store) ->
-    ok = write(Store, write_req(<<"test-file">>, <<"test-data">>), #{}),
-    ok = link(Store, link_req(<<"test-link">>, <<"test-file">>), #{}),
-    ?assertEqual({ok, <<"test-data">>}, read(Store, <<"test-link">>, #{})).
-
-%% @doc Ensure that we can resolve links recursively.
-resursive_path_resolution_test(Store) ->
-    ok = write(Store, write_req(<<"test-file">>, <<"test-data">>), #{}),
-    ok = link(Store, link_req(<<"test-link">>, <<"test-file">>), #{}),
-    ok = link(Store, link_req(<<"test-link2">>, <<"test-link">>), #{}),
-    ?assertEqual({ok, <<"test-data">>}, read(Store, <<"test-link2">>, #{})).
-
-%% @doc Ensure that we can resolve links through a directory.
-hierarchical_path_resolution_test(Store) ->
-    ok = group(Store, <<"test-dir1">>, #{}),
-    ok =
-        write(
-            Store,
-            write_req([<<"test-dir1">>, <<"test-file">>], <<"test-data">>),
-            #{}
-        ),
-    ok = link(Store, link_req(<<"test-link">>, [<<"test-dir1">>]), #{}),
-    ?assertEqual(
-        {ok, <<"test-data">>},
-        read(Store, [<<"test-link">>, <<"test-file">>], #{})
-    ).
-
-%% @doc Ensure that we can list a directory through a link to it.
-linked_list_test(Store) ->
-    ok = group(Store, <<"test-dir1">>, #{}),
-    ok =
-        write(
-            Store,
-            write_req([<<"test-dir1">>, <<"test-file">>], <<"test-data">>),
-            #{}
-        ),
-    ok = link(Store, link_req(<<"test-link">>, [<<"test-dir1">>]), #{}),
-    ?assertEqual({ok, [<<"test-file">>]}, list(Store, <<"test-link">>, #{})).
-
 %% @doc Ensure that keys with non-ASCII characters are listed and read as
 %% written.
 unicode_key_test(Store) ->
     Keys = [<<"é"/utf8>>, <<"日本語"/utf8>>, <<"🚀"/utf8>>],
-    ok = group(Store, <<"test-dir1">>, #{}),
     lists:foreach(
         fun(Key) ->
             ok = write(Store, write_req([<<"test-dir1">>, Key], Key), #{})
@@ -1075,13 +971,22 @@ unicode_key_test(Store) ->
         Keys
     ).
 
+%% @doc Ensure that a store reads every value as it was written, including
+%% the values `group' and `link:k'.
+literal_values_test(Store) ->
+    ok =
+        write(
+            Store,
+            #{ <<"k/group">> => <<"group">>, <<"k/link">> => <<"link:k">> },
+            #{}
+        ),
+    ?assertEqual({ok, <<"group">>}, read(Store, <<"k/group">>, #{})),
+    ?assertEqual({ok, <<"link:k">>}, read(Store, <<"k/link">>, #{})).
+
 store_suite_test_() ->
     generate_test_suite([
-        {"simple path resolution", fun simple_path_resolution_test/1},
-        {"resursive path resolution", fun resursive_path_resolution_test/1},
-        {"hierarchical path resolution", fun hierarchical_path_resolution_test/1},
-        {"linked list", fun linked_list_test/1},
-        {"unicode key", fun unicode_key_test/1}
+        {"unicode key", fun unicode_key_test/1},
+        {"literal values", fun literal_values_test/1}
     ]).
 
 benchmark_suite_test_() ->
@@ -1248,7 +1153,6 @@ benchmark_list(Store, WriteOps, ListOps, GroupSize) ->
             fun() ->
                 lists:map(
                     fun({GroupID, KeyPairs}) ->
-                        ok = group(Store, GroupID, #{}),
                         lists:foreach(
                             fun({Key, Value}) ->
                                 ok =
@@ -1464,8 +1368,7 @@ benchmark_message(nested, N, TestDataSize) ->
 
 %% @doc Test that a store with a `prefix' only admits keys bearing it --
 %% writes and reads alike -- stripping the prefix ahead of invocation and
-%% falling through to later stores otherwise, and that a path resolved
-%% through it regains the prefix, as `hb_cache' reuses the resolution.
+%% falling through to later stores otherwise.
 prefix_pipeline_test() ->
     Mounted =
         (hb_test_utils:test_store(hb_store_fs, <<"pipeline-prefix">>))#{
@@ -1482,10 +1385,6 @@ prefix_pipeline_test() ->
     ?assertEqual({ok, <<"1">>}, read(StoreList, <<"mnt/inner">>, #{})),
     ?assertEqual({ok, <<"1">>}, read([Ungated], <<"inner">>, #{})),
     ?assertEqual({error, not_found}, read([Plain], <<"mnt/inner">>, #{})),
-    ?assertEqual(
-        {ok, <<"mnt/inner">>},
-        resolve(StoreList, <<"mnt/inner">>, #{})
-    ),
     ?assertEqual(
         {ok, <<"1">>},
         hb_cache:read(
@@ -1581,16 +1480,16 @@ normalize_children_test() ->
         [{<<"~message@1.0/body">>, [<<"abc">>, <<0, 255>>, 17, [<<"a">>]]},
             {<<"~message@1.0&body=fixed/body">>, [<<"abc">>]},
             {<<"~message@1.0/set&value=constant/body">>, [<<"abc">>]},
-            {<<"~message@1.0&ao-types=body%3D%22integer%22/body">>, [<<"12">>]}]
+            {<<"~message@1.0&ao-types=integer%3D%28%22body%22%29/body">>,
+                [<<"12">>]}]
     ).
 
 %% @doc Test that `to-key' and `to-value' rewrite a request's paths and
 %% values ahead of the store -- for writes and reads alike -- and that
-%% `from-key' and `from-value' normalize its answers: a read's value, each
-%% child a list or a composite read enumerates, and a resolved path, which
-%% regains its prefix. A path the normalization cannot decode, or an answer
-%% that fails its normalization, falls through to the next store with the
-%% caller's original request.
+%% `from-key' and `from-value' normalize its answers: the value of a read, and
+%% the children that a list or a composite read returns. A path that the
+%% normalization cannot decode, or an answer that fails its normalization,
+%% falls through to the next store with the caller's original request.
 normalize_pipeline_test() ->
     Store =
         (hb_test_utils:test_store(hb_store_fs, <<"pipeline-normalize">>))#{
@@ -1655,8 +1554,7 @@ normalize_pipeline_test() ->
             {<<"key">>, true, <<"alternate">>}]
     ),
     ?event(testing, {normalized_write_and_read_passed}),
-    % Each child a list or a composite read enumerates is encoded, and a
-    % resolved path is encoded and regains its prefix.
+    % The children that a list or a composite read returns are encoded.
     EncodedChild = hb_util:encode(<<"g/a">>),
     ?assertEqual(
         ok,
@@ -1673,12 +1571,8 @@ normalize_pipeline_test() ->
         list([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
     ),
     ?assertEqual(
-        {composite, [hb_util:encode(<<"a">>)]},
+        {composite, [{hb_util:encode(<<"a">>), <<"x">>}]},
         read([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
-    ),
-    ?assertEqual(
-        {ok, <<"b64/", EncodedChild/binary>>},
-        resolve([Store], <<"b64/", EncodedChild/binary>>, #{})
     ),
     % An undecodable key skips the store for writes and reads alike, so the
     % fallback both receives and serves the original request.
@@ -1846,9 +1740,6 @@ list_access_control_test() ->
     TestValue = <<"list-test-value">>,
     start(StoreList),
     ?event(testing, {list_access_test_started}),
-    GroupResult = group(StoreList, ListGroup, #{}),
-    ?assertEqual(ok, GroupResult),
-    ?event(testing, {group_created, GroupResult}),
     WriteResponse = write(StoreList, write_req([ListGroup, TestKey], TestValue), #{}),
     ?assertEqual(ok, WriteResponse),
     ListResult = list(StoreList, ListGroup, #{}),
@@ -1856,27 +1747,6 @@ list_access_control_test() ->
     ?event(testing, {list_result, ListResult, ListValue}),
     ?assertEqual({ok,[TestKey]}, ListResult),
     ?assertEqual({ok,TestValue}, ListValue).
-
-%% @doc Test make_link operations with write access
-make_link_access_test() ->
-    WriteOnlyStore =
-        (hb_test_utils:test_store(hb_store_fs, <<"link-write-only">>))#{
-            <<"access">> => [<<"write">>,<<"read">>]
-        },
-    FallbackStore = hb_test_utils:test_store(hb_store_fs, <<"link-fallback">>),
-    StoreList = [WriteOnlyStore, FallbackStore],
-    SourceKey = <<"link-source">>,
-    TargetKey = <<"link-target">>,
-    TestValue = <<"link-test-value">>,
-    start(StoreList),
-    ?event(testing, {make_link_access_test_started}),
-    ?assertEqual(ok, write(StoreList, write_req(TargetKey, TestValue), #{})),
-    LinkResult = link(StoreList, link_req(SourceKey, TargetKey), #{}),
-    ?event(testing, {make_link_result, LinkResult}),
-    ReadResult = read(StoreList, SourceKey, #{}),
-    ?event(testing, {read_linked_value, ReadResult}),
-    ?assertEqual({ok, TestValue}, ReadResult),
-    ?assertEqual(ok, LinkResult).
 
 %% Prevent stores with access property to return local scope if they are defined as remote.
 get_store_scope_access_test() ->

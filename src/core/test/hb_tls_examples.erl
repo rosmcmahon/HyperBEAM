@@ -12,7 +12,7 @@ certificate_file() ->
     E = Key#'RSAPrivateKey'.publicExponent,
     N = binary:encode_unsigned(Key#'RSAPrivateKey'.modulus),
     D = binary:encode_unsigned(Key#'RSAPrivateKey'.privateExponent),
-    Wallet = {{{rsa, E}, D, N}, {{rsa, E}, N}},
+    Wallet = ar_wallet:new({rsa, E}, D, N),
     ServerID = hb:address(Wallet),
     Store = [hb_test_utils:test_store()],
     Opts = #{
@@ -39,14 +39,18 @@ certificate_file() ->
         {ok, NamesID} = hb_cache:write(
             #{ <<"1">> => <<"localhost">>, <<"2">> => <<"*.localhost">> }, Opts
         ),
-        TLS = #{ <<"domains">> => {link, NamesID, #{}} },
+        TLS = #{ <<"domains">> => {link, <<"ao:", NamesID/binary>>, #{}} },
         {ok, TLSID} = hb_cache:write(TLS, Opts),
         {ok, Linked} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
-            #{ <<"path">> => <<"csr">>, <<"domains">> => {link, NamesID, #{}} },
+            #{
+                <<"path">> => <<"csr">>,
+                <<"domains">> => {link, <<"ao:", NamesID/binary>>, #{}}
+            },
             Opts),
         ?assertEqual(PEM, hb_maps:get(<<"body">>, Linked)),
         {ok, Default} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
-            <<"csr">>, Opts#{ <<"tls">> => {link, TLSID, #{}} }),
+            <<"csr">>,
+            Opts#{ <<"tls">> => {link, <<"ao:", TLSID/binary>>, #{}} }),
         ?assertEqual(PEM, hb_maps:get(<<"body">>, Default)),
         ok = cowboy:stop_listener(ServerID),
         % A locally issued chain exercises file loading without any ACME service.
@@ -67,7 +71,7 @@ certificate_file() ->
         ])),
         {ok, PathID} = hb_cache:write(hb_util:bin(Path), Opts),
         FileOpts = Opts#{ <<"tls">> => #{
-            <<"certificate-path">> => {link, PathID, #{}},
+            <<"certificate-path">> => {link, PathID, #{ <<"lazy">> => true }},
             <<"domains">> => [<<"localhost">>, <<"*.localhost">>],
             <<"acme">> => #{ <<"http-port">> => GuardPort }
         } },
@@ -104,7 +108,8 @@ certificate_file() ->
     end.
 
 %% @doc Independently check the public key, signature and requested SANs.
-verify_csr(PEM, {{{rsa, E}, _D, N}, _}) ->
+verify_csr(PEM, #{ <<"type">> := Type, <<"owner">> := N }) ->
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     [{'CertificationRequest', DER, not_encrypted}] = public_key:pem_decode(PEM),
     CSR = public_key:der_decode('CertificationRequest', DER),
     Info = CSR#'CertificationRequest'.certificationRequestInfo,
@@ -186,6 +191,7 @@ pebble() ->
             }, Guard}
     end,
     ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Committer = hb_test_utils:committer(Wallet),
     RuntimeName = {<<"tls@1.0">>, ServerID},
     ResolverOrder = inet_db:res_option(lookup),
     ok = inet_db:set_lookup([file | lists:delete(file, ResolverOrder)]),
@@ -208,7 +214,7 @@ pebble() ->
             hb_tls:socket_options(ar_wallet:load_keyfile("test/key-2.json"),
                 [FirstCertificate])),
         {ok, Info} = hb_http:get(PublicURL, <<"/~meta@1.0/info">>, ClientOpts),
-        ?assertEqual([ServerID], hb_message:signers(Info, ClientOpts)),
+        ?assertEqual([Committer], hb_message:signers(Info, ClientOpts)),
         ?assert(hb_message:verify(Info, all, ClientOpts)),
         HTTP2 = http2_connection(Domain, Port, IssuerCAs),
         http2_address(HTTP2, ServerID),

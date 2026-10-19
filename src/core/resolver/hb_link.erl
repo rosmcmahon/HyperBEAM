@@ -1,6 +1,12 @@
 %%% @doc Utility functions for working with links.
+%%%
+%%% A link is a value that refers to another message with an `ao:' URI. In
+%%% memory, a link is represented as `{link, URI, LinkOpts}', where `URI' is
+%%% given as it was written. If the `lazy' option is set, the tuple instead
+%%% refers to a value that has not been loaded yet, and its second element
+%%% gives the location of that value in the store.
 -module(hb_link).
--export([is_link_key/1, remove_link_specifier/1]).
+-export([decode/1, decode/2]).
 -export([normalize/2, normalize/3]).
 -export([format/1, format/2, format/3]).
 -export([format_unresolved/1, format_unresolved/2, format_unresolved/3]).
@@ -9,16 +15,15 @@
 
 %% @doc Takes a structured message and ensures that its sub-message links are
 %% normalized to TABM form:
-%% 
-%% - All literal (binary) lazily-loadable values are in-memory.
-%% - All submaps are represented as links, optionally offloading their local 
+%%
+%% - All lazily-loadable values are in-memory.
+%% - All links are represented by their URIs.
+%% - All submaps are represented as links, optionally offloading their local
 %%   values to the cache.
 %% - All other values are left unchanged (including their potential types).
-%% 
+%%
 %% The response is a non-recursive, fully loaded message. It may still contain
-%% types, but all submessages are guaranteed to be linkified. This stands in 
-%% contrast to `linkify', which takes a structured message and returns a message
-%% with structured links.
+%% types, but all submessages are guaranteed to be linkified.
 normalize(Msg, Opts) when is_map(Opts) ->
     normalize(Msg, hb_opts:get(linkify_mode, offload, Opts), Opts).
 
@@ -28,50 +33,19 @@ normalize(Msg, Mode, Opts) when is_map(Msg) ->
     Private = lists:filter(fun hb_private:is_private/1, maps:keys(Msg)),
     maps:merge(
         maps:with([<<"commitments">> | Private], Msg),
-            maps:from_list(
-                lists:map(
-                    fun({Key, V}) -> normalize_pair(Key, V, Mode, Opts) end,
-                    maps:to_list(maps:without([<<"commitments">> | Private], Msg))
-                )
-            )
+        maps:map(
+            fun(Key, V) -> normalize_value(Key, V, Mode, Opts) end,
+            maps:without([<<"commitments">> | Private], Msg)
+        )
     );
 normalize(OtherVal, Mode, Opts) when is_list(OtherVal) ->
     lists:map(fun(X) -> normalize(X, Mode, Opts) end, OtherVal);
 normalize(OtherVal, _Mode, _Opts) ->
     OtherVal.
 
-%% @doc Normalize a single key and value of a message, returning the pair as it
-%% appears in the normalized message.
-normalize_pair(Key, {link, ID, LinkOpts = #{ <<"type">> := <<"link">> }},
-        _Mode, Opts) ->
-    % The value is a link. Deconstruct it and ensure it is
-    % normalized (lazy links are made greedy, and both are
-    % returned in binary TABM form).
-    NormKey = hb_util:bin(Key),
-    UnderlyingID =
-        case maps:get(<<"lazy">>, LinkOpts, false) of
-            true ->
-                case hb_cache:read(ID, hb_util:deep_merge(Opts, LinkOpts, Opts)) of
-                    {ok, Underlying} when ?IS_ID(Underlying)
-                            orelse ?IS_HASHPATH(Underlying) ->
-                        Underlying;
-                    Err ->
-                        throw(
-                            {could_not_read_lazy_link,
-                                {key, Key},
-                                {lazy_id, ID},
-                                {error, Err}
-                            }
-                        )
-                end;
-            false ->
-                % The ID given is already in 'greedy' form.
-                % We embed it in the result unchanged.
-                ID
-        end,
-    ?event(debug_linkify, {link_normalized, Key, UnderlyingID}),
-    {<< NormKey/binary, "+link">>, UnderlyingID};
-normalize_pair(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
+%% @doc Normalize the value of a key, returning it as it appears in the
+%% normalized message.
+normalize_value(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
     ?event(debug_linkify, {linkifying_submessage, Key}),
     % The value is a submessage that we have in local memory.
     % We must offload it such that it is cached, and
@@ -81,7 +55,6 @@ normalize_pair(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
     % and offloads its own submessages, so this pass only
     % derives the ID.
     NormChild = normalize(V, discard, Opts),
-    NormKey = hb_util:bin(Key),
     % Generate the ID of the normalized child message.
     ID = hb_message:id(NormChild, all, Opts),
     % If we are in `offload' mode, we write the message to the
@@ -97,27 +70,39 @@ normalize_pair(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
             hb_cache:write(V, Opts)
     end,
     ?event(debug_linkify, {generated_link, {key, Key}, {id, ID}}),
-    {<<NormKey/binary, "+link">>, ID};
-normalize_pair(Key, V, Mode, Opts) when ?IS_LINK(V) ->
-    % Loading a link must not change the normalized value. This clause is
-    % used when we are normalizing a lazily-loaded message.
-    normalize_pair(Key, hb_cache:ensure_loaded(V, Opts), Mode, Opts);
-normalize_pair(Key, V, _Mode, _Opts) ->
+    <<"ao:", ID/binary>>;
+normalize_value(Key, {link, Path, LinkOpts = #{ <<"lazy">> := true }},
+        Mode, Opts) when not is_map_key(<<"type">>, LinkOpts) ->
+    % The value is not loaded yet. We read it as it is stored, as we do for
+    % the values in a commitment, so that a link in it stays a link.
+    ReadOpts = hb_util:deep_merge(Opts, LinkOpts, Opts),
+    {ok, Value} = hb_cache:read(Path, ReadOpts#{ <<"commitment">> => true }),
+    normalize_value(Key, Value, Mode, Opts);
+normalize_value(Key, V = {link, _Path, #{ <<"lazy">> := true }}, Mode, Opts) ->
+    % The value is a lazy link with a type. We load it, which decodes it to
+    % its type, and then normalize the result.
+    normalize_value(Key, hb_cache:ensure_loaded(V, Opts), Mode, Opts);
+normalize_value(_Key, {link, URI, _LinkOpts}, _Mode, _Opts) ->
+    % The value is a link. Its normalized form is its URI.
+    URI;
+normalize_value(_Key, V, _Mode, _Opts) ->
     % The value is a primitive type. We do not need to do
     % anything.
-    {Key, V}.
+    V.
 
-%% @doc Determine if a key is an encoded link.
-is_link_key(Key) when byte_size(Key) >= 5 ->
-    binary:part(Key, byte_size(Key) - 5, 5) =:= <<"+link">>;
-is_link_key(_) -> false.
-
-%% @doc Remove any `+link` suffixes from a key.
-remove_link_specifier(Key) ->
-    case is_link_key(Key) of
-        true -> binary:part(Key, 0, byte_size(Key) - 5);
-        false -> Key
+%% @doc Decode the value of a key, returning a link if the value is a binary
+%% that starts with `ao:'. The values of the keys in `?AO_CORE_KEYS', such as
+%% `path' and `hashpath', are AO-Core syntax, so they are returned unchanged.
+decode(Key, Value) ->
+    case lists:member(Key, ?AO_CORE_KEYS) of
+        true -> Value;
+        false -> decode(Value)
     end.
+
+%% @doc Decode a value, returning a link if it is a binary that starts with
+%% `ao:'. Any other value is returned as it is.
+decode(URI = <<"ao:", _/binary>>) -> {link, URI, #{}};
+decode(Value) -> Value.
 
 %% @doc Format a link as a short string suitable for printing. Checks the node
 %% options (optionally) given, to see how many link levels it should resolve

@@ -12,7 +12,9 @@
 %%% Paths found in keys interpreted by this device can contain a `base:' or
 %%% `request:' prefix to indicate the message from which the path should be
 %%% retrieved. If no such prefix is present, the `Request' message is checked
-%%% first, and the `Base' message is checked second.
+%%% first, and the `Base' message is checked second. `hb_singleton' reads a
+%%% path part that starts with `base:' or `request:' as a URI, so a key with
+%%% one of these prefixes must be given as a value: `source=request:key'.
 -module(dev_apply).
 -export([info/1, pair/3, default/4]).
 -include_lib("eunit/include/eunit.hrl").
@@ -252,7 +254,7 @@ reverse_resolve_pair_test() ->
         )
     ).
 
-resolve_with_prefix_test() ->
+resolve_from_request_test() ->
     ShortTraceLen = hb_opts:get(short_trace_len),
     Node = hb_http_server:start_node(),
     ?assertEqual(
@@ -260,7 +262,7 @@ resolve_with_prefix_test() ->
         hb_http:request(
             <<"GET">>,
             Node,
-            <<"/~meta@1.0/info/request:debug-info~apply@1.0">>,
+            <<"/~meta@1.0/info/debug-info~apply@1.0">>,
             #{
                 <<"debug-info">> => <<"short-trace-len">>
             },

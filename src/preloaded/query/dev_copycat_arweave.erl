@@ -787,7 +787,6 @@ pending_index(Request, Mode, TXIDs, Store, Opts) ->
     else
         _ ->
             ok = hb_store:reset(Store),
-            ok = hb_store:group(Store, <<"~copycat@1.0/pending">>, Opts),
             ok = hb_store:write(
                 Store, #{ <<"~copycat@1.0/pending-mode">> => ModeBin }, Opts),
             Current
@@ -2248,8 +2247,7 @@ pending_bundle_children(Rejected, StoreModule) ->
     end,
     Remote = #{
         <<"store-module">> => hb_store_remote_node,
-        <<"node">> => hb_http_server:start_node(RemoteOpts),
-        <<"read-only">> => true
+        <<"node">> => hb_http_server:start_node(RemoteOpts)
     },
     Opts =
         DefaultOpts#{
@@ -2297,7 +2295,7 @@ pending_bundle_children(Rejected, StoreModule) ->
         ?assertEqual(
             {ok, Binary},
             hb_cache:read(
-                [<<"data">>, hb_path:hashpath(Binary, Opts)],
+                ?NI_URI(hb_path:hashpath(Binary, Opts)),
                 hb_store:scope(Opts, local)
             )
         ),
@@ -2507,7 +2505,8 @@ pending_reuse_checks(TXID, ExtraID, ChildID, Control, Mock, Opts) ->
         {ok, <<"full">>}, hb_store:read(Pending, <<"~copycat@1.0/pending-mode">>, Opts)
     ),
     ?assertEqual(
-        {ok, []}, hb_store:list(Pending, <<"~copycat@1.0/pending">>, Opts)
+        {error, not_found},
+        hb_store:list(Pending, <<"~copycat@1.0/pending">>, Opts)
     ),
     ?assertMatch({ok, #{ total_txs := 0, items_count := 0 }}, Run()).
 

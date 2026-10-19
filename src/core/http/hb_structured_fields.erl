@@ -333,34 +333,13 @@ parse_number(R, _L, Acc) ->
 %% @doc Parse a decimal binary.
 parse_decimal(<<C, R/bits>>, L1, L2, IntAcc, FracAcc) when ?IS_DIGIT(C) ->
     parse_decimal(R, L1, L2 + 1, IntAcc, <<FracAcc/binary, C>>);
-parse_decimal(R, L1, L2, IntAcc, FracAcc0) when L1 =< 12, L2 >= 1, L2 =< 3 ->
+parse_decimal(R, L1, L2, IntAcc, FracAcc0) when
+        L1 >= 1, L1 =< 12, L2 >= 1, L2 =< 3 ->
     %% While not strictly required this gives a more consistent representation.
-    FracAcc =
-        case FracAcc0 of
-            <<$0>> -> <<>>;
-            <<$0, $0>> -> <<>>;
-            <<$0, $0, $0>> -> <<>>;
-            <<A, B, $0>> -> <<A, B>>;
-            <<A, $0, $0>> -> <<A>>;
-            <<A, $0>> -> <<A>>;
-            _ -> FracAcc0
-        end,
-    Mul =
-        case byte_size(FracAcc) of
-            3 -> 1000;
-            2 -> 100;
-            1 -> 10;
-            0 -> 1
-        end,
-    Int = binary_to_integer(IntAcc),
-    Frac =
-        case FracAcc of
-            <<>> -> 0;
-            %% Mind the sign.
-            _ when Int < 0 -> -binary_to_integer(FracAcc);
-            _ -> binary_to_integer(FracAcc)
-        end,
-    {{decimal, {Int * Mul + Frac, -byte_size(FracAcc)}}, R}.
+    FracAcc = string:trim(FracAcc0, trailing, "0"),
+    % The sign and the digits without the point are the base: -0.05 is {-5, -2}.
+    Base = binary_to_integer(<<IntAcc/binary, FracAcc/binary>>),
+    {{decimal, {Base, -byte_size(FracAcc)}}, R}.
 
 %% @doc Parse a string binary.
 parse_string(<<$\\, $", R/bits>>, Acc) ->
@@ -571,68 +550,33 @@ bare_item({token, Token}) ->
     Token;
 bare_item({binary, Binary}) ->
     [$:, base64:encode(Binary), $:];
-bare_item({decimal, {Base, Exp}}) when Exp >= 0 ->
-    Mul =
-        case Exp of
-            0 -> 1;
-            1 -> 10;
-            2 -> 100;
-            3 -> 1000;
-            4 -> 10000;
-            5 -> 100000;
-            6 -> 1000000;
-            7 -> 10000000;
-            8 -> 100000000;
-            9 -> 1000000000;
-            10 -> 10000000000;
-            11 -> 100000000000;
-            12 -> 1000000000000
-        end,
-    MaxLenWithSign =
-        if
-            Base < 0 -> 13;
-            true -> 12
-        end,
-    Bin = integer_to_binary(Base * Mul),
-    true = byte_size(Bin) =< MaxLenWithSign,
-    [Bin, <<".0">>];
-bare_item({decimal, {Base, -1}}) ->
-    Int = Base div 10,
-    Frac = abs(Base) rem 10,
-    [integer_to_binary(Int), $., integer_to_binary(Frac)];
-bare_item({decimal, {Base, -2}}) ->
-    Int = Base div 100,
-    Frac = abs(Base) rem 100,
-    [integer_to_binary(Int), $., integer_to_binary(Frac)];
-bare_item({decimal, {Base, -3}}) ->
-    Int = Base div 1000,
-    Frac = abs(Base) rem 1000,
-    [integer_to_binary(Int), $., integer_to_binary(Frac)];
+%% A decimal with fewer than three fractional digits is scaled to three.
+bare_item({decimal, {Base, Exp}}) when Exp > -3 ->
+    bare_item({decimal, {Base * 10, Exp - 1}});
 bare_item({decimal, {Base, Exp}}) ->
-    Div = exp_div(Exp),
-    Int0 = Base div Div,
-    true = abs(Int0) < 1000000000000,
-    Frac0 = abs(Base) rem Div,
-    DivFrac = Div div 1000,
-    Frac1 = Frac0 div DivFrac,
-    {Int, Frac} =
-        if
-            (Frac0 rem DivFrac) > (DivFrac div 2) ->
-                case Frac1 of
-                    999 when Int0 < 0 -> {Int0 - 1, 0};
-                    999 -> {Int0 + 1, 0};
-                    _ -> {Int0, Frac1 + 1}
-                end;
-            true ->
-                {Int0, Frac1}
+    % Round to thousandths, half to even.
+    Div = exp_div(Exp + 3),
+    Thousandths =
+        case {abs(Base) div Div, abs(Base) rem Div} of
+            {Q, Rem} when 2 * Rem > Div; 2 * Rem =:= Div, Q rem 2 =:= 1 ->
+                Q + 1;
+            {Q, _} ->
+                Q
         end,
+    Int = Thousandths div 1000,
+    true = Int < 1000000000000,
+    % Pad the fraction to three digits, then drop its trailing zeros.
+    <<$1, Frac/binary>> = integer_to_binary(1000 + Thousandths rem 1000),
     [
+        if
+            Base < 0, Thousandths > 0 -> $-;
+            true -> <<>>
+        end,
         integer_to_binary(Int),
         $.,
-        if
-            Frac < 10 -> [$0, $0, integer_to_binary(Frac)];
-            Frac < 100 -> [$0, integer_to_binary(Frac)];
-            true -> integer_to_binary(Frac)
+        case string:trim(Frac, trailing, "0") of
+            <<>> -> $0;
+            Digits -> Digits
         end
     ];
 bare_item(Integer) when is_integer(Integer) ->
@@ -662,11 +606,25 @@ escape_chars(<<$\\, R/bits>>, Acc) -> escape_chars(R, [$\\, $\\ | Acc]);
 escape_chars(<<$", R/bits>>, Acc) -> escape_chars(R, [$", $\\ | Acc]);
 escape_chars(<<C, R/bits>>, Acc) -> escape_chars(R, [C | Acc]).
 
+%% @doc Reject parameter names that cannot be serialized as RFC 9651 keys.
+validate_param_key(<<C, R/bits>>) when ?IS_LC_ALPHA(C) or (C =:= $*) ->
+    validate_param_key1(R).
+validate_param_key1(<<C, R/bits>>) when
+        ?IS_LC_ALPHA(C) or ?IS_DIGIT(C) or
+        (C =:= $_) or (C =:= $-) or (C =:= $.) or (C =:= $*) ->
+    validate_param_key1(R);
+validate_param_key1(<<>>) ->
+    ok.
+
 params(Params) ->
     [
         case Param of
-            {Key, true} -> [$;, Key];
-            {Key, Value} -> [$;, Key, $=, bare_item(Value)]
+            {Key, true} ->
+                ok = validate_param_key(Key),
+                [$;, Key];
+            {Key, Value} ->
+                ok = validate_param_key(Key),
+                [$;, Key, $=, bare_item(Value)]
         end
     ||
         Param <- Params
@@ -829,6 +787,11 @@ to_list_test() ->
             }
         ]}
     ),
+    % Decimals keep their sign and leading fractional zeros, not trailing zeros.
+    ?assertEqual(
+        <<"1.05, -0.05, 1.5">>,
+        iolist_to_binary(list(parse_list(<<"1.05, -0.05, 1.500">>)))
+    ),
     ok.
 
 to_list_depth_test() ->
@@ -836,3 +799,29 @@ to_list_depth_test() ->
     {too_deep, _} = to_list([1,2,3, #{ foo => bar } ]),
     {too_deep, _} = to_list([1,2,3, [#{ foo => bar }] ]),
     ok.
+
+%% @doc Parameter names must follow the structured-fields key grammar.
+serialize_param_keys_test() ->
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual(
+                <<"?1;", Key/binary>>,
+                iolist_to_binary(item({item, true, [{Key, true}]}))
+            ),
+            ?assertEqual(
+                <<"?1;", Key/binary, "=\"v\"">>,
+                iolist_to_binary(item({item, true, [{Key, {string, <<"v">>}}]}))
+            )
+        end,
+        [<<"a">>, <<"*">>, <<"a0_-.*">>]
+    ),
+    lists:foreach(
+        fun(Key) ->
+            ?assertError(function_clause, item({item, true, [{Key, true}]})),
+            ?assertError(
+                function_clause,
+                item({item, true, [{Key, {string, <<"v">>}}]})
+            )
+        end,
+        [<<>>, <<"A">>, <<"0a">>, <<"a%">>, <<"a/b">>, <<"x\r\nx-injected">>]
+    ).

@@ -4,11 +4,10 @@
 %%%
 %%% The store knows the file's layout alone, and reads it from the file.
 %%% A main database in LMDB's default mode -- keys with values -- holds
-%%% paths as `hb_store_lmdb' writes them: a value is a `group' marker, a
-%%% `link:' to another path, or the value itself. Such a file is served as
-%%% that store serves its own, read-only: reads follow links and answer a
-%%% group with its children's values, lists answer with a group's children,
-%%% and `resolve' follows the links in a path. A main database in DUP mode
+%%% paths as `hb_store_lmdb' writes them. We serve such a file read-only, in
+%%% the same way as that store serves its own: a read returns the value of a
+%%% path, or the values of its children, and a list returns the children of
+%%% a path. A main database in DUP mode
 %%% (`MDB_DUPSORT bor MDB_DUPFIXED') -- fixed-width keys, each holding a
 %%% sorted set of fixed-width duplicate values -- takes a request that is
 %%% a key, or a key followed by value bits:
@@ -21,8 +20,6 @@
 %%%             leaf only while the first holds nothing past the value the
 %%%             list starts from. A request shorter than the key width
 %%%             lists the keys beginning with it instead.
-%%%     type:   `composite' for a key, `simple' for a key and value bits
-%%%             that a read finds.
 %%% '''
 %%% A file holding a single key serves that key's values, and its requests
 %%% leave the key out: they are value bits. A store definition with
@@ -108,7 +105,7 @@
 %%% read leaf.
 -module(hb_store_arlmdb).
 -export([start/3, stop/3, scope/0, scope/1]).
--export([read/3, list/3, resolve/3, type/3]).
+-export([read/3, list/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -157,48 +154,6 @@ stop(_StoreOpts, _Req, _NodeOpts) -> ok.
 scope() -> remote.
 scope(#{ <<"scope">> := Scope }) -> Scope;
 scope(_) -> scope().
-
-%% @doc A path with its links followed; a key of a sorted set holds no
-%% links, so it resolves to itself.
-resolve(StoreOpts, #{ <<"resolve">> := Key }, _NodeOpts) ->
-    case hb_store:find(StoreOpts) of
-        Meta = #{ <<"mode">> := default } ->
-            path_resolve(hb_path:to_binary(Key), Meta, StoreOpts);
-        _ ->
-            {ok, Key}
-    end.
-
-%% @doc The type of a path or of a key: `composite' for a group, a prefix
-%% of keys or a key a sorted set holds, and `simple' for a value.
-type(StoreOpts, #{ <<"type">> := Key }, NodeOpts) ->
-    Meta = hb_store:find(StoreOpts),
-    case Meta of
-        #{ <<"mode">> := default } ->
-            path_type(hb_path:to_binary(Key), Meta, StoreOpts);
-        _ ->
-            set_type(StoreOpts, Key, Meta, NodeOpts)
-    end.
-
-%% @doc `composite' for a prefix of keys or a key a sorted set holds, and
-%% `simple' for a key and value bits that a read finds.
-set_type(StoreOpts, Bits, Meta, NodeOpts) ->
-    case classify(Bits, Meta, StoreOpts) of
-        {keys, _Prefix} ->
-            {ok, composite};
-        {key, Key} ->
-            maybe
-                {ok, _Set} ?= set_of(Key, Meta, StoreOpts),
-                {ok, composite}
-            end;
-        Error = {error, _} ->
-            Error;
-        _ ->
-            maybe
-                {ok, _Found} ?=
-                    read(StoreOpts, #{ <<"read">> => Bits }, NodeOpts),
-                {ok, simple}
-            end
-    end.
 
 %% @doc A path's value, or the values under a key.
 read(StoreOpts, #{ <<"read">> := Key }, _NodeOpts) ->
@@ -283,174 +238,65 @@ classify(Bits, _Meta, _StoreOpts) ->
 
 %%% Paths, as `hb_store_lmdb' writes them.
 
-%% @doc A path's value: its own when it holds one, its target's when it
-%% holds a link, and its children's values when it holds a group or has
-%% children with no marker of its own. A path the file lacks is read
-%% again with the links in it followed, and is otherwise a miss.
+%% @doc Read a path's value: the row whose key is the path itself. A path with
+%% no row of its own returns its children, each with its value if it holds
+%% one, and a path with neither is a miss.
 path_read(Path, Meta, Opts) ->
-    maybe
-        {ok, Rows} ?= rows(Path, Meta, Opts),
-        case path_result(Path, Rows, Meta, Opts) of
-            {error, not_found} -> path_miss(Path, Meta, Opts);
-            Result -> Result
-        end
-    end.
-
-%% @doc Classify the marker row of a path's scan, which sorts ahead of the
-%% path's descendants: a link chases its target, a group answers with its
-%% immediate children, any other value answers itself, and a path with
-%% descendants but no marker is a group without a marker. A content-addressed
-%% `data/' row answers itself, whatever its bytes.
-path_result(<<"data/", _/binary>> = Path, [{Path, Value} | _], _Meta, _Opts) ->
-    {ok, Value};
-path_result(Path, [{Path, <<"link:", Link/binary>>} | _], Meta, Opts)
-        when byte_size(Link) > 0 ->
-    path_read(Link, Meta, Opts);
-path_result(Path, [{Path, <<"group">>} | Rows], _Meta, _Opts) ->
-    Prefix = hb_store_utils:child_prefix(Path),
-    {composite, hb_store_utils:immediate_children(Prefix, Rows)};
-path_result(Path, [{Path, Value} | _], _Meta, _Opts) ->
-    {ok, Value};
-path_result(Path, Rows, _Meta, _Opts) ->
-    Prefix = hb_store_utils:child_prefix(Path),
-    Children = hb_store_utils:immediate_children(Prefix, Rows),
-    case {hb_store_utils:is_data_path(Path), Children} of
-        {false, [_ | _]} -> {composite, Children};
-        _ -> {error, not_found}
-    end.
-
-%% @doc A path absent from the scan, read again through the links in it.
-path_miss(Path, Meta, Opts) ->
-    through_links(Path, fun path_read/3, Meta, Opts).
-
-%% @doc A path taken again by `Then' with the links within it followed,
-%% when they lead elsewhere, and a miss otherwise. Content-addressed `data'
-%% keys hold no links.
-through_links(Path, Then, Meta, Opts) ->
-    Parts = binary:split(Path, <<"/">>, [global, trim_all]),
-    Links =
-        case hb_store_utils:is_data_path(Path) of
-            true ->
-                {ok, Parts};
-            false ->
-                hb_store_utils:resolve_path_links(reader(Meta, Opts), Parts)
+    Read =
+        fun(Leaf, Node = #{ key := Key }, Miss) ->
+            case Key of
+                Path ->
+                    maybe
+                        {ok, Value} ?= node_value(Leaf, Node, Meta, Opts),
+                        {stop, {ok, Value}}
+                    end;
+                _ ->
+                    {stop, Miss}
+            end
         end,
-    case Links of
-        {ok, Resolved} ->
-            case hb_store_utils:to_path(Resolved) of
-                Path -> {error, not_found};
-                Target -> Then(Target, Meta, Opts)
+    case fold_nodes(Path, Read, {error, not_found}, Meta, Opts) of
+        {ok, {error, not_found}} ->
+            case children(Path, true, Meta, Opts) of
+                {ok, []} -> {error, not_found};
+                {ok, Children} -> {composite, Children};
+                Error -> Error
             end;
-        {error, _} ->
-            {error, not_found}
-    end.
-
-%% @doc A group's children, bounded by the request: the path's links are
-%% followed, and it must hold a group.
-path_list(Path, Req, Meta, Opts) ->
-    case resolved(Path, Meta, Opts) of
-        {ok, Group, <<"group">>} ->
-            maybe
-                {ok, Children} ?= children(Group, Meta, Opts),
-                {ok, hb_store_utils:apply_list_bounds(Children, Req)}
-            end;
-        {ok, _Path, _Value} ->
-            {error, not_found};
-        Error ->
-            Error
-    end.
-
-%% @doc `composite' for a path that holds a group, and `simple' for one
-%% that holds a value, its links followed.
-path_type(Path, Meta, Opts) ->
-    case resolved(Path, Meta, Opts) of
-        {ok, _Resolved, <<"group">>} -> {ok, composite};
-        {ok, _Resolved, _Value} -> {ok, simple};
+        {ok, Result} -> Result;
         Error -> Error
     end.
 
-%% @doc The path with the links in it followed, or the path itself when
-%% they cannot be.
-path_resolve(Path, Meta, Opts) ->
-    Parts = binary:split(Path, <<"/">>, [global]),
-    case hb_store_utils:resolve_path_links(reader(Meta, Opts), Parts) of
-        {ok, Resolved} -> {ok, hb_store_utils:to_path(Resolved)};
-        {error, _} -> {ok, Path}
-    end.
-
-%% @doc The value a path holds and the path holding it, with a link the
-%% path holds followed, and the links within the path followed when it
-%% holds nothing.
-resolved(Path, Meta, Opts) ->
-    case value(Path, Meta, Opts) of
-        {ok, Value} ->
-            case hb_store_utils:is_link(Value) of
-                {true, Link} -> resolved(Link, Meta, Opts);
-                false -> {ok, Path, Value}
-            end;
-        {error, not_found} ->
-            through_links(Path, fun resolved/3, Meta, Opts);
-        Error ->
-            Error
-    end.
-
-%% @doc A reader of values for the link resolver, which sees only hits
-%% and misses.
-reader(Meta, Opts) ->
-    fun(Key) ->
-        case value(Key, Meta, Opts) of
-            {ok, Value} -> {ok, Value};
-            _ -> not_found
-        end
-    end.
-
-%% @doc The value a key holds, or a proven miss.
-value(Key, Meta, Opts) ->
-    #{ <<"main-root">> := Root, <<"main-depth">> := Depth } = Meta,
-    maybe
-        {ok, {Leaf, Slot, Count, _Bound}} ?=
-            descend(Root, Depth, Key, nodes, asc, none, Meta, Opts),
-        true ?= Slot < Count orelse {error, not_found},
-        Node = node(Leaf, Slot),
-        true ?= maps:get(key, Node) =:= Key orelse {error, not_found},
-        node_value(Leaf, Node, Meta, Opts)
-    end.
-
-%% @doc Every row whose key begins with the prefix, in key order.
-rows(Prefix, Meta, Opts) ->
-    Collect =
-        fun(Leaf, Node = #{ key := Key }, Rows) ->
-            case begins_with(Key, Prefix) of
-                true ->
-                    maybe
-                        {ok, Value} ?= node_value(Leaf, Node, Meta, Opts),
-                        {ok, [{Key, Value} | Rows]}
-                    end;
-                false ->
-                    {stop, Rows}
-            end
-        end,
-    maybe
-        {ok, Rows} ?= fold_nodes(Prefix, Collect, [], Meta, Opts),
-        {ok, lists:reverse(Rows)}
+%% @doc List a path's children, bounded by the request. A path without
+%% children is a miss.
+path_list(Path, Req, Meta, Opts) ->
+    case children(Path, false, Meta, Opts) of
+        {ok, []} -> {error, not_found};
+        {ok, Children} -> {ok, hb_store_utils:apply_list_bounds(Children, Req)};
+        Error -> Error
     end.
 
 %% @doc A group's children: each key beneath it gives one, its next path
 %% component, and a component with descendants of its own is seen once,
-%% the read seeking past its subtree.
-children(Path, Meta, Opts) ->
+%% the read seeking past its subtree. If `Values' is `true', a child with a
+%% row of its own is returned with its value, as `{Child, Value}'.
+children(Path, Values, Meta, Opts) ->
     Prefix = hb_store_utils:child_prefix(Path),
     Size = byte_size(Prefix),
     Collect =
-        fun(_Leaf, #{ key := Key }, Children) ->
+        fun(Leaf, Node = #{ key := Key }, Children) ->
             case Key of
                 <<Prefix:Size/binary, Rest/binary>> when Rest =/= <<>> ->
                     case binary:split(Rest, <<"/">>) of
+                        [Child] when Values ->
+                            maybe
+                                {ok, Value} ?=
+                                    node_value(Leaf, Node, Meta, Opts),
+                                {ok, [{Child, {Child, Value}} | Children]}
+                            end;
                         [Child] ->
-                            {ok, [Child | Children]};
+                            {ok, [{Child, Child} | Children]};
                         [Child, _Below] ->
                             Past = <<Prefix/binary, Child/binary, ($/ + 1)>>,
-                            {seek, Past, [Child | Children]}
+                            {seek, Past, [{Child, Child} | Children]}
                     end;
                 _ ->
                     {stop, Children}
@@ -458,7 +304,10 @@ children(Path, Meta, Opts) ->
         end,
     maybe
         {ok, Children} ?= fold_nodes(Prefix, Collect, [], Meta, Opts),
-        {ok, lists:usort(Children)}
+        % A child's own row sorts before the rows below it, so we keep the
+        % first entry of each name.
+        Named = lists:ukeysort(1, lists:reverse(Children)),
+        {ok, [ Child || {_Name, Child} <- Named ]}
     end.
 
 %% @doc Fold a function over the main tree's nodes from the target key
@@ -1487,10 +1336,6 @@ list_values() ->
         List(#{ <<"from">> => <<Prefix/bitstring, 381852134215638:49, 0:34>> })
     ),
     ?assertEqual({ok, Row}, hb_store:read(Raw, #{ <<"read">> => Prefix }, #{})),
-    ?assertEqual(
-        {ok, simple},
-        hb_store:type(Raw, #{ <<"type">> => Prefix }, #{})
-    ),
     {ok, Head} =
         hb_store:list(Raw, #{ <<"list">> => <<>>, <<"limit">> => 3 }, #{}),
     ?assertEqual(3, length(Head)),
@@ -1568,10 +1413,6 @@ published_rows() ->
         {ok, hd(Rows)},
         hb_store:read(Store, #{ <<"read">> => Small }, #{})
     ),
-    ?assertEqual(
-        {ok, simple},
-        hb_store:type(Store, #{ <<"type">> => Small }, #{})
-    ),
     Large = predicate(<<"action">>, <<"Battle.Info">>),
     Page = List(Large, #{ <<"limit">> => 600 }),
     ?assertEqual(600, length(Page)),
@@ -1595,8 +1436,7 @@ published_rows() ->
 %% start and under a name's hash; a predicate's
 %% key holds its rows' offsets as 48-bit values, listed whole, from a
 %% value, and to a limit; a key reads its first value and a key with a
-%% value that value; a key is composite and a value simple; and a key the
-%% index lacks is not found.
+%% value that value; and a key the index lacks is not found.
 published_keys_test_() ->
     {timeout, 600, fun published_keys/0}.
 published_keys() ->
@@ -1650,18 +1490,6 @@ published_keys() ->
         )
     ),
     ?assertEqual(
-        {ok, composite},
-        hb_store:type(Store, #{ <<"type">> => Key }, #{})
-    ),
-    ?assertEqual(
-        {ok, simple},
-        hb_store:type(
-            Store,
-            #{ <<"type">> => <<Key/bitstring, Middle/binary>> },
-            #{}
-        )
-    ),
-    ?assertEqual(
         {error, not_found},
         hb_store:list(Store, #{ <<"list">> => <<Small/bitstring, 0:1>> }, #{})
     ).
@@ -1681,11 +1509,10 @@ paths_store() ->
     }.
 
 %% @doc A published `hb_store_lmdb' layout is served as that store serves
-%% its own: a value reads as itself, a link as its target, a link within a
-%% path as the target's child, a large value from its overflow pages, and a
-%% group as its children's values; a group lists its children, each once
-%% and bounded on request, while a value lists none; types and resolution
-%% follow links; and an absent path is a miss.
+%% its own. A value reads as itself, including a row that an earlier store
+%% wrote as a link, and a path under a value is a miss. A large value reads
+%% from its overflow pages. A path lists each of its children once, bounded
+%% on request, and a value lists nothing. An absent path is a miss.
 published_paths_test_() ->
     {timeout, 600, fun published_paths/0}.
 published_paths() ->
@@ -1693,23 +1520,13 @@ published_paths() ->
     ok = hb_store:start(Store),
     Read = fun(Path) -> hb_store:read(Store, Path, #{}) end,
     ?assertEqual({ok, <<"value-b">>}, Read(<<"a/b">>)),
-    ?assertEqual({ok, <<"value-b">>}, Read(<<"a/link">>)),
-    ?assertEqual({ok, <<"value-b">>}, Read(<<"l/b">>)),
-    ?assertEqual({ok, <<"deep">>}, Read(<<"l/c/d">>)),
+    ?assertMatch({ok, <<"link:", _/binary>>}, Read(<<"a/link">>)),
+    ?assertEqual({error, not_found}, Read(<<"l/b">>)),
     Big = binary:copy(<<"0123456789abcdef">>, 6400),
     ?assertEqual({ok, Big}, Read(<<"a/big">>)),
-    ?assertEqual({ok, <<"raw">>}, Read(<<"data/k">>)),
     ?assertEqual({error, not_found}, Read(<<"nope">>)),
-    {composite, Children} = Read(<<"a">>),
-    ?assertEqual(
-        [<<"b">>, <<"big">>, <<"c">>, <<"link">>],
-        lists:sort([ Name || {Name, _Value} <- Children ])
-    ),
-    ?assertEqual(<<"group">>, proplists:get_value(<<"c">>, Children)),
     List = fun(Req) -> hb_store:list(Store, Req, #{}) end,
     ?assertEqual({ok, [<<"b">>, <<"b-x">>]}, List(<<"z">>)),
-    % Only a group lists, as in `hb_store_lmdb': the root holds no marker.
-    ?assertEqual({error, not_found}, List(#{ <<"list">> => <<>> })),
     ?assertEqual(
         {ok, [<<"c">>, <<"link">>]},
         List(#{
@@ -1727,8 +1544,4 @@ published_paths() ->
             <<"direction">> => desc
         })
     ),
-    ?assertEqual({error, not_found}, List(<<"a/b">>)),
-    ?assertEqual({ok, composite}, hb_store:type(Store, <<"a">>, #{})),
-    ?assertEqual({ok, simple}, hb_store:type(Store, <<"a/b">>, #{})),
-    ?assertEqual({ok, composite}, hb_store:type(Store, <<"l">>, #{})),
-    ?assertEqual({ok, <<"a/c/d">>}, hb_store:resolve(Store, <<"l/c/d">>, #{})).
+    ?assertEqual({error, not_found}, List(<<"a/b">>)).

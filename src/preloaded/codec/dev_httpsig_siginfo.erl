@@ -4,12 +4,14 @@
 -export([commitments_to_siginfo/3, siginfo_to_commitments/3]).
 -export([committed_keys_to_siginfo/1, to_siginfo_keys/3, from_siginfo_keys/3]).
 -export([add_derived_specifiers/1, remove_derived_specifiers/1]).
--export([commitment_to_sig_name/1, derived_commitment_id/1]).
+-export([keyid_to_committer/1, derived_commitment_id/1, signature_input/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%% A list of components that are `derived' in the context of RFC-9421 from the
-%%% request message.
+%%% request message. A key that is one of these components is signed and sent
+%%% as that component: `path' as `@path'. `@query-param' also needs the query
+%%% parameter that it selects, so a `query-param' key is signed as a field.
 -define(DERIVED_COMPONENTS, [
     <<"method">>,
     <<"target-uri">>,
@@ -17,8 +19,7 @@
     <<"scheme">>,
     <<"request-target">>,
     <<"path">>,
-    <<"query">>,
-    <<"query-param">>
+    <<"query">>
     % <<"status">> % Some libraries do not support it
 ]).
 
@@ -54,12 +55,6 @@ commitments_to_siginfo(Msg, Comms, Opts) ->
 %% @doc Generate a `signature' and `signature-input' key pair from a given
 %% commitment.
 commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
-    % Generate the `alg' key from the commitment.
-    Alg = commitment_to_alg(Commitment, Opts),
-    % Find the public key from the commitment, which we will use as the
-    % `keyid' in the `signature-input' keys. Absent in the commitment =>
-    % absent on the wire (permitted by RFC 9421 §1.4.2.3).
-    KeyID = maps:get(<<"keyid">>, Commitment, undefined),
     % Extract the signature from the commitment. A commitment of another
     % device without one, such as that of an unsigned item, is sent with an
     % empty signature.
@@ -67,12 +62,6 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
     % Extract the keys present in the commitment.
     CommittedKeys = to_siginfo_keys(Msg, Commitment, Opts),
     ?event_debug({normalized_for_enc, CommittedKeys, {commitment, Commitment}}),
-    % Extract the hashpath, used as a tag, from the commitment.
-    Tag = maps:get(<<"tag">>, Commitment, undefined),
-    % Extract other permissible values, if present.
-    Nonce = maps:get(<<"nonce">>, Commitment, undefined),
-    Created = maps:get(<<"created">>, Commitment, undefined),
-    Expires = maps:get(<<"expires">>, Commitment, undefined),
     % Generate the name of the signature. A commitment without a signature is
     % named by its ID.
     NameSource =
@@ -86,55 +75,17 @@ commitment_to_sf_siginfo(Msg, CommID, Commitment, Opts) ->
     % (e.g. `~ipfs@1.0') key on a CID that is not a function of `Sig'; HMAC,
     % RSA-PSS, and other `h(Sig)'-keyed devices never pay this cost.
     DerivedID = derived_commitment_id(Signature),
-    IDParam =
+    WithID =
         case CommID of
-            undefined -> [];
-            DerivedID -> [];
-            _         -> [{<<"id">>, {string, CommID}}]
+            undefined -> Commitment;
+            DerivedID -> Commitment;
+            _         -> Commitment#{ <<"id">> => CommID }
         end,
     % Generate the signature input and signature structured-fields. These can
     % then be placed into a dictionary with other commitments and transformed
     % into their binary representations.
     SFSig = {item, {binary, Signature}, []},
-    AdditionalParams = get_additional_params(Commitment),
-    KeyIDItem =
-        case KeyID of
-            undefined -> undefined;
-            _         -> {string, KeyID}
-        end,
-    RawParams =
-        lists:filter(
-            fun({_Key, undefined}) ->
-                false;
-               ({_Key, {_, Val}}) ->
-                Val =/= undefined
-            end,
-            [
-                {<<"alg">>, {string, Alg}},
-                {<<"keyid">>, KeyIDItem},
-                {<<"tag">>, {string, Tag}},
-                {<<"created">>, Created},
-                {<<"expires">>, Expires},
-                {<<"nonce">>, {string, Nonce}}
-            ] ++ IDParam ++ AdditionalParams
-        ),
-    Params =
-        lists:map(
-            fun({Key, {string, Value}}) ->
-                {Key, {string, encode_param(Value)}};
-               (Param) -> Param
-            end,
-            RawParams
-        ),
-    SFSigInput =
-        {list,
-            [
-                {item, {string, Key}, []}
-            ||
-                Key <- CommittedKeys
-            ],
-            Params
-        },
+    SFSigInput = signature_input(CommittedKeys, WithID, Opts),
     ?event_debug(
         {sig_input,
             {string,
@@ -156,37 +107,49 @@ derived_commitment_id(Sig) when byte_size(Sig) == 32 ->
 derived_commitment_id(Sig) ->
     hb_util:human_id(crypto:hash(sha256, Sig)).
 
-%% @doc HTTPSig derives its committer; other codecs transport theirs explicitly.
-get_additional_params(Commitment = #{
-        <<"commitment-device">> := <<"httpsig@1.0">>, <<"committer">> := _ }) ->
-    get_additional_params(maps:remove(<<"committer">>, Commitment));
-get_additional_params(Commitment) ->
-    AdditionalParams =
-        sets:to_list(
-            sets:subtract(
-                sets:from_list(maps:keys(Commitment)),
-                sets:from_list(
+%% @doc Generate the `signature-input' of a commitment: the inner list of its
+%% components, with the other keys of the commitment as its parameters, sorted.
+%% The `alg' parameter holds the `commitment-device' and `type' of the
+%% commitment. The `@signature-params' line of a signature base is this list,
+%% so the signature covers every parameter that is sent. HTTPSig derives the
+%% committer of a commitment from its `keyid', so it does not send it.
+signature_input(Components, Commitment = #{
+        <<"commitment-device">> := <<"httpsig@1.0">>, <<"committer">> := _ },
+        Opts) ->
+    signature_input(Components, maps:remove(<<"committer">>, Commitment), Opts);
+signature_input(Components, Commitment, Opts) ->
+    Params = Commitment#{ <<"alg">> => commitment_to_alg(Commitment, Opts) },
+    {ok, [SignatureInput]} =
+        hb_structured_fields:to_list(
+            [
+                {
+                    list,
+                    Components,
                     [
-                        <<"alg">>,
-                        <<"keyid">>,
-                        <<"tag">>,
-                        <<"created">>,
-                        <<"expires">>,
-                        <<"nonce">>,
-                        <<"committed">>,
-                        <<"signature">>,
-                        <<"type">>,
-                        <<"id">>,
-                        <<"commitment-device">>
+                        {Key, param_value(maps:get(Key, Params))}
+                    ||
+                        Key <-
+                            lists:sort(
+                                maps:keys(Params) --
+                                    [
+                                        <<"committed">>,
+                                        <<"signature">>,
+                                        <<"type">>,
+                                        <<"commitment-device">>
+                                    ]
+                            ),
+                        not hb_private:is_private(Key)
                     ]
-                )
-            )
+                }
+            ]
         ),
-    [
-        {Param, {string, maps:get(Param, Commitment)}}
-    ||
-        Param <- AdditionalParams
-    ].
+    SignatureInput.
+
+%% @doc Convert the value of a parameter for `hb_structured_fields'. Integers,
+%% such as `created', are sent as integers, and other values as the text that
+%% `encode_param/1' returns for them.
+param_value(Value) when is_integer(Value) -> Value;
+param_value(Value) -> encode_param(Value).
 
 %% @doc Lists start with a comma and a colon per element. Maps start with a
 %% colon and contain comma-separated key:value pairs. Nested values are escaped.
@@ -347,7 +310,7 @@ sf_siginfo_to_commitment(Msg, BodyKeys, SFSig, SFSigInput, Opts) ->
         end,
     KeyID = maps:get(<<"keyid">>, Commitment4, <<>>),
     Commitment5 =
-        case dev_httpsig_keyid:keyid_to_committer(KeyID) of
+        case keyid_to_committer(KeyID) of
             undefined ->
                 Commitment4;
             Committer ->
@@ -393,7 +356,11 @@ decode_param(Bin) ->
 to_siginfo_keys(Msg, Commitment = #{
         <<"commitment-device">> := <<"httpsig@1.0">> }, Opts) ->
     {ok, _EncMsg, EncComm, _} =
-        dev_httpsig:normalize_for_encoding(Msg, Commitment, Opts),
+        dev_httpsig:normalize_for_encoding(
+            linkify(Msg, Commitment, Opts),
+            Commitment,
+            Opts
+        ),
     maps:get(<<"committed">>, EncComm);
 to_siginfo_keys(_Msg, Commitment, Opts) ->
     lists:map(
@@ -404,24 +371,48 @@ to_siginfo_keys(_Msg, Commitment, Opts) ->
         )
     ).
 
+%% @doc Replace the messages nested in a message with their links, unless the
+%% commitment is made over a bundle. A commitment that is not made over a
+%% bundle covers the nested messages by their links, even when the message
+%% carries them in full.
+linkify(Msg, Commitment, Opts) ->
+    case hb_util:atom(maps:get(<<"bundle">>, Commitment, false)) of
+        true -> Msg;
+        false -> hb_link:normalize(Msg, discard, Opts)
+    end.
+
 %% @doc Normalize a list of `httpsig@1.0' keys to their equivalents in AO-Core
-%% format. Replace `content-digest' with the body keys, remove component prefixes,
-%% and restore the body's original key. A multipart `content-type' header is not
-%% a message key; the message's own `content-type' may be in the body instead.
+%% format. Replace `content-digest' with the body keys, in alphabetical order,
+%% remove component prefixes, and restore the body's original key. A
+%% `multipart/' `content-type' header with a `boundary' gives the encoding of
+%% the body, and is not a message key. The message's own `content-type' may be
+%% in the body instead.
 from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     % 1. Replace the `content-digest' component with the body keys, then remove
-    %    specifiers from the other keys and decode them. A key of the message
-    %    named `content-digest' is one of the body keys.
+    %    specifiers from the other keys and decode them. A `content-digest'
+    %    key of the message is one of the body keys. A key of the body that
+    %    is also a component of its own, such as a message that a commitment
+    %    covers by its link, keeps the place of that component.
+    ComponentKeys =
+        fun(<<"content-type">>) ->
+                ContentType =
+                    maps:get(<<"content-type">>, HTTPEncMsg, undefined),
+                case dev_httpsig_conv:boundary(ContentType) of
+                    false -> [<<"content-type">>];
+                    _ -> []
+                end;
+           (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
+           (Key) -> [hb_escape:decode(Key)]
+        end,
+    Listed =
+        lists:flatmap(
+            ComponentKeys,
+            SigInfoCommitted -- [<<"content-digest">>]
+        ),
     WithBody =
         lists:flatmap(
-            fun(<<"content-digest">>) -> BodyKeys;
-               (<<"content-type">>) ->
-                    case maps:get(<<"content-type">>, HTTPEncMsg, undefined) of
-                        <<"multipart/", _/binary>> -> [];
-                        _ -> [<<"content-type">>]
-                    end;
-               (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
-               (Key) -> [hb_escape:decode(Key)]
+            fun(<<"content-digest">>) -> lists:sort(BodyKeys -- Listed);
+               (Component) -> ComponentKeys(Component)
             end,
             SigInfoCommitted
         ),
@@ -448,13 +439,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
             false ->
                 WithBody
         end,
-    Normalized =
-        hb_ao:normalize_keys(
-            lists:map(
-                fun hb_link:remove_link_specifier/1,
-                ListWithoutBodyKey
-            )
-        ),
+    Normalized = hb_ao:normalize_keys(ListWithoutBodyKey),
     List = hb_util:message_to_ordered_list(Normalized),
     ?event_debug({from_siginfo_keys, {list, List}}),
     List.
@@ -519,29 +504,14 @@ commitment_to_alg(Commitment, _Opts) ->
     CommitmentDevice = maps:get(<<"commitment-device">>, Commitment),
     <<CommitmentDevice/binary, Type/binary>>.
 
-%% @doc Generate a signature name from a commitment. The commitment message is
-%% not expected to be complete: Only the `commitment-device`, and the
-%% `committer' or `keyid' keys are required.
-commitment_to_sig_name(Commitment) ->
-    BaseStr =
-        case maps:get(<<"committer">>, Commitment, undefined) of
-            undefined -> maps:get(<<"keyid">>, Commitment);
-            Committer ->
-                <<
-                    (hb_util:to_hex(binary:part(hb_util:native_id(Committer), 1, 8)))
-                        /binary
-                >>
-        end,
-    DeviceStr =
-        binary:replace(
-            maps:get(
-                <<"commitment-device">>,
-                Commitment
-            ),
-            <<"@">>,
-            <<"-">>
-        ),
-    <<DeviceStr/binary, ".", BaseStr/binary>>.
+%% @doc Convert a `keyid' to the committer of a commitment. The `keyid' is the
+%% URI of the committer that made the commitment. The key of an
+%% `hmac:constant:' keyid is known to everyone, so its commitments are unsigned.
+%% Unsigned commitments and commitments without a `keyid' have no committer, so
+%% we return `undefined'.
+keyid_to_committer(<<>>) -> undefined;
+keyid_to_committer(<<"hmac:constant:", _/binary>>) -> undefined;
+keyid_to_committer(KeyID) -> KeyID.
 
 %% @doc Normalize key parameters to ensure their names are correct for inclusion
 %% in the `signature-input' and associated keys.

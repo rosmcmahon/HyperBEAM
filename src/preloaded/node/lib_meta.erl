@@ -1,17 +1,28 @@
 %%% @doc Authorization for typed operations on a node. Only keys committed by
 %%% the requested role are returned to the caller.
 -module(lib_meta).
--export([is_authorized/4, role/2]).
+-export([is_authorized/4, authorized/3, role/2]).
 -include("include/hb.hrl").
 
 %% @doc Verify the role's commitments and require their signed operation type.
 %% The admin defaults to the operator, which defaults to the node wallet.
-%% HTTP calls authorize the original singleton, before its path is split.
 is_authorized(Type, Role, Msg, Opts) when Role == operator; Role == admin ->
+    maybe
+        {ok, Authorized} ?= authorized(role(Role, Opts), Msg, Opts),
+        true ?=
+            Type == hb_maps:get(<<"type">>, Authorized, not_found, Opts) orelse
+                {error, not_authorized},
+        {ok, Authorized}
+    end.
+
+%% @doc Return the keys of a message that the given committers signed, after
+%% verifying their commitments. For an HTTP request, we read the original
+%% request from `priv/http-request', before its path was split into messages.
+authorized(Committers, Msg, Opts) ->
     try
         maybe
             Loaded = hb_cache:ensure_loaded(Msg, Opts),
-            Identities = role(Role, Opts),
+            Identities = committers(Committers),
             % Retain signed inputs so their computations cannot be cached.
             [_ | _] ?= hb_message:signers(
                 hb_message:with_only_committers(Loaded, Identities, Opts), Opts
@@ -20,9 +31,7 @@ is_authorized(Type, Role, Msg, Opts) when Role == operator; Role == admin ->
             Signed =
                 hb_message:with_only_committers(Original, Identities, Opts),
             [_ | _] ?= hb_message:signers(Signed, Opts),
-            Authorized = signed_keys(Signed, Opts),
-            Type ?= hb_maps:get(<<"type">>, Authorized, not_found, Opts),
-            {ok, Authorized}
+            {ok, signed_keys(Signed, Opts)}
         else
             _ -> {error, not_authorized}
         end
@@ -36,15 +45,17 @@ is_authorized(Type, Role, Msg, Opts) when Role == operator; Role == admin ->
 
 %% @doc Return the configured identities for a role. Unclaimed roles deny access.
 role(admin, Opts) ->
-    addresses(hb_opts:get(admin, role(operator, Opts), Opts));
+    committers(hb_opts:get(admin, role(operator, Opts), Opts));
 role(operator, Opts) ->
-    addresses(hb_opts:get(operator, hb_opts:address(Opts), Opts)).
+    committers(hb_opts:get(operator, hb_opts:committer(Opts), Opts)).
 
-%% @doc Accept a role address or list of addresses in native or human form.
-addresses(Address) when ?IS_ID(Address) -> [hb_util:human_id(Address)];
-addresses(Addresses) when is_list(Addresses) ->
-    [hb_util:human_id(Address) || Address <- Addresses, ?IS_ID(Address)];
-addresses(_) -> [].
+%% @doc Accept a role's committer or list of committers. An Arweave address is
+%% read as its `did:pkh:' committer.
+committers(Committer) when is_binary(Committer) ->
+    [hb_util:committer(Committer)];
+committers(Committers) when is_list(Committers) ->
+    [hb_util:committer(C) || C <- Committers, is_binary(C)];
+committers(_) -> [].
 
 %% @doc Follow committed children without admitting their uncommitted fields.
 signed_keys(Msg, Opts) when is_map(Msg) ->

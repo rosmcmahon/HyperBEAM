@@ -62,11 +62,12 @@
 -export([with_only_committers/2, with_only_committers/3, commitment_devices/2]).
 -export([verify/1, verify/2, verify/3, deep_verify/2]).
 -export([paranoid_verify/2, paranoid_verify/3]).
--export([commit/2, commit/3, signers/2, type/1, minimize/1]).
+-export([commit/2, commit/3, with_committer/2, signers/2, type/1, minimize/1]).
 -export([normalize_commitments/2, normalize_commitments/3]).
 -export([is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
--export([with_only_committed/2, with_links/3, without_unless_signed/3]).
+-export([with_only_committed/2, with_only_committed/3]).
+-export([without_unless_signed/3]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
 -export([diff/3, match/2, match/3, match/4, find_target/3]).
 %%% Helpers:
@@ -350,7 +351,9 @@ normalize_message(Msg, Opts, Settings) ->
 normalization_fast_hash(Msg) ->
     crypto:hash(sha256, term_to_binary(hb_private:reset(Msg))).
 
-%% @doc Return a message with only the committed keys. If no commitments are
+%% @doc Return a message with only the committed keys. `all', the default, keeps
+%% the keys that every commitment covers; `any', the keys that any covers; a
+%% list of IDs or a spec, those that `committed/3' gives. If no commitments are
 %% present, the message is returned unchanged. This means that you need to
 %% check if the message is:
 %% - Committed
@@ -358,7 +361,11 @@ normalization_fast_hash(Msg) ->
 %% ...before using the output of this function as the 'canonical' message. This
 %% is such that expensive operations like signature verification are not
 %% performed unless necessary.
-with_only_committed(Msg, Opts) when is_map(Msg) ->
+with_only_committed(Msg, Opts) ->
+    with_only_committed(Msg, all, Opts).
+with_only_committed(Msg, Mode, Opts) when is_atom(Mode) ->
+    with_only_committed(Msg, #{ <<"ids">> => hb_util:bin(Mode) }, Opts);
+with_only_committed(Msg, Spec, Opts) when is_map(Msg) ->
     ?event_debug({with_only_committed, {msg, Msg}, {opts, Opts}}),
     Comms = hb_maps:get(<<"commitments">>, Msg, not_found, Opts),
     case is_map(Msg) andalso Comms /= not_found of
@@ -367,14 +374,14 @@ with_only_committed(Msg, Opts) when is_map(Msg) ->
                 CommittedKeys =
                     hb_message:committed(
                         Msg,
-                        #{ <<"ids">> => <<"all">> },
+                        Spec,
                         Opts
                     ),
                 % Add the ao-body-key to the committed list if it is not
                 % already present.
                 ?event_debug(debug_bundle, {committed_keys, CommittedKeys, {msg, Msg}}),
                 {ok,
-                    with_links(
+                    hb_maps:with(
                         [<<"commitments">> | CommittedKeys],
                         Msg,
                         Opts
@@ -392,24 +399,9 @@ with_only_committed(Msg, Opts) when is_map(Msg) ->
             end;
         false -> {ok, Msg}
     end;
-with_only_committed(Msg, _) ->
+with_only_committed(Msg, _, _) ->
     % If the message is not a map, it cannot be signed.
     {ok, Msg}.
-
-%% @doc Filter keys from a map that do not match either the list of keys or
-%% their relative `+link` variants.
-with_links(Keys, Map, Opts) ->
-    hb_maps:with(
-        Keys ++
-            lists:map(
-                fun(Key) ->
-                    <<(hb_link:remove_link_specifier(Key))/binary, "+link">>
-                end,
-                Keys
-            ),
-        Map,
-        Opts
-    ).
 
 %% @doc Return the message with only the specified committers attached.
 with_only_committers(Msg, Committers) ->
@@ -442,7 +434,7 @@ without_unless_signed(Keys, Msg, Opts) ->
         Msg
     ).
 
-%% @doc Sign a message with the given wallet.
+%% @doc Sign a message with the `priv-wallet' of `Opts', else of the node.
 commit(Msg, Opts) ->
     commit(
         Msg,
@@ -459,7 +451,7 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
 commit(Msg, GivenOpts, Spec) ->
-    Opts = hb_http_server:with_node_key(GivenOpts),
+    Opts = hb_http_server:with_node_committer(GivenOpts),
     % hb_ao:raw does not vary for us but ~message@1.0/commit|id expects a
     % ~structured@1.0 form, so we force an idempotent 'to' call to ensure it
     {ok, Structured} =
@@ -497,6 +489,17 @@ commit(Msg, GivenOpts, Spec) ->
         ),
     Signed.
 
+%% @doc Add a committer to a commitment request, if it does not have one. The
+%% committer is the `priv-wallet' in `Opts'. Requests for unsigned commitments
+%% are returned unchanged.
+with_committer(Spec = #{ <<"committer">> := _ }, _Opts) -> Spec;
+with_committer(Spec = #{ <<"type">> := <<"unsigned">> }, _Opts) -> Spec;
+with_committer(Spec, Opts) ->
+    case hb_opts:get(priv_wallet, no_viable_wallet, Opts) of
+        no_viable_wallet -> Spec;
+        Wallet -> Spec#{ <<"committer">> => Wallet }
+    end.
+
 %% @doc Return the list of committed keys from a message.
 committed(Msg, all, Opts) ->
     committed(Msg, #{ <<"committers">> => <<"all">> }, Opts);
@@ -533,17 +536,7 @@ verify(Msg, none, Opts) ->
 verify(Msg, signers, Opts) ->
     verify(Msg, #{ <<"committers">> => <<"all">> }, Opts);
 verify(Msg, Committers, Opts) when not is_map(Committers) ->
-    verify(
-        Msg,
-        #{
-            <<"committers">> =>
-                case ?IS_ID(Committers) of
-                    true -> [Committers];
-                    false -> Committers
-                end
-        },
-        Opts
-    );
+    verify(Msg, #{ <<"committers">> => Committers }, Opts);
 verify(Msg, Spec, Opts) ->
     ?event(verify, {verify, {spec, Spec}}),
     {ok, Res} =

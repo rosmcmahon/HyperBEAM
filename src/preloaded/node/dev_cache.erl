@@ -4,7 +4,7 @@
 %%% the corresponding cache operation type.
 -module(dev_cache).
 -device_libraries([lib_meta]).
--export([read/3, write/3, link/3, group/3]).
+-export([read/3, write/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -64,8 +64,8 @@ read(_M1, M2, Opts) ->
                     {ok, Res}
             end;
         {error, not_found} ->
-            % The cache does not have this ID,but it may still be an explicit
-            % `data/' path.
+            % The cache does not have this ID, but the store may hold a value at
+            % the path.
             % Store = hb_opts:get(store, [], Opts),
             Store = hb_opts:get(store, no_viable_store, Opts),
             ?event(dev_cache, {read, {location, Location}, {store, Store}}),
@@ -97,29 +97,6 @@ write(_Base, Req, Opts) ->
                     #{ <<"status">> => 400, <<"body">> => <<"Invalid write type.">> }
                 }
         end
-    end.
-
-%% @doc Link a signed source to a signed destination on behalf of the operator.
-link(_Base, Req, Opts) ->
-    maybe
-        {ok, Authorized} ?=
-            lib_meta:is_authorized(<<"cache-link">>, operator, Req, Opts),
-        {ok, Destination} ?= hb_maps:find(<<"destination">>, Authorized, Opts),
-        {ok, Source} ?= hb_maps:find(<<"source">>, Authorized, Opts),
-        wrap_store_result(hb_store:link(#{ Destination => Source }, Opts))
-    else
-        _ -> {error, not_authorized}
-    end.
-
-%% @doc Create a signed cache group on behalf of the operator.
-group(_Base, Req, Opts) ->
-    maybe
-        {ok, Authorized} ?=
-            lib_meta:is_authorized(<<"cache-group">>, operator, Req, Opts),
-        {ok, Group} ?= hb_maps:find(<<"group">>, Authorized, Opts),
-        wrap_store_result(hb_store:group(#{ <<"group">> => Group }, Opts))
-    else
-        _ -> {error, not_authorized}
     end.
 
 %% @doc Helper function to write a single data item to the cache.
@@ -186,7 +163,7 @@ setup_test_env() ->
     hb_store:reset(LocalStore),
     ?event(dev_cache, {setup_test_env, {store_reset}}),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     ?event(dev_cache, {setup_test_env, {address, Address}}),
     Node = hb_http_server:start_node(#{ 
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
@@ -203,7 +180,7 @@ setup_test_env() ->
                 <<"store-module">> => hb_store_remote_node,
                 <<"node">> => Node,
                 <<"priv-wallet">> => Wallet,
-                % The tests read back the `data/' path of a binary they write.
+                % The tests read back the `ni:' path of a binary they write.
                 <<"trusted">> => true
             }
 	    ]
@@ -214,62 +191,47 @@ setup_test_env() ->
 %%% Tests
 %%%--------------------------------------------------------------------
 
-%% @doc Cache mutations require their own signed type and signed parameters.
+%% @doc Ensure that a cache write requires its own signed type.
 typed_cache_mutations_test() ->
     Wallet = ar_wallet:new(),
     Store = hb_test_utils:test_store(),
     Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => Store,
         <<"http-only-result">> => false },
     Node = hb_http_server:start_node(Opts),
-    {ok, Source} = hb_cache:write(<<"cached-value">>, Opts),
-    lists:foreach(
-        fun({Path, Fields, Unsigned}) ->
-            Signed = hb_message:commit(Fields, Opts),
-            Req = (maps:merge(Signed, Unsigned))#{ <<"path">> => Path },
-            ?assertMatch({error, #{ <<"status">> := 403 }},
-                hb_http:post(Node, Req, Opts))
-        end,
-        [
-            {<<"/~cache@1.0/write">>,
-                #{ <<"type">> => <<"node-message">>, <<"body">> => <<"wrong-type">> }, #{}},
-            {<<"/~cache@1.0/group">>,
-                #{ <<"group">> => <<"unsigned-group">> },
-                #{ <<"type">> => <<"cache-group">> }},
-            {<<"/~cache@1.0/link">>,
-                #{ <<"type">> => <<"cache-link">>, <<"source">> => Source },
-                #{ <<"destination">> => <<"unsigned-link">> }}
-        ]
-    ),
-    ?assertEqual({error, not_found}, hb_cache:read(<<"unsigned-link">>, Opts)),
-    Remote = #{ <<"store-module">> => hb_store_remote_node,
-        <<"node">> => Node, <<"priv-wallet">> => Wallet },
-    ?assertEqual(ok, hb_store:group(Remote, #{ <<"group">> => <<"authorized-group">> }, Opts)),
-    ?assertEqual(ok, hb_store:link(Remote, #{ <<"authorized-link">> => Source }, Opts)),
-    ?assertEqual({ok, <<"cached-value">>}, hb_cache:read(<<"authorized-link">>, Opts)).
+    Signed =
+        hb_message:commit(
+            #{
+                <<"type">> => <<"node-message">>,
+                <<"body">> => <<"wrong-type">>
+            },
+            Opts
+        ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:post(
+            Node,
+            Signed#{ <<"path">> => <<"/~cache@1.0/write">> },
+            Opts
+        )
+    ).
 
-%% @doc Test that the cache can be written to and read from using the hb_cache
-%% API.
-cache_write_message_test() ->
-    ?event(dev_cache, {cache_api_test, {start}}),
-    {ok, Opts, _} = setup_test_env(),
-    TestData = #{
-        <<"test_key">> => <<"test_value">>
-    },
-    ?event(dev_cache, {cache_api_test, {opts, Opts}}),
-    {ok, Path} = hb_cache:write(TestData, Opts),
-    ?event(dev_cache, {cache_api_test, {data_written, Path}}),
-    {ok, ReadData} = hb_cache:read(Path, Opts),
-    ?event(dev_cache, {cache_api_test, {data_read, ReadData}}),
-    ?assert(hb_message:match(TestData, ReadData, only_present, Opts)),
-    ?event(dev_cache, {cache_api_test}),
-    ok.
-
-%% @doc Ensure that we can write direct binaries to the cache.
+%% @doc Ensure that the operator can write direct binaries to the cache.
 cache_write_binary_test() ->
     ?event(dev_cache, {cache_api_test, {start}}),
-    {ok, Opts, _} = setup_test_env(),
+    {ok, Opts, [_LocalStore, Wallet, _Address, Node]} = setup_test_env(),
     TestData = <<"test_binary">>,
-    {ok, Path} = hb_cache:write(TestData, Opts),
+    Write =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"/~cache@1.0/write">>,
+                <<"type">> => <<"cache-write">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> => TestData
+            },
+            #{ <<"priv-wallet">> => Wallet }
+        ),
+    {ok, Written} = hb_http:post(Node, Write, Opts),
+    Path = hb_ao:get(<<"path">>, Written, Opts),
     {ok, ReadData} = hb_cache:read(Path, Opts),
     ?event(dev_cache, {cache_api_test, {data_read, ReadData}}),
     ?assertEqual(TestData, ReadData),

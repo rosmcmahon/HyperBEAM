@@ -37,9 +37,8 @@ deserialize(Binary, Req, Opts) when is_binary(Binary) ->
 deserialize(TX, Req, Opts) when is_record(TX, tx) ->
     from(TX, Req, Opts).
 
-%% @doc Sign a message using the `priv-wallet' key in the options. Supports both
-%% the `hmac-sha256' and `rsa-pss-sha256' algorithms, offering unsigned and
-%% signed commitments.
+%% @doc Sign a message with the committer of the request, or give it an
+%% unsigned commitment.
 -spec commit(#{ _ => _ }, #{ type := binary(), _ => _ }, #{ _ => _ }) ->
     {ok, #{ _ => _ }}.
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
@@ -53,17 +52,7 @@ commit(Msg, Req = #{ <<"type">> := Type }, Opts)
     % Convert the given message to an ANS-104 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
-    case {hb_opts:get(priv_wallet, no_viable_wallet, Opts), Type} of
-        {{{?RSA_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?RSA_SIGN_TYPE} ->
-            sign_tx(Msg, TX, Wallet, Opts);
-        {{{?EDDSA_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?EDDSA_SIGN_TYPE} ->
-            sign_tx(Msg, TX, Wallet, Opts);
-        {{{?ETHEREUM_KEY_TYPE, _Priv, _Pub}, _} = Wallet, ?ETHEREUM_SIGN_TYPE} ->
-            sign_tx(Msg, TX, Wallet, Opts);
-        {{{WalletType, _, _}, _}, _Type} ->
-            ?event(warning, {wrong_wallet_to_sign, {request_type, Type}, {wallet_type, WalletType}}),
-            throw({wrong_wallet_to_sign, {request_type, Type}, {wallet_type, WalletType}})
-    end;
+    sign_tx(Msg, TX, Req, Opts);
 commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
     % Remove the commitments from the message, convert it to ANS-104, then back.
     % This forces the message to be normalized and the unsigned ID to be
@@ -78,9 +67,16 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
         )
     }.
 
-%% @doc Sign `TX', the item of `Msg', and add its commitment to those of `Msg'.
-sign_tx(Msg, TX, Wallet, Opts) ->
-    Signed = ar_bundles:sign_item(TX, Wallet),
+%% @doc Sign `TX', the item of `Msg', with the committer of the request, and
+%% add its commitment to those of `Msg'.
+sign_tx(Msg, TX, Req, Opts) ->
+    Signed =
+        lib_arweave_common:sign(
+            Msg,
+            (ar_tx:normalize(TX))#tx{ format = ans104 },
+            Req,
+            Opts
+        ),
     SignedStructured =
         hb_message:convert(
             Signed,
@@ -118,7 +114,7 @@ do_verify(OnlyWithCommitment, Req, Opts) ->
     ?event({verify, {encoded, TX}}),
     Res =
         item_verifies(TX, Req, OnlyWithCommitment) andalso
-            lib_arweave_common:verify_identity(TX, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment, Opts) andalso
             lib_arweave_common:verify_committed_keys(
                 ?BASE_FIELDS, TX, fun lib_arweave_common:fields/3,
                 OnlyWithCommitment, Opts),

@@ -3,6 +3,72 @@
 -include("include/hb_http_client.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% @doc Pool replacement must retain configured limits and usable HTTP service.
+hackney_pool_restart_test_() ->
+    {timeout, 30, fun() ->
+        application:ensure_all_started(hb),
+        Original = #{
+            <<"http-client-hackney-max-connections">> =>
+                hackney_pool:max_connections(?HACKNEY_POOL),
+            <<"http-client-keepalive">> => hackney_pool:timeout(?HACKNEY_POOL)
+        },
+        Peer = hb_http_server:start_node(#{ <<"test-key">> => <<"pool-settings">> }),
+        Server = hb_opts:get(http_server, undefined, hb_http_server:get_opts()),
+        try
+            lists:foreach(
+                fun({Max, Timeout}) ->
+                    ok = hb_http_client:setup_conn(#{
+                        <<"http-client-hackney-max-connections">> => Max,
+                        <<"http-client-keepalive">> => Timeout
+                    }),
+                    ?assertEqual(Max, hackney_pool:max_connections(?HACKNEY_POOL)),
+                    ?assertEqual(Timeout, hackney_pool:timeout(?HACKNEY_POOL)),
+                    pool_request(Peer),
+                    Old = hackney_pool:find_pool(?HACKNEY_POOL),
+                    Ref = monitor(process, Old),
+                    exit(Old, kill),
+                    receive {'DOWN', Ref, process, Old, killed} -> ok
+                    after 1000 -> error(pool_not_stopped)
+                    end,
+                    await_pool_restart(Old, 100),
+                    ?assertEqual(Max, hackney_pool:max_connections(?HACKNEY_POOL)),
+                    ?assertEqual(Timeout, hackney_pool:timeout(?HACKNEY_POOL)),
+                    pool_request(Peer),
+                    {ok, #{ start := {hackney_pool, start_link, [_, PoolOpts]} }} =
+                        supervisor:get_childspec(hackney_sup, ?HACKNEY_POOL),
+                    ?assertEqual(Max, proplists:get_value(max_connections, PoolOpts)),
+                    ?assertEqual(Timeout, proplists:get_value(timeout, PoolOpts)),
+                    ?assertEqual(0, proplists:get_value(queue_count,
+                        hackney_pool:get_stats(?HACKNEY_POOL)))
+                end,
+                [{600, 120000}, {37, 90000}, {600, 120000}, {100, 60000}]
+            )
+        after
+            cowboy:stop_listener(Server),
+            hb_http_client:setup_conn(Original)
+        end
+    end}.
+
+%% @doc Read through the ordinary client and an independent HyperBEAM listener.
+pool_request(Peer) ->
+    ?assertMatch(
+        {ok, 200, _, <<"pool-settings">>},
+        hb_http_client:request(#{
+            peer => Peer, path => <<"/~meta@1.0/info/test-key">>, method => <<"GET">>,
+            headers => #{}, body => <<>>
+        }, #{ <<"http-client">> => hackney, <<"http-retry">> => 0 })
+    ).
+
+%% @doc Wait for a new registered pool, not the dead ETS entry.
+await_pool_restart(_Old, 0) -> error(pool_not_restarted);
+await_pool_restart(Old, Attempts) ->
+    case hackney_pool:find_pool(?HACKNEY_POOL) of
+        New when is_pid(New), New =/= Old -> ok;
+        _ ->
+            timer:sleep(10),
+            await_pool_restart(Old, Attempts - 1)
+    end.
+
 hackney_basic_request_test_() ->
     {timeout, 30, fun() ->
         application:ensure_all_started(hb),

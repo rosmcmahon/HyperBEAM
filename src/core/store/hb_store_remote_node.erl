@@ -4,7 +4,7 @@
 %%% been written to the remote node. In that case, the node would probably want
 %%% to upload it to an Arweave bundler to ensure persistence, too.
 -module(hb_store_remote_node).
--export([scope/1, type/3, read/3, write/3, link/3, group/3, resolve/3]).
+-export([scope/1, read/3]).
 %%% Public utilities.
 -export([maybe_cache/2, read_local_cache/3]).
 -include("include/hb.hrl").
@@ -19,33 +19,6 @@
 scope(_StoreOpts) ->
     remote.
 
-%% @doc Resolve a key path in the remote store.
-%%
-%% For the remote node store, the key is returned as-is.
-%%
-%% @param Data A map containing node configuration.
-%% @param Key The key to resolve.
-%% @returns The resolved key.
-resolve(#{ <<"node">> := Node }, #{ <<"resolve">> := Key }, _NodeOpts) ->
-    ?event({remote_resolve, {node, Node}, {key, Key}}),
-    {ok, Key}.
-
-%% @doc Determine the type of value at a given key.
-%%
-%% Remote nodes support `simple', `composite', or `{error, not_found}'.
-%%
-%% @param Opts A map of options (including node configuration).
-%% @param Key The key whose value type is determined.
-%% @returns `{ok, simple}' or `{ok, composite}' if found, or
-%%          `{error, not_found}' otherwise.
-type(Opts = #{ <<"node">> := Node }, #{ <<"type">> := Key }, _NodeOpts) ->
-    ?event({remote_type, {node, Node}, {key, Key}}),
-    case read_request(Opts, Key) of
-        {composite, _} -> {ok, composite};
-        {ok, _} -> {ok, simple};
-        Other -> Other
-    end.
-
 %% @doc Read a key from the remote node. A key that is not an ID names the
 %% remote node's own state, which its reply cannot be checked against, so it
 %% is read only if the store sets `trusted' to `true'.
@@ -58,7 +31,9 @@ read_request(Opts = #{ <<"trusted">> := true }, Key) -> remote_read(Opts, Key);
 read_request(_, _) -> {error, not_found}.
 
 %% @doc Make an HTTP GET request for a key to the remote node and return the
-%% committed message.
+%% committed message. Unless the key is a `ni:' name, a binary is encoded with
+%% `hb_cache:encode_value/1', so that the cache reads it back as the same
+%% binary.
 remote_read(Opts = #{ <<"node">> := Node }, Key) ->
     ?event(store_remote_node, {executing_read, {node, Node}, {key, Key}}),
     Path =
@@ -80,7 +55,10 @@ remote_read(Opts = #{ <<"node">> := Node }, Key) ->
             case not ?IS_ID(Key) orelse has_id(Msg, Key, Opts) of
                 true ->
                     maybe_cache(Opts, Msg),
-                    {ok, Msg};
+                    case Key of
+                        <<"ni:", _/binary>> -> {ok, Msg};
+                        _ -> {ok, hb_cache:encode_value(Msg)}
+                    end;
                 false ->
                     ?event(store_remote_node, {read_other_id, {key, Key}}),
                     {error, not_found}
@@ -109,9 +87,9 @@ has_id(Bin, ID, Opts) ->
 %% @doc Remove the transport commitments from the response: the replying
 %% node's signature over `hashpath', and its unsigned commitment over the keys
 %% of its reply, once the keys that it does not cover are removed. The reply's
-%% `hashpath' and `status' are removed with them, unless a signed commitment
-%% of the message covers them.
-without_transport_commitment(Msg, Opts) when is_map(Msg) ->
+%% `hashpath' is removed with them, unless a signed commitment of the message
+%% covers it. A reply without commitments loses its `hashpath' and `status'.
+without_transport_commitment(Msg = #{ <<"commitments">> := _ }, Opts) ->
     {ok, Committed} =
         hb_message:with_only_committed(
             hb_message:without_commitments(
@@ -122,7 +100,7 @@ without_transport_commitment(Msg, Opts) when is_map(Msg) ->
             Opts
         ),
     hb_message:without_unless_signed(
-        [<<"hashpath">>, <<"status">>],
+        [<<"hashpath">>],
         hb_message:with_commitments(
             #{ <<"committer">> => '_' },
             Committed,
@@ -130,6 +108,8 @@ without_transport_commitment(Msg, Opts) when is_map(Msg) ->
         ),
         Opts
     );
+without_transport_commitment(Msg, _Opts) when is_map(Msg) ->
+    maps:without([<<"hashpath">>, <<"status">>], Msg);
 without_transport_commitment(Res, _Opts) ->
     Res.
 
@@ -175,118 +155,6 @@ read_local_cache(StoreOpts, ID, Opts) ->
             )
     end.
 
-%% @doc Write a key to the remote node.
-%%
-%% Uploads each value to the remote cache and then links each requested
-%% destination to the uploaded path.
-%%
-%% @param Opts A map of options (including node configuration).
-%% @param Req Map of destination paths to values.
-%% @returns `ok' on success or `{error, Reason}' on failure.
-write(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
-    {error, not_found};
-write(Opts = #{ <<"node">> := Node }, Req, _NodeOpts) when is_map(Req) ->
-    ?event({write, {node, Node}, {request, Req}}),
-    maps:fold(
-        fun(Destination, Value, ok) ->
-            case remote_write_value(Opts, Value) of
-                {ok, SourcePath} ->
-                    remote_link(Opts, hb_path:to_binary(SourcePath), hb_path:to_binary(Destination));
-                {error, _} = Error ->
-                    Error
-            end;
-           (_Destination, _Value, Error) ->
-            Error
-        end,
-        ok,
-        Req
-    ).
-
-%% @doc Link a source to a destination in the remote node.
-%%
-%% Constructs an HTTP POST link request for the given source and destination,
-%% signing the request when a wallet is available.
-%%
-%% @returns `ok' on success or `{error, Reason}' on failure.
-link(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
-    {error, not_found};
-link(Opts = #{ <<"node">> := _Node }, Req, _NodeOpts) when is_map(Req) ->
-    maps:fold(
-        fun(Destination, Source, ok) ->
-            remote_link(Opts, hb_path:to_binary(Source), hb_path:to_binary(Destination));
-           (_Destination, _Source, Error) ->
-            Error
-        end,
-        ok,
-        Req
-    ).
-
-%% @doc Create a group in the remote node cache.
-group(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
-    {error, not_found};
-group(Opts = #{ <<"node">> := _Node }, #{ <<"group">> := Path }, _NodeOpts) ->
-    remote_group(Opts, hb_path:to_binary(Path)).
-
-remote_write_value(Opts = #{ <<"node">> := Node }, Value) ->
-    Msg = #{
-        <<"path">> => <<"/~cache@1.0/write">>,
-        <<"type">> => <<"cache-write">>,
-        <<"method">> => <<"POST">>,
-        <<"body">> => Value
-    },
-    SignedMsg = hb_message:commit(Msg, Opts),
-    case hb_http:post(Node, SignedMsg, Opts) of
-        {ok, Response} ->
-            case hb_ao:get(<<"status">>, Response, 0, #{}) of
-                200 ->
-                    case hb_ao:get(<<"path">>, Response, not_found, #{}) of
-                        not_found -> {error, missing_path};
-                        Path -> {ok, Path}
-                    end;
-                Status ->
-                    {error, {unexpected_status, Status}}
-            end;
-        {error, Err} ->
-            {error, Err}
-    end.
-
-remote_link(Opts = #{ <<"node">> := Node }, Source, Destination) ->
-    Msg = #{
-        <<"path">> => <<"/~cache@1.0/link">>,
-        <<"type">> => <<"cache-link">>,
-        <<"method">> => <<"POST">>,
-        <<"source">> => Source,
-        <<"destination">> => Destination
-    },
-    SignedMsg = hb_message:commit(Msg, Opts),
-    case hb_http:post(Node, SignedMsg, Opts) of
-        {ok, Response} ->
-            case hb_ao:get(<<"status">>, Response, 0, #{}) of
-                200 -> ok;
-                Status -> {error, {unexpected_status, Status}}
-            end;
-        {error, Err} ->
-            {error, Err}
-    end.
-
-remote_group(Opts = #{ <<"node">> := Node }, Path) ->
-    Msg = #{
-        <<"path">> => <<"/~cache@1.0/group">>,
-        <<"type">> => <<"cache-group">>,
-        <<"method">> => <<"POST">>,
-        <<"group">> => Path
-    },
-    SignedMsg = hb_message:commit(Msg, Opts),
-    case hb_http:post(Node, SignedMsg, Opts) of
-        {ok, Response} ->
-            case hb_ao:get(<<"status">>, Response, 0, #{}) of
-                200 -> ok;
-                Status -> {error, {unexpected_status, Status}}
-            end;
-        {error, Err} ->
-            {error, Err}
-    end.
-
 %%%--------------------------------------------------------------------
 %%% Tests
 %%%--------------------------------------------------------------------
@@ -328,6 +196,19 @@ read_test() ->
         {ok, []},
         hb_cache:read(
             hb_util:ok(hb_cache:write([], #{ <<"store">> => LocalStore })),
+            #{ <<"store">> => RemoteStore }
+        )
+    ),
+    % A message keeps the `status' key that it holds.
+    ?assertMatch(
+        {ok, #{ <<"status">> := <<"pending">> }},
+        hb_cache:read(
+            hb_util:ok(
+                hb_cache:write(
+                    #{ <<"status">> => <<"pending">> },
+                    #{ <<"store">> => LocalStore }
+                )
+            ),
             #{ <<"store">> => RemoteStore }
         )
     ).

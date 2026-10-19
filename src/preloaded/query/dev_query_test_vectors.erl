@@ -604,8 +604,8 @@ transactions_query_recipients_test_parallel() ->
         },
     Node = hb_http_server:start_node(Opts),
     Alice = ar_wallet:new(),
-    ?event({alice, Alice, {explicit, hb_util:human_id(Alice)}}),
-    AliceAddress = hb_util:human_id(Alice),
+    ?event({alice, Alice, {explicit, hb:address(Alice)}}),
+    AliceAddress = hb:address(Alice),
     {ok, WrittenMsg} = write_test_message_with_recipient(AliceAddress, Opts),
     TagOnly = ar_bundles:sign_item(#tx{ tags = [
         {<<"Target">>, AliceAddress}, {<<"field-target">>, AliceAddress}
@@ -1121,6 +1121,7 @@ transactions_header_only_test_parallel() ->
     Result = dev_query_graphql:test_query(Node,
         <<"query($id: ID!) { transaction(id: $id) { id anchor recipient",
             " owner { address } tags { name value } data { size }",
+            " bundledIn { id } parent { id }",
             " quantity { winston } fee { winston } } }">>,
         #{ <<"id">> => ID }, Opts),
     ?assertMatch(#{ <<"data">> := #{ <<"transaction">> := #{
@@ -1128,6 +1129,7 @@ transactions_header_only_test_parallel() ->
     }}}, Result),
     ?assertEqual({error, not_found}, hb_cache:read(ID, hb_store:scope(Opts, local))),
     #{ <<"data">> := #{ <<"transaction">> := Projected }} = Result,
+    ?assertMatch(#{ <<"bundledIn">> := null, <<"parent">> := null }, Projected),
     ?assertEqual(hb_util:encode(TX#tx.anchor), maps:get(<<"anchor">>, Projected)),
     ?assertEqual(hb_util:encode(TX#tx.target), maps:get(<<"recipient">>, Projected)),
     ?assertEqual(#{ <<"winston">> => hb_util:bin(TX#tx.quantity) },
@@ -1467,9 +1469,9 @@ transaction_query_full_test_parallel() ->
         },
     Node = hb_http_server:start_node(Opts),
     Alice = ar_wallet:new(),
-    ?event({alice, Alice, {explicit, hb_util:human_id(Alice)}}),
-    AliceAddress = hb_util:human_id(Alice),
-    SenderAddress = hb_util:human_id(SenderKey),
+    ?event({alice, Alice, {explicit, hb:address(Alice)}}),
+    AliceAddress = hb:address(Alice),
+    SenderAddress = hb:address(SenderKey),
     SenderPubKey = hb_util:encode(ar_wallet:to_pubkey(SenderKey)),
     {ok, WrittenMsg} = write_test_message_with_recipient(AliceAddress, Opts),
     ExpectedID = hb_message:id(WrittenMsg, all, Opts),
@@ -1623,10 +1625,12 @@ transaction_tags_exclude_fields_test_parallel() ->
                         Actual
                     );
                 false ->
+                    % The query gives the tags in the order they were signed.
                     ?assertEqual(
-                        lists:sort([#{ <<"name">> => Name, <<"value">> => Value }
-                            || {Name, Value} <- Expected]),
-                        lists:sort(Actual)
+                        [#{ <<"name">> => Name, <<"value">> => Value }
+                            || {Name, Value} <- Tags,
+                                lists:member({Name, Value}, Expected)],
+                        Actual
                     )
             end
         end,

@@ -6,6 +6,7 @@
 -export([is_direct_key_access/3, is_direct_key_access/4]).
 -export([find_exported_function/5, is_exported/4, info/2, info/3]).
 -include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -define(DEFAULT_DEVICE, <<"message@1.0">>).
 
@@ -134,11 +135,49 @@ message_to_fun(Dev, Msg, Key, Opts) ->
 %% internal module-loading path.
 message_to_device(Msg, Opts) ->
     DevID = hb_maps:get(<<"device">>, Msg, ?DEFAULT_DEVICE, Opts),
+    % Enforce node policy before consulting any loader or resolved-device cache.
+    case lists:member(DevID, hb_opts:get(exclude_devices, [], Opts)) of
+        true ->
+            throw({error, {device_not_loadable, DevID, 'device-excluded'}});
+        false -> ok
+    end,
     case hb_device_load:reference(DevID, Opts) of
         {error, Reason} -> throw({error, {device_not_loadable, DevID, Reason}});
         {ok, DevMod} -> DevMod
     end.
 
+
+%% @doc Exclusions take precedence over cold loading and trusted pins.
+excluded_device_test() ->
+    Ref = <<"excluded-test-device@1.0">>,
+    Msg = #{ <<"device">> => Ref },
+    Opts = #{ <<"exclude-devices">> => [Ref] },
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(Msg, Opts)
+    ),
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(Msg, Opts#{
+            <<"trusted-devices">> => #{ Ref => <<0:344>> }
+        })
+    ).
+
+%% @doc A resolved device cannot bypass a subsequently applied exclusion.
+excluded_cached_device_test() ->
+    Ref = <<"message@1.0">>,
+    Msg = #{ <<"device">> => Ref },
+    Mod = message_to_device(Msg, #{}),
+    ?assertEqual(Mod, message_to_device(Msg, #{ <<"exclude-devices">> => [] })),
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(Msg, #{ <<"exclude-devices">> => [Ref] })
+    ),
+    ?assertThrow(
+        {error, {device_not_loadable, Ref, 'device-excluded'}},
+        message_to_device(#{}, #{ <<"exclude-devices">> => [Ref] })
+    ),
+    ?assertEqual(Mod, message_to_device(#{}, #{})).
 %% @doc Parse a handler key given by a device's `info'.
 info_handler_to_fun(Handler, _Msg, _Key, _Opts) when is_function(Handler) ->
 	{add_key, Handler};
@@ -267,24 +306,32 @@ is_direct_key_access(Base, Req, Opts, MaybeStore) when ?IS_ID(Base) ->
         if MaybeStore =:= unknown -> hb_opts:get(store, no_viable_store, Opts);
         true -> MaybeStore
         end,
-    DevPath =
-        hb_util:ok_or(
-            hb_store:resolve(Store, [Base, <<"device">>], Opts),
-            [Base, <<"device">>]
-        ),
-    case hb_store:read(Store, DevPath, Opts) of
+    ReadOpts = Opts#{ <<"store">> => Store },
+    case hb_cache:read(<<Base/binary, "/device">>, ReadOpts) of
         {ok, Dev} ->
             do_is_direct_key_access(Dev, Req, Opts);
-        {error, not_found} ->
-            fallback_direct_key_access(Store, Base, Req, Opts)
+        _ ->
+            fallback_direct_key_access(Base, Req, ReadOpts)
     end;
 is_direct_key_access(Base, Req, Opts, _) when is_map(Base) ->
     do_is_direct_key_access(hb_maps:find(<<"device">>, Base, Opts), Req, Opts).
 
-fallback_direct_key_access(Store, Base, Req, Opts) ->
-    case hb_store:type(Store, Base, Opts) of
-        {error, not_found} -> unknown;
-        {ok, _} -> do_is_direct_key_access(<<"message@1.0">>, Req, Opts)
+%% @doc Determine whether a key can be read directly from a message that has no
+%% `device' key in the stores. Such a message is read by `message@1.0', and an
+%% ID that the stores do not hold is `unknown'. We first list one key under
+%% the ID in the local stores. If there is none, we list the ID with
+%% `hb_cache:list/2', which also follows a signed ID to its message.
+fallback_direct_key_access(Base, Req, Opts) ->
+    Local = hb_store:scope(hb_opts:get(store, no_viable_store, Opts), local),
+    OneKey = #{ <<"list">> => Base, <<"limit">> => 1 },
+    Listed =
+        case hb_store:list(Local, OneKey, Opts) of
+            {ok, [_ | _]} -> true;
+            _ -> hb_cache:list(Base, Opts) =/= []
+        end,
+    case Listed of
+        false -> unknown;
+        true -> do_is_direct_key_access(<<"message@1.0">>, Req, Opts)
     end.
 
 do_is_direct_key_access(DevRes, #{ <<"path">> := Key }, Opts) ->

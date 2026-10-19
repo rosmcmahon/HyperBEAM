@@ -123,7 +123,7 @@ messages() ->
         {"explicit types",
             {
                 #{
-                    <<"ao-types">> => <<"answer=\"integer\"">>,
+                    <<"ao-types">> => <<"integer=(\"answer\")">>,
                     <<"answer">> => <<"42">>
                 },
                 #{ <<"answer">> => 42 }
@@ -133,7 +133,10 @@ messages() ->
             fun(Opts) ->
                 Child = typed(),
                 {ok, ID} = hb_cache:write(Child, Opts),
-                {#{ <<"child+link">> => ID }, #{ <<"child">> => Child }}
+                {
+                    #{ <<"child">> => <<"ao:", ID/binary>> },
+                    #{ <<"child">> => Child }
+                }
             end
         },
         {"ID shaped binaries",

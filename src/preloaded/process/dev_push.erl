@@ -753,14 +753,22 @@ apply_security(authority, Msg, TargetProcess, Codec, Opts) ->
     	Authorities when is_list(Authorities) ->
             % The `authority` key has already been parsed into a list of
             % committers. Sign with all local valid keys.
-            commit_result(Msg, Authorities, Codec, Opts);
+            commit_result(
+                Msg,
+                lists:map(fun hb_util:committer/1, Authorities),
+                Codec,
+                Opts
+            );
         Authority ->
             % Parse the authority string into a list of committers. Sign with
             % all local valid keys.
             ?event(push, {found_authority, {authority, Authority}}, Opts),
             commit_result(
                 Msg,
-                hb_util:binary_to_strings(Authority),
+                lists:map(
+                    fun hb_util:committer/1,
+                    hb_util:binary_to_strings(Authority)
+                ),
                 Codec,
                 Opts
             )
@@ -769,7 +777,7 @@ apply_security(default, Msg, TargetProcess, Codec, Opts) ->
     ?event(push, {default_policy, {target, TargetProcess}}, Opts),
     commit_result(
         Msg,
-        [hb_opts:address(Opts)],
+        [hb_opts:committer(Opts)],
         Codec,
         Opts
     ).
@@ -982,9 +990,9 @@ test_push_as_identity() ->
     % Create a new identity for the scheduler.
     DefaultWallet = hb:wallet(),
     SchedulingWallet = ar_wallet:new(),
-    SchedulingID = hb_util:human_id(SchedulingWallet),
+    SchedulingID = hb:address(SchedulingWallet),
     ComputeWallet = ar_wallet:new(),
-    ComputeID = hb_util:human_id(ComputeWallet),
+    ComputeID = hb:address(ComputeWallet),
     TestStore = [hb_test_utils:test_store(hb_store_lmdb)],
     Opts = #{
         <<"priv-wallet">> => DefaultWallet,
@@ -1001,12 +1009,14 @@ test_push_as_identity() ->
         }
     },
     % Create a new test AOS process, which will use the given identities as
-    % its authority and scheduler.
+    % its authority and scheduler. Its first scheduler is an Ethereum address,
+    % which is not a committer.
+    EthAddress = <<"0xb9c5714089478a327f09197987f16f9e5d936e8a">>,
     Base =
         hb_process_test_vectors:aos_process(
             Opts#{
                 <<"authority">> => ComputeID,
-                <<"scheduler">> => [SchedulingID, ComputeID]
+                <<"scheduler">> => [EthAddress, SchedulingID, ComputeID]
             }
         ),
     ?event({base, Base}),
@@ -1050,12 +1060,28 @@ test_push_as_identity() ->
         hb_cache:read_all_commitments(Assignment, Opts),
         Opts
     ),
-    ?assert(lists:member(SchedulingID, Committers)),
-    ?assert(lists:member(ComputeID, Committers)),
+    ?assert(
+        lists:member(hb_test_utils:committer(SchedulingWallet), Committers)
+    ),
+    ?assert(lists:member(hb_test_utils:committer(ComputeWallet), Committers)),
     % Validate that the compute wallet was used to sign the message.
     ?assertEqual(
-        [ComputeID],
+        [hb_test_utils:committer(ComputeWallet)],
         hb_ao:get(<<"schedule/assignments/2/body/committers">>, Base, Opts)
+    ),
+    % A push skips an authority that is not a committer, and signs with the
+    % process's other authorities.
+    ?assertEqual(
+        [hb_test_utils:committer(ComputeWallet)],
+        hb_message:signers(
+            apply_security(
+                #{ <<"body">> => <<"pushed">> },
+                Base#{ <<"authority">> => [EthAddress, ComputeID] },
+                <<"httpsig@1.0">>,
+                Opts
+            ),
+            Opts
+        )
     ).
 
 test_multi_process_push() ->
@@ -1309,8 +1335,8 @@ test_remote_routed_push() ->
     SetAuthoritiesCommand =
         <<
             "ao.authorities = { ",
-                "\"", (hb_util:human_id(N1Wallet))/binary, "\",",
-                "\"", (hb_util:human_id(N2Wallet))/binary, "\"",
+                "\"", (hb:address(N1Wallet))/binary, "\",",
+                "\"", (hb:address(N2Wallet))/binary, "\"",
             " }; ",
             "ao.addAssignable('foobar', function (msg) return true end); "
             "ao.isAssignable = function(m) return true end"
@@ -1387,8 +1413,8 @@ test_cron_depth_zero_push() ->
     ReadOnlyShared = SharedStore#{ <<"access">> => [<<"read">>] },
     Wallet1 = ar_wallet:new(),
     Wallet2 = ar_wallet:new(),
-    Address1 = hb_util:human_id(Wallet1),
-    Address2 = hb_util:human_id(Wallet2),
+    Address1 = hb:address(Wallet1),
+    Address2 = hb:address(Wallet2),
     UserWallet = ar_wallet:new(),
     Opts = #{
         <<"priv-wallet">> => UserWallet,

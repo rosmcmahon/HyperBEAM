@@ -185,8 +185,15 @@ from_preloaded(Ref, Opts) ->
 preloaded_spec(Ref, _Store, _Opts) when ?IS_ID(Ref) ->
     {ok, Ref};
 preloaded_spec(Ref, Store, Opts) ->
-    Key = hb_escape:encode_path_component(Ref),
-    hb_store:read(Store, <<?PRELOADED_INDEX_KEY/binary, "/", Key/binary>>, Opts).
+    % The index key holds `ao:' and the ID of the index, whose keys are the
+    % device names.
+    case hb_store:read(Store, ?PRELOADED_INDEX_KEY, Opts) of
+        {ok, <<"ao:", IndexID/binary>>} ->
+            Key = hb_escape:encode_path_component(Ref),
+            hb_cache:read(<<IndexID/binary, "/", Key/binary>>, Opts);
+        _ ->
+            {error, not_found}
+    end.
 
 %% @doc Device names are literal members of the preloaded index.
 preloaded_literal_names_test() ->
@@ -416,8 +423,8 @@ signers(Msg, Opts) ->
         Opts
     ).
 
-%% @doc Trusted signers, defaulting to the node's own address.
-%% Computed lazily so the default config need not call `hb:address/0'.
+%% @doc Return the trusted signers, defaulting to the node's own committer.
+%% Computed lazily so the default config need not read the node's key.
 trusted_signers(Ref, SpecID, Opts) ->
     [
         Address
@@ -440,7 +447,7 @@ trusted_signer_entries(Ref, SpecID, Signers, Opts) ->
 
 trusted_signer_entries(Opts) ->
     case hb_opts:get(trusted_device_signers, [], Opts) of
-        [] -> [hb:address()];
+        [] -> [hb_opts:committer(Opts)];
         Signers when is_list(Signers) -> Signers
     end.
 
@@ -458,33 +465,59 @@ trusted_signer_accepts(_Ref, _SpecID, _Signer, _Opts) ->
     false.
 
 trusted_signer_address(Signer, _Opts) when is_binary(Signer) ->
-    Signer;
+    hb_util:committer(Signer);
 trusted_signer_address(Signer, Opts) when is_map(Signer) ->
-    hb_maps:get(<<"address">>, Signer, undefined, Opts);
+    hb_util:committer(hb_maps:get(<<"address">>, Signer, undefined, Opts));
 trusted_signer_address(_Signer, _Opts) ->
     undefined.
 
 trusted_signer_devices_test() ->
     Ref = <<"copycat@1.0">>,
     SpecID = <<"SPEC_ID">>,
+    [Plain, Unscoped, ByRef, BySpec, Other] =
+        [hb_util:human_id(<<N:256>>) || N <- lists:seq(1, 5)],
     ?assertEqual(
-        [<<"plain">>, <<"unscoped">>, <<"by-ref">>, <<"by-spec">>],
+        [
+            ?ARWEAVE_COMMITTER(Address)
+        ||
+            Address <- [Plain, Unscoped, ByRef, BySpec]
+        ],
         trusted_signers(
             Ref,
             SpecID,
             #{
                 <<"trusted-device-signers">> => [
-                    <<"plain">>,
-                    #{<<"address">> => <<"unscoped">>},
-                    #{<<"address">> => <<"by-ref">>, <<"devices">> => [Ref]},
-                    #{<<"address">> => <<"by-spec">>, <<"devices">> => [SpecID]},
+                    Plain,
+                    #{<<"address">> => Unscoped},
+                    #{<<"address">> => ByRef, <<"devices">> => [Ref]},
+                    #{<<"address">> => BySpec, <<"devices">> => [SpecID]},
                     #{
-                        <<"address">> => <<"other">>,
+                        <<"address">> => Other,
                         <<"devices">> => [<<"arweave@2.9">>]
                     }
                 ]
             }
         )
+    ),
+    % A signer that is neither an Arweave address nor a URI is not a
+    % committer, and is kept as it is.
+    ?assertEqual(
+        [<<"plain">>],
+        trusted_signers(
+            Ref,
+            SpecID,
+            #{ <<"trusted-device-signers">> => [<<"plain">>] }
+        )
+    ),
+    % With no signers configured, the node's committer is trusted.
+    NodeOpts =
+        #{
+            <<"priv-wallet">> => ar_wallet:new(?ETHEREUM_KEY_TYPE),
+            <<"trusted-device-signers">> => []
+        },
+    ?assertEqual(
+        [hb_opts:committer(NodeOpts)],
+        trusted_signers(Ref, SpecID, NodeOpts)
     ).
 
 %% @doc Every `requires-*' key must match this machine's `system_info'.

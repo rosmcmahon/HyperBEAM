@@ -216,7 +216,7 @@ beam_reductions_price_test() ->
 p4_response_charge_test() ->
     HostWallet = ar_wallet:new(),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     Rate = 2,
     Item =
         hb_message:commit(
@@ -249,7 +249,7 @@ p4_response_charge_test() ->
                 <<"arweave-bytes">> => Rate,
                 ?BEAM_REDUCTIONS => 0
             },
-            <<"operator">> => ar_wallet:to_address(HostWallet),
+            <<"operator">> => hb_test_utils:committer(HostWallet),
             <<"on">> => #{
                 <<"request">> => Processor,
                 <<"response">> => Processor

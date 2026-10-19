@@ -3,7 +3,7 @@
 -export([info/3]).
 -export([info/1, test_func/1, compute/3, init/3, restore/3, snapshot/3, mul/2]).
 -export([mangle/3, update_state/3, increment_counter/3, delay/3, append/3]).
--export([index/3, postprocess/3, load/3]).
+-export([index/3, load/3, from/3, to/3]).
 -export([vary_projection/3, vary_wildcard/3, vary_unspecified/3, vary_inspect/3]).
 -export([vary_overlay/3, vary_request_overlay/3]).
 -export([vary_alternatives/3, vary_dependent/3]).
@@ -70,6 +70,26 @@ index(Msg, _Req, Opts) ->
     {ok, #{ device := binary(), _ => _ }}.
 load(Base, _, _Opts) ->
     {ok, Base#{ <<"device">> => <<"test-device@1.0">> }}.
+
+%% @doc Returns the resource of the URI `test:device:<body>': a message with
+%% this device and the given body. The proxy test of `hb_uri' reads it.
+-spec from(
+    #{ body := binary(), _ => _ },
+    #{ type := binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ device := binary(), body := binary() }}.
+from(#{ <<"body">> := Body }, #{ <<"type">> := <<"uri">> }, _Opts) ->
+    {ok, #{ <<"device">> => <<"test-device@1.0">>, <<"body">> => Body }}.
+
+%% @doc Writes the whole URI, `test:device:<body>', of a message that
+%% `from/3' returns.
+-spec to(
+    #{ body := binary(), _ => _ },
+    #{ type := binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, binary()}.
+to(#{ <<"body">> := Body }, #{ <<"type">> := <<"uri">> }, _Opts) ->
+    {ok, <<"test:device:", Body/binary>>}.
 
 test_func(_) ->
 	{ok, <<"GOOD FUNCTION">>}.
@@ -160,14 +180,6 @@ append(Base, Req, Opts) ->
     Prefix = hb_maps:get(<<"append-prefix">>, Base, <<>>, Opts),
     Bin = hb_maps:get(<<"bin">>, Req, <<>>, Opts),
     {ok, Base#{ <<"result">> => <<Existing/binary, Prefix/binary, Bin/binary>> }}.
-
-%% @doc Set the `postprocessor-called' key to true in the HTTP server.
--spec postprocess(#{ _ => _ }, #{ body := _, _ => _ }, #{ _ => _ }) ->
-    {ok, _}.
-postprocess(_Msg, #{ <<"body">> := Msgs }, Opts) ->
-    ?event({postprocess_called, Opts}),
-    hb_http_server:set_opts(Opts#{ <<"postprocessor-called">> => true }),
-    {ok, Msgs}.
 
 %% @doc Find a test worker's PID and send it an update message.
 -spec update_state(#{ _ => _ }, #{ 'test-id' => _, _ => _ }, #{ _ => _ }) ->
@@ -521,13 +533,16 @@ vary_loaded_link_preserves_commitments_test_() ->
 %% @doc Check signed identity before and after varying and caching an input.
 vary_loaded_link_preserves_commitments(Which, Mode, Function) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = (vary_opts())#{ <<"priv-wallet">> => Wallet },
+    % A value of 60 bytes or more is written under its `ni:' name, so
+    % `required' is read back as a link.
+    Int = hb_util:int(binary:copy(<<"7">>, 60)),
     Signed = hb_message:commit(
         #{
             <<"device">> => <<"test-device@1.0">>,
             <<"path">> => Function,
-            <<"required">> => 7
+            <<"required">> => Int
         },
         Opts,
         <<"httpsig@1.0">>
@@ -543,31 +558,35 @@ vary_loaded_link_preserves_commitments(Which, Mode, Function) ->
         <<"vary-unspecified">> ->
             ?assertEqual(maps:get(<<"required">>, Lazy),
                 maps:get(<<"required">>, Varied));
-        _ -> ?assertEqual(7, maps:get(<<"required">>, Varied))
+        _ -> ?assertEqual(Int, maps:get(<<"required">>, Varied))
     end,
     ?assert(lists:member(Signer, hb_message:signers(Varied, Opts))),
     ?assertEqual(SignedID, hb_message:id(Varied, [Signer], Opts)),
     ?assert(hb_message:verify(Varied, [Signer], Opts)),
     {ok, _} = hb_cache:write(Varied, Opts),
     {ok, Cached} = hb_cache:read(SignedID, Opts),
-    ?assertEqual(7, hb_maps:get(<<"required">>, Cached, not_found, Opts)),
+    ?assertEqual(Int, hb_maps:get(<<"required">>, Cached, not_found, Opts)),
     ?assert(lists:member(Signer, hb_message:signers(Cached, Opts))),
     ?assertEqual(SignedID, hb_message:id(Cached, [Signer], Opts)),
     ?assert(hb_message:verify(Cached, [Signer], Opts)).
 
 %% @doc Only changes to signed content invalidate parent or child commitments.
 vary_child_commitments_test_() ->
+    % A value of 60 bytes or more is written under its `ni:' name, so the
+    % child's `slot' is read back as a link.
+    Int = hb_util:int(binary:copy(<<"7">>, 60)),
+    Padded = <<"00", (hb_util:bin(Int))/binary>>,
     [
         {Description, fun() ->
             vary_child_commitments(Required, Slot, Mode, Keep)
         end}
     ||
         {Description, Required, Slot, Mode, Keep} <- [
-            {"unchanged parent and child", 7, 7, inline, {true, true}},
-            {"loaded child", 7, 7, lazy, {true, true}},
-            {"coerced child", 7, <<"007">>, inline, {false, false}},
-            {"loaded and coerced child", 7, <<"007">>, lazy, {false, false}},
-            {"coerced parent preserves child", <<"007">>, 7, inline,
+            {"unchanged parent and child", 7, Int, inline, {true, true}},
+            {"loaded child", 7, Int, lazy, {true, true}},
+            {"coerced child", 7, Padded, inline, {false, false}},
+            {"loaded and coerced child", 7, Padded, lazy, {false, false}},
+            {"coerced parent preserves child", <<"007">>, Int, inline,
                 {true, false}}
         ]
     ].
@@ -575,7 +594,7 @@ vary_child_commitments_test_() ->
 %% @doc Check each signed cache entry as well as the varied parent and child.
 vary_child_commitments(Required, Slot, Mode, {KeepChild, KeepParent}) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = (vary_opts())#{ <<"priv-wallet">> => Wallet },
     Child = hb_message:commit(#{ <<"slot">> => Slot }, Opts, <<"httpsig@1.0">>),
     ChildID = hb_message:id(Child, [Signer], Opts),
@@ -606,7 +625,7 @@ vary_child_commitments(Required, Slot, Mode, {KeepChild, KeepParent}) ->
     Varied = hb_maps:get(<<"base">>, Res, not_found, Opts),
     VariedChild = maps:get(<<"child">>, Varied),
     ?assertEqual(7, maps:get(<<"required">>, Varied)),
-    ?assertEqual(7, maps:get(<<"slot">>, VariedChild)),
+    ?assertEqual(hb_util:int(Slot), maps:get(<<"slot">>, VariedChild)),
     {ok, _} = hb_cache:write(Varied, Opts),
     {ok, CachedParent} = hb_cache:read(ParentID, Opts),
     {ok, CachedChild} = hb_cache:read(ChildID, Opts),
@@ -650,13 +669,16 @@ vary_coercion_preserves_original_signed_cache_entry_test_() ->
 %% @doc Exercise coercion of both in-memory and linked signed values.
 vary_coercion_preserves_original_signed_cache_entry(Which, Mode) ->
     Wallet = ar_wallet:new(),
-    Signer = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Signer = hb_test_utils:committer(Wallet),
     Opts = (vary_opts())#{ <<"priv-wallet">> => Wallet },
+    % A value of 60 bytes or more is written under its `ni:' name, so
+    % `required' is read back as a link. It coerces to the integer 7.
+    Padded = <<(binary:copy(<<"0">>, 59))/binary, "7">>,
     Signed = hb_message:commit(
         #{
             <<"device">> => <<"test-device@1.0">>,
             <<"path">> => <<"vary-wildcard">>,
-            <<"required">> => <<"007">>
+            <<"required">> => Padded
         },
         Opts,
         <<"httpsig@1.0">>
@@ -668,7 +690,7 @@ vary_coercion_preserves_original_signed_cache_entry(Which, Mode) ->
     {ok, Original} = hb_cache:read(SignedID, Opts),
     ?assertMatch({link, _, _}, maps:get(<<"required">>, Original)),
     ?assertEqual(
-        <<"007">>, hb_maps:get(<<"required">>, Original, not_found, Opts)
+        Padded, hb_maps:get(<<"required">>, Original, not_found, Opts)
     ),
     ?assert(hb_message:verify(Original, [Signer], Opts)),
     Input = case Mode of inline -> Signed; lazy -> Original end,
@@ -681,7 +703,7 @@ vary_coercion_preserves_original_signed_cache_entry(Which, Mode) ->
     ?assert(lists:member(Signer, hb_message:signers(CachedOriginal, Opts))),
     ?assertEqual(SignedID, hb_message:id(CachedOriginal, [Signer], Opts)),
     ?assertEqual(
-        {<<"007">>, true},
+        {Padded, true},
         {
             hb_maps:get(<<"required">>, CachedOriginal, not_found, Opts),
             hb_message:verify(CachedOriginal, [Signer], Opts)

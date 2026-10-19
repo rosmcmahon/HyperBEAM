@@ -56,7 +56,7 @@ private_tags_test_() ->
                 format = Format,
                 tags = [{Name, <<"True">>}, {<<"public">>, <<"1">>}] ++
                     case Typed of
-                        true -> [{<<"ao-types">>, <<"public=integer">>}];
+                        true -> [{<<"ao-types">>, <<"integer=(\"public\")">>}];
                         false -> []
                     end
             },
@@ -114,8 +114,8 @@ private_link_binding_test_() ->
         {binary_to_list(Codec) ++ ": " ++ binary_to_list(TypeKey), fun() ->
             Opts = test_opts(),
             Raw = #tx{ format = Format, tags = [
-                {Name, hb_util:human_id(<<1:256>>)},
-                {<<"ao-types">>, <<TypeKey/binary, "=list">>},
+                {Name, <<"ao:", (hb_util:human_id(<<1:256>>))/binary>>},
+                {<<"ao-types">>, <<"list=(\"", TypeKey/binary, "\")">>},
                 {<<"public">>, <<"ok">>}
             ] },
             Signed = case Codec of
@@ -123,7 +123,7 @@ private_link_binding_test_() ->
                 <<"ans104@1.0">> -> ar_bundles:sign_item(Raw, hb:wallet())
             end,
             TABM = hb_message:convert(Signed, tabm, Codec, Opts),
-            Key = hb_link:remove_link_specifier(hb_util:to_lower(Name)),
+            Key = hb_util:to_lower(Name),
             [Commitment] = maps:values(maps:get(<<"commitments">>, TABM)),
             CommittedKeys =
                 hb_util:message_to_ordered_list(
@@ -149,12 +149,10 @@ private_link_binding_test_() ->
     ||
         {Codec, Format} <- [{<<"tx@1.0">>, 2}, {<<"ans104@1.0">>, ans104}],
         {Name, TypeKey} <- [
-            {<<"private-field+link">>, <<"private-field">>},
-            {<<"Private-Field+link">>, <<"Private-Field">>},
-            {<<"Private-Field+link">>, <<"%50rivate-%46ield">>},
+            {<<"private-field">>, <<"private-field">>},
+            {<<"Private-Field">>, <<"Private-Field">>},
+            {<<"Private-Field">>, <<"%50rivate-%46ield">>},
             {<<"private-field+link">>, <<"private-field%2blink">>},
-            {<<"private-field+link+link">>, <<"private-field">>},
-            {<<"Private-Field+link+link+link">>, <<"%50rivate-%46ield">>},
             {<<"Private">>, <<"priv-unused">>},
             {<<"Private">>, <<"%50riv-unused">>}
         ]
@@ -209,9 +207,8 @@ rsa_wallet_not_match_message_ed25519_type_test() ->
     Opts = #{<<"priv-wallet">> => ar_wallet:new(?RSA_KEY_TYPE)},
     SignatureType = ?EDDSA_SIGN_TYPE,
     Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?EDDSA_SIGN_TYPE},
-                 {wallet_type, {rsa,65537}}},
+    ?assertThrow(
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             Msg,
             Opts,
@@ -222,9 +219,8 @@ ed25519_wallet_not_match_message_rsa_type_test() ->
     Opts = #{<<"priv-wallet">> => ar_wallet:new(?EDDSA_KEY_TYPE)},
     SignatureType = ?RSA_SIGN_TYPE,
     Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?RSA_SIGN_TYPE},
-                 {wallet_type, {eddsa,ed25519}}},
+    ?assertThrow(
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             Msg,
             Opts,
@@ -235,9 +231,8 @@ ethereum_wallet_not_match_message_rsa_type_test() ->
     Opts = #{<<"priv-wallet">> => ar_wallet:new(?ETHEREUM_KEY_TYPE)},
     SignatureType = ?RSA_SIGN_TYPE,
     Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?RSA_SIGN_TYPE},
-                 {wallet_type, ethereum}},
+    ?assertThrow(
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             Msg,
             Opts,

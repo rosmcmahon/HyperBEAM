@@ -311,11 +311,6 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
                     )
             ]
         ),
-    Groups = lists:uniq([Group || #{ <<"path">> := Group } <- maps:keys(Keys)]),
-    lists:foreach(
-        fun(Group) -> hb_store:group(Stores, Group, Opts) end,
-        Groups
-    ),
     case hb_store:write(Stores, Keys, Opts) of
         ok -> {ok, Req};
         {error, not_found} -> {ok, Req};
@@ -341,8 +336,7 @@ pairs(Handler, Msg, Names, Opts) ->
         ),
     OwnPairs = case Names of
         all -> hb_maps:to_list(Own, Opts);
-        _ -> template(hb_maps:with(Names ++
-            [hb_link:remove_link_specifier(Name) || Name <- Names], Own, Opts),
+        _ -> template(hb_maps:with(Names, Own, Opts),
             Opts#{ <<"linkify-mode">> => discard })
     end,
     OwnPairs ++ Single ++
@@ -1034,7 +1028,6 @@ weave_order_test() ->
     lists:foreach(
         fun({Name, Value}) ->
             Group = group(Name, Value, Opts),
-            hb_store:group(Stores, Group, Opts),
             ok = hb_store:write(
                 Stores, #{ <<Group/binary, "/", (digits(5))/binary>> => <<>> },
                 Opts
@@ -1113,7 +1106,7 @@ alignment_test() ->
 paths_test() ->
     Opts = test_opts(),
     Wallets = [ar_wallet:new(), ar_wallet:new()],
-    Addresses = [ hb_util:human_id(ar_wallet:to_address(W)) || W <- Wallets ],
+    Addresses = [ hb_test_utils:committer(W) || W <- Wallets ],
     Signed =
         lists:foldl(
             fun(Wallet, Msg) ->

@@ -607,12 +607,12 @@ tx_field(Body, Field, Default, Opts) ->
             Default
     end.
 
-%% @doc The single signer of a message. A message with any other number of
-%% signers is not attributable to one party, so it cannot open, cancel, reserve
-%% or pay for anything.
+%% @doc Return the Arweave address of the single signer of a message. A
+%% message with any other number of signers is not attributable to one party,
+%% so it cannot open, cancel, reserve or pay for anything.
 signer(Body, Opts) ->
     case hb_message:signers(Body, Opts) of
-        [Signer] -> {ok, hb_util:human_id(Signer)};
+        [?ARWEAVE_COMMITTER(Address)] -> {ok, Address};
         _ -> not_found
     end.
 

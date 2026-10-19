@@ -16,6 +16,7 @@
 %%% errors are returned to the caller rather than retried indefinitely.
 -module(dev_tls_acme).
 -export([obtain/5, dns_name/1]).
+-include("include/ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(ISSUANCE_TIMEOUT, 180000).
@@ -363,7 +364,8 @@ directory_url(Key, State) ->
     end.
 
 %% @doc Encode only the RSA public modulus and exponent as a JWK.
-jwk({{{rsa, E}, _D, N}, {{rsa, E}, N}}) ->
+jwk(#{ <<"type">> := Type = ?RSA_SIGN_TYPE, <<"owner">> := N }) ->
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     #{
         <<"e">> => hb_util:encode(binary:encode_unsigned(E)),
         <<"kty">> => <<"RSA">>,
@@ -371,7 +373,9 @@ jwk({{{rsa, E}, _D, N}, {{rsa, E}, N}}) ->
     }.
 
 %% @doc Sign the ACME JWS input using RS256 and the account wallet.
-rsa_sign({{{rsa, E}, D, N}, {{rsa, E}, N}}, Data) ->
+rsa_sign(Wallet = #{ <<"type">> := Type = ?RSA_SIGN_TYPE }, Data) ->
+    #{ <<"owner">> := N, <<"priv">> := #{ <<"d">> := D } } = Wallet,
+    {rsa, E} = ar_tx:deserialize_sig_type(Type),
     crypto:sign(rsa, sha256, Data,
         [E, binary:decode_unsigned(N), binary:decode_unsigned(D)],
         [{rsa_padding, rsa_pkcs1_padding}]).

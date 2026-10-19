@@ -1,7 +1,8 @@
 %%% @doc Shared Arweave codec helpers.
 -module(lib_arweave_common).
 -export([from/3]).
--export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/2]).
+-export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/3]).
+-export([sign/4, order_tags/3]).
 -export([verify_committed_keys/5]).
 -export([add_commitment/4]).
 -export([with_commitments/8]).
@@ -155,36 +156,16 @@ tags(Item, Opts) ->
 normalize_key(Key) -> hb_util:lowercase_key(hb_ao:normalize_key(Key)).
 
 %% @doc Ensure the encoded keys in the `ao-types' field are lowercased and
-%% normalized like the other keys in the tags field.
+%% normalized like the other keys in the tags field, and that the field is
+%% encoded as `structured@1.0' writes it.
 ao_types(#{ <<"ao-types">> := AoTypes } = Tags, Opts) ->
-    ConvOpts = Opts#{ <<"hashpath">> => ignore },
-    {ok, AOTypes} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"structured@1.0">> },
-            #{
-                <<"path">> => <<"decode-types">>,
-                <<"body">> => AoTypes
-            },
-            ConvOpts
-        ),
-    % Normalize all keys in the ao-types map and re-encode
-    NormAOTypes =
-        maps:fold(
-            fun(Key, Val, Acc) ->
-                NormKey = normalize_key(Key),
-                Acc#{ NormKey => Val }
-            end,
-            #{},
-            AOTypes
-        ),
     {ok, EncodedAOTypes} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"structured@1.0">> },
-            #{
-                <<"path">> => <<"encode-types">>,
-                <<"body">> => NormAOTypes
-            },
-            ConvOpts
+        hb_ao:raw(
+            <<"structured@1.0">>,
+            <<"encode-types">>,
+            decode_types(AoTypes, Opts),
+            #{},
+            Opts
         ),
     Tags#{ <<"ao-types">> := EncodedAOTypes };
 ao_types(Tags, _Opts) ->
@@ -224,14 +205,10 @@ data(Item, Req, Tags, FromFun, Opts) ->
 %% @doc Calculate the list of committed keys for an item, based on its
 %% components (fields, tags, and data).
 committed(FieldKeys, Item, Fields, Tags, Data, Opts) ->
-    CommittedKeys = hb_util:unique(
+    hb_util:unique(
         data_keys(Data, Opts) ++
         tag_keys(Item, Opts) ++
         field_keys(FieldKeys, Fields, Tags, Data, Opts)
-    ),
-    lists:map(
-        fun hb_link:remove_link_specifier/1,
-        CommittedKeys
     ).
 
 %% @doc Return the list of the keys from the fields TABM.
@@ -287,52 +264,107 @@ base(CommittedKeys, Fields, Tags, Data, Opts) ->
     hb_maps:from_list(
         lists:map(
             fun(Key) ->
-                case find_key(Key, Data, Opts) of
+                case hb_maps:find(Key, Data, Opts) of
                     error ->
-                        case find_key(Key, Fields, Opts) of
+                        case hb_maps:find(Key, Fields, Opts) of
                             error ->
-                                case find_key(Key, Tags, Opts) of
+                                case hb_maps:find(Key, Tags, Opts) of
                                     error -> throw({missing_key, Key});
-                                    {FoundKey, Value} -> {FoundKey, Value}
+                                    {ok, Value} -> {Key, Value}
                                 end;
-                            {FoundKey, Value} -> {FoundKey, Value}
+                            {ok, Value} -> {Key, Value}
                         end;
-                    {FoundKey, Value} -> {FoundKey, Value}
+                    {ok, Value} -> {Key, Value}
                 end
             end,
             CommittedKeys
         )
     ).
 
-%% @doc Find a key, accepting either the plain key or its `+link' form.
-find_key(Key, Map, Opts) ->
-    case hb_maps:find(Key, Map, Opts) of
-        {ok, Value} -> {Key, Value};
-        error ->
-            KeyLink = <<Key/binary, "+link">>,
-            case hb_maps:find(KeyLink, Map, Opts) of
-                {ok, Value} -> {KeyLink, Value};
-                error -> error
-            end
-    end.
-
 %% @doc Check that a commitment's ID and committer are those of the item
 %% encoded from the message. The item's values need no check here:
 %% `commitment_to_tx/4' takes the commitment's fields and tags only while the
 %% message holds their values, and gives a changed message its own, which the
 %% item's signature then does not verify.
-verify_identity(Item, TABM) ->
+verify_identity(Item, TABM, Opts) ->
     [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
     case maps:get(<<"type">>, Commitment) of
         <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
         _ ->
             hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
-                maps:get(<<"committer">>, Commitment, undefined) =:=
-                    hb_util:human_id(
-                        ar_wallet:to_address(
-                            Item#tx.owner, Item#tx.signature_type)
-                    )
+                maps:get(<<"committer">>, Commitment, unset) =:=
+                    committer(Item, Opts)
     end.
+
+%% @doc Return the URI of the committer of an item's signature: the
+%% `did-pkh@1.0' committer of the item's owner. If the key has no account, we
+%% return `unset'.
+committer(Item, Opts) ->
+    Committer =
+        #{
+            <<"device">> => <<"did-pkh@1.0">>,
+            <<"owner">> => Item#tx.owner,
+            <<"type">> => ar_tx:serialize_sig_type(Item#tx.signature_type)
+        },
+    ToURI = #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
+    case hb_ao:raw(Committer, ToURI, Opts) of
+        {ok, URI} -> URI;
+        {error, _} -> unset
+    end.
+
+%% @doc Sign the item or transaction of a message with the committer of the
+%% request, using the signature type of the request's `type'. The committer's
+%% public key becomes the owner of the item, which the signature covers. The
+%% tags are signed in the order of the request's `committed' keys.
+sign(Msg, TX, Req = #{ <<"committer">> := Committer, <<"type">> := Type },
+        Opts) ->
+    Owner = hb_maps:get(<<"owner">>, Committer, ?DEFAULT_OWNER, Opts),
+    Unsigned =
+        TX#tx{
+            owner = Owner,
+            signature_type = ar_tx:deserialize_sig_type(Type),
+            tags = order_tags(TX#tx.tags, Req, Opts)
+        },
+    CommitRes =
+        hb_ao:raw(
+            Committer,
+            #{
+                <<"path">> => <<"commit">>,
+                <<"body">> => ar_tx:generate_signature_data_segment(Unsigned),
+                <<"type">> => Type
+            },
+            Opts
+        ),
+    case CommitRes of
+        {ok, #{ <<"signature">> := Sig, <<"owner">> := Owner }} ->
+            ar_tx:reset_ids(Unsigned#tx{ signature = Sig });
+        CommitError -> throw({cannot_commit, CommitError, Msg})
+    end.
+
+%% @doc Order the tags of an item as a request lists its `committed' keys. The
+%% tags of a bundle come first, and the tags that the request does not list
+%% follow the listed ones, in the order they had. A request without a
+%% `committed' list leaves the tags as they are.
+order_tags(Tags, #{ <<"committed">> := Committed }, Opts) ->
+    Order =
+        [
+            normalize_key(Key)
+        ||
+            Key <-
+                ?BUNDLE_KEYS ++ hb_util:message_to_ordered_list(Committed, Opts)
+        ],
+    Rank =
+        fun({Name, _}) ->
+            length(
+                lists:takewhile(
+                    fun(Key) -> Key =/= normalize_key(Name) end,
+                    Order
+                )
+            )
+        end,
+    lists:sort(fun(A, B) -> Rank(A) =< Rank(B) end, Tags);
+order_tags(Tags, _Req, _Opts) ->
+    Tags.
 
 %% @doc Check that a commitment's committed keys are the keys of the item
 %% encoded from the message, and that the message gives those keys the types the
@@ -407,7 +439,6 @@ with_unsigned_commitment(
 with_signed_commitment(
         BaseFields, Item, Device, FieldCommitments, Tags,
         UncommittedMessage, CommittedKeys, Opts) ->
-    Address = hb_util:human_id(ar_wallet:to_address(Item#tx.owner, Item#tx.signature_type)),
     ID = hb_util:human_id(Item#tx.id),
     ExtraCommitments = hb_maps:merge(
         FieldCommitments,
@@ -420,11 +451,10 @@ with_signed_commitment(
                 ExtraCommitments,
                 #{
                     <<"commitment-device">> => Device,
-                    <<"committer">> => Address,
+                    <<"committer">> => committer(Item, Opts),
                     <<"committed">> => CommittedKeys,
                     <<"signature">> => hb_util:encode(Item#tx.signature),
-                    <<"keyid">> =>
-                        <<"publickey:", (hb_util:encode(Item#tx.owner))/binary>>,
+                    <<"owner">> => hb_util:encode(Item#tx.owner),
                     <<"type">> => ar_tx:serialize_sig_type(Item#tx.signature_type),
                     <<"bundle">> => bundle_commitment_key(Tags, Opts),
                     <<"original-tags">> => original_tags(
@@ -442,13 +472,14 @@ with_signed_commitment(
 
 %% @doc Return the bundle key for an item: whether its nested messages are
 %% bundled in its data. An item whose nested messages are not bundled links
-%% each with a `+link' tag, and bundles only its values too large for tags.
+%% each with a tag whose value is an `ao:' URI, and bundles only the values
+%% that are too large for tags.
 bundle_commitment_key(Tags, Opts) ->
     hb_util:bin(
         hb_maps:is_key(<<"bundle-format">>, Tags, Opts) andalso
             not lists:any(
-                fun hb_link:is_link_key/1,
-                hb_maps:keys(Tags, Opts)
+                fun({Key, Value}) -> ?IS_LINK(hb_link:decode(Key, Value)) end,
+                hb_maps:to_list(Tags, Opts)
             )
     ).
 
@@ -615,9 +646,8 @@ commitment_to_tx(Message, Commitment, FieldsFun, Opts) ->
             maps:get(<<"signature">>, Commitment, hb_util:encode(?DEFAULT_SIG))
         ),
     Owner =
-        case hb_maps:find(<<"keyid">>, Commitment, Opts) of
-            {ok, KeyID} ->
-                hb_util:decode(hb_util:remove_scheme_prefix(KeyID));
+        case hb_maps:find(<<"owner">>, Commitment, Opts) of
+            {ok, EncodedOwner} -> hb_util:decode(EncodedOwner);
             error -> ?DEFAULT_OWNER
         end,
     Tags =
@@ -693,7 +723,7 @@ holds_types(Types, _Commitment, #{ <<"ao-types">> := Types }, _Opts) ->
 holds_types(SignedTypes, Commitment, TABM, Opts) ->
     Committed =
         [
-            normalize_key(hb_link:remove_link_specifier(Key))
+            normalize_key(Key)
         ||
             Key <-
                 hb_util:message_to_ordered_list(
@@ -836,16 +866,9 @@ tags(TX, MaybeCommitment, TABM, ExcludedTagKeys, Opts) ->
     bundle_tags_to_tags(MaybeCommitment) ++
         committed_tag_keys_to_tags(TABM, TagKeys, Opts).
 
-committed_tag_keys({ok, _, Commitment}, TABM, Opts) ->
+committed_tag_keys({ok, _, Commitment}, _TABM, Opts) ->
     lists:map(
-        fun(CommittedKey) ->
-            NormalizedKey = hb_ao:normalize_key(CommittedKey),
-            BaseKey = hb_link:remove_link_specifier(NormalizedKey),
-            case find_key(BaseKey, TABM, Opts) of
-                error -> BaseKey;
-                {FoundKey, _} -> FoundKey
-            end
-        end,
+        fun hb_ao:normalize_key/1,
         hb_util:message_to_ordered_list(
             hb_util:ok(
                 hb_maps:find(<<"committed">>, Commitment, Opts)
@@ -925,7 +948,9 @@ inline_key(Msg) ->
         InlineKey,
         maps:get(<<"data">>, Msg, ?DEFAULT_DATA) == ?DEFAULT_DATA,
         maps:is_key(<<"body">>, Msg)
-            andalso not ?IS_LINK(maps:get(<<"body">>, Msg, undefined))
+            andalso not ?IS_LINK(
+                hb_link:decode(maps:get(<<"body">>, Msg, undefined))
+            )
     } of
         {Explicit, _, _} when Explicit =/= undefined ->
             InlineKey;

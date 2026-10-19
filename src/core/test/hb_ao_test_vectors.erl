@@ -437,7 +437,7 @@ load_device_test() ->
     Wallet = ar_wallet:new(),
     Opts = #{
         <<"trusted-device-signers">> =>
-            [hb:address(), hb_util:human_id(ar_wallet:to_address(Wallet))],
+            [hb:address(), hb_test_utils:committer(Wallet)],
         <<"store">> => Store = hb_test_utils:test_store(hb_store_fs),
         <<"priv-wallet">> => Wallet
     },
@@ -450,7 +450,7 @@ untrusted_load_device_test() ->
     TrustedWallet = ar_wallet:new(),
     Opts = #{
         <<"trusted-device-signers">> =>
-            [hb:address(), hb_util:human_id(ar_wallet:to_address(TrustedWallet))],
+            [hb:address(), hb_test_utils:committer(TrustedWallet)],
         <<"store">> => Store = hb_test_utils:test_store(hb_store_fs),
         <<"priv-wallet">> => UntrustedWallet
     },
@@ -488,7 +488,7 @@ resolve_simple_test(Opts) ->
     Res = hb_ao:resolve(#{ <<"a">> => <<"RESULT">> }, <<"a">>, Opts),
     ?assertEqual({ok, <<"RESULT">>}, Res),
     % A key linking to a message the node does not hold reads as the default.
-    Link = {link, hb_util:human_id(<<0:256>>), #{ <<"type">> => <<"link">> }},
+    Link = {link, <<"ao:", (hb_util:human_id(<<0:256>>))/binary>>, #{}},
     ?assertEqual(default, hb_ao:get(<<"a">>, #{ <<"a">> => Link }, default, Opts)).
 
 singleton_id_base_test() ->
@@ -583,7 +583,7 @@ resolve_capitalised_key_test(Opts) ->
         )
     ),
     ?assertEqual(
-        {ok, <<"a=\"integer\"">>},
+        {ok, <<"integer=(\"a\")">>},
         hb_ao:resolve(
             #{ <<"Device">> => <<"structured@1.0">> },
             #{
@@ -1335,7 +1335,7 @@ paranoid_message_verification_test(RawOpts) ->
     ?assertThrow(_, hb_message:paranoid_verify(Base#{ <<"a">> => 2 }, Opts)),
     % Verify loaded children and link commitments without loading link targets.
     ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
-    Link = {link, ID, #{ <<"type">> => <<"link">> }},
+    Link = {link, <<"ao:", ID/binary>>, #{}},
     ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
     ?assert(hb_message:paranoid_verify(Link, Opts)),
     Linked = hb_message:normalize_commitments(

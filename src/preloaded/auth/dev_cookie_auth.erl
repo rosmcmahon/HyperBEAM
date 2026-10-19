@@ -266,7 +266,7 @@ http_set_get_cookies_test() ->
             #{}
         ),
     ?event(debug_cookie, {set_cookie_test, {set_res, SetRes}}),
-    ?assertMatch(#{ <<"set-cookie">> := _ }, SetRes),
+    ?assertMatch(#{ <<"priv">> := #{ <<"cookie">> := _ } }, SetRes),
     Req = apply_cookie(#{ <<"path">> => <<"/~cookie@1.0/extract">> }, SetRes, #{}),
     {ok, Res} = hb_http:get(Node, Req, #{}),
     ?assertMatch(#{ <<"k1">> := <<"v1">>, <<"k2">> := <<"v2">> }, Res),

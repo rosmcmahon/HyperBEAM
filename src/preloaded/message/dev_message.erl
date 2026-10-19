@@ -228,7 +228,8 @@ id_device(#{ <<"commitments">> := Commitments }, Opts) ->
 id_device(_, _) ->
     {ok, ?DEFAULT_ID_DEVICE}.
 
-%% @doc Return the committers of a message that are present in the given request.
+%% @doc Return the committers of a message. A committer is listed once, however
+%% many commitments it made.
 committers(Base) -> committers(Base, #{}).
 committers(Base, Req) -> committers(Base, Req, #{}).
 -spec committers(
@@ -237,7 +238,7 @@ committers(Base, Req) -> committers(Base, Req, #{}).
     #{ _ => _ }
 ) -> {ok, [_]}.
 committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
-    {ok,
+    Committers =
         hb_maps:values(
             hb_maps:filtermap(
                 fun(_ID, Commitment) ->
@@ -250,8 +251,8 @@ committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
                 NodeOpts
             ),
             NodeOpts
-        )
-    };
+        ),
+    {ok, hb_util:unique(Committers)};
 committers(_, _, _) ->
     {ok, []}.
 
@@ -307,7 +308,9 @@ commit(Self, Req, Opts) ->
             AttDev,
             <<"commit">>,
             Loaded,
-            Req#{ <<"type">> => maps:get(<<"type">>, Req, <<"signed">>) },
+            (hb_message:with_committer(Req, Opts))#{
+                <<"type">> => maps:get(<<"type">>, Req, <<"signed">>)
+            },
             CommitOpts
         ),
     {ok, Base#{ <<"commitments">> => maps:get(<<"commitments">>, Committed) }}.
@@ -445,7 +448,7 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
                 % bundle state of another commitment does not set the
                 % encoding of this one.
                 Covered =
-                    hb_message:with_links(
+                    hb_maps:with(
                         [
                             <<"commitments">>,
                             <<"priv">>
@@ -567,7 +570,7 @@ read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
 %% that every one covers.
 -spec committed(
     #{ _ => _ },
-    #{ raw => boolean(), committers => _, ids => _, _ => _ },
+    #{ committers => _, ids => _, _ => _ },
     #{ _ => _ }
 ) -> {ok, [binary()]}.
 committed(Self, Req, Opts) ->
@@ -625,22 +628,8 @@ committed(Self, Req, Opts) ->
                     AllCommittedKeys
                 )
         end,
-    % Remove any `+link` suffixes from TABM-form committed keys if the `raw` flag
-    % is not set. This means that callers to `committed/3' will receive a list of
-    % keys that they can match  against the 'normal' representation of the message
-    % in devices, etc., without exposure to TABM-specifics. If `raw' is set, the
-    % recipient receives the `committed` list in its unprocessed form.
-    CommittedNormalizedKeys =
-        case maps:get(<<"raw">>, Req, false) of
-            true -> OnlyCommittedKeys;
-            false ->
-                lists:map(
-                    fun hb_link:remove_link_specifier/1,
-                    OnlyCommittedKeys
-                )
-        end,
-    ?event_debug(debug_commitments, {only_committed_keys, CommittedNormalizedKeys}),
-    {ok, CommittedNormalizedKeys}.
+    ?event_debug(debug_commitments, {only_committed_keys, OnlyCommittedKeys}),
+    {ok, OnlyCommittedKeys}.
 
 %% @doc Return a message with only the relevant commitments for a given request.
 %% See `commitment_ids_from_request/3' for more information on the request format.
@@ -1251,6 +1240,29 @@ set_new_key_drops_commitments_test() ->
             hb_message:committed(PartiallySigned, #{ <<"ids">> => <<"any">> }, Opts)
         )
     ),
+    % `with_only_committed' with `any' keeps both keys and both commitments.
+    ?assertEqual(
+        {ok, PartiallySigned},
+        hb_message:with_only_committed(PartiallySigned, any, Opts)
+    ),
+    % With a list of IDs, the keys that every listed commitment covers are kept.
+    ?assertEqual(
+        hb_message:with_only_committed(PartiallySigned, Opts),
+        hb_message:with_only_committed(
+            PartiallySigned,
+            maps:keys(maps:get(<<"commitments">>, PartiallySigned)),
+            Opts
+        )
+    ),
+    % With a spec, the keys that `committed/3' gives for it are kept.
+    ?assertEqual(
+        {ok, PartiallySigned},
+        hb_message:with_only_committed(
+            PartiallySigned,
+            #{ <<"ids">> => <<"any">> },
+            Opts
+        )
+    ),
     {ok, Set} = hb_ao:resolve(
         PartiallySigned,
         #{ <<"path">> => <<"set">>, <<"b">> => <<"3">> },
@@ -1323,7 +1335,7 @@ commitment_spec(?ETHEREUM_KEY_TYPE) ->
 test_unsupported_key(KeyType) ->
     Wallet = ar_wallet:new(KeyType),
     ?assertThrow(
-        {cannot_commit, 'unsupported-key-type', _},
+        {cannot_commit, {error, #{ <<"error">> := <<"unsupported-key-type">> }}, _},
         hb_message:commit(
             #{ <<"a">> => <<"b">> },
             #{ <<"priv-wallet">> => Wallet }
@@ -1433,8 +1445,8 @@ commit_keeps_private_links_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
     Missing =
         {link,
-            hb_util:human_id(crypto:strong_rand_bytes(32)),
-            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+            <<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+            #{}
         },
     Priv = #{ <<"request">> => #{ <<"x">> => Missing } },
     Committed =

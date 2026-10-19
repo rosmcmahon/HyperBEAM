@@ -107,7 +107,7 @@ do_set(Trie, [], Opts) ->
         hb_message:commit(
             Uncommitted,
             Opts,
-            #{ <<"type">> => <<"hmac-sha256">> }
+            #{ <<"type">> => <<"unsigned">> }
         ),
     {ok, _} = hb_cache:write(CommittedTrie, Opts),
     CommittedTrie;

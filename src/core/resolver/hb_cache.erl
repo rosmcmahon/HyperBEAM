@@ -2,18 +2,39 @@
 %%%
 %%% HyperBEAM stores all paths in key value stores, abstracted by the `hb_store'
 %%% module. Each store has its own storage backend, but each works with simple
-%%% key-value pairs. Each store can write binary keys at paths, and link between
-%%% paths.
+%%% key-value pairs. A reference from one path to another is written as a
+%%% value: `ao:<ID>' refers to a message, and a `ni:' name refers to a binary.
+%%% The cache follows these references itself when it reads a path.
 %%%
 %%% There are three layers to HyperBEAMs internal data representation on-disk:
 %%%
-%%% 1. The raw binary data, written to the store at the hash of the content.
-%%%    Storing binary paths in this way effectively deduplicates the data.
-%%% 2. Messages, stored as links from their IDs and keys to underlying data
-%%%    or child messages. Commitment IDs link to the message's content root.
-%%% 3. Computations, stored separately in `attested-store' as links from
-%%%    `VBaseID/VReqID' to `VResID'. Portable hashpath receipts describe the
-%%%    execution and its witnesses independently of these lookup entries.
+%%% 1. The raw binary data, written to the store under its `ni:' name, which
+%%%    holds the hash of the content. Storing binary paths in this way
+%%%    effectively deduplicates the data.
+%%% 2. Messages, whose keys are written under the ID of the message without
+%%%    its commitments (its unsigned ID). Each key is written at `<ID>/<key>'.
+%%%    The keys of a nested message are written under the key's path, and the
+%%%    keys of each commitment under `<ID>/commitments/<CommitmentID>'. A
+%%%    binary of 60 bytes or more is written under its `ni:' name, and the key
+%%%    holds the name. Each of the message's other IDs, such as its signed ID,
+%%%    holds `ao:' and the unsigned ID.
+%%% 3. Computations, stored separately in `attested-store'. The path
+%%%    `VBaseID/VReqID' holds `ao:<VResID>', or the `ni:' name of a binary
+%%%    result. Portable hashpath receipts describe the execution and its
+%%%    witnesses independently of these lookup entries.
+%%%
+%%% For example, a signed message with a short key `a' and a 64-byte key `b'
+%%% is written as follows, where `U' is its unsigned ID and `S' its signed ID:
+%%% <pre>
+%%%     U/a                                  => 1
+%%%     U/b                                  => ni:///sha-256;fOEA...
+%%%     ni:%2f%2f%2fsha-256;fOEA...          => xxxxxxxx... (the 64 bytes)
+%%%     U/commitments/S/commitment-device    => httpsig@1.0
+%%%     U/commitments/S/type                 => rsa-pss-sha512
+%%%     U/commitments/S/signature            => ni:///sha-256;HVZf...
+%%%     ...
+%%%     S                                    => ao:U
+%%% </pre>
 %%%
 %%% Before writing a message to the store, we convert it to Type-Annotated
 %%% Binary Messages (TABMs), such that each of the keys in the message is
@@ -38,13 +59,14 @@
 -module(hb_cache).
 -export([read_all_commitments/2]).
 -export([ensure_loaded/1, ensure_loaded/2, ensure_all_loaded/1, ensure_all_loaded/2]).
--export([read/2, read_resolved/3, write/2, link/3]).
+-export([read/2, read_resolved/3, write/2, link/3, encode_value/1]).
 -export([match/2, list/2, list_numbered/2]).
 -export([test_unsigned/1, test_signed/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -define(DIRECT_VALUE_LENGTH, 60).
 -define(MAX_KEY_LENGTH, 256).
+-define(MAX_REDIRECTS, 32).
 
 %% @doc Ensure that a value is loaded from the cache if it is an ID or a link.
 %% If it is not loadable we raise an error. If the value is a message, we will
@@ -64,72 +86,25 @@ ensure_loaded(Ref, {link, ID, LinkOpts = #{ <<"execution-input">> := true }}, Op
             {link, ID, maps:remove(<<"execution-input">>, LinkOpts)}, Opts),
         Opts
     );
-ensure_loaded(Ref,
-        Lk = {link, ID, LkOpts = #{ <<"type">> := <<"link">>, <<"lazy">> := Lazy }},
-        RawOpts) ->
-    % The link is to a submessage; either in lazy (unresolved) form, or direct
-    % form.
-    Opts = link_opts(LkOpts, RawOpts),
-    _Store = hb_opts:get(store, no_viable_store, Opts),
-    ?event_debug(debug_cache,
-        {loading_multi_link,
-            {link, ID},
-            {link_opts, LkOpts},
-            {store, _Store}
-        }
-    ),
-    CacheReadResult = 
-        case hb_opts:get(commitment, undefined, Opts) of
-            true ->
-                do_read_commitment(ID, hb_util:deep_merge(Opts, LkOpts, Opts));
-            _ ->
-                hb_cache:read(ID, hb_util:deep_merge(Opts, LkOpts, Opts))
-        end,
-    case CacheReadResult of
-        {ok, Next} ->
-            ?event_debug(debug_cache,
-                {loaded,
-                    {link, ID},
-                    {store, _Store}
-                }),
-            case Lazy of
-                true ->
-                    % We have resolved the ID of the submessage, so we continue
-                    % to load the submessage itself.
-                    ensure_loaded(
-                        {link,
-                            Next,
-                            #{
-                                <<"type">> => <<"link">>,
-                                <<"lazy">> => false,
-                                <<"store">> =>
-                                    lists:flatten([
-                                        hb_opts:get(store, [], Opts),
-                                        hb_opts:get(store, [], RawOpts)
-                                    ])
-                            }
-                        },
-                        RawOpts
-                    );
-                false ->
-                    % The already had the ID of the submessage, so now we have
-                    % the data, we simply return it.
-                    Next
-            end;
-        {error, not_found} ->
-            report_ensure_loaded_not_found(Ref, Lk, Opts);
-        {error, Reason} -> erlang:error(Reason)
-    end;
 ensure_loaded(Ref, Link = {link, ID, LinkOpts = #{ <<"lazy">> := true }}, RawOpts) ->
     % If the user provided their own options, we merge them and _overwrite_
-    % the options that are already set in the link.
+    % the options that are already set in the link. We read the value from the
+    % stores named in the link first, then from the caller's stores.
     Opts = link_opts(LinkOpts, RawOpts),
-    CacheReadResult = 
-        case hb_opts:get(commitment, undefined, Opts) of
+    Stores =
+        lists:uniq(
+            lists:flatten([
+                hb_opts:get(store, [], Opts),
+                hb_opts:get(store, [], RawOpts)
+            ])
+        ),
+    Commitment = hb_opts:get(commitment, undefined, Opts),
+    CacheReadResult =
+        case Commitment of
             true ->
                 do_read_commitment(ID, Opts);
             _ ->
-                read(ID, Opts)
+                read(ID, Opts#{ <<"store">> => Stores })
         end,
     case CacheReadResult of
         {ok, LoadedMsg} ->
@@ -140,19 +115,39 @@ ensure_loaded(Ref, Link = {link, ID, LinkOpts = #{ <<"lazy">> := true }}, RawOpt
                     {link_opts, LinkOpts}
                 }
             ),
-            case hb_maps:get(<<"type">>, LinkOpts, undefined, Opts) of
+            case maps:get(<<"type">>, LinkOpts, undefined) of
+                % A value that is a link is loaded too, except in a commitment,
+                % which is read as it is stored.
+                undefined when Commitment =/= true ->
+                    case hb_link:decode(LoadedMsg) of
+                        {link, URI, _} ->
+                            ensure_loaded(
+                                Ref,
+                                {link, URI, #{ <<"store">> => Stores }},
+                                RawOpts
+                            );
+                        Value -> Value
+                    end;
                 undefined -> LoadedMsg;
-                Type -> hb_util:decode(Type, LoadedMsg)
+                Type -> structured_decode_value(Type, LoadedMsg, Opts)
             end;
         {error, not_found} ->
             report_ensure_loaded_not_found(Ref, Link, Opts);
         {error, Reason} -> erlang:error(Reason)
     end;
-ensure_loaded(Ref, {link, ID, LinkOpts}, Opts) ->
-	ensure_loaded(Ref, {link, ID, LinkOpts#{ <<"lazy">> => true}}, Opts);
+ensure_loaded(Ref, Link = {link, URI, LinkOpts}, RawOpts) ->
+    % The value is a link, so we read the message at its URI.
+    Opts = link_opts(LinkOpts, RawOpts),
+    case read(URI, Opts) of
+        {ok, Msg} -> Msg;
+        {error, not_found} -> report_ensure_loaded_not_found(Ref, Link, Opts);
+        {error, Reason} -> erlang:error(Reason)
+    end;
 ensure_loaded(_Ref, Msg, _Opts) when not ?IS_LINK(Msg) ->
     Msg.
 
+%% @doc Merge the options of a link over the caller's. A link that names stores
+%% is read from them first, and then from the caller's stores.
 link_opts(LinkOpts, RawOpts) ->
     Opts = hb_util:deep_merge(RawOpts, LinkOpts, RawOpts),
     case hb_opts:get(store, not_found, LinkOpts#{ <<"only">> => local }) of
@@ -161,7 +156,13 @@ link_opts(LinkOpts, RawOpts) ->
                 Opts,
                 hb_opts:get(scope, hb_opts:get(scope, local, RawOpts), LinkOpts)
             );
-        _ -> Opts
+        Store ->
+            Opts#{
+                <<"store">> =>
+                    lists:uniq(
+                        lists:flatten([Store, hb_opts:get(store, [], RawOpts)])
+                    )
+            }
     end.
 
 %% @doc Report that a value was not found in the cache. If a key is provided,
@@ -212,9 +213,23 @@ list(Path, Opts) when is_map(Opts) and not is_map_key(<<"store-module">>, Opts) 
 list(Path, Store) ->
     list(Path, Store, #{}).
 list(Path, Store, Opts) ->
-    case hb_store:list(Store, Path, Opts) of
+    PathBin = hb_path:to_binary(Path),
+    % List the path in the local stores first. The other stores are only asked
+    % if the local stores have no keys for it.
+    case list(PathBin, hb_store:scope(Store, local), Store, Opts) of
+        [] -> list(PathBin, remote_stores(Store), Store, Opts);
+        Names -> Names
+    end.
+list(PathBin, Stores, AllStores, Opts) ->
+    case hb_store:list(Stores, PathBin, Opts) of
         {ok, Names} -> Names;
-        _ -> []
+        _ ->
+            % If the path holds a link, we list the keys of the link's target.
+            case lookup(PathBin, PathBin, Stores, Opts, 0) of
+                {ok, _Target, Resolved, _} when Resolved =/= PathBin ->
+                    list(Resolved, AllStores, Opts);
+                _ -> []
+            end
     end.
 
 %% @doc Match a template message against the cache, returning a list of IDs
@@ -259,7 +274,7 @@ store_match(NormalizedSpec, Opts) ->
         maps:from_list([
             {
                 hb_escape:encode_path_component(Key),
-                store_match_value(Key, Value, Opts)
+                store_match_value(Value, Opts)
             }
         ||
             {Key, Value} <- maps:to_list(NormalizedSpec)
@@ -269,28 +284,37 @@ store_match(NormalizedSpec, Opts) ->
         ConvertedMatchSpec,
         Opts
     ) of
-        {ok, []} -> {error, not_found};
-        {ok, Matches} -> {ok, Matches};
+        {ok, Matches} ->
+            case lists:filtermap(fun match_id/1, Matches) of
+                [] -> {error, not_found};
+                IDs -> {ok, IDs}
+            end;
         _ -> {error, not_found}
     end.
 
-%% @doc Generate the path at which a binary value should be stored.
-generate_binary_path(Bin, Opts) ->
-    Hashpath = hb_path:hashpath(Bin, Opts),
-    <<"data/", Hashpath/binary>>.
+%% @doc Find the message ID in a path that a store match returns. A top-level
+%% key is itself the ID, and a path under `<ID>/commitments/' gives the ID of
+%% the commitment. Any other path does not name a message.
+match_id(Path) ->
+    case binary:split(Path, <<"/">>, [global]) of
+        [ID] -> {true, ID};
+        [_ID, <<"commitments">>, CommitmentID] -> {true, CommitmentID};
+        _ -> false
+    end.
 
-%% @doc Write a message to the cache. For raw binaries, we write the data at
-%% the hashpath of the data (by default the SHA2-256 hash of the data). We link
-%% the unattended ID's hashpath for the keys (including `/commitments') on the
-%% message to the underlying data and recurse. We then link each commitment ID
-%% to the uncommitted message, such that any of the committed or uncommitted IDs
-%% can be read, and once in memory all of the commitments are available. For
-%% deep messages, the commitments will also be read, such that the ID of the
-%% outer message (which does not include its commitments) will be built upon
-%% the commitments of the inner messages. We do not, however, store the IDs from
-%% commitments on signed _inner_ messages. We may wish to revisit this.
-%% Commitments over different keys are written as separate messages, and the
-%% ID of the one with the most keys is returned.
+%% @doc Generate the path at which a binary value should be stored: its `ni:'
+%% name, as one path component.
+generate_binary_path(Bin, Opts) ->
+    hb_escape:encode_path_component(?NI_URI(hb_path:hashpath(Bin, Opts))).
+
+%% @doc Write a message to the cache. For raw binaries, we write the data under
+%% its `ni:' name, which holds the SHA2-256 hash of the data. For messages, we
+%% write each key under the unsigned ID of the message (see `key_ops/3'). We
+%% then write `ao:' and the unsigned ID at each of the message's other IDs,
+%% such that any of the committed or uncommitted IDs can be read, and once in
+%% memory all of the commitments are available. Commitments over different
+%% keys are written as separate messages, and the ID of the one with the most
+%% keys is returned.
 write(RawMsg, Opts) when is_map(RawMsg) ->
     lists:last(
         [
@@ -384,24 +408,17 @@ link_prepared(Msg, Opts) ->
 link_prepared(true, Child, Opts) when is_map(Child) orelse is_list(Child) ->
     write_prepared(Child, Child, Opts),
     ID = hb_message:id(Child, all, Opts#{ <<"linkify-mode">> => discard }),
-    {link, ID, #{ <<"type">> => <<"link">>, <<"lazy">> => false }};
+    {link, <<"ao:", ID/binary>>, #{}};
 link_prepared(_Prepared, Child, _Opts) -> Child.
 
 %% @doc Prepare a message to be written: prepare each child, except those under
 %% private keys, and each commitment message, then remove the commitments that
 %% do not verify. If commitments remain and do not commit every key that is not
 %% private, keep only the keys they commit, and again remove the commitments
-%% that do not verify over those keys. A key present both as a literal and as
-%% a `+link' is refused: `k+link' is only the link form of `k'. A message with
-%% an empty key is refused.
+%% that do not verify over those keys. A message with an empty key is refused.
 prepare_write(Msg, Opts) when is_map(Msg) ->
     Deep = maps:map(
         fun
-            (Key, _Value)
-                    when is_binary(Key), byte_size(Key) >= 5,
-                         binary_part(Key, byte_size(Key) - 5, 5) =:= <<"+link">>,
-                         is_map_key(binary_part(Key, 0, byte_size(Key) - 5), Msg) ->
-                throw({duplicated_key_cache_write, Key});
             % The empty key names no key, and its store path is the parent's own.
             (Key, _Value) when Key =:= <<>> ->
                 throw({invalid_key, Key});
@@ -443,11 +460,10 @@ do_write_message(List, Store, Opts) when is_list(List) ->
     );
 do_write_message(Msg, Store, Opts) when is_map(Msg) ->
     {ok, UncommittedID, Ops} = write_message_ops(Msg, Opts),
-    % Check the key of every write and link before any reaches the store: a
-    % store that fails one key leaves the message stored without it.
+    % Check the length of every key before we write any of them. A store that
+    % fails to write one key would leave the message stored without it.
     lists:foreach(
         fun({write, Path, _Value}) -> check_key_length(Path);
-           ({link, New, _Existing}) -> check_key_length(New);
            (_) -> ok
         end,
         Ops
@@ -463,20 +479,11 @@ check_key_length(Key) when byte_size(Key) > ?MAX_KEY_LENGTH ->
 check_key_length(_Key) ->
     ok.
 
-write_message_ops(Bin, Opts) when is_binary(Bin) ->
-    Path = generate_binary_path(Bin, Opts),
-    {ok, Path, [{write, Path, Bin}]};
-write_message_ops(List, Opts) when is_list(List) ->
-    write_message_ops(
-        hb_message:convert(List, tabm, <<"structured@1.0">>, Opts),
-        Opts
-    );
 write_message_ops(Msg, Opts) when is_map(Msg) ->
     ?event_debug(debug_cache, {writing_message, Msg}),
     UncommittedID =
         hb_message:id(Msg, none, Opts#{ <<"linkify-mode">> => discard }),
     {SignedIDs, UnsignedIDs, AllID} = calculate_all_ids(Msg, UncommittedID, Opts),
-    MsgHashpathAlg = hb_path:hashpath_alg(Msg, Opts),
     ?event_debug(debug_cache,
         {writing_message,
             {id, UncommittedID},
@@ -486,19 +493,12 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
             {original, Msg}
         }
     ),
-    KeyOps =
-        maps:fold(
-            fun(Key, Value, Acc) ->
-                write_key_ops(UncommittedID, Key, MsgHashpathAlg, Value, Opts, Acc)
-            end,
-            [{group, UncommittedID}],
-            maps:without([<<"priv">>], Msg)
-        ),
-    % Create an operation to link from the root ID the keys are replicated under
-    % to each of the known alternative IDs for the message (signed IDs, and
-    % _other_ non-root IDs). The combined 'all' ID of several signed
-    % commitments is the ID of none of them: the path that attaches them to the
-    % message is written at it.
+    KeyOps = key_ops(UncommittedID, maps:without([<<"priv">>], Msg), Opts),
+    % Create an operation to write `ao:' and the unsigned ID at each of the
+    % known alternative IDs for the message (signed IDs, and _other_ non-root
+    % IDs). The combined 'all' ID of several signed commitments does not
+    % identify any one of them, so we write an `ao://' path at it that reads
+    % the message with all of them (see `commitments_path/1').
     Ops =
         lists:foldl(
             fun(AltID, Acc) ->
@@ -508,7 +508,7 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
                         {committed_id, AltID}
                     }
                 ),
-                [{link, AltID, UncommittedID} | Acc]
+                [{write, AltID, <<"ao:", UncommittedID/binary>>} | Acc]
             end,
             [
                 {write, AllID, commitments_path(SignedIDs)}
@@ -525,6 +525,21 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
 commitments_path(IDs) ->
     iolist_to_binary([<<"ao://with-commitments=">> | lists:join(<<",">>, IDs)]).
 
+%% @doc Read the `ao://' path that is stored at an ID. A `with-commitments'
+%% path (see `is_commitments_path/1') is resolved by `ao@1.0' in the local
+%% stores only, giving the message with those commitments. In `raw' mode we
+%% return the path itself, because resolving it needs `message@1.0'. Any other
+%% `ao://' value at an ID is not found.
+read_commitments_path(AOPath, Opts) ->
+    case hb_opts:get(cache_read_mode, normal, Opts) of
+        raw -> {ok, AOPath};
+        _ ->
+            case is_commitments_path(AOPath) of
+                true -> hb_uri:from(AOPath, hb_store:scope(Opts, local));
+                false -> {error, not_found}
+            end
+    end.
+
 %% @doc Whether a value at an ID is `ao://with-commitments=' followed by only
 %% base64url characters and commas: a path that resolves `with-commitments' on
 %% the empty message, and nothing else.
@@ -533,98 +548,125 @@ is_commitments_path(<<"ao://with-commitments=", List/binary>>) ->
 is_commitments_path(_Value) ->
     false.
 
-write_key_ops(Base, <<"commitments">>, _HPAlg, RawCommitments, Opts, Acc) ->
+%% @doc Generate the write operations for a message's keys under a path. A
+%% message with no keys is written as an empty `ao-types' key, so that the
+%% path can still be read.
+key_ops(Path, Msg, Opts) ->
+    case maps:fold(
+        fun(Key, Value, Acc) -> write_key_ops(Path, Key, Value, Opts, Acc) end,
+        [],
+        Msg
+    ) of
+        [] -> [{write, <<Path/binary, "/ao-types">>, <<>>}];
+        KeyOps -> KeyOps
+    end.
+
+%% @doc Add the write operations for one key of a message to the accumulator.
+%% The keys of each commitment are written under `<Path>/commitments/<ID>',
+%% and a list is written as a message. Any other value is written at the key's
+%% path by `value_ops/4'.
+write_key_ops(Path, <<"commitments">>, RawCommitments, Opts, Acc) ->
     Commitments = prepare_commitments(RawCommitments, Opts),
-    CommitmentsBase = commitment_path(Base, Opts),
-    ?event(
-        {writing_commitments,
-            {base, Base},
-            {commitments_message, Commitments},
-            {commitments_base, CommitmentsBase}
-        }
-    ),
-    Acc1 = [{group, CommitmentsBase} | Acc],
-    Acc2 =
-        maps:fold(
-            fun(BaseCommID, Commitment, InnerAcc) ->
-                ?event_debug(debug_cache, {writing_commitment, {commitment, Commitment}}),
-                {ok, CommMsgID, CommOps} = write_message_ops(Commitment, Opts),
-                [
-                    {link, <<CommitmentsBase/binary, "/", BaseCommID/binary>>, CommMsgID}
-                    | prepend_reversed(CommOps, InnerAcc)
-                ]
-            end,
-            Acc1,
-            Commitments
-        ),
-    [{link, <<Base/binary, "/commitments">>, CommitmentsBase} | Acc2];
-write_key_ops(Base, Key, HPAlg, Value, Opts, Acc) ->
-    KeyHashPath =
-        hb_path:hashpath(
-            Base,
-            hb_escape:encode_path_component(Key),
-            HPAlg,
-            Opts
-        ),
-    case is_immediate_value(Key, Value) of
-        true ->
-            [{write, KeyHashPath, encode_immediate_value(Value)} | Acc];
+    ?event({writing_commitments, {path, Path}, {commitments, Commitments}}),
+    maps:fold(
+        fun(CommID, Commitment, InnerAcc) ->
+            prepend_reversed(
+                key_ops(
+                    <<Path/binary, "/commitments/", CommID/binary>>,
+                    Commitment,
+                    Opts
+                ),
+                InnerAcc
+            )
+        end,
+        Acc,
+        Commitments
+    );
+write_key_ops(Path, Key, Value, Opts, Acc) when is_list(Value) ->
+    write_key_ops(
+        Path,
+        Key,
+        hb_message:convert(Value, tabm, <<"structured@1.0">>, Opts),
+        Opts,
+        Acc
+    );
+write_key_ops(Path, Key, Value, Opts, Acc) ->
+    value_ops(
+        <<Path/binary, "/", (hb_escape:encode_path_component(Key))/binary>>,
+        Value,
+        Opts,
+        Acc
+    ).
+
+%% @doc Add the write operations for a value at a key's path. A nested message
+%% has its keys written under the path. A binary of `?DIRECT_VALUE_LENGTH'
+%% bytes or more is written under its `ni:' name, and the path holds the name.
+%% A shorter binary is written at the path itself, encoded by `encode_value/1'.
+value_ops(KeyPath, Value, Opts, Acc) when is_map(Value) ->
+    prepend_reversed(key_ops(KeyPath, Value, Opts), Acc);
+value_ops(KeyPath, Value, Opts, Acc) ->
+    case is_immediate_value(Value) of
+        true -> [{write, KeyPath, encode_value(Value)} | Acc];
         false ->
-            {ok, Path, ValueOps} = write_message_ops(Value, Opts),
+            Name = ?NI_URI(hb_path:hashpath(Value, Opts)),
             [
-                {link, KeyHashPath, Path}
-                | prepend_reversed(ValueOps, Acc)
+                {write, KeyPath, Name},
+                {write, hb_escape:encode_path_component(Name), Value}
+                | Acc
             ]
     end.
 
-%% @doc True when `Value' should be stored at `Key''s path instead of linked
-%% through `data/'.
-is_immediate_value(Key, Value) ->
-    is_binary(Value) andalso
-        byte_size(Value) < ?DIRECT_VALUE_LENGTH andalso
-        not hb_link:is_link_key(Key).
+%% @doc Return whether a value is a binary that is short enough to be written
+%% at its key's path. Longer binaries are written under their `ni:' name.
+is_immediate_value(Value) ->
+    is_binary(Value) andalso byte_size(Value) < ?DIRECT_VALUE_LENGTH.
 
-%% @doc Encode an immediate value so it cannot be confused with cache markers.
-%% Most values are stored unchanged. Literal marker-looking values get a single
-%% `raw:' prefix, so decoding removes exactly one layer and preserves literal
-%% values that start with `link:' or `raw:'.
-encode_immediate_value(<<"group">>) -> <<"raw:group">>;
-encode_immediate_value(<<"link:", _/binary>> = Value) -> <<"raw:", Value/binary>>;
-encode_immediate_value(<<"raw:", _/binary>> = Value) -> <<"raw:", Value/binary>>;
-encode_immediate_value(Value) -> Value.
+%% @doc Encode a binary to be written at a key's path. Most binaries are
+%% written unchanged. A binary that starts with `ni:' or `data:' would be read
+%% back as a `ni:' name or as an encoded value, so we write it as a `data:,'
+%% URI of the binary, escaped by `hb_escape:encode/1'. The gateway and remote
+%% node stores encode the binaries that they return in the same way.
+encode_value(Value = <<"ni:", _/binary>>) -> data_uri(Value);
+encode_value(Value = <<"data:", _/binary>>) -> data_uri(Value);
+encode_value(Value) -> Value.
 
-%% @doc Decode a value read from a message key path. Linked payloads under
-%% `data/' are not immediate values, so leave them byte-for-byte intact.
-decode_immediate_value(<<"data/", _/binary>>, Value) -> Value;
-decode_immediate_value(_Path, <<"raw:", Value/binary>>) -> Value;
-decode_immediate_value(_Path, Value) -> Value.
+data_uri(Value) -> <<"data:,", (hb_escape:encode(Value))/binary>>.
 
-store_match_value(Key, Bin, Opts) when is_binary(Bin) ->
-    case is_immediate_value(Key, Bin) of
-        true -> encode_immediate_value(Bin);
-        false -> <<"link:", (generate_binary_path(Bin, Opts))/binary>>
+%% @doc Decode a value read at a key's path. A `data:,' URI is decoded to the
+%% binary that it holds, and one that is not percent-encoded is refused. Any
+%% other value is returned as it is.
+decode_value(<<"data:,", Value/binary>>) ->
+    case re:run(Value, <<"%(?![0-9a-fA-F]{2})">>, [{capture, none}]) of
+        match -> throw({'invalid-data-uri', Value});
+        nomatch -> hb_escape:decode(Value)
     end;
-store_match_value(_Key, Map, Opts) when is_map(Map) ->
-    <<"link:",
+decode_value(Value) -> Value.
+
+store_match_value(Bin, Opts) when is_binary(Bin) ->
+    case is_immediate_value(Bin) of
+        true -> encode_value(Bin);
+        false -> ?NI_URI(hb_path:hashpath(Bin, Opts))
+    end;
+store_match_value(Map, Opts) when is_map(Map) ->
+    <<"ao:",
         (hb_message:id(
             Map,
-            none,
+            all,
             Opts#{ <<"linkify-mode">> => discard }
         ))/binary
     >>;
-store_match_value(Key, List, Opts) when is_list(List) ->
+store_match_value(List, Opts) when is_list(List) ->
     case io_lib:printable_unicode_list(List) of
         true ->
-            store_match_value(Key, iolist_to_binary(List), Opts);
+            store_match_value(iolist_to_binary(List), Opts);
         false ->
             store_match_value(
-                Key,
                 hb_message:convert(List, tabm, <<"structured@1.0">>, Opts),
                 Opts
             )
     end;
-store_match_value(Key, Other, Opts) ->
-    store_match_value(Key, hb_path:to_binary(Other), Opts).
+store_match_value(Other, Opts) ->
+    store_match_value(hb_path:to_binary(Other), Opts).
 
 prepend_reversed(Ops, Acc) ->
     lists:foldl(fun(Op, InnerAcc) -> [Op | InnerAcc] end, Acc, Ops).
@@ -661,53 +703,33 @@ flush_write_ops(_Store, [], _Opts) ->
 flush_write_ops(Store, Pending, Opts) ->
     apply_write_ops(Store, lists:reverse(Pending), Opts).
 
-%% @doc Apply a list of write/group/link operations through the store's existing
-%% interfaces, collapsing a message's per-key store round-trips into a small
-%% constant number of calls: the group markers, then all values in a single
-%% `write' map, then all links in a single `link' map. Links stay links -- the
-%% store decides how to represent them -- so this is store-agnostic.
+%% @doc Apply a list of write operations in one store `write'.
 apply_write_ops(Store, Ops, Opts) ->
-    {Groups, Writes, Links} =
-        lists:foldl(
-            fun({group, Path}, {Gs, Ws, Ls}) ->
-                    {[Path | Gs], Ws, Ls};
-               ({write, Path, Value}, {Gs, Ws, Ls}) ->
-                    {Gs, Ws#{ Path => Value }, Ls};
-               ({link, New, Existing}, {Gs, Ws, Ls}) ->
-                    {Gs, Ws, Ls#{ New => Existing }}
-            end,
-            {[], #{}, #{}},
-            Ops
-        ),
-    lists:foreach(
-        fun(Group) -> hb_store:group(Store, Group, Opts) end,
-        lists:reverse(Groups)
+    hb_store:write(
+        Store,
+        maps:from_list([{Path, Value} || {write, Path, Value} <- Ops]),
+        Opts
     ),
-    case map_size(Writes) of
-        0 -> ok;
-        _ -> hb_store:write(Store, Writes, Opts)
-    end,
-    case map_size(Links) of
-        0 -> ok;
-        _ -> hb_store:link(Store, Links, Opts)
-    end,
     ok.
 
 %% @doc The `structured@1.0` encoder does not typically encode `commitments`,
 %% subsequently, when we encounter a commitments message we prepare its contents
-%% separately, then write each to the store.
+%% separately, then write each to the store. A commitment does not contain
+%% links, so we convert it with `bundle' set, keeping its nested values in its
+%% TABM.
 prepare_commitments(RawCommitments, Opts) ->
     Commitments = ensure_all_loaded(RawCommitments, Opts),
     maps:map(
         fun(_, StructuredCommitment) ->
-            hb_message:convert(StructuredCommitment, tabm, Opts)
+            hb_message:convert(
+                StructuredCommitment,
+                tabm,
+                #{ <<"device">> => <<"structured@1.0">>, <<"bundle">> => true },
+                Opts
+            )
         end,
         Commitments
     ).
-
-%% @doc Generate the commitment path for a given base path.
-commitment_path(Base, Opts) ->
-    hb_path:hashpath(<<Base/binary, "/commitments">>, Opts).
 
 %% @doc Calculate the IDs for a message.
 calculate_all_ids(Bin, _UncommittedID, _Opts) when is_binary(Bin) -> [];
@@ -742,15 +764,27 @@ calculate_all_ids(Msg, UncommittedID, Opts) ->
     end.
 
 %% @doc Read the message at a path. Returns in `structured@1.0' format: Either
-%% a richly typed map or a direct binary. If `cache-read-mode' is `raw',
-%% composite reads return lazy links without decoding `ao-types'. An ID that
-%% holds an `ao://' path for which `is_commitments_path/1' is true reads as the
-%% result of the path, resolved against the local stores alone; in `raw' mode
-%% it reads as the stored path, as resolving it needs `message@1.0'. Any other
-%% `ao://' value at an ID is not found.
-read(Path, Opts) when ?IS_HASHPATH(Path) ->
-    hb_hashpath:load(Path, Opts);
+%% a richly typed map or a direct binary. A URI is read by the device of its
+%% scheme (`hb_uri'), except a `ni:' name, under which the stores hold a
+%% binary (`write/2'), and `ao:<ID>', which is read as the ID: `ao@1.0' reads
+%% it so, and a link then loads without a resolution. If `cache-read-mode' is
+%% `raw', composite reads return lazy links without decoding `ao-types'. We
+%% follow the `ao:' and `ni:' references that the cache writes (see
+%% `lookup/5'). An ID that holds an `ao://' path is read by
+%% `read_commitments_path/2'.
+read(<<"ni:", _/binary>> = Name, Opts) ->
+    do_read(Name, Opts);
+read(ID, Opts) when ?IS_ID(ID) ->
+    % An ID has no scheme, so it is read without looking for one.
+    do_read(ID, Opts);
+read(<<"ao:", ID/binary>>, Opts) when ?IS_ID(ID) ->
+    do_read(ID, Opts);
 read(Path, Opts) ->
+    case hb_uri:scheme(Path) of
+        {error, not_found} -> do_read(Path, Opts);
+        _ -> hb_uri:from(Path, Opts)
+    end.
+do_read(Path, Opts) ->
     Store = hb_opts:get(store, no_viable_store, Opts),
     case {
         store_read(Path, Store, Opts),
@@ -758,11 +792,6 @@ read(Path, Opts) ->
     } of
         {{ok, Res}, raw} ->
             {ok, Res};
-        {{ok, AOPath = <<"ao://", Singleton/binary>>}, _} when ?IS_ID(Path) ->
-            case is_commitments_path(AOPath) of
-                true -> hb_ao:raw(Singleton, hb_store:scope(Opts, local));
-                false -> {error, not_found}
-            end;
         {{ok, Res}, _} ->
             hb_message:paranoid_verify(cache_read, Res, Opts),
             {ok, Res};
@@ -770,8 +799,14 @@ read(Path, Opts) ->
             Other
     end.
 
+%% @doc Read a commitment from the store. The values in a commitment are not
+%% links, so they are returned as they are stored.
 do_read_commitment(Path, Opts) ->
-    store_read(Path, hb_opts:get(store, no_viable_store, Opts), Opts).
+    store_read(
+        Path,
+        hb_opts:get(store, no_viable_store, Opts),
+        Opts#{ <<"commitment">> => true }
+    ).
 
 %% @doc Load all of the commitments for a message into memory.
 read_all_commitments(Msg, Opts) ->
@@ -817,101 +852,215 @@ read_all_commitments(Msg, Opts) ->
             maps:from_list(FoundCommitments)
         ),
     Msg#{ <<"commitments">> => NewCommitments }.
-%% @doc List all of the subpaths of a given path and return a map of keys and
-%% links to the subpaths, including their types.
+
+%% @doc Read a path from a store, returning its value, or the message of the
+%% keys under it. The references that the cache writes as values are followed
+%% by `lookup/5'.
 store_read(Path, Store, Opts) ->
     store_read(Path, Path, Store, Opts).
 store_read(_Target, _Path, no_viable_store, _) ->
     {error, not_found};
-store_read(Target, <<"data/", _/binary>> = PathBin, Store, Opts) ->
-    read_resolved_path(Target, PathBin, Store, Opts);
+store_read(Target, <<"ni:///", _/binary>> = Name, Store, Opts) ->
+    % A `ni:' name is stored as one escaped path component.
+    store_read(Target, hb_escape:encode_path_component(Name), Store, Opts);
 store_read(Target, Path, Store, Opts) ->
-    PathBin = hb_path:to_binary(Path),
-    case hb_store:resolve(Store, PathBin, Opts) of
-        {ok, ResolvedFullPath} ->
-            ?event_debug({reading,
-                {original_path, {string, PathBin}},
-                {fully_resolved_path, ResolvedFullPath},
-                {store, Store}
-            }),
-            read_resolved_path(Target, ResolvedFullPath, Store, Opts);
-        {error, _} = Error ->
-            Error;
-        {failure, _} = Failure ->
-            Failure
+    case lookup(Target, hb_path:to_binary(Path), Store, Opts, 0) of
+        {ok, _ReadTarget, <<"ni:", _/binary>>, {ok, Bin}} ->
+            % The value under a `ni:' name is the binary itself, so we do not
+            % decode it.
+            {ok, Bin};
+        {ok, _ReadTarget, ID, {ok, AOPath = <<"ao://", _/binary>>}}
+                when ?IS_ID(ID) ->
+            read_commitments_path(AOPath, Opts);
+        {ok, _ReadTarget, _ResolvedFullPath, {ok, Value}} ->
+            {ok, decode_value(Value)};
+        {ok, ReadTarget, ResolvedFullPath, {composite, Children}} ->
+            ?event_debug({reading_composite, ResolvedFullPath}),
+            {ok,
+                read_message(
+                    ReadTarget,
+                    ResolvedFullPath,
+                    Children,
+                    Store,
+                    Opts
+                )
+            };
+        Error ->
+            Error
     end.
 
-%% @doc Read a path whose intermediate links are already resolved, skipping the
-%% redundant per-segment `hb_store:resolve' round-trip.
-read_resolved_path(_Target, _Path, no_viable_store, _) ->
-    {error, not_found};
-read_resolved_path(Target, ResolvedFullPath, Store, Opts) ->
-    case hb_store:read(Store, ResolvedFullPath, Opts) of
-        {ok, Bin} ->
-            ?event_debug({reading_data, ResolvedFullPath}),
-            {ok, decode_immediate_value(ResolvedFullPath, Bin)};
-        {composite, Children} ->
-            ?event_debug({reading_composite, ResolvedFullPath}),
-            Subpaths =
-                [
-                    hb_util:bin(child_name(Child))
-                ||
-                    Child <- Children
-                ],
-            ?event(
-                {listed,
-                    {original_path, Target},
-                    {subpaths, {explicit, Subpaths}}
-                }
-            ),
-            Msg =
-                case hb_opts:get(cache_read_mode, normal, Opts) of
-                    raw ->
-                        maps:from_list(
-                            [
-                                {
-                                    hb_escape:decode_path_component(Subpath),
-                                    {link,
-                                        hb_path:to_binary([ResolvedFullPath, Subpath]),
-                                        #{ <<"lazy">> => true, <<"store">> => Store }
-                                    }
-                                }
-                            ||
-                                Subpath <- Subpaths,
-                                Subpath =/= <<"ao-types">>
-                            ]
-                        );
-                    _ ->
-                        Values =
-                            maps:from_list([
-                                {hb_util:bin(Subpath), Value}
-                            ||
-                                {Subpath, Value} <- Children
-                            ]),
-                        prepare_typed_values(
-                            Target,
-                            ResolvedFullPath,
-                            Subpaths,
-                            Values,
-                            Store,
-                            Opts
-                        )
-                end,
-            ?event(
-                {completed_read,
-                    {resolved_path, ResolvedFullPath},
-                    {explicit, Msg}
-                }
-            ),
-            {ok, Msg};
-        {error, _} = Error ->
-            Error;
-        {failure, _} = Failure ->
-            Failure
+%% @doc Read a path, following the references that the cache writes as
+%% values. A `ni:' name is followed to the binary stored under it, and
+%% `ao:<ID>' to the message with that ID. The `ao:' values of `path' and
+%% `hashpath' keys, and those in a commitment, are not followed. We read from
+%% the local stores first. If they do not hold the path, but its first part is
+%% an ID that holds `ao:<ID>' in them, we read the path under that ID instead.
+%% Only then do we ask the other stores for the path. A chain of more than
+%% `?MAX_REDIRECTS' references is refused. Returns the ID that selects the
+%% commitment of a message, the path read, and the store's result for it.
+lookup(_Target, _Path, _Store, _Opts, Depth) when Depth > ?MAX_REDIRECTS ->
+    {error, 'too-many-links'};
+lookup(Target, Path = <<"ni:", _/binary>>, Store, Opts, _Depth) ->
+    Result =
+        case hb_store:read(hb_store:scope(Store, local), Path, Opts) of
+            {ok, Bin} -> {ok, Bin};
+            _ -> hb_store:read(remote_stores(Store), Path, Opts)
+        end,
+    lookup_result(Target, Path, Result);
+lookup(Target, Path, Store, Opts, Depth) ->
+    Local = hb_store:scope(Store, local),
+    case hb_store:read(Local, Path, Opts) of
+        {ok, _} = Found ->
+            follow(Target, Path, Found, Store, Opts, Depth);
+        {composite, _} = Found ->
+            follow(Target, Path, Found, Store, Opts, Depth);
+        _ ->
+            case alias(Path, Local, Opts) of
+                {ok, Aliased} ->
+                    lookup(Target, Aliased, Store, Opts, Depth + 1);
+                {error, not_found} ->
+                    follow(
+                        Target,
+                        Path,
+                        hb_store:read(remote_stores(Store), Path, Opts),
+                        Store,
+                        Opts,
+                        Depth
+                    )
+            end
     end.
+
+%% @doc Return the stores in a list that are not local, in their order.
+remote_stores(Store) ->
+    hb_store:filter(Store, fun(Scope, _) -> Scope =/= local end).
+
+%% @doc Follow a value read at a path. A `ni:' name is followed to the binary
+%% stored under it, and `ao:<ID>' to the message with that ID, if
+%% `follows_links/2' allows it. Any other value is returned for the path.
+follow(Target, _Path, {ok, Name = <<"ni:", _/binary>>}, Store, Opts, Depth) ->
+    lookup(
+        Target,
+        hb_escape:encode_path_component(Name),
+        Store,
+        Opts,
+        Depth + 1
+    );
+follow(Target, Path, {ok, Link = <<"ao:", ID/binary>>}, Store, Opts, Depth) ->
+    case ?IS_ID(ID) andalso follows_links(Path, Opts) of
+        true -> lookup(link_target(Target, ID), ID, Store, Opts, Depth + 1);
+        false -> {ok, Target, Path, {ok, Link}}
+    end;
+follow(Target, Path, Result, _Store, _Opts, _Depth) ->
+    lookup_result(Target, Path, Result).
+
+%% @doc Return the store's answer for the path that a lookup ends at. Errors
+%% are returned unchanged.
+lookup_result(Target, Path, Result = {ok, _}) ->
+    {ok, Target, Path, Result};
+lookup_result(Target, Path, Result = {composite, _}) ->
+    {ok, Target, Path, Result};
+lookup_result(_Target, _Path, Error) ->
+    Error.
+
+%% @doc Return whether an `ao:' value at a path should be followed as a link.
+%% It is not followed in a commitment, in a value that is read as it is stored
+%% (the `commitment' option), or as the value of `path' or `hashpath'.
+follows_links(Path, Opts) ->
+    hb_opts:get(commitment, undefined, Opts) =/= true andalso
+        not lists:member(
+            lists:last(binary:split(Path, <<"/">>, [global])),
+            ?AO_CORE_KEYS
+        ).
+
+%% @doc Choose the ID that selects the commitment of a message read through a
+%% link. If the path that was asked for is an ID, we use it. Otherwise, we use
+%% the ID that the link names.
+link_target(Target, ID) ->
+    case ?IS_ID(Target) of
+        true -> Target;
+        false -> ID
+    end.
+
+%% @doc Rewrite a path whose first part is an ID that holds `ao:<ID>', such
+%% that the rest of the path is read under the ID in that value. An ID with
+%% keys below it holds a message, so it is not an alias. We read an ID for its
+%% `ao:' value only if it has no keys.
+alias(Path, Store, Opts) ->
+    case binary:split(Path, <<"/">>) of
+        [First, Rest] when ?IS_ID(First) ->
+            OneKey = #{ <<"list">> => First, <<"limit">> => 1 },
+            case hb_store:list(Store, OneKey, Opts) of
+                {ok, [_ | _]} -> {error, not_found};
+                _ -> alias_path(hb_store:read(Store, First, Opts), Rest)
+            end;
+        _ ->
+            {error, not_found}
+    end.
+
+%% @doc Join the rest of a path to the ID of an `ao:<ID>' value that was read.
+alias_path({ok, <<"ao:", ID/binary>>}, Rest) when ?IS_ID(ID) ->
+    {ok, <<ID/binary, "/", Rest/binary>>};
+alias_path(_Read, _Rest) ->
+    {error, not_found}.
+
+%% @doc Read the message under a path from the store's listing of its
+%% children.
+read_message(Target, ResolvedFullPath, Children, Store, Opts) ->
+    Subpaths =
+        [
+            hb_util:bin(child_name(Child))
+        ||
+            Child <- Children
+        ],
+    ?event(
+        {listed,
+            {original_path, Target},
+            {subpaths, {explicit, Subpaths}}
+        }
+    ),
+    Msg =
+        case hb_opts:get(cache_read_mode, normal, Opts) of
+            raw ->
+                maps:from_list(
+                    [
+                        {
+                            hb_escape:decode_path_component(Subpath),
+                            {link,
+                                hb_path:to_binary([ResolvedFullPath, Subpath]),
+                                #{ <<"lazy">> => true, <<"store">> => Store }
+                            }
+                        }
+                    ||
+                        Subpath <- Subpaths,
+                        Subpath =/= <<"ao-types">>
+                    ]
+                );
+            _ ->
+                Values =
+                    maps:from_list([
+                        {hb_util:bin(Subpath), Value}
+                    ||
+                        {Subpath, Value} <- Children
+                    ]),
+                prepare_typed_values(
+                    Target,
+                    ResolvedFullPath,
+                    Subpaths,
+                    Values,
+                    Store,
+                    Opts
+                )
+        end,
+    ?event(
+        {completed_read,
+            {resolved_path, ResolvedFullPath},
+            {explicit, Msg}
+        }
+    ),
+    Msg.
 
 %% @doc Normalize a composite child entry to its subpath name, dropping any
-%% inline value the prefix read supplied alongside it.
+%% inline value the read supplied alongside it.
 child_name({Subpath, _Value}) -> Subpath;
 child_name(Subpath) -> Subpath.
 
@@ -923,25 +1072,12 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
         maps:from_list(lists:filtermap(
             fun(<<"ao-types">>) -> false;
                 (<<"commitments">>) ->
-                    % List the commitments for this message, and load them into
-                    % memory. If there no commitments at the path, we exclude
-                    % commitments from the list of links. The `commitments' key is
-                    % itself a link to the hashpath-addressed commitments group.
-                    % The composite read already returned that link inline, so
-                    % when it is present we address the commitment straight from
-                    % the resolved group, skipping the redundant re-reads of
-                    % `RootPath' and `RootPath/commitments' that the scan just
-                    % materialised. Only when the inline value is absent (or is
-                    % not the usual link) do we fall back to resolving the full
-                    % `RootPath/commitments/Target' path from scratch.
+                    % If the message has the commitment that the target ID
+                    % names, we read it into memory. Otherwise, the message is
+                    % read without commitments.
                     CommPath =
-                        case maps:get(<<"commitments">>, Values, none) of
-                            <<"link:", CommGroup/binary>> when byte_size(CommGroup) > 0 ->
-                                hb_path:to_binary([CommGroup, Target]);
-                            _ ->
-                                hb_path:to_binary(
-                                    [RootPath, <<"commitments">>, Target])
-                        end,
+                        hb_path:to_binary(
+                            [RootPath, <<"commitments">>, Target]),
                     ?event(read_commitment,
                         {reading_commitment,
                             {target, Target},
@@ -982,58 +1118,39 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
                     ),
                     SubkeyPath = hb_path:to_binary([RootPath, Subpath]),
                     Key = hb_escape:decode_path_component(Subpath),
-                    case hb_link:is_link_key(Key) of
-                        false ->
-                            % The key is a literal value, not a nested composite
-                            % message. Subsequently, we return a resolvable link
-                            % to the subpath, leaving the key as-is.
-                            LinkOpts =
-                                (case Types of
-                                    #{ Key := Type } ->
-                                        % We have an `ao-types' entry for the
-                                        % subpath, so the link carries its type
-                                        % and resolves lazily to the final value.
-                                        #{
-                                            <<"type">> => Type,
-                                            <<"lazy">> => true
-                                        };
-                                    _ ->
-                                        % No `ao-types' entry: the subpath is a
-                                        % literal value, resolved lazily.
-                                        #{
-                                            <<"lazy">> => true
-                                        }
-                                end)#{ <<"store">> => Store },
-                            PreparedValue =
-                                case maps:get(Subpath, Values, none) of
-                                    <<"raw:", ImmediateValue/binary>> ->
-                                        apply_type_to_immediate(ImmediateValue, LinkOpts);
-                                    <<"link:", Path/binary>> ->
-                                        {link, Path, LinkOpts};
-                                    ImmediateValue when is_binary(ImmediateValue) ->
-                                        apply_type_to_immediate(ImmediateValue, LinkOpts);
-                                    _ ->
-                                        {link, SubkeyPath, LinkOpts}
-                                end,
-                            {true, {Key, PreparedValue}};
-                        true ->
-                            % The key is an encoded link, so we create a resolvable
-                            % link to the underlying link. This requires that we
-                            % dereference the link twice in order to get the final
-                            % value. Returning the data this way avoids having to
-                            % read each of the link keys themselves, which may be
-                            % a large quantity.
-                            {true,
-                                {
-                                    binary:part(Key, 0, byte_size(Key) - 5),
-                                    {link, SubkeyPath, #{
-                                        <<"type">> => <<"link">>,
-                                        <<"lazy">> => true,
-                                        <<"store">> => Store
-                                    }}
+                    % We return the value of the subpath, or a resolvable link
+                    % to it, leaving the key as-is.
+                    LinkOpts =
+                        (case Types of
+                            #{ Key := Type } ->
+                                % We have an `ao-types' entry for the
+                                % subpath, so the link carries its type
+                                % and resolves lazily to the final value.
+                                #{
+                                    <<"type">> => Type,
+                                    <<"lazy">> => true
+                                };
+                            _ ->
+                                % No `ao-types' entry: the subpath is a
+                                % literal value, resolved lazily.
+                                #{
+                                    <<"lazy">> => true
                                 }
-                            }
-                    end
+                        end)#{ <<"store">> => Store },
+                    PreparedValue =
+                        case maps:get(Subpath, Values, none) of
+                            Name = <<"ni:", _/binary>> ->
+                                {link, Name, LinkOpts};
+                            ImmediateValue when is_binary(ImmediateValue) ->
+                                apply_type_to_immediate(
+                                    decode_value(ImmediateValue),
+                                    LinkOpts,
+                                    Opts
+                                );
+                            _ ->
+                                {link, SubkeyPath, LinkOpts}
+                        end,
+                    {true, {Key, key_value(Key, PreparedValue, Store, Opts)}}
                 end,
             Subpaths
         )),
@@ -1050,13 +1167,34 @@ prepare_typed_values(Target, RootPath, Subpaths, Values, Store, Opts) ->
             end
     end.
 
-apply_type_to_immediate(Value, #{ <<"type">> := Type }) ->
-    hb_util:decode(Type, Value);
-apply_type_to_immediate(Value, _LinkOpts) ->
+%% @doc Prepare the value of a key in a message that was read from a store. If
+%% we are reading a commitment, the value is returned unchanged. The values of
+%% `path' and `hashpath' are AO-Core syntax, so we load them immediately and
+%% return them as they are stored. Any other value that starts with `ao:' is
+%% returned as a link that is loaded from the same store as the message.
+key_value(Key, Value, Store, Opts) ->
+    case hb_opts:get(commitment, undefined, Opts) of
+        true -> Value;
+        _ ->
+            case lists:member(Key, ?AO_CORE_KEYS) of
+                true -> ensure_loaded(Value, Opts#{ <<"commitment">> => true });
+                false when ?IS_LINK(Value) -> Value;
+                false ->
+                    case hb_link:decode(Value) of
+                        {link, URI, _} ->
+                            {link, URI, #{ <<"store">> => Store }};
+                        Literal -> Literal
+                    end
+            end
+    end.
+
+apply_type_to_immediate(Value, #{ <<"type">> := Type }, Opts) ->
+    structured_decode_value(Type, Value, Opts);
+apply_type_to_immediate(Value, _LinkOpts, _Opts) ->
     Value.
 
 %% @doc Read and parse the ao-types for a given path if it is in the supplied
-%% list of subpaths, returning a map of keys and their types. Prefix reads
+%% list of subpaths, returning a map of keys and their types. Composite reads
 %% already return small inline `ao-types' values, so reuse them when present.
 read_ao_types(Path, Subpaths, Values, Store, Opts) ->
     ?event_debug({reading_ao_types, {path, Path}, {subpaths, {explicit, Subpaths}}}),
@@ -1065,15 +1203,12 @@ read_ao_types(Path, Subpaths, Values, Store, Opts) ->
             TypesPath = hb_path:to_binary([Path, <<"ao-types">>]),
             TypesBin =
                 case Values of
-                    #{ <<"ao-types">> := <<"raw:", Direct/binary>> } -> Direct;
-                    #{ <<"ao-types">> := <<"link:", _/binary>> } ->
-                        {ok, Bin} = hb_store:read(Store, TypesPath, Opts),
-                        decode_immediate_value(TypesPath, Bin);
+                    #{ <<"ao-types">> := <<"ni:", _/binary>> } ->
+                        hb_util:ok(store_read(TypesPath, Store, Opts));
                     #{ <<"ao-types">> := Direct } when is_binary(Direct) ->
-                        Direct;
+                        decode_value(Direct);
                     _ ->
-                        {ok, Bin} = hb_store:read(Store, TypesPath, Opts),
-                        decode_immediate_value(TypesPath, Bin)
+                        hb_util:ok(store_read(TypesPath, Store, Opts))
                 end,
             Types = structured_decode_types(TypesBin, Opts),
             ?event_debug({parsed_ao_types, {types, Types}}),
@@ -1094,7 +1229,9 @@ types_to_implicit(Types) ->
         Types
     ).
 
-%% @doc Decode the `ao-types' field through the structured device.
+%% @doc Decode the `ao-types' field through the structured device. An empty
+%% value is the `ao-types' of a message with no keys, and holds no types.
+structured_decode_types(<<>>, _Opts) -> #{};
 structured_decode_types(Types, Opts) ->
     hb_util:ok(
         hb_ao:raw(
@@ -1102,6 +1239,18 @@ structured_decode_types(Types, Opts) ->
             <<"decode-types">>,
             Types,
             #{},
+            Opts
+        )
+    ).
+
+%% @doc Decode a value of the given type through the structured device.
+structured_decode_value(Type, Value, Opts) ->
+    hb_util:ok(
+        hb_ao:raw(
+            <<"structured@1.0">>,
+            <<"decode-value">>,
+            Value,
+            #{ <<"type">> => Type },
             Opts
         )
     ).
@@ -1146,15 +1295,11 @@ read_resolved(BaseMsgID, Req = #{ <<"path">> := Key }, Opts) when ?IS_ID(BaseMsg
                     {key, NormKey}
                 }
             ),
-            case hb_store:resolve(
-                Store,
-                [BaseMsgID, hb_escape:encode_path_component(NormKey)],
-                Opts
-            ) of
-                {ok, KeyPath} -> hashpath_read_result(read(KeyPath, Opts));
-                {error, not_found} -> miss;
-                Other -> {hit, Other}
-            end
+            KeyPath =
+                hb_path:to_binary(
+                    [BaseMsgID, hb_escape:encode_path_component(NormKey)]
+                ),
+            hashpath_read_result(read(KeyPath, Opts))
     end;
 read_resolved(BaseMsg, Req = #{ <<"path">> := Key }, Opts) when is_map(BaseMsg) ->
     % The base message is loaded, so we determine if it has an explicit device
@@ -1191,9 +1336,11 @@ read_in_memory_key(BaseMsg, NormKey, Opts) ->
 read_computation(BaseMsgID, ReqID, Opts) when ?IS_ID(BaseMsgID) and ?IS_ID(ReqID) ->
     ?event_debug({cache_lookup, {base, BaseMsgID}, {req, ReqID}, {opts, Opts}}),
     Key = <<BaseMsgID/binary, "/", ReqID/binary>>,
-    case hb_store:resolve(hb_opts:get(attested_store, [], Opts), Key, Opts) of
-        {ok, Path} when Path =/= Key ->
-            hashpath_read_result(read(Path, Opts));
+    case hb_store:read(hb_opts:get(attested_store, [], Opts), Key, Opts) of
+        {ok, Result = <<"ao:", _/binary>>} ->
+            hashpath_read_result(read(Result, Opts));
+        {ok, Result = <<"ni:", _/binary>>} ->
+            hashpath_read_result(read(Result, Opts));
         _ -> miss
     end;
 read_computation(BaseMsgID, Req, Opts) when ?IS_ID(BaseMsgID) and is_map(Req) ->
@@ -1206,16 +1353,21 @@ hashpath_read_result({ok, Msg}) -> {hit, {ok, Msg}};
 hashpath_read_result({error, not_found}) -> miss;
 hashpath_read_result(Other) -> {hit, Other}.
 
-%% @doc Make a link from one path to another in the store.
+%% @doc Make a link from a path to an existing message or binary. For the ID
+%% of a message, we write `ao:<ID>' at the path. For the `ni:' name of a
+%% binary, as `write/2' returns it, we write the name.
 %% Note: Argument order is `link(Src, Dst, Opts)'.
 link(Existing, New, Opts) ->
     NewPath = hb_path:to_binary(New),
     check_key_length(NewPath),
-    hb_store:link(
+    hb_store:write(
         hb_opts:get(store, no_viable_store, Opts),
-        #{ NewPath => hb_path:to_binary(Existing) },
+        #{ NewPath => link_value(Existing) },
         Opts
     ).
+
+link_value(Name = <<"ni:", _/binary>>) -> hb_escape:decode_path_component(Name);
+link_value(ID) when ?IS_ID(ID) -> <<"ao:", ID/binary>>.
 
 %%% Tests
 
@@ -1236,7 +1388,23 @@ test_store_binary(Store) ->
     Opts = #{ <<"store">> => Store },
     {ok, ID} = write(Bin, Opts),
     {ok, RetrievedBin} = read(ID, Opts),
-    ?assertEqual(Bin, RetrievedBin).
+    ?assertEqual(Bin, RetrievedBin),
+    % A binary is stored under its `ni:' name, which reads it back.
+    Name = ?NI_URI(hb_path:hashpath(Bin, Opts)),
+    ?assertEqual({ok, Bin}, read(Name, Opts)),
+    % Reading a path that is linked to the name returns the binary.
+    ok = link(Name, <<"named">>, Opts),
+    ?assertEqual({ok, Bin}, read(<<"named">>, Opts)),
+    % A binary whose bytes are a store marker reads back as those bytes.
+    {ok, Marker} = write(<<"group">>, Opts),
+    ?assertEqual({ok, <<"group">>}, read(Marker, Opts)),
+    % A key with a value of 60 bytes or more holds the value's `ni:' name.
+    Long = binary:copy(<<"x">>, 60),
+    {ok, LongID} = write(#{ <<"long">> => Long }, Opts),
+    ?assertEqual(
+        {ok, ?NI_URI(hb_path:hashpath(Long, Opts))},
+        hb_store:read(Store, <<LongID/binary, "/long">>, Opts)
+    ).
 
 test_store_unsigned_empty_message(Store) ->
     ?event_debug(debug_store_test, {store, Store}),
@@ -1345,7 +1513,7 @@ test_store_simple_signed_message(Store) ->
     Opts = #{ <<"store">> => Store },
     hb_store:reset(Store),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     Item = test_signed(<<"Simple signed data item">>, #{ <<"priv-wallet">> => Wallet }),
     ?event_debug({writing_test_message, Item}),
     %% Write the simple unsigned item
@@ -1358,6 +1526,23 @@ test_store_simple_signed_message(Store) ->
     % ?event_debug({match_result, MatchRes}),
     % ?assert(MatchRes),
     CommittedID = hb_message:id(Item, [Address], Opts),
+    % The signed ID holds `ao:' and the unsigned ID.
+    UID = hb_message:id(Item, none, Opts),
+    ?assertEqual(
+        {ok, <<"ao:", UID/binary>>},
+        hb_store:read(Store, CommittedID, Opts)
+    ),
+    % A path under the signed ID is read under the unsigned ID in the local
+    % stores before a remote store is asked for it.
+    Remote = (hb_test_utils:test_store(hb_store_fs, <<"remote">>))#{
+        <<"scope">> => remote
+    },
+    KeyPath = <<CommittedID/binary, "/base-test-key">>,
+    ok = hb_store:write(Remote, #{ KeyPath => <<"remote">> }, Opts),
+    ?assertEqual(
+        {ok, <<"base-test-value">>},
+        read(KeyPath, Opts#{ <<"store">> => [Store, Remote] })
+    ),
     {ok, RetrievedItemSigned} = read(CommittedID, Opts),
     ?event_debug({retrieved_signed_message, {expected, Item}, {got, RetrievedItemSigned}}),
     MatchResSigned = 
@@ -1494,7 +1679,19 @@ test_match_message(Store) ->
     ),
     {ok, MatchedItems2} = match(#{ <<"x">> => <<"4">> }, Opts),
     ?assertEqual(1, length(MatchedItems2)),
-    ?assertEqual([ID2b], MatchedItems2).
+    ?assertEqual([ID2b], MatchedItems2),
+    % A match on the keys of a commitment returns the commitment's ID.
+    Wallet = ar_wallet:new(),
+    Committer =
+        hb_util:committer(hb_util:human_id(ar_wallet:to_address(Wallet))),
+    Signed = hb_message:commit(#{ <<"w">> => <<"1">> }, Opts#{
+        <<"priv-wallet">> => Wallet
+    }),
+    {ok, _} = hb_cache:write(Signed, Opts),
+    ?assertEqual(
+        {ok, [hb_message:id(Signed, signed, Opts)]},
+        match(#{ <<"committer">> => Committer }, Opts)
+    ).
 
 test_match_linked_message(Store) when map_get(<<"store-module">>, Store) =/= hb_store_lmdb ->
     skip;
@@ -1635,41 +1832,41 @@ test_signed_literal_keys(Store) ->
     ?assertEqual(ID, hb_message:id(Loaded, signed, Opts)),
     ?assert(is_map(hb_message:convert(Loaded, <<"httpsig@1.0">>, Opts))).
 
-%% @doc A key present both as a literal and as a `+link' is refused: `k+link'
-%% is only the link form of `k'. Each form alone still writes and reads back
-%% as before.
-test_literal_link_collision(Store) ->
+%% @doc Ensure that a value of the form `ao:<ID>' is read back as a link to the
+%% message with that ID. A `hashpath' value is read back as it was written, and
+%% a key that ends in `+link' is stored like any other key.
+test_link_value(Store) ->
     hb_store:reset(Store),
     Opts = #{ <<"store">> => Store },
-    {ok, OtherID} = write(#{ <<"poison">> => <<"from-link">> }, Opts),
-    ?assertThrow(
-        {duplicated_key_cache_write, <<"k+link">>},
-        write(#{ <<"k">> => <<"literal-value">>, <<"k+link">> => OtherID }, Opts)
-    ),
-    % The refusal follows the write into nested messages.
-    ?assertThrow(
-        {duplicated_key_cache_write, <<"k+link">>},
-        write(#{ <<"parent">> => #{ <<"k">> => <<"v">>, <<"k+link">> => OtherID } }, Opts)
-    ),
-    ?assertThrow(
-        {duplicated_key_cache_write, <<"k+link">>},
-        write(#{ <<"list">> => [#{ <<"k">> => <<"v">>, <<"k+link">> => OtherID }] }, Opts)
-    ),
-    % A literal alone is stored and read back unchanged.
-    {ok, LiteralID} = write(#{ <<"k">> => <<"literal-value">> }, Opts),
-    {ok, LiteralRead} = read(LiteralID, Opts),
+    {ok, OtherID} = write(#{ <<"target">> => <<"value">> }, Opts),
+    Hashpath = <<"ao://", OtherID/binary, "/target">>,
+    {ok, ID} =
+        write(
+            #{
+                <<"k">> => <<"ao:", OtherID/binary>>,
+                <<"hashpath">> => Hashpath,
+                <<"k+link">> => OtherID
+            },
+            Opts
+        ),
+    {ok, Read} = read(ID, Opts),
     ?assertEqual(
-        #{ <<"k">> => <<"literal-value">> },
-        ensure_all_loaded(LiteralRead, Opts)
+        #{
+            <<"k">> => #{ <<"target">> => <<"value">> },
+            <<"hashpath">> => Hashpath,
+            <<"k+link">> => OtherID
+        },
+        ensure_all_loaded(Read, Opts)
     ),
-    % A link alone resolves to its target under the literal key.
-    {ok, LinkID} = write(#{ <<"k+link">> => OtherID }, Opts),
-    {ok, LinkRead} = read(LinkID, Opts),
-    ?assertEqual(
-        #{ <<"k">> => #{ <<"poison">> => <<"from-link">> } },
-        ensure_all_loaded(LinkRead, Opts)
-    ),
-    ok.
+    % A chain of more than 32 links is refused.
+    [A, B] = [hb_util:human_id(crypto:strong_rand_bytes(32)) || _ <- [a, b]],
+    ok =
+        hb_store:write(
+            Store,
+            #{ A => <<"ao:", B/binary>>, B => <<"ao:", A/binary>> },
+            Opts
+        ),
+    ?assertEqual({error, 'too-many-links'}, read(A, Opts)).
 
 test_immediate_marker_values(Store) ->
     hb_store:reset(Store),
@@ -1677,13 +1874,28 @@ test_immediate_marker_values(Store) ->
     Msg = #{
         <<"groupish">> => <<"group">>,
         <<"linkish">> => <<"link:literal">>,
-        <<"rawish">> => <<"raw:literal">>
+        <<"rawish">> => <<"raw:literal">>,
+        <<"niish">> => <<"ni:literal">>
     },
     {ok, ID} = write(Msg, Opts),
     {ok, Read} = read(ID, Opts),
     ?assertEqual(<<"group">>, hb_maps:get(<<"groupish">>, Read, Opts)),
     ?assertEqual(<<"link:literal">>, hb_maps:get(<<"linkish">>, Read, Opts)),
     ?assertEqual(<<"raw:literal">>, hb_maps:get(<<"rawish">>, Read, Opts)),
+    % A short value that starts with `ni:' is written as a `data:' URI.
+    ?assertEqual(<<"ni:literal">>, hb_maps:get(<<"niish">>, Read, Opts)),
+    ?assertEqual(
+        {ok, <<"data:,ni%3aliteral">>},
+        hb_store:read(Store, <<ID/binary, "/niish">>, Opts)
+    ),
+    ?assertEqual(
+        {ok, <<"link:literal">>},
+        hb_store:read(Store, <<ID/binary, "/linkish">>, Opts)
+    ),
+    % A `data:' value that is not percent-encoded is refused.
+    Bad = <<ID/binary, "/bad">>,
+    ok = hb_store:write(Store, #{ Bad => <<"data:,%zz">> }, Opts),
+    ?assertThrow({'invalid-data-uri', _}, read(Bad, Opts)),
     case map_get(<<"store-module">>, Store) of
         hb_store_lmdb ->
             ?assertEqual({ok, [ID]}, match(#{ <<"rawish">> => <<"raw:literal">> }, Opts));
@@ -1742,7 +1954,7 @@ cache_suite_test_() ->
         {"match typed message", fun test_match_typed_message/1},
         {"raw match read", fun test_raw_match_read/1},
         {"literal keys", fun test_literal_keys/1},
-        {"literal and link key collision", fun test_literal_link_collision/1},
+        {"link value", fun test_link_value/1},
         {"signed literal keys", fun test_signed_literal_keys/1},
         {"immediate marker values", fun test_immediate_marker_values/1},
         {"cache-write hook", fun test_cache_write_hook/1}
@@ -1765,9 +1977,8 @@ test_device_map_cannot_be_written_test() ->
 %% @doc Cache writes are best-effort with respect to the configured store
 %% list: a list whose only entry rejects write-class operations (e.g. a
 %% read-only store) must still yield `{ok, ID}', not crash. Exercises both
-%% the binary path (`hb_store:write') and the map path (`hb_store:group'
-%% plus `hb_store:link') so every store side-effect in `do_write_message'
-%% is covered.
+%% the binary path and the map path, so every store write in
+%% `do_write_message' is covered.
 write_with_only_read_only_store_test() ->
     ReadOnlyStore = #{
         <<"store-module">> => hb_store_volatile,

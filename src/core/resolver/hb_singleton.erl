@@ -1,6 +1,6 @@
-%%% @doc A parser that translates AO-Core HTTP API requests in TABM format
-%%% into an ordered list of messages to evaluate. The details of this format
-%%% are described in `docs/ao-core-http-api.md'.
+%%% @doc A parser that translates AO-Core HTTP API requests in TABM format,
+%%% and hashpaths, into an ordered list of messages to evaluate. The details
+%%% of this format are described in `docs/ao-core-http-api.md'.
 %%%
 %%% Syntax overview:
 %%% <pre>
@@ -9,9 +9,11 @@
 %%%
 %%%     Path:
 %%%         - /Part1/Part2/.../PartN/ => [Part1, Part2, ..., PartN]
-%%%         - /ID/Part2/.../PartN => [ID, Part2, ..., PartN]
+%%%         - /ID or URI/Part2/.../PartN => [ID or URI, Part2, ..., PartN]
+%%%         - ao://ID/Part2/.../PartN => [ID, Part2, ..., PartN]
+%%%         - ao://ID1/ID2 => [ID1, {resolve, [ID2]}]
 %%%
-%%%     Part: (Key + Resolution), Device?, #{ K => V}?
+%%%     Part: (Key + Resolution), Device?, #{ K => V}?, Claims?
 %%%         - Part => #{ path => Part }
 %%%         - `Part&Key=Value => #{ path => Part, Key => Value }'
 %%%         - `Part=Value&... => #{ path => Part, Part => Value, ... }'
@@ -19,23 +21,138 @@
 %%%         - `Part&k1=v1&k2=v2 => #{ path => Part, k1 => `<<"v1">>', k2 => `<<"v2">>' }'
 %%%         - `Part~Device => {as, Device, #{ path => Part }}'
 %%%         - `Part~D&K1=V1 => {as, D, #{ path => Part, K1 => `<<"v1">>' }}'
-%%%         - `pt&k1+int=1 => #{ path => pt, k1 => 1 }'
-%%%         - `pt~d&k1+int=1 => {as, d, #{ path => pt, k1 => 1 }}'
+%%%         - `pt&k1+integer=1 => #{ path => pt, k1 => 1 }'
+%%%         - `pt~d&k1+integer=1 => {as, d, #{ path => pt, k1 => 1 }}'
 %%%         - `(/nested/path) => Resolution of the path /nested/path'
 %%%         - `(/nested/path&k1=v1) => (resolve /nested/path)#{k1 => v1}'
 %%%         - `(/nested/path~D&K1=V1) => (resolve /nested/path)#{K1 => V1}'
-%%%         - `pt&k1+res=(/a/b/c) => #{ path => pt, k1 => (resolve /a/b/c) }'
+%%%         - `pt&k1+resolve=(/a/b/c) => #{ path => pt, k1 => (resolve /a/b/c) }'
+%%%         - `Part;VB+VR@D.R => #{ path => Part }' and its claims, which are
+%%%           read by `hb_hashpath'
 %%%     Key:
 %%%         - key: `<<"value">>' => #{ key => `<<"value">>', ... } for all messages
 %%%         - n.key: `<<"value">>' => #{ key => `<<"value">>', ... } for Nth message
-%%%         - key+int: 1 => #{ key => 1, ... }
-%%%         - key+res: /nested/path => #{ key => (resolve /nested/path), ... }
-%%%         - N.Key+res=(/a/b/c) => #{ Key => (resolve /a/b/c), ... }
+%%%         - key+integer: 1 => #{ key => 1, ... }
+%%%         - key+resolve: /nested/path => #{ key => (resolve /nested/path), ... }
+%%%         - N.Key+resolve: /a/b/c => #{ Key => (resolve /a/b/c), ... }
 %%% </pre>
+%%%
+%%% A path is a list of parts, separated by `/'. The first part is the base
+%%% message, or the first request if the base is empty (see below). Each
+%%% request is applied in turn to the result of the parts before it. A
+%%% hashpath is `ao://' followed by a path, in which each request may be
+%%% followed by claims about the result of its execution. `hb_hashpath' reads
+%%% and checks these claims. For example:
+%%% <pre>
+%%%     /a/b            => [#{}, #{ path => a }, #{ path => b }]
+%%%     /~meta@1.0/info => [{as, meta@1.0, #{}}, #{ path => info }]
+%%%     /ID/k=v         => [ID, #{ path => k, k => v }]
+%%%     /ID/ao:ID2      => [ID, {resolve, [ao:ID2]}]
+%%%     /a/(b/c)/d      => [#{}, #{ path => a }, (resolve /b/c), #{ path => d }]
+%%%     ao://ID/k.ID2   => [ID, #{ path => k }], claiming that the result is ID2
+%%% </pre>
+%%%
+%%% The grammar of a path is given below in EBNF (ISO 14977), over the bytes
+%%% of the path. `hb_singleton_lexer' and `hb_singleton_parser' implement it,
+%%% and are generated from the `.xrl' and `.yrl' files of the same names that
+%%% sit beside this module.
+%%% <pre>
+%%%     hashpath     = "ao://", path ;
+%%%     path         = [ "/" ], [ part ], { "/", [ part ] }, [ "?", query ] ;
+%%%     part         = uri | subpath | step, [ claims ] ;
+%%%     uri          = scheme, ":", { uri byte | group | quoted } ;
+%%%     scheme       = letter, { letter | digit | "+" | "-" | "." } ;
+%%%     subpath      = group ;
+%%%     group        = "(", { group byte | group | quoted }, ")" ;
+%%%     quoted       = '"', { quoted byte | "\", byte }, '"' ;
+%%%     step         = key
+%%%                  | head, "=", value, [ items ]
+%%%                  | [ head ], "~", device, [ items ]
+%%%                  | [ head ], items ;
+%%%     head         = key | group ;
+%%%     key          = ( key byte | quoted ), { key byte | group | quoted }
+%%%                  | group, ( key byte | group | quoted ),
+%%%                    { key byte | group | quoted } ;
+%%%     value        = { value byte | group | quoted } ;
+%%%     device       = ( value byte | group | quoted ), value ;
+%%%     items        = "&", item, { "&", item } ;
+%%%     item         = [ item key, [ "=", value ] ] ;
+%%%     item key     = ( key byte | "~" | group | quoted ),
+%%%                    { key byte | "~" | group | quoted } ;
+%%%     claims       = varied, [ dependencies ], [ equivalence ]
+%%%                  | dependencies, [ equivalence ]
+%%%                  | equivalence ;
+%%%     varied       = ";", id, "+", id ;
+%%%     dependencies = "@", id ;
+%%%     equivalence  = ( "." | "*" ), id ;
+%%%     id           = 43 * ( letter | digit | "-" | "_" ) ;
+%%%     query        = ? the bytes to the end of the path, read as an
+%%%                    application/x-www-form-urlencoded string ? ;
+%%%     key byte     = byte - ( "/" | "?" | "&" | "=" | "~" | "(" | ")" | '"' ) ;
+%%%     value byte   = key byte | "=" | "~" ;
+%%%     uri byte     = value byte | "&" ;
+%%%     group byte   = uri byte | "/" | "?" ;
+%%%     quoted byte  = byte - ( '"' | "\" ) ;
+%%% </pre>
+%%%
+%%% The grammar does not express the following rules, which are applied to
+%%% the parts that it reads:
+%%% <ul>
+%%%   <li>A part that starts with a URI scheme and its `:' (see `hb_uri') is
+%%%       read as a URI, whatever follows the scheme. The `:' of a URI is
+%%%       written in a path as it is, but its `/', `?', `#' and `%' characters
+%%%       must be percent-escaped. Like an ID, a URI is a step of its own: as
+%%%       the first part it is the base, and after the base it is the request
+%%%       that it names.</li>
+%%%   <li>The query of a path starts at the first `?' that is not inside a
+%%%       group.</li>
+%%%   <li>Claims are only read at the end of a part, in the order that the
+%%%       grammar gives them. Anywhere else, `;', `@', `.' and `*' are
+%%%       ordinary characters of a key, as they are when the text after them
+%%%       is not an ID of 43 bytes. For example, `~meta@1.0' names a device,
+%%%       and `a.b' is a key. These characters are not in the base64url
+%%%       alphabet of IDs, so a claim never needs to be escaped.</li>
+%%%   <li>The base is the first part when it is an ID or a URI, a subpath, or
+%%%       a step with a device. Otherwise the base is the empty message, and
+%%%       the first part is the first request. A bare key of 32, 42 or 43
+%%%       bytes is an ID. After the base, a bare ID is a key in a path. In a
+%%%       hashpath, whose request position holds an ID, a bare ID of 43 bytes
+%%%       is the ID of the request, and one of 32 or 42 bytes is a key.</li>
+%%%   <li>Claims follow a request, never the base.</li>
+%%%   <li>In `key=value', and in `&key=value' after a step, the key is split
+%%%       at its first `+' or space that is not inside a group or a quoted
+%%%       string. The text after it is the type of the value: `k+integer=1'
+%%%       sets `k' to the integer 1.</li>
+%%%   <li>A value or a device that is a single group, such as `(/a/b)', is a
+%%%       subpath. It is resolved, and its result is used in its place.</li>
+%%%   <li>The key of a step keeps its percent-escapes, unless the step gives
+%%%       it a value with `='. Every other key, value, device and URI is
+%%%       percent-decoded after it is parsed.</li>
+%%% </ul>
 -module(hb_singleton).
--export([from/2, from_request/2, from_path/1, to/1]).
+-export([from/2, from_request/2, from_path/1, to/1, to_part/1, parse/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+%%% The characters that cannot be written as they are in a key, or in a value
+%%% or a device, of a path part.
+-define(KEY_SYNTAX, [<<"/">>, <<"?">>, <<"&">>, <<"=">>, <<"~">>, <<"(">>,
+    <<")">>, <<"\"">>, <<":">>, <<" ">>]).
+-define(VALUE_SYNTAX, [<<"/">>, <<"?">>, <<"&">>, <<"(">>, <<")">>, <<"\"">>,
+    <<"%">>]).
+
+%%% The tokens that a syntax error may list as expected, with the names that
+%%% it gives them.
+-define(SYNTAX_TOKENS, [
+    {text, <<"text">>},
+    {'(', <<"'('">>},
+    {')', <<"')'">>},
+    {'/', <<"'/'">>},
+    {'&', <<"'&'">>},
+    {'=', <<"'='">>},
+    {'~', <<"'~'">>},
+    {result, <<"a claim">>}
+]).
 
 -type ao_message() :: map() | binary().
 -type tabm_message() :: map().
@@ -52,6 +169,9 @@ to(Messages) ->
                 % Special case when AO-Core message is ID
                 (Message, {Acc, Index, ScopedModifications}) when ?IS_ID(Message) ->
                     {append_path(Message, Acc), Index + 1, ScopedModifications};
+                % Special case when AO-Core message can be written as one part
+                ({part, Part}, {Acc, Index, ScopedModifications}) ->
+                    {append_path(Part, Acc), Index + 1, ScopedModifications};
                 % Special case when AO-Core message contains resolve command
                 ({resolve, SubMessages0}, {Acc, Index, ScopedModifications}) ->
                     SubMessages1 = hb_maps:get(<<"path">>, to(SubMessages0)),
@@ -97,7 +217,7 @@ to(Messages) ->
 
             end,
             {#{}, 0, #{}},
-            Messages),
+            smallest(Messages)),
     MessageWithTypeAndScopes =
         hb_maps:fold(
             fun
@@ -120,6 +240,80 @@ to(Messages) ->
             Scopes),
     MessageWithTypeAndScopes.
 
+%% @doc Mark the messages that `to_part/1' can write in their smallest form:
+%% every request that has one, and a base that is only a device.
+smallest([]) -> [];
+smallest([Base | Requests]) ->
+    [
+        case Base of
+            #{ <<"device">> := _ } when map_size(Base) == 1 -> smallest_part(Base);
+            {as, _, Msg} when map_size(Msg) == 0 -> smallest_part(Base);
+            _ -> Base
+        end
+    |
+        lists:map(fun smallest_part/1, Requests)
+    ].
+
+smallest_part(Msg) ->
+    case to_part(Msg) of
+        {ok, Part} -> {part, Part};
+        error -> Msg
+    end.
+
+%% @doc Write a message in its smallest form, as a single path part. Returns
+%% `error' if the message has no such form that `from/2' reads back as the
+%% same message. The forms are:
+%% <pre>
+%%     #{ path => X }               => X
+%%     #{ path => X, X => V }       => X=V
+%%     #{ device => D }             => ~D
+%%     {as, D, #{ path => X }}      => X~D
+%% </pre>
+to_part(#{ <<"device">> := Device } = Msg) when map_size(Msg) == 1 ->
+    to_part({as, Device, #{}});
+to_part({as, Device, Msg}) when map_size(Msg) == 0 ->
+    maybe
+        {ok, D} ?= literal(Device, ?VALUE_SYNTAX),
+        true ?= byte_size(D) > 0 orelse error,
+        {ok, <<"~", D/binary>>}
+    end;
+to_part({as, Device, #{ <<"path">> := Key } = Msg}) when map_size(Msg) == 1 ->
+    maybe
+        {ok, K} ?= literal(Key, ?KEY_SYNTAX),
+        {ok, <<"~", D/binary>>} ?= to_part({as, Device, #{}}),
+        {ok, <<K/binary, "~", D/binary>>}
+    end;
+to_part(#{ <<"path">> := Key } = Msg) when map_size(Msg) == 1 ->
+    maybe
+        {ok, K} ?= literal(Key, ?KEY_SYNTAX),
+        true ?= (byte_size(K) > 0 andalso not ?IS_ID(K)) orelse error,
+        {ok, K}
+    end;
+to_part(#{ <<"path">> := Key } = Msg) when map_size(Msg) == 2 ->
+    maybe
+        {ok, Value} ?= maps:find(Key, Msg),
+        {ok, K} ?= literal(Key, [<<"%">>, <<"+">> | ?KEY_SYNTAX]),
+        {ok, V} ?= literal(Value, ?VALUE_SYNTAX),
+        true ?= byte_size(K) > 0 orelse error,
+        {ok, <<K/binary, "=", V/binary>>}
+    end;
+to_part(_) -> error.
+
+%% @doc Check that a binary can be written in a path part as it is. It must
+%% not hold any of the given characters, and if it is long enough to end in a
+%% claim, it must not hold a claim separator. Returns `{ok, Bin}' or `error'.
+literal(Bin, Syntax) when is_binary(Bin) ->
+    case binary:match(Bin, Syntax) of
+        nomatch when byte_size(Bin) < 44 -> {ok, Bin};
+        nomatch ->
+            case binary:match(Bin, [<<";">>, <<"@">>, <<".">>, <<"*">>]) of
+                nomatch -> {ok, Bin};
+                _ -> error
+            end;
+        _ -> error
+    end;
+literal(_, _) -> error.
+
 append_path(PathPart, #{<<"path">> := Path} = Message) ->
     hb_maps:put(<<"path">>, <<Path/binary, "/", PathPart/binary>>, Message);
 append_path(PathPart, Message) ->
@@ -132,34 +326,138 @@ type(_Value) -> unknown.
 %% @doc Normalize a singleton TABM message into a list of executable AO-Core
 %% messages. Throws `{invalid_singleton, Type, Offender}' if a part of the
 %% message cannot be parsed, where `Offender' is that part.
-from(RawMsg, Opts) when is_binary(RawMsg) ->
-    from(#{ <<"path">> => RawMsg }, Opts);
 from(RawMsg, Opts) ->
+    requests(parse(RawMsg, Opts)).
+
+%% @doc Parse a singleton TABM message, a path or a hashpath into the contexts
+%% of its steps. The first context holds the base, and each context holds a
+%% request and the claims that follow it in the path. A base that is an ID is
+%% given as `base-id', and a request that is an ID in a hashpath is given as
+%% `request-id'. Throws as `from/2' does.
+parse(RawMsg, Opts) when is_binary(RawMsg) ->
+    parse(#{ <<"path">> => RawMsg }, Opts);
+parse(RawMsg, Opts) ->
     RawPath = hb_maps:get(<<"path">>, RawMsg, <<>>, Opts),
     ?event_debug(parsing, {raw_path, RawPath}),
-    {ok, Path, Query} = from_path(RawPath),
-    ?event_debug(parsing, {parsed_path, Path, Query}),
+    {ok, Parts, Query} = from_path(RawPath),
+    ?event_debug(parsing, {parsed_path, Parts, Query}),
     MsgWithoutBasePath =
         hb_maps:merge(
             hb_maps:remove(<<"path">>, RawMsg, Opts),
             Query,
             Opts
         ),
-    % 2. Parse path segments. Each yields one step message.
-    RawMsgs = [parse_part(Part, Opts) || Part <- Path],
+    Contexts = contexts(Parts, MsgWithoutBasePath, Opts),
+    case ?IS_HASHPATH(RawPath) of
+        true -> lists:map(fun request_id/1, Contexts);
+        false -> Contexts
+    end.
+
+%% @doc Move a request that is a bare ID of 43 bytes to the `request-id' of
+%% its context. Only hashpaths are read this way, as their requests may be
+%% given by ID.
+request_id(Ctx = #{ <<"request">> := ID }) when byte_size(ID) == 43 ->
+    (maps:remove(<<"request">>, Ctx))#{ <<"request-id">> => ID };
+request_id(Ctx) -> Ctx.
+
+%% @doc Build the contexts of the parts of a path. The other keys of the
+%% singleton are added to the messages, as their scopes direct.
+contexts(Parts, MsgWithoutBasePath, Opts) ->
+    % 2. Build the message of each part, and collect the claims after it.
+    {RawMsgs, Claims} =
+        lists:unzip(normalize_base([ build_part(Part, Opts) || Part <- Parts ])),
     ?event_debug(parsing, {raw_messages, RawMsgs}),
-    Msgs = normalize_base(RawMsgs),
-    ?event_debug(parsing, {normalized_messages, Msgs}),
     % 3. Type keys and values
     Typed = apply_types(MsgWithoutBasePath, Opts),
     ?event_debug(parsing, {typed_messages, Typed}),
     % 4. Group keys by N-scope and global scope
-    ScopedModifications = group_scoped(Typed, Msgs, Opts),
+    ScopedModifications = group_scoped(Typed, RawMsgs, Opts),
     ?event_debug(parsing, {scoped_modifications, ScopedModifications}),
     % 5. Generate the list of messages (plus-notation, device, typed keys).
-    Result = build_messages(Msgs, ScopedModifications, Opts),
+    Result = build_messages(RawMsgs, ScopedModifications, Opts),
     ?event_debug(parsing, {result, Result}),
-    Result.
+    pair(Result, Claims).
+
+%% @doc Pair each request with the claims that follow it, and add the base to
+%% the first context. Throws `invalid_claim' if the base is followed by claims.
+pair([], []) -> [];
+pair([Base | Requests], [[] | Claims]) ->
+    case lists:zipwith(fun request_context/2, Requests, Claims) of
+        [] -> [base_context(Base)];
+        [First | Rest] -> [maps:merge(base_context(Base), First) | Rest]
+    end;
+pair(_Msgs, [[Claim | _] | _]) ->
+    throw({invalid_singleton, invalid_claim, text([Claim])}).
+
+%% @doc Make the context of a base. A base that is an ID is given as
+%% `base-id'.
+base_context(Base) ->
+    case step_id(Base) of
+        {ok, ID} -> #{ <<"base-id">> => ID };
+        _ -> #{ <<"base">> => Base }
+    end.
+
+%% @doc Make the context of a request, with the keys of its claims. A request
+%% that is a URI is given as `{resolve, [URI]}', so that the message it names
+%% is the request.
+request_context(Req, Claims) ->
+    lists:foldl(
+        fun claim_context/2,
+        case step_id(Req) of
+            uri -> #{ <<"request">> => {resolve, [Req]} };
+            _ -> #{ <<"request">> => Req }
+        end,
+        Claims
+    ).
+
+%% @doc Tell whether a step is an ID, a URI or a key. A binary of 43 bytes
+%% without a URI scheme is an ID, and a binary with a scheme is a URI.
+step_id(Step) when is_binary(Step) ->
+    case {hb_uri:scheme(Step), byte_size(Step)} of
+        {{error, not_found}, 43} -> {ok, Step};
+        {{error, not_found}, _} -> key;
+        _ -> uri
+    end;
+step_id(_Step) -> key.
+
+%% @doc Add the keys of a claim to a context.
+claim_context({varied, _, {Base, Req, _}}, Ctx) ->
+    Ctx#{
+        <<"varied-base-id">> => hb_util:bin(Base),
+        <<"varied-request-id">> => hb_util:bin(Req)
+    };
+claim_context({dependencies, _, {ID, _}}, Ctx) ->
+    Ctx#{ <<"dependencies-id">> => hb_util:bin(ID) };
+claim_context({result, _, {ID, _}}, Ctx) ->
+    Ctx#{ <<"varied-result-id">> => hb_util:bin(ID) };
+claim_context({extension, _, {ID, _}}, Ctx) ->
+    Ctx#{
+        <<"varied-result-id">> => hb_util:bin(ID),
+        <<"normalizer">> => base
+    }.
+
+%% @doc Convert a list of contexts into the messages to execute: the base,
+%% then each request. A request given by its ID is resolved to the message
+%% with that ID.
+requests([]) -> [];
+requests(Contexts = [First | _]) ->
+    [
+        case First of
+            #{ <<"base-id">> := ID } -> ID;
+            #{ <<"base">> := Base } -> Base
+        end
+    |
+        [
+            case Ctx of
+                #{ <<"request-id">> := ID } -> {resolve, [ID]};
+                #{ <<"request">> := Req } -> Req
+            end
+        ||
+            Ctx <- Contexts,
+            is_map_key(<<"request">>, Ctx) orelse
+                is_map_key(<<"request-id">>, Ctx)
+        ]
+    ].
 
 %% @doc Parse a request's path and apply its fields to each request.
 from_request(Req, Opts) ->
@@ -167,21 +465,203 @@ from_request(Req, Opts) ->
     {ok, Parts, Query} = from_path(Path),
     Fields = hb_maps:merge(Req, Query, Opts),
     [
-        case parse_part(RawPart, Opts) of
-            Msg when is_map(Msg) -> hb_maps:merge(Fields, Msg, Opts);
-            Subres = {resolve, _} -> Subres;
-            Part -> Fields#{ <<"path">> => Part }
+        case build_part(Part, Opts) of
+            {Msg, _} when is_map(Msg) -> hb_maps:merge(Fields, Msg, Opts);
+            {Subres = {resolve, _}, _} -> Subres;
+            {Step, _} -> Fields#{ <<"path">> => Step }
         end
     ||
-        RawPart <- Parts
+        Part <- Parts
     ].
 
-%% @doc Parse the relative reference into path, query, and fragment.
-from_path(Parts) when is_list(Parts) -> {ok, Parts, #{}};
+%% @doc Parse the relative reference into its parts and its query. The parts
+%% of a hashpath follow its `ao://'. A path given as a list is already split:
+%% each element is one part, even if it holds a `/'.
+from_path(Parts) when is_list(Parts) -> {ok, lists:map(fun list_part/1, Parts), #{}};
 from_path(RelativeRef) when is_binary(RelativeRef) ->
-    {_Sep, Path, QStr} = hb_util:split_depth_string_aware_single("?", RelativeRef),
-    {ok, path_parts($/, Path), parse_query(QStr)};
+    {PathTokens, QStr} = split_query(tokens(RelativeRef)),
+    {ok, parts(PathTokens), parse_query(QStr)};
 from_path(Other) -> from_path(hb_util:bin(Other)).
+
+%% @doc Parse an element of a path that is given as a list. In a binary, a
+%% `/' or `?' outside of a group is read as a character of the key, not as a
+%% separator. Any other term is used as the step as it is.
+list_part(<<>>) -> {step, {key, []}, []};
+list_part(Part) when is_binary(Part) ->
+    {Tokens, _} =
+        lists:mapfoldl(
+            fun
+                ({Separator, Loc}, 0) when Separator == '/'; Separator == '?' ->
+                    {{text, Loc, atom_to_list(Separator)}, 0};
+                (Token = {'(', _}, Depth) -> {Token, Depth + 1};
+                (Token = {')', _}, Depth) when Depth > 0 -> {Token, Depth - 1};
+                (Token, Depth) -> {Token, Depth}
+            end,
+            0,
+            lex(Part)
+        ),
+    [Parsed] = parts(Tokens),
+    Parsed;
+list_part(Part) -> {term, Part}.
+
+%% @doc Scan a path into its tokens. The `ao://' of a hashpath is dropped.
+tokens(<<"ao://", _/binary>> = Hashpath) ->
+    [{scheme, _, "ao:"}, {'/', _}, {'/', _} | Tokens] = lex(Hashpath),
+    Tokens;
+tokens(Path) -> lex(Path).
+
+%% @doc Scan a path with `hb_singleton_lexer'. Each byte of the path is given
+%% to the lexer as one character, followed by the code point 256 to mark the
+%% end of the path.
+lex(Path) ->
+    {ok, Tokens, _} = hb_singleton_lexer:string(binary_to_list(Path) ++ [256]),
+    Tokens.
+
+%% @doc Split the tokens of a path at the first `?' that is not inside a
+%% group. Returns the tokens before it, and the text of the query after it.
+split_query(Tokens) -> split_query(Tokens, 0, []).
+split_query([{'?', _} | Query], 0, Path) ->
+    {lists:reverse(Path), text(Query)};
+split_query([Token = {'(', _} | Rest], Depth, Path) ->
+    split_query(Rest, Depth + 1, [Token | Path]);
+split_query([Token = {')', _} | Rest], Depth, Path) when Depth > 0 ->
+    split_query(Rest, Depth - 1, [Token | Path]);
+split_query([Token | Rest], Depth, Path) ->
+    split_query(Rest, Depth, [Token | Path]);
+split_query([], _Depth, Path) ->
+    {lists:reverse(Path), <<>>}.
+
+%% @doc Parse the tokens of a path into its parts with `hb_singleton_parser'.
+%% If the path does not follow the grammar, we throw `invalid_path' with a
+%% description of the error.
+parts(Tokens) ->
+    case hb_singleton_parser:parse(Tokens) of
+        {ok, Parts} -> Parts;
+        {error, {Loc, _, [_, Before]}} ->
+            throw(
+                {invalid_singleton,
+                    invalid_path,
+                    syntax_error(Tokens, Loc, Before =/= [])
+                }
+            )
+    end.
+
+%% @doc Describe a syntax error in a path: the character at which it stops
+%% following the grammar, what was found there, and the tokens that the
+%% grammar would accept instead. The parser gives the location of the token
+%% that it cannot accept, or of the last token if the path ends too soon.
+syntax_error(Tokens, Loc, AtToken) ->
+    {Accepted, Found} =
+        case AtToken of
+            true ->
+                lists:splitwith(
+                    fun(Token) -> element(2, Token) =/= Loc end,
+                    Tokens
+                );
+            false -> {Tokens, []}
+        end,
+    Expected =
+        [
+            Name
+        ||
+            {Category, Name} <- ?SYNTAX_TOKENS,
+            accepts(Accepted ++ [syntax_token(Category)])
+        ] ++
+        [
+            <<"the end of the path">>
+        ||
+            {ok, _} <- [hb_singleton_parser:parse(Accepted)]
+        ],
+    iolist_to_binary(
+        [
+            <<"character ">>,
+            integer_to_binary(character(Tokens, Accepted)),
+            <<": expected ">>,
+            lists:join(<<", ">>, Expected),
+            <<"; found ">>,
+            case {Found, open_group(Tokens)} of
+                {[{'"', _} | _], _} -> <<"a quote that is not closed">>;
+                {[Other | _], _} -> [<<"'">>, text([Other]), <<"'">>];
+                {[], none} -> <<"the end of the path">>;
+                {[], BeforeOpen} ->
+                    [
+                        <<"the end of the path, with the '(' at character ">>,
+                        integer_to_binary(character(Tokens, BeforeOpen)),
+                        <<" not closed">>
+                    ]
+            end,
+            <<".">>
+        ]
+    ).
+
+%% @doc Find the first `(' in a list of tokens that is not closed, and return
+%% the tokens before it. Returns `none' if every group is closed.
+open_group(Tokens) ->
+    Open =
+        lists:foldl(
+            fun
+                ({'(', Loc}, Locs) -> [Loc | Locs];
+                ({')', _}, [_ | Locs]) -> Locs;
+                (_, Locs) -> Locs
+            end,
+            [],
+            Tokens
+        ),
+    case Open of
+        [] -> none;
+        _ ->
+            OpenLoc = lists:last(Open),
+            {Before, _} =
+                lists:splitwith(
+                    fun(Token) -> element(2, Token) =/= OpenLoc end,
+                    Tokens
+                ),
+            Before
+    end.
+
+%% @doc Find the position of the character that follows the given leading
+%% tokens of a path, counted in bytes from the start of the text. We take the
+%% column of the first token from the lexer, as only `ao://' can come before
+%% it, and add the bytes of the tokens that follow. The lexer's columns cannot
+%% be used for later tokens: they do not count bytes after a tab, a newline,
+%% a byte above 127, or a separator that does not start a claim, such as the
+%% `@' of `~meta@1.0'.
+character([], _Before) -> 1;
+character([First | _], Before) ->
+    {1, Column} = element(2, First),
+    Column + byte_size(text(Before)).
+
+%% @doc Check whether the grammar accepts a list of tokens as the start of a
+%% path. A list that ends too soon is accepted. The list is refused only if
+%% the parser stops at a token made by `syntax_token/1', which has the
+%% location `{0, 0}'.
+accepts(Tokens) ->
+    case hb_singleton_parser:parse(Tokens) of
+        {error, {{0, 0}, _, [_, [_ | _]]}} -> false;
+        _ -> true
+    end.
+
+%% @doc Make a token of the given category, to test with `accepts/1'. It has
+%% the location `{0, 0}', which no token of a path has.
+syntax_token(Category) when Category == text; Category == quoted;
+        Category == scheme ->
+    {Category, {0, 0}, "x"};
+syntax_token(varied) -> {varied, {0, 0}, {"x", "x", "x"}};
+syntax_token(Category) when Category == dependencies; Category == result;
+        Category == extension ->
+    {Category, {0, 0}, {"x", "x"}};
+syntax_token(Category) -> {Category, {0, 0}}.
+
+%% @doc Return the text of a list of tokens. Every byte of a path is in
+%% exactly one token, so this is the text of the path that the tokens cover.
+text(Tokens) ->
+    iolist_to_binary(lists:map(fun token_text/1, Tokens)).
+
+token_text({group, _, Tokens}) -> [$(, lists:map(fun token_text/1, Tokens), $)];
+token_text({varied, _, {_, _, Text}}) -> Text;
+token_text({_, _, {_, Text}}) -> Text;
+token_text({_, _, Chars}) -> Chars;
+token_text({Separator, _}) -> atom_to_list(Separator).
 
 %% @doc Parse a query string into a message of its unquoted values, with the
 %% keys in lowercase, or throw `invalid_query' naming the query string.
@@ -202,38 +682,10 @@ parse_query(QStr) ->
 
 %% @doc Normalize the base path.
 normalize_base([]) -> [];
-normalize_base([First|Rest]) when ?IS_ID(First) -> [First|Rest];
-normalize_base([{as, DevID, First}|Rest]) -> [{as, DevID, First}|Rest];
-normalize_base([Subres = {resolve, _}|Rest]) -> [Subres|Rest];
-normalize_base(Rest) -> [#{}|Rest].
-
-%% @doc Split the path into segments, filtering out empty segments.
-path_parts(Sep, PathBin) when is_binary(PathBin) ->
-    Res = lists:filtermap(
-        fun(Part) ->
-            case byte_size(Part) of
-                0 -> false;
-                _ -> {true, Part}
-            end
-        end,
-        all_path_parts(Sep, PathBin)
-    ),
-    ?event_debug({path_parts, Res}),
-    Res.
-
-%% @doc Extract all of the parts from the binary, given (a list of) separators.
-all_path_parts(_Sep, <<>>) -> [];
-all_path_parts(Sep, Bin) ->
-    hb_util:split_depth_string_aware(Sep, Bin).
-
-%% @doc Extract the characters from the binary until a separator is found.
-%% The first argument of the function is an explicit separator character, or
-%% a list of separator characters. Returns a tuple with the separator, the
-%% accumulated characters, and the rest of the binary.
-part(Sep, Bin) when not is_list(Sep) ->
-    part([Sep], Bin);
-part(Seps, Bin) ->
-    hb_util:split_depth_string_aware_single(Seps, Bin).
+normalize_base([First = {Base, _} | Rest]) when is_binary(Base) -> [First | Rest];
+normalize_base([First = {{as, _, _}, _} | Rest]) -> [First | Rest];
+normalize_base([First = {{resolve, _}, _} | Rest]) -> [First | Rest];
+normalize_base(Rest) -> [{#{}, []} | Rest].
 
 %% @doc Step 3: Apply types to values and remove specifiers. A link is loaded
 %% only when its key has a type.
@@ -318,8 +770,8 @@ do_build(I, [{as, DevID, RawMsg} | Rest], ScopedKeys, Opts) when is_map(RawMsg) 
         end,
     Merged = hb_maps:merge(Additional, Msg, Opts),
     StepMsg = hb_message:convert(
-        Merged, 
-        <<"structured@1.0">>, 
+        Merged,
+        <<"structured@1.0">>,
         Opts#{ <<"topic">> => ao_internal }
     ),
     ?event_debug(parsing, {build_messages, {base, Msg}, {additional, Additional}}),
@@ -330,90 +782,68 @@ do_build(I, [Msg | Rest], ScopedKeys, Opts) ->
     Additional = lists:nth(I, ScopedKeys),
     Merged = hb_maps:merge(Additional, Msg, Opts),
     StepMsg = hb_message:convert(
-        Merged, 
-        <<"structured@1.0">>, 
+        Merged,
+        <<"structured@1.0">>,
         Opts#{ <<"topic">> => ao_internal }
     ),
     ?event_debug(parsing, {build_messages, {base, Msg}, {additional, Additional}}),
     [StepMsg | do_build(I + 1, Rest, ScopedKeys, Opts)].
 
-%% @doc Parse a path part into a message or an ID.
-%% Applies the syntax rules outlined in the module doc, in the following order:
-%% 1. ID
-%% 2. Part subpath resolutions
-%% 3. Inlined key-value pairs
-%% 4. Device specifier
-parse_part(Part, Opts) when is_binary(Part) ->
-    case maybe_subpath(Part, Opts) of
-        {resolve, Subpath} -> {resolve, Subpath};
-        Part ->
-            case part([$&, $~, $=], Part) of
-                {no_match, PartKey, <<>>} when ?IS_ID(PartKey) ->
-                    PartKey;
-                {no_match, PartKey, <<>>} ->
-                    #{ <<"path">> =>
-                        binary:replace(PartKey, <<"/">>, <<"%2f">>, [global]) };
-                {$=, _, _} ->
-                    % The key of `Key=Value' or `Key+Type=Value' is the path.
-                    {_, KeyVal, PartModBin} = part($&, Part),
-                    {Key, Val} = parse_inlined_key_val(KeyVal, Opts),
-                    parse_part_mods(
-                        << "&", PartModBin/binary >>,
-                        #{
-                            <<"path">> =>
-                                binary:replace(Key, <<"/">>, <<"%2f">>, [global]),
-                            Key => Val
-                        },
-                        Opts
-                    );
-                {Sep, PartKey, PartModBin} ->
-                    parse_part_mods(
-                        << Sep:8/integer, PartModBin/binary >>,
-                        #{ <<"path">> =>
-                            binary:replace(PartKey, <<"/">>, <<"%2f">>, [global]) },
-                        Opts
-                    )
-            end
-    end;
-parse_part(Part, _Opts) -> Part.
+%% @doc Build the step of a part, and return it with the claims that follow
+%% it. A URI is decoded, a subpath is parsed as a path, and the keys of a step
+%% are built in the following order:
+%% 1. The key, and its value after `=' or its device after `~'
+%% 2. Inlined key-value pairs after `&'
+%% 3. The device specifier
+build_part({term, Term}, _Opts) -> {Term, []};
+build_part({uri, Tokens}, _Opts) -> {decode_string(text(Tokens)), []};
+build_part({subpath, {group, _, Tokens}}, Opts) ->
+    {{resolve, subpath(Tokens, Opts)}, []};
+build_part({step, Step, Claims}, Opts) -> {step(Step, Opts), Claims}.
 
-%% @doc Parse part modifiers:
-%% 1. `~Device' => `{as, Device, Msg}'
-%% 2. `&K=V' => `Msg#{ K => V }'
-parse_part_mods([], Msg, _Opts) -> Msg;
-parse_part_mods(<<>>, Msg, _Opts) -> Msg;
-parse_part_mods(<<"~", PartMods/binary>>, Msg, Opts) ->
-    % Get the string until the end of the device specifier or end of string.
-    {_, DeviceBin, InlinedMsgBin} = part([$&], PartMods),
-    % Calculate the inlined keys
-    MsgWithInlines = parse_part_mods(<<"&", InlinedMsgBin/binary >>, Msg, Opts),
-    % Apply the device specifier
-    {as, decode_string(maybe_subpath(DeviceBin, Opts)), MsgWithInlines};
-parse_part_mods(<< "&", InlinedMsgBin/binary >>, Msg, Opts) ->
-    InlinedKeys = path_parts($&, InlinedMsgBin),
-    MsgWithInlined =
-        lists:foldl(
-            fun(InlinedKey, Acc) ->
-                {Key, Val} = parse_inlined_key_val(InlinedKey, Opts),
+%% @doc Build the message of a step, or return its key if it is an ID.
+step({key, Tokens}, _Opts) ->
+    case text(Tokens) of
+        ID when ?IS_ID(ID) -> ID;
+        Key -> #{ <<"path">> => path_key(Key) }
+    end;
+step({value, KeyTokens, ValueTokens, Items}, Opts) ->
+    % The key of `Key=Value' or `Key+Type=Value' is the path.
+    {Key, Val} = key_value(KeyTokens, ValueTokens, Opts),
+    items(Items, #{ <<"path">> => path_key(Key), Key => Val }, Opts);
+step({device, KeyTokens, DeviceTokens, Items}, Opts) ->
+    {as,
+        decode_string(maybe_subpath(DeviceTokens, Opts)),
+        items(Items, #{ <<"path">> => path_key(text(KeyTokens)) }, Opts)
+    };
+step({mods, KeyTokens, Items}, Opts) ->
+    items(Items, #{ <<"path">> => path_key(text(KeyTokens)) }, Opts).
+
+%% @doc Escape the `/' characters of a key, so that it can be used as a path.
+path_key(Key) -> binary:replace(Key, <<"/">>, <<"%2f">>, [global]).
+
+%% @doc Add the inlined keys of a step to its message. A key without a value
+%% is set to `true'.
+items(Items, Msg, Opts) ->
+    lists:foldl(
+        fun(empty, Acc) -> Acc;
+            ({flag, KeyTokens}, Acc) ->
+                hb_maps:put(decode_string(text(KeyTokens)), true, Acc, Opts);
+            ({value, KeyTokens, ValueTokens}, Acc) ->
+                {Key, Val} = key_value(KeyTokens, ValueTokens, Opts),
                 ?event_debug({inlined_key, {explicit, Key}, {explicit, Val}}),
                 hb_maps:put(Key, Val, Acc, Opts)
-            end,
-            Msg,
-            InlinedKeys
-        ),
-    MsgWithInlined.
+        end,
+        Msg,
+        Items
+    ).
 
-%% @doc Extrapolate the inlined key-value pair from a path segment. If the
-%% key has a value, it may provide a type (as with typical keys), but if a
-%% value is not provided, it is assumed to be a boolean `true'.
-parse_inlined_key_val(Bin, Opts) ->
-    case part([$=, $&], Bin) of
-        {no_match, K, <<>>} -> {decode_string(K), true};
-        {$=, K, RawV} ->
-            V = hb_util:unquote(decode_string(maybe_subpath(RawV, Opts))),
-            {_, Key, Val} = maybe_typed(K, V, Opts),
-            {decode_string(Key), Val}
-    end.
+%% @doc Parse the key and the value of a `Key=Value' pair. The key may give a
+%% type for the value, as with typical keys.
+key_value(KeyTokens, ValueTokens, Opts) ->
+    V = hb_util:unquote(decode_string(maybe_subpath(ValueTokens, Opts))),
+    {_, Key, Val} = maybe_typed(text(KeyTokens), V, Opts),
+    {decode_string(Key), Val}.
 
 %% @doc Attempt Cowboy URL decode, then sanitize the result.
 decode_string(Value) when not is_binary(Value) -> Value;
@@ -424,16 +854,25 @@ decode_string(B) ->
         _ -> throw({error, cannot_decode, B})
     end.
 
-%% @doc Check if the string is a subpath, returning it in parsed form,
-%% or the original string with a specifier.
-maybe_subpath(Str, Opts) when byte_size(Str) >= 2 ->
-    case {binary:first(Str), binary:last(Str)} of
-        {$(, $)} ->
-            Inside = binary:part(Str, 1, byte_size(Str) - 2),
-            {resolve, from(#{ <<"path">> => Inside }, Opts)};
-        _ -> Str
-    end;
-maybe_subpath(Other, _Opts) -> Other.
+%% @doc Parse a value or a device that is a single group as a subpath. Any
+%% other value or device is returned as its text.
+maybe_subpath([{group, _, Tokens}], Opts) -> {resolve, subpath(Tokens, Opts)};
+maybe_subpath(Tokens, _Opts) -> text(Tokens).
+
+%% @doc Parse the tokens of a subpath into its requests. A subpath is a path,
+%% and may have a query of its own.
+subpath(Tokens, Opts) ->
+    {PathTokens, QStr} = split_query(Tokens),
+    requests(contexts(parts(PathTokens), parse_query(QStr), Opts)).
+
+%% @doc Extract the characters from the binary until a separator is found.
+%% The first argument of the function is an explicit separator character, or
+%% a list of separator characters. Returns a tuple with the separator, the
+%% accumulated characters, and the rest of the binary.
+part(Sep, Bin) when not is_list(Sep) ->
+    part([Sep], Bin);
+part(Seps, Bin) ->
+    hb_util:split_depth_string_aware_single(Seps, Bin).
 
 %% @doc Parse a key's type (applying it to the value) and device name if present.
 %% We allow ` ` characters as type indicators because some URL-string encoders
@@ -446,6 +885,9 @@ maybe_typed(Key, Value, Opts) ->
         {no_match, OnlyKey, <<>>} -> {untyped, OnlyKey, Value};
         {_, OnlyKey, Type} ->
             case {Type, hb_cache:ensure_loaded(Value, Opts)} of
+                % The value is a group, which is already parsed as a subpath.
+                {<<"resolve">>, Subres = {resolve, _}} ->
+                    {typed, OnlyKey, Subres};
                 {<<"resolve">>, Subpath} ->
                     % If the value needs to be resolved before it is converted,
                     % use the `Codec/1.0' device to resolve it.
@@ -463,17 +905,11 @@ maybe_typed(Key, Value, Opts) ->
                         catch _:_ ->
                             throw({invalid_singleton, invalid_type, Key})
                         end
-                    }
+                    };
+                % The key has a type, but there is no text to decode, as in
+                % `?k+integer'.
+                _ -> throw({invalid_singleton, invalid_type, Key})
             end
-    end.
-
-%% @doc Join a list of items with a separator, or return the first item if there
-%% is only one item. If there are no items, return an empty binary.
-maybe_join(Items, Sep) ->
-    case length(Items) of
-        0 -> <<>>;
-        1 -> hd(Items);
-        _ -> iolist_to_binary(lists:join(Sep, Items))
     end.
 
 %%% Tests
@@ -533,6 +969,17 @@ parse_explicit_message_test() ->
     ?assertEqual(
         [DummyID, #{ <<"path">> => <<"a">>, <<"a">> => <<"b">> }],
         from(Singleton3, #{})
+    ),
+    % After the base, a bare ID is a key.
+    ?assertEqual(
+        [DummyID, DummyID],
+        from(<<"/", DummyID/binary, "/", DummyID/binary>>, #{})
+    ),
+    % A part that starts with a URI scheme is the URI, decoded, with the `&',
+    % `~' and `=' that follow the scheme.
+    ?assertEqual(
+        [<<"ni:///sha-256;x&k=v~d@1.0">>, #{ <<"path">> => <<"a">> }],
+        from(#{ <<"path">> => <<"/ni:%2f%2f%2fsha-256;x&k=v~d@1.0/a">> }, #{})
     ).
 
 %%% `to/1' function tests
@@ -557,7 +1004,15 @@ simple_to_test() ->
     ],
     Expected = #{<<"path">> => <<"/a">>, <<"test-key">> => <<"test-value">>},
     ?assertEqual(Expected, to(Messages)),
-    ?assertEqual(Messages, from(to(Messages), #{})).
+    ?assertEqual(Messages, from(to(Messages), #{})),
+    % A request that holds only the value of its key is written `key=value'.
+    KeyValue = [#{}, #{ <<"path">> => <<"k">>, <<"k">> => <<"v">> }],
+    ?assertEqual(#{ <<"path">> => <<"/k=v">> }, to(KeyValue)),
+    ?assertEqual(KeyValue, from(to(KeyValue), #{})),
+    % A message that is only a device is written `~device'.
+    Device = [{as, <<"meta@1.0">>, #{}}, #{ <<"path">> => <<"info">> }],
+    ?assertEqual(#{ <<"path">> => <<"/~meta@1.0/info">> }, to(Device)),
+    ?assertEqual(Device, from(to(Device), #{})).
 
 multiple_messages_to_test() ->
     Messages =
@@ -781,8 +1236,8 @@ linked_key_test() ->
     {ok, PathID} = hb_cache:write(<<"/a">>, Opts),
     Missing =
         {link,
-            hb_util:human_id(crypto:strong_rand_bytes(32)),
-            #{ <<"type">> => <<"link">>, <<"lazy">> => false }
+            <<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+            #{}
         },
     Req = #{
         <<"path">> => {link, PathID, #{}},
@@ -883,7 +1338,12 @@ inlined_quoted_key_test() ->
     },
     MsgsB = from(ReqB, #{}),
     [_, Msg2b] = MsgsB,
-    ?assertEqual(<<"~meta@1.0/info">>, hb_maps:get(<<"eval">>, Msg2b)).
+    ?assertEqual(<<"~meta@1.0/info">>, hb_maps:get(<<"eval">>, Msg2b)),
+    % A value that starts with a quote, but does not end with one, keeps it.
+    ?assertMatch(
+        [_, #{ <<"k">> := <<"\"v">> }],
+        from(#{ <<"path">> => <<"/a&k=%22v">> }, #{})
+    ).
 
 inlined_assumed_key_test() ->
     Req = #{
@@ -936,31 +1396,79 @@ subpath_in_inlined_test() ->
     ?assertEqual(
         {resolve, [#{}, #{ <<"path">> => <<"x">> }, #{ <<"path">> => <<"y">> }] },
         hb_maps:get(<<"b">>, Second)
+    ),
+    % A group given with the `+resolve' type is read as a single subpath.
+    ?assertEqual(
+        Msgs,
+        from(
+            #{ <<"path">> => <<"/part1/part2&test=1&b+resolve=(/x/y)/part3">> },
+            #{}
+        )
     ).
 
 path_parts_test() ->
-    ?assertEqual(
-        [<<"a">>, <<"b&c=(/d/e)">>, <<"f">>],
-        path_parts($/, <<"/a/b&c=(/d/e)/f">>)
-    ),
-    ?assertEqual([<<"a">>], path_parts($/, <<"/a">>)),
-    ?assertEqual([<<"a">>, <<"b">>, <<"c">>], path_parts($/, <<"/a/b/c">>)),
-    ?assertEqual(
+    % A `/' in a group does not split the path.
+    ?assertMatch(
         [
-            <<"IYkkrqlZNW_J-4T-5eFApZOMRl5P4VjvrcOXWvIqB1Q">>,
-            <<"req">>
+            #{},
+            #{ <<"path">> := <<"a">> },
+            #{ <<"path">> := <<"b">>, <<"c">> := {resolve, [_, _, _]} },
+            #{ <<"path">> := <<"f">> }
         ],
-        path_parts($/, <<"/IYkkrqlZNW_J-4T-5eFApZOMRl5P4VjvrcOXWvIqB1Q/req">>)
+        from(<<"/a/b&c=(/d/e)/f">>, #{})
     ),
-    ?assertEqual(
-        [<<"a">>, <<"b&K1=V1">>, <<"c&K2=V2">>],
-        path_parts($/, <<"/a/b&K1=V1/c&K2=V2">>)
+    ?assertMatch([#{}, #{ <<"path">> := <<"a">> }], from(<<"/a">>, #{})),
+    ?assertMatch(
+        [#{}, #{ <<"path">> := <<"a">> }, #{ <<"path">> := <<"b">> }, _],
+        from(<<"/a/b/c">>, #{})
     ),
-    ?assertEqual(
-        [<<"a">>, <<"(x/y/z)">>, <<"c">>],
-        path_parts($/, <<"/a/(x/y/z)/c">>)
+    ?assertMatch(
+        [<<"IYkkrqlZNW_J-4T-5eFApZOMRl5P4VjvrcOXWvIqB1Q">>, #{}],
+        from(<<"/IYkkrqlZNW_J-4T-5eFApZOMRl5P4VjvrcOXWvIqB1Q/req">>, #{})
+    ),
+    ?assertMatch(
+        [
+            #{},
+            #{ <<"path">> := <<"a">> },
+            #{ <<"path">> := <<"b">>, <<"k1">> := <<"V1">> },
+            #{ <<"path">> := <<"c">>, <<"k2">> := <<"V2">> }
+        ],
+        from(<<"/a/b&K1=V1/c&K2=V2">>, #{})
+    ),
+    ?assertMatch(
+        [#{}, #{ <<"path">> := <<"a">> }, {resolve, [_, _, _, _]}, _],
+        from(<<"/a/(x/y/z)/c">>, #{})
+    ),
+    % A path that does not follow the grammar is refused with the position of
+    % the error, counted in bytes, also after a character of two bytes.
+    ?assertThrow(
+        {invalid_singleton, invalid_path, <<"character 6: ", _/binary>>},
+        from(<<"/", 16#C3, 16#A9, "/c)">>, #{})
+    ),
+    % The end of the path is expected only where the path can end.
+    ?assertThrow(
+        {invalid_singleton,
+            invalid_path,
+            <<
+                "character 6: expected text, '(', '=', '~'; "
+                "found the end of the path."
+            >>
+        },
+        from(<<"/a/b~">>, #{})
     ),
     ok.
 
 parse_part_space_edge_case_test() ->
-    parse_part(<<"42jky7O3rzKkMOfHBXgK-304YjulzEYqHc9qyjT3efA~manifest@1.0/[object Object]">>, #{}).
+    ?assertMatch(
+        [
+            {as, <<"manifest@1.0">>, _},
+            #{ <<"path">> := <<"[object Object]">> }
+        ],
+        from(
+            <<
+                "/42jky7O3rzKkMOfHBXgK-304YjulzEYqHc9qyjT3efA~manifest@1.0"
+                "/[object Object]"
+            >>,
+            #{}
+        )
+    ).
