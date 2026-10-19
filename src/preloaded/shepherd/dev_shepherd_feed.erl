@@ -6,9 +6,10 @@
 %%% an `httpsig@1.0' commitment (`rsa-pss-sha512') over its body and content
 %%% type, so that the receiver can check which node sent it.
 %%% Every field is read from an item the node has verified, from its signed
-%%% `ans104@1.0' or `tx@1.0' commitment: `owner/address' is the committer,
-%%% which is native to the signer's chain for Ethereum and Solana signers, as
-%%% in GraphQL, and `owner/key' is the signer's base64url public key.
+%%% `ans104@1.0' or `tx@1.0' commitment: `owner/address' is the address of
+%%% its `did:pkh' committer, which is native to the signer's chain for Ethereum
+%%% and Solana signers, as in GraphQL, and `owner/key' is the commitment's
+%%% `owner', the signer's base64url public key.
 %%% `data/type' is omitted when the item has no UTF-8 `content-type', and tags
 %%% that are not UTF-8 are omitted.
 %%%
@@ -113,10 +114,11 @@ upload(_Base, Req, Opts) ->
     {ok, Req}.
 
 %% @doc Whether a request to a bundler path resulted in an accepted item: an
-%% `id' and `timestamp' with status 200.
+%% `id' and `timestamp' with status 200. The hook sees the result before the
+%% node gives it a status, so a result without one is accepted.
 is_upload(Request, Res, Opts) when is_map(Request), is_map(Res) ->
     Path = hb_util:bin(hb_maps:get(<<"path">>, Request, <<>>, Opts)),
-    hb_maps:get(<<"status">>, Res, 0, Opts) =:= 200 andalso
+    hb_maps:get(<<"status">>, Res, 200, Opts) =:= 200 andalso
         hb_maps:is_key(<<"id">>, Res, Opts) andalso
         hb_maps:is_key(<<"timestamp">>, Res, Opts) andalso
         binary:match(Path, <<"bundler@1.0">>) =/= nomatch;
@@ -173,8 +175,9 @@ gql_node(ID, TABM, Opts) ->
     Device = hb_maps:get(<<"commitment-device">>, Commitment, none, Opts),
     maybe
         true ?= lists:member(Device, ?DEVICES),
-        {ok, Owner} ?= hb_maps:find(<<"committer">>, Commitment, Opts),
-        {ok, KeyID} ?= hb_maps:find(<<"keyid">>, Commitment, Opts),
+        {ok, <<"did:pkh:", Account/binary>>} ?=
+            hb_maps:find(<<"committer">>, Commitment, Opts),
+        {ok, Key} ?= hb_maps:find(<<"owner">>, Commitment, Opts),
         Size = integer_to_binary(data_size(TABM, Commitment, Opts)),
         Type = text(hb_maps:get(<<"content-type">>, TABM, not_found, Opts)),
         #{
@@ -187,13 +190,18 @@ gql_node(ID, TABM, Opts) ->
             <<"tags">> => tags(TABM, Commitment, Opts),
             <<"owner">> =>
                 #{
-                    <<"address">> => Owner,
-                    <<"key">> => hb_util:remove_scheme_prefix(KeyID)
+                    <<"address">> => account_address(Account),
+                    <<"key">> => Key
                 }
         }
     else
         _ -> skip
     end.
+
+%% @doc The address of a CAIP-10 account, such as `arweave:7wIU:<address>':
+%% its last part, which is native to the account's chain.
+account_address(Account) ->
+    lists:last(binary:split(Account, <<":">>, [global])).
 
 %% @doc The size of an item's data. Items carry their data; transaction
 %% headers carry `data_size' instead.
@@ -665,7 +673,7 @@ upload_test() ->
         RSAAddress = hb_util:human_id(ar_wallet:to_address(RSAWallet)),
         ?assertEqual(
             {
-                [hb_util:human_id(ar_wallet:to_address(NodeWallet))],
+                [hb_test_utils:committer(NodeWallet)],
                 [
                     #{
                         id => hb_util:encode(RSAItem#tx.id),
@@ -733,7 +741,7 @@ copycat_test() ->
     {ok, _} =
         hb_cache:write(hb_private:set(Placed, <<"offset">>, 1000, Opts), Opts),
     {Signers, Report} = receive_report(),
-    ?assertEqual([hb_util:human_id(ar_wallet:to_address(Wallet))], Signers),
+    ?assertEqual([hb_test_utils:committer(Wallet)], Signers),
     ?assertEqual(
         [hb_message:id(Placed, signed, Opts)],
         [maps:get(id, Item) || Item <- Report]
