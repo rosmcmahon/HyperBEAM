@@ -1,43 +1,21 @@
-%%% @doc `shepherd-feed@1.0' reports the weave items a node takes in to a
-%%% Shepherd content-moderation server. Each report is a JSON object whose
-%%% `items' are GraphQL-shaped transaction nodes (`id', `data/size',
-%%% `data/type', `tags', `owner/address' and `owner/key'), POSTed to the node
-%%% option `shepherd-feed-url'. Each report is signed with the node's wallet, as
-%%% an `httpsig@1.0' commitment (`rsa-pss-sha512') over its body and content
-%%% type, so that the receiver can check which node sent it.
-%%% Every field is read from an item the node has verified, from its signed
-%%% `ans104@1.0' or `tx@1.0' commitment: `owner/address' is the address of
-%%% its `did:pkh' committer, which is native to the signer's chain for Ethereum
-%%% and Solana signers, as in GraphQL, and `owner/key' is the commitment's
-%%% `owner', the signer's base64url public key.
-%%% `data/type' is omitted when the item has no UTF-8 `content-type', and tags
-%%% that are not UTF-8 are omitted.
+%%% @doc `shepherd-feed@1.0' reports the weave items that a node takes in to a
+%%% Shepherd content-moderation server at the node option `shepherd-feed-url'.
+%%% Each report is a JSON object whose `items' are GraphQL-shaped transaction
+%%% nodes (`id', `data', `tags', `owner'), read from each item's signed
+%%% `ans104@1.0' or `tx@1.0' commitment. The node signs each report as an
+%%% `httpsig@1.0' commitment.
 %%%
-%%% Sources:
+%%% Sources, which log their failures and return the hook request unchanged:
 %%% ```
-%%%     upload:  `response' hook. Items accepted by `~bundler@1.0', read back
-%%%              from the cache that the bundler writes them to before it
-%%%              responds.
-%%%     copycat: `cache-write' hook. Items written at a weave offset, as
-%%%              copycat writes them. A node that runs no copycat reports
-%%%              none.
+%%%     upload:  `response' hook. Items that `~bundler@1.0' accepts.
+%%%     copycat: `cache-write' hook. Items written at a weave offset.
 %%% '''
-%%% Both pass items to a batching process per node, and return the hook
-%%% request unchanged. Their failures are logged and dropped: a failed
-%%% `response' hook fails the upload's response, and a failed `cache-write'
-%%% hook fails the cache write. The batching process writes each report as a
-%%% page file in the directory `shepherd-feed-dir', which survives the node's
-%%% restart. Its sender sends the pages in order, each until the feed URL
-%%% answers ok, waiting up to `MAX_RETRY_MS' between attempts, then deletes it.
-%%% Only the items of the page being filled, at most `FLUSH_MS' old, are held
-%%% in memory.
+%%% Reports are written as pages to `shepherd-feed-dir', which survives a
+%%% restart, and each page is sent until the feed URL accepts it.
 %%%
-%%% `install' is a `start' hook that registers the sources and starts the
-%%% batching process, which sends the pages that the node held when it
-%%% stopped. A node's `on' option replaces the default hooks, so `install'
-%%% rebuilds them: the defaults, overridden by the node's own hooks, with the
-%%% sources appended. Without `shepherd-feed-url' it rebuilds the hooks and
-%%% appends no sources.
+%%% `install' is a `start' hook. A node's `on' option replaces the default
+%%% hooks, so `install' rebuilds them, and adds the sources when
+%%% `shepherd-feed-url' is set:
 %%% ```
 %%%     "on": { "start": { "device": "shepherd-feed@1.0", "path": "install" } }
 %%% '''
@@ -62,7 +40,7 @@
 -define(NOT_TAGS, [
     <<"commitments">>, <<"priv">>, <<"ao-types">>, <<"ao-data-key">>,
     <<"data">>, <<"anchor">>, <<"target">>, <<"format">>, <<"quantity">>,
-    <<"reward">>, <<"data_root">>, <<"data_size">>
+    <<"reward">>, <<"data-root">>, <<"data-size">>
 ]).
 
 %% @doc Rebuild the node's hooks from the defaults and its own hooks, with the
@@ -168,16 +146,17 @@ guard(Fun) ->
 
 %% @doc The GraphQL `transactions' node of one ID of a TABM item, without
 %% `block' and `parent', or `skip' if the ID is not of a weave item's signed
-%% commitment.
+%% commitment. `owner/key' is the commitment's `owner', and `owner/address' the
+%% address of that key for its signature `type': native to the signer's chain
+%% for Ethereum and Solana signers, as in GraphQL.
 gql_node(ID, TABM, Opts) ->
     Commitments = hb_maps:get(<<"commitments">>, TABM, #{}, Opts),
     Commitment = hb_maps:get(ID, Commitments, #{}, Opts),
     Device = hb_maps:get(<<"commitment-device">>, Commitment, none, Opts),
     maybe
         true ?= lists:member(Device, ?DEVICES),
-        {ok, <<"did:pkh:", Account/binary>>} ?=
-            hb_maps:find(<<"committer">>, Commitment, Opts),
         {ok, Key} ?= hb_maps:find(<<"owner">>, Commitment, Opts),
+        {ok, SigType} ?= hb_maps:find(<<"type">>, Commitment, Opts),
         Size = integer_to_binary(data_size(TABM, Commitment, Opts)),
         Type = text(hb_maps:get(<<"content-type">>, TABM, not_found, Opts)),
         #{
@@ -190,7 +169,13 @@ gql_node(ID, TABM, Opts) ->
             <<"tags">> => tags(TABM, Commitment, Opts),
             <<"owner">> =>
                 #{
-                    <<"address">> => account_address(Account),
+                    <<"address">> =>
+                        hb_util:human_id(
+                            ar_wallet:to_address(
+                                hb_util:decode(Key),
+                                ar_tx:deserialize_sig_type(SigType)
+                            )
+                        ),
                     <<"key">> => Key
                 }
         }
@@ -198,26 +183,41 @@ gql_node(ID, TABM, Opts) ->
         _ -> skip
     end.
 
-%% @doc The address of a CAIP-10 account, such as `arweave:7wIU:<address>':
-%% its last part, which is native to the account's chain.
-account_address(Account) ->
-    lists:last(binary:split(Account, <<":">>, [global])).
-
 %% @doc The size of an item's data. Items carry their data; transaction
-%% headers carry `data_size' instead.
+%% headers carry `data-size' instead.
 data_size(TABM, Commitment, Opts) ->
-    DataKey = hb_maps:get(<<"ao-data-key">>, TABM, <<"data">>, Opts),
-    case hb_maps:get(DataKey, TABM, not_found, Opts) of
+    case hb_maps:get(data_key(Commitment, Opts), TABM, not_found, Opts) of
         Data when is_binary(Data) -> byte_size(Data);
         _ ->
             hb_util:int(
                 hb_maps:get(
-                    <<"data_size">>,
+                    <<"data-size">>,
                     TABM,
-                    hb_maps:get(<<"field-data_size">>, Commitment, 0, Opts),
+                    hb_maps:get(<<"field-data-size">>, Commitment, 0, Opts),
                     Opts
                 )
             )
+    end.
+
+%% @doc The key of an item's data: the value of its `ao-data-key' tag, which
+%% the commitment's `original-tags' keep, or `data'.
+data_key(Commitment, Opts) ->
+    Tags =
+        hb_util:message_to_ordered_list(
+            hb_maps:get(<<"original-tags">>, Commitment, #{}, Opts),
+            Opts
+        ),
+    case
+        [
+            hb_maps:get(<<"value">>, Tag, <<"data">>, Opts)
+        ||
+            Tag <- Tags,
+            hb_util:to_lower(hb_maps:get(<<"name">>, Tag, <<>>, Opts)) =:=
+                <<"ao-data-key">>
+        ]
+    of
+        [Key | _] -> Key;
+        [] -> <<"data">>
     end.
 
 %% @doc An item's tags that JSON can carry. Exact tag names and order are in
@@ -460,9 +460,8 @@ send(URL, N, Body, Opts, Wait) ->
 %% @doc POST a report body to the feed URL as JSON, signed with the node's
 %% wallet, returning `ok' if the feed URL answers ok. The request goes to an
 %% explicit URL, so that the node's HTTP client and its TLS and retry settings
-%% apply. Its `method', `path' and `codec-device' are not signed: the router
-%% removes an unsigned `path', and `codec-device' tells a receiving HyperBEAM
-%% node to read the request as the signed message rather than as a JSON body.
+%% apply. Its `method' and `path' are not signed: the router removes an
+%% unsigned `path'.
 post(URL, Body, Opts) ->
     try
         Report =
@@ -477,8 +476,7 @@ post(URL, Body, Opts) ->
         hb_http:request(
             Report#{
                 <<"method">> => <<"POST">>,
-                <<"path">> => URL,
-                <<"codec-device">> => <<"httpsig@1.0">>
+                <<"path">> => URL
             },
             Opts
         )
@@ -745,6 +743,36 @@ copycat_test() ->
     ?assertEqual(
         [hb_message:id(Placed, signed, Opts)],
         [maps:get(id, Item) || Item <- Report]
+    ).
+
+%% @doc A transaction header is reported with its `data-size', and an item
+%% whose data is under its `ao-data-key' with the size of that data.
+copycat_data_size_test() ->
+    Opts = copycat_opts(start_receiver()),
+    Header =
+        hb_message:commit(
+            #{
+                <<"data-size">> => <<"1000000">>,
+                <<"data-root">> => hb_util:encode(crypto:strong_rand_bytes(32))
+            },
+            Opts,
+            <<"tx@1.0">>
+        ),
+    Body = hb_message:commit(#{ <<"body">> => <<"12345">> }, Opts, <<"ans104@1.0">>),
+    lists:foreach(
+        fun(Item) ->
+            {ok, _} =
+                hb_cache:write(hb_private:set(Item, <<"offset">>, 1000, Opts), Opts)
+        end,
+        [Header, Body]
+    ),
+    {_Signers, Report} = receive_report(),
+    ?assertEqual(
+        [
+            {hb_message:id(Header, signed, Opts), <<"1000000">>},
+            {hb_message:id(Body, signed, Opts), <<"5">>}
+        ],
+        [{maps:get(id, Item), maps:get(size, Item)} || Item <- Report]
     ).
 
 %% @doc A report that the receiver refuses is sent again until the receiver
