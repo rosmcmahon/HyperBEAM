@@ -1,6 +1,6 @@
 %%% @doc A device that renders a REPL-like interface for AO-Core via HTML.
 -module(dev_hyperbuddy).
--export([info/1, format/3, return_file/2, return_error/2]).
+-export([device_info/1, format/3, return_file/2]).
 -export([metrics/3, events/3]).
 -export([throw/3]).
 -include_lib("include/hb.hrl").
@@ -10,7 +10,7 @@
 %% `hyperbuddy-serve' key of the node message will be served as static files.
 %% Each filename must point to a path relative to the HyperBEAM instance's
 %% build subdirectory as follows: `priv/html/hyperbuddy@1.0'.
-info(Opts) ->
+device_info(Opts) ->
     ServedRoutes = hb_opts:get(<<"hyperbuddy-serve">>, #{}, Opts),
     #{
         default => fun serve/4,
@@ -59,7 +59,7 @@ metrics(_, Req, Opts) ->
                     RawHeaderMap,
 					Opts
                 ),
-            % Prometheus names its exposition format in a `version' parameter.
+            % Prometheus states its exposition format in a `version' parameter.
             % `0.0.4' is not a valid structured-field value, so the parameter is
             % dropped and the bare media type served.
             {ok,
@@ -72,10 +72,13 @@ metrics(_, Req, Opts) ->
             {ok, #{ <<"body">> => <<"Prometheus metrics disabled.">> }}
     end.
 
-%% @doc Return the current event counters as a message.
+%% @doc Return the current event counters in the reply's body.
 -spec events(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 events(_, _Req, _Opts) ->
-    {ok, hb_event:counters()}.
+    {ok, #{
+        <<"ao-result">> => <<"body">>,
+        <<"body">> => hb_event:counters()
+    }}.
 
 %% @doc Employ HyperBEAM's internal pretty printer to format a message.
 %% 
@@ -184,7 +187,7 @@ throw(_Msg, _Req, Opts) ->
     end.
 
 %% @doc Serve a file from the priv directory. Only serves files that are explicitly
-%% listed in the `routes' field of the `info/1' return value.
+%% listed in the `routes' field of the `device_info/1' return value.
 -spec serve(term(), #{ _ => _ }, #{ _ => _ }, map()) -> term().
 serve(<<"keys">>, M1, _M2, Opts) ->
     hb_ao:raw(<<"message@1.0">>, <<"keys">>, M1, #{}, Opts);
@@ -192,7 +195,7 @@ serve(<<"set">>, M1, M2, Opts) ->
     hb_ao:raw(<<"message@1.0">>, <<"set">>, M1, M2, Opts);
 serve(Key, _, _, Opts) ->
     ?event({hyperbuddy_serving, Key}),
-    ServeRoutes = hb_maps:get(serve, info(Opts), #{}, Opts),
+    ServeRoutes = hb_maps:get(serve, device_info(Opts), #{}, Opts),
     case hb_maps:find(Key, ServeRoutes, Opts) of
         {ok, Filename} -> return_file(<<"hyperbuddy@1.0">>, Filename, #{});
         error -> {error, not_found}
@@ -209,16 +212,6 @@ return_file(Device, <<"404.html">>, Template) ->
     );
 return_file(Device, Name, Template) ->
     hb_http_server:static(Device, Name, Template, #{}).
-
-%% @doc Return an error page, with the `{{error}}` template variable replaced.
-return_error(Error, Opts) when not is_map(Error) ->
-    return_error(#{ <<"body">> => Error }, Opts);
-return_error(ErrorMsg, Opts) ->
-    return_file(
-        <<"hyperbuddy@1.0">>,
-        <<"500.html">>,
-        #{ <<"error">> => hb_format:error(ErrorMsg, Opts) }
-    ).
 
 %%% Tests
 

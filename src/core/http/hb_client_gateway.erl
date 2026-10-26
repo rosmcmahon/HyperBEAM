@@ -103,7 +103,7 @@ item_spec() ->
 %% where `<id>' is the base64-url-encoded transaction ID.
 data(ID, Opts) ->
     Req = #{
-        <<"multirequest-accept-status">> => 200,
+        <<"multirequest-admissible-status">> => 200,
         <<"multirequest-responses">> => 1,
         <<"path">> => <<"/arweave/raw/", ID/binary>>,
         <<"method">> => <<"GET">>
@@ -114,7 +114,7 @@ data(ID, Opts) ->
             Data =
                 case hb_maps:find(<<"data">>, Res, Opts) of
                     {ok, D} -> D;
-                    _ -> hb_ao:get(<<"body">>, Res, <<>>, Opts)
+                    _ -> hb_maps:get(<<"body">>, Res, <<>>, Opts)
                 end,
             ?event(gateway,
                 {data,
@@ -130,40 +130,29 @@ data(ID, Opts) ->
     end.
 
 %% @doc Find the location of the scheduler based on its ID, through GraphQL.
-%% The `did:pkh:' committer of an Arweave address is found by the address.
-%% Current AO location records use lowercase tags. Nodes may disable the
-%% fallback to legacy capitalized tags with `scheduler-legacy-locations'.
+%% The committer of an Arweave address is found by the address. The query asks
+%% for the newest record with a `type' of `location', `Location' or
+%% `Scheduler-Location', and with the given `variant', if any. An `ao.TN.1'
+%% lookup asks only for `Location' and `Scheduler-Location', as HyperBEAM's
+%% `location' records are `ao.N.1'. The gateway matches tag names in any case,
+%% so `type' and `variant' also find `Type' and `Variant' tags. With
+%% `scheduler-legacy-locations' set to `false', the query asks only for a
+%% `type' of `location'.
 location(Address, Opts) ->
     location(Address, undefined, Opts).
-location(?ARWEAVE_COMMITTER(Address), Variant, Opts) ->
-    location(Address, Variant, Opts);
-location(Address, Variant, Opts) ->
-    maybe
-        % Fallback to legacy capitalized tags if a lower-case result is not
-        % available and `scheduler-legacy-locations' is enabled.
-        Error = {error, _} ?=
-            do_location(Address, Variant, <<"type">>, [<<"location">>], Opts),
-        true ?= hb_opts:get(scheduler_legacy_locations, true, Opts)
-            orelse Error,
-        do_location(
-            Address,
-            Variant,
-            <<"Type">>,
-            [<<"Location">>, <<"Scheduler-Location">>],
-            Opts
-        )
-    end.
-do_location(Address, Variant, TagName, TagValues, Opts) ->
+location(Committer, Variant, Opts) ->
+    Address = hb_util:committer_address(Committer),
+    Types =
+        case {hb_opts:get(scheduler_legacy_locations, true, Opts), Variant} of
+            {false, _} -> [<<"location">>];
+            {true, <<"ao.TN.1">>} -> [<<"Location">>, <<"Scheduler-Location">>];
+            {true, _} ->
+                [<<"location">>, <<"Location">>, <<"Scheduler-Location">>]
+        end,
     VariantTags =
         case Variant of
             undefined -> [];
-            _ ->
-                VariantTag =
-                    case TagName of
-                        <<"type">> -> <<"variant">>;
-                        <<"Type">> -> <<"Variant">>
-                    end,
-                [#{ <<"name">> => VariantTag, <<"values">> => [Variant] }]
+            _ -> [#{ <<"name">> => <<"variant">>, <<"values">> => [Variant] }]
         end,
     Query =
         <<"query($Addresses: [String!]!, $Tags: [TagFilter!]!) { ",
@@ -180,7 +169,7 @@ do_location(Address, Variant, TagName, TagValues, Opts) ->
     Variables = #{
         <<"Addresses">> => [Address],
         <<"Tags">> =>
-            [#{ <<"name">> => TagName, <<"values">> => TagValues } | VariantTags]
+            [#{ <<"name">> => <<"type">>, <<"values">> => Types } | VariantTags]
     },
     case query(Query, Variables, Opts) of
         {error, Reason} ->
@@ -262,10 +251,10 @@ device_queries(SpecID, TrustedSigners, Opts) ->
             {Address, signer_valid_until_height(Signer, Opts)}
         ||
             Signer <- TrustedSigners,
-            % GraphQL finds the items of a `did:pkh:' committer of an Arweave
-            % address by the address.
-            ?ARWEAVE_COMMITTER(Address) <-
-                [trusted_signer_address(Signer, Opts)]
+            % GraphQL finds the items of the committer of an Arweave address
+            % by the address.
+            {ok, Address} <-
+                [hb_committer:address(trusted_signer_address(Signer, Opts))]
         ],
     case lists:any(fun({_Signer, Height}) -> Height =/= undefined end, SignerPolicies) of
         false ->
@@ -279,10 +268,10 @@ device_queries(SpecID, TrustedSigners, Opts) ->
             ]
     end.
 
-trusted_signer_address(Signer, _Opts) when is_binary(Signer) ->
-    hb_util:committer(Signer);
+trusted_signer_address(Signer, Opts) when is_binary(Signer) ->
+    hb_committer:uri(Signer, Opts);
 trusted_signer_address(Signer, Opts) when is_map(Signer) ->
-    hb_util:committer(hb_maps:get(<<"address">>, Signer, undefined, Opts));
+    hb_committer:uri(hb_maps:get(<<"address">>, Signer, undefined, Opts));
 trusted_signer_address(_Signer, _Opts) ->
     undefined.
 
@@ -396,8 +385,13 @@ result_to_message(Item, Opts) ->
             result_to_message(undefined, Item, Opts)
     end.
 %% @doc Load an L1 transaction in its native form. The node is read through
-%% `hb_ao:get/3', so its keys are in `structured@1.0' form.
-result_to_message(ExpectedID, #{ <<"bundledin">> := null }, Opts) ->
+%% `hb_ao:get/3', so its keys are in `structured@1.0' form. A node is an L1
+%% transaction if its `bundledIn' is null or its fee is not zero. ANS-104
+%% items pay no fee. Some gateways give an L1 transaction an empty
+%% `bundledIn' ID.
+result_to_message(ExpectedID, Item, Opts)
+        when map_get(<<"bundledin">>, Item) =:= null;
+             map_get(<<"winston">>, map_get(<<"fee">>, Item)) =/= <<"0">> ->
     hb_ao:resolve(
         #{ <<"device">> => <<"arweave@2.9">> },
         #{ <<"path">> => <<"tx">>, <<"tx">> => ExpectedID },
@@ -553,10 +547,9 @@ subindex_to_tags(Subindex) ->
 %%% Tests
 device_valid_until_height_query_test() ->
     SpecID = <<"spec">>,
-    Alice = <<"alice">>,
-    Bob = <<"bob">>,
-    AliceCommitter = ?ARWEAVE_COMMITTER(Alice),
-    BobCommitter = ?ARWEAVE_COMMITTER(Bob),
+    [Alice, Bob] = [hb_util:human_id(<<N:256>>) || N <- [1, 2]],
+    AliceCommitter = hb_committer:uri(Alice),
+    BobCommitter = hb_committer:uri(Bob),
     [{BaseQuery, BaseVars}] =
         device_queries(SpecID, [AliceCommitter, BobCommitter], #{}),
     ?assertEqual([Alice, Bob], maps:get(<<"trusted">>, BaseVars)),
@@ -620,9 +613,11 @@ ans104_no_data_item_test() ->
 scheduler_location_test() ->
     % Start a random node so that all of the services come up.
     _Node = hb_http_server:start_node(#{}),
+    % Look up the legacy scheduler with its variant, as a scheduler lookup does.
     {ok, Res} =
         location(
             <<"fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY">>,
+            <<"ao.TN.1">>,
             #{}
         ),
     ?event(gateway, {get_scheduler_location_test, Res}),
@@ -647,29 +642,32 @@ l1_transaction_test() ->
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"Hello World">>, Data).
 
-%% @doc Test l2 message from graphql. The gateway index leaves out the item's
-%% anchor, so explicit trust is needed to serve it uncommitted.
+%% @doc Test l2 message from graphql. The gateway serves the item's anchor, so
+%% the item verifies and is served with its owner's commitment.
 l2_dataitem_test() ->
     _Node = hb_http_server:start_node(#{}),
-    {ok, Res} = read(
-        <<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>,
-        #{ <<"ans104-trust-gql">> => true }
-    ),
+    {ok, Res} = read(<<"oyo3_hCczcU7uYhfByFZ3h0ELfeMMzNacT-KpRoJK6g">>, #{}),
     ?event(gateway, {l2_dataitem, Res}),
-    ?assertEqual([], hb_message:signers(Res, #{})),
-    ?assertNot(maps:is_key(<<"commitments">>, Res)),
+    ?assert(hb_message:verify(Res, all, #{})),
+    ?assertEqual(
+        [hb_committer:uri(<<"vh-NTHVvlKZqRxc8LyyTNok65yQ55a_PJ1zWLb9G2JI">>)],
+        hb_message:signers(Res, #{})
+    ),
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"Hello World">>, Data).
 
-%% @doc ed25519 L2 Transaction test. The gateway index leaves out the item's
-%% anchor, so explicit trust is needed to serve it uncommitted.
+%% @doc ed25519 L2 Transaction test. The gateway serves the item's anchor, so
+%% the item verifies and is served with its owner's commitment.
 l2_dataitem_ed25519_test() ->
     _Node = hb_http_server:start_node(#{}),
     ID = <<"AwrAs-HaBlc8xeI8sw6Wpbi7A0weQWeXYwW20CpX5oM">>,
-    {ok, Res} = read(ID, #{ <<"ans104-trust-gql">> => true }),
+    {ok, Res} = read(ID, #{}),
     ?event(gateway, {l2_dataitem, Res}),
-    ?assertEqual([], hb_message:signers(Res, #{})),
-    ?assertNot(maps:is_key(<<"commitments">>, Res)),
+    ?assert(hb_message:verify(Res, all, #{})),
+    ?assertEqual(
+        [hb_committer:uri(<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>)],
+        hb_message:signers(Res, #{})
+    ),
     %% Check Data
     Data = maps:get(<<"data">>, Res),
     ?assertEqual(<<"{\"displayName\":\"Test Hub\",\"description\":\"This is a test hub created in the test suite\",\"externalurl\":\"\",\"image\":\"\"}">>, Data).
@@ -687,8 +685,8 @@ ao_dataitem_test() ->
 
 %% @doc An index that serves an item's anchor lets the item verify against its
 %% real signature, so it is served with its commitment. With the anchor left
-%% out, as arweave.net and goldsky serve bundled items, the signature cannot be
-%% verified: the item is refused unless the node explicitly trusts the index.
+%% out, the signature cannot be verified: the item is refused unless the node
+%% explicitly trusts the index.
 anchor_verification_test() ->
     {ok, Bin} = file:read_file(<<"test/arbundles.js/ans104-item-ed25519.bin">>),
     TX = ar_bundles:deserialize(Bin),
@@ -709,7 +707,7 @@ anchor_verification_test() ->
     {ok, Verified} = result_to_message(Item, #{}),
     ?assert(hb_message:verify(Verified, all, #{})),
     ?assertEqual(
-        [?ARWEAVE_COMMITTER(<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>)],
+        [hb_committer:uri(<<"ejhYD9Cw9VCsVik6yGLoclo3CLRvAITHTZamLY_6ro4">>)],
         hb_message:signers(Verified, #{})
     ),
     Unanchored = Item#{ <<"anchor">> => <<>> },

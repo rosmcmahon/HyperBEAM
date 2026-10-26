@@ -387,24 +387,6 @@ codec_roundtrip_conversion_is_idempotent_test(Codec, Opts) ->
     ?assert(is_idempotent(Roundtrip, Signed, Opts)),
     ?assert(is_idempotent(Roundtrip, ComplexMsg, Opts)).
 
-%% @doc Test that the filter_default_keys/1 function removes TX fields
-%% that have the default values found in the tx record, but not those that
-%% have been set by the user.
-default_keys_removed_test() ->
-    TX = #tx { unsigned_id = << 1:256 >>, anchor = << 2:256 >> },
-    TXMap = #{
-        <<"unsigned_id">> => TX#tx.unsigned_id,
-        <<"anchor">> => TX#tx.anchor,
-        <<"owner">> => TX#tx.owner,
-        <<"target">> => TX#tx.target,
-        <<"data">> => TX#tx.data
-    },
-    FilteredMap = hb_message:filter_default_keys(TXMap),
-    ?assertEqual(<< 1:256 >>, hb_maps:get(<<"unsigned_id">>, FilteredMap)),
-    ?assertEqual(<< 2:256 >>, hb_maps:get(<<"anchor">>, FilteredMap, not_found)),
-    ?assertEqual(not_found, hb_maps:get(<<"owner">>, FilteredMap, not_found)),
-    ?assertEqual(not_found, hb_maps:get(<<"target">>, FilteredMap, not_found)).
-
 minimization_test() ->
     Msg = #{
         <<"unsigned_id">> => << 1:256 >>,
@@ -420,6 +402,8 @@ match_modes_test() ->
     Res = #{ <<"a">> => 1, <<"b">> => 2, <<"c">> => 3 },
     ?assert(hb_message:match(Base, Req, only_present)),
     ?assert(hb_message:match(Req, Base, strict) =/= true),
+    % `match' compares a key with a `#tx{}' default value like any other key.
+    ?assert(hb_message:match(#{ <<"quantity">> => 0 }, #{}, strict) =/= true),
     ?assert(hb_message:match(Base, Res, primary)),
     ?assert(hb_message:match(Res, Base, primary) =/= true),
     StrictMap =
@@ -738,7 +722,7 @@ verify_nested_complex_signed_test(Codec, Opts) ->
     ?assert(MatchRes),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     % % Ensure that both of the messages can be verified (and retreived).
-    % `hb_cache:read' no longer normalizes commitments, so `hb_maps:get' returns
+    % `hb_cache:read' does not normalize commitments, so `hb_maps:get' returns
     % the inner message exactly as it was signed. Re-normalizing it here would
     % mint an unsigned commitment for the nested `parameters' submessage -- a key
     % the outer signature was made over in its uncommitted form -- changing the
@@ -990,6 +974,17 @@ changed_signed_message_test(Codec, Opts) ->
     ?assertMatch(
         #{ <<"a">> := <<"1">> },
         RoundTrip(Signed#{ <<"a">> => <<"1">> })
+    ),
+    % A message given keys after signing, typed or untyped, still verifies
+    % after the round trip.
+    ?assert(
+        hb_message:verify(
+            RoundTrip(
+                Signed#{ <<"t">> => 3, <<"big">> => binary:copy(<<"z">>, 5000) }
+            ),
+            all,
+            Opts
+        )
     ).
 
 specific_order_signed_message_test(RawCodec, Opts) ->
@@ -1155,7 +1150,21 @@ deep_multisignature_test() ->
     Committers = hb_message:signers(MsgSignedTwice, Opts),
     ?event({committers, Committers}),
     ?assert(lists:member(hb_test_utils:committer(Wallet1), Committers)),
-    ?assert(lists:member(hb_test_utils:committer(Wallet2), Committers)).
+    ?assert(lists:member(hb_test_utils:committer(Wallet2), Committers)),
+    % A committer given by its address selects only its own commitment.
+    Address1 = hb:address(Wallet1),
+    ?assert(hb_message:verify(MsgSignedTwice, [Address1], Opts)),
+    ?assertMatch(
+        {ok, _, _},
+        hb_message:commitment(Address1, MsgSignedTwice, Opts)
+    ),
+    ?assertEqual(
+        [hb_test_utils:committer(Wallet1)],
+        hb_message:signers(
+            hb_message:with_only_committers(MsgSignedTwice, [Address1], Opts),
+            Opts
+        )
+    ).
 
 deep_typed_message_id_test(Codec, Opts) ->
     Msg = #{
@@ -1650,8 +1659,8 @@ priv_survives_conversion_test(Codec, Opts) ->
         maps:get(<<"priv">>, Decoded)
     ).
 
-%% @doc A message whose `priv' key holds a literal converts, and decodes to its
-%% other keys.
+%% @doc A message whose `priv' key contains a literal converts, and decodes to
+%% its other keys.
 literal_priv_test(Codec, Opts) ->
     Msg = #{ <<"data">> => <<"TEST_DATA">>, <<"priv">> => <<"literal">> },
     Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),

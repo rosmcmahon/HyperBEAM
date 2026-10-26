@@ -14,7 +14,8 @@
 %%% `{00, 11, 01, 10}`, which is why each node in a radix-4 trie can have at-most
 %%% 4 children!)
 -module(dev_trie).
--export([info/0, keys/2, keys/3, set/3, get/3, get_key/4]).
+-specification("../../../specs/trie@1.0.md").
+-export([device_info/0, keys/2, keys/3, set/3, get/3, get_key/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -33,7 +34,7 @@
     <<"hashpath">>
 ]).
 
-info() ->
+device_info() ->
     #{
         default => fun get_key/4,
         reserved => ?RESERVED_KEYS
@@ -94,11 +95,12 @@ get(TrieNode, Req, Opts) ->
             end
     end.
 
-%% @doc Set keys and their values in the trie.
+%% @doc Set keys and their values in the trie, and `device' on the message.
 -spec set(#{ _ => _ }, #{ path => binary(), _ => _ }, #{ _ => _ }) ->
     {ok, #{ _ => _ }}.
 set(Trie, Req, Opts) ->
-    Insertable = hb_maps:without([<<"path">>], Req, Opts),
+    % A request is caller input, so its private keys are not trie data.
+    Insertable = hb_private:reset(hb_maps:without([<<"path">>], Req, Opts)),
     KeyVals = hb_maps:to_list(Insertable, Opts),
     {ok, do_set(Trie, KeyVals, Opts)}.
 do_set(Trie, [], Opts) ->
@@ -111,6 +113,8 @@ do_set(Trie, [], Opts) ->
         ),
     {ok, _} = hb_cache:write(CommittedTrie, Opts),
     CommittedTrie;
+do_set(Trie, [{<<"device">>, Device} | KeyVals], Opts) ->
+    do_set(Trie#{<<"device">> => Device}, KeyVals, Opts);
 do_set(Trie, [{Key, Val} | KeyVals], Opts) ->
     NewTrie = insert(Trie, Key, Val, Opts),
     do_set(NewTrie, KeyVals, Opts).
@@ -519,6 +523,15 @@ device_prefix_test() ->
                 Entries
             ),
             ?assertEqual(<<"trie@1.0">>, hb_maps:get(<<"device">>, Trie, Opts)),
+            % `set' of `device' changes it on the message, not in the trie.
+            ?assertEqual(
+                <<"message@1.0">>,
+                hb_maps:get(
+                    <<"device">>,
+                    hb_ao:set(Trie, <<"device">>, <<"message@1.0">>, Opts),
+                    Opts
+                )
+            ),
             {ok, ID} = hb_cache:write(Trie, Opts),
             {ok, Loaded} = hb_cache:read(ID, Opts),
             lists:foreach(

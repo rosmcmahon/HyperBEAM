@@ -67,11 +67,10 @@
 -export([is_signed_key/3]).
 -export([commitment/2, commitment/3, commitments/3]).
 -export([with_only_committed/2, with_only_committed/3]).
+-export([with_only_committed_deep/2]).
 -export([without_unless_signed/3]).
 -export([with_commitments/3, without_commitments/3, uncommitted_deep/2]).
--export([diff/3, match/2, match/3, match/4, find_target/3]).
-%%% Helpers:
--export([default_tx_list/0, filter_default_keys/1]).
+-export([diff/3, match/2, match/3, match/4, find_subject/4]).
 %%% Debugging tools:
 -export([print/1]).
 -include("include/hb.hrl").
@@ -187,7 +186,7 @@ from_tabm(Msg, TargetFormat, OldPriv, Opts) ->
 
 %% @doc Add the existing `priv' sub-map back to a converted message, honoring
 %% any existing `priv' sub-map that may already be present. A `priv' key that
-%% holds a literal is not a sub-map, and is not restored.
+%% contains a literal is not a sub-map, and is not restored.
 restore_priv(Msg, OldPriv, _Opts)
         when not is_map(OldPriv); map_size(OldPriv) == 0 ->
     Msg;
@@ -403,10 +402,54 @@ with_only_committed(Msg, _, _) ->
     % If the message is not a map, it cannot be signed.
     {ok, Msg}.
 
+%% @doc Return a message with only the committed keys, as
+%% `with_only_committed/2' does, and the same for each message inside it. A
+%% commitment covers a child message by its ID, which the child's own
+%% commitments give, so the child keeps only the keys that they cover. A child
+%% that only bundled signed commitments cover is kept as it is.
+with_only_committed_deep(Msg, Opts) when is_map(Msg) ->
+    {ok, Committed} = with_only_committed(Msg, Opts),
+    Bundled = bundled_keys(Committed, Opts),
+    maps:map(
+        fun(Key, Value) ->
+            case lists:member(Key, [<<"commitments">> | Bundled]) of
+                true -> Value;
+                false -> with_only_committed_deep(Value, Opts)
+            end
+        end,
+        Committed
+    );
+with_only_committed_deep(Values, Opts) when is_list(Values) ->
+    [ with_only_committed_deep(Value, Opts) || Value <- Values ];
+with_only_committed_deep(Value, _Opts) ->
+    Value.
+
+%% @doc Return the keys whose whole values a message's signed commitments
+%% cover: the keys of its bundled signed commitments, except those that a
+%% signed commitment that is not bundled also covers, as it covers only an ID.
+bundled_keys(Msg, Opts) ->
+    Signed =
+        [
+            {
+                hb_util:bool(maps:get(<<"bundle">>, Commitment, false)),
+                committed(Msg, [ID], Opts)
+            }
+        ||
+            {ID, Commitment = #{ <<"committer">> := _ }} <-
+                maps:to_list(hb_maps:get(<<"commitments">>, Msg, #{}, Opts))
+        ],
+    Linked = lists:append([ Keys || {false, Keys} <- Signed ]),
+    [
+        Key
+    ||
+        {true, Keys} <- Signed, Key <- Keys, not lists:member(Key, Linked)
+    ].
+
 %% @doc Return the message with only the specified committers attached.
 with_only_committers(Msg, Committers) ->
     with_only_committers(Msg, Committers, #{}).
-with_only_committers(Msg, Committers, Opts) when is_map(Msg) ->
+with_only_committers(Msg, RawCommitters, Opts) when is_map(Msg) ->
+    Committers = [hb_committer:uri(C, Opts) || C <- RawCommitters],
     NewCommitments =
         hb_maps:filter(
             fun(_, #{ <<"committer">> := Committer }) ->
@@ -451,7 +494,12 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
 commit(Msg, GivenOpts, Spec) ->
-    Opts = hb_http_server:with_node_committer(GivenOpts),
+    % Only a signed commitment takes the node's key material.
+    Opts =
+        case Spec of
+            #{ <<"type">> := <<"unsigned">> } -> GivenOpts;
+            _ -> hb_http_server:with_node_committer(GivenOpts)
+        end,
     % hb_ao:raw does not vary for us but ~message@1.0/commit|id expects a
     % ~structured@1.0 form, so we force an idempotent 'to' call to ensure it
     {ok, Structured} =
@@ -599,11 +647,15 @@ deep_verify(Path, Msg, Opts) when is_map(Msg) ->
         true ?=
             maps:fold(
                 fun(Key, Value, true) ->
-                    deep_verify(Path ++ [Key], Value, Opts);
+                    deep_verify([Key | Path], Value, Opts);
                    (_, _, Failure) -> Failure
                 end,
                 true,
-                uncommitted(hb_private:reset(Msg), Opts)
+                % `verify/3' reads `Msg' with its private keys; the fold skips them.
+                maps:filter(
+                    fun(Key, _) -> not hb_private:is_private(Key) end,
+                    uncommitted(Msg, Opts)
+                )
             ),
         Verified =
             try verify(Msg, #{ <<"ids">> => <<"all">> }, Opts)
@@ -611,7 +663,7 @@ deep_verify(Path, Msg, Opts) when is_map(Msg) ->
             end,
         case Verified of
             true -> true;
-            false -> {false, hb_path:to_binary(Path), Msg}
+            false -> {false, hb_path:to_binary(lists:reverse(Path)), Msg}
         end
     end;
 deep_verify(_Path, _Msg, _Opts) ->
@@ -725,23 +777,11 @@ unsafe_match(RawMap1, RawMap2, Mode, Path, Opts) ->
     Map2 = RawMap2#{ <<"commitments">> => SignedCommitments2 },
     Keys1 =
         hb_maps:keys(
-            NormMap1 =
-                minimize(
-                    normalize(
-                        hb_ao:normalize_keys(Map1, Opts),
-                        Opts
-                    )
-                )
+            NormMap1 = minimize(hb_ao:normalize_keys(Map1, Opts))
         ),
     Keys2 =
         hb_maps:keys(
-            NormMap2 =
-                minimize(
-                    normalize(
-                        hb_ao:normalize_keys(Map2, Opts),
-                        Opts
-                    )
-                )
+            NormMap2 = minimize(hb_ao:normalize_keys(Map2, Opts))
         ),
     PrimaryKeysPresent =
         (Mode == primary) andalso
@@ -817,9 +857,6 @@ unsafe_match(RawMap1, RawMap2, Mode, Path, Opts) ->
                 }
             )
     end.
-	
-matchable_keys(Map) ->
-    lists:sort(lists:map(fun hb_ao:normalize_key/1, hb_maps:keys(Map))).
 
 %% @doc Return the numeric differences between two messages, matching deeply
 %% across nested messages. If the values are non-numeric, the new value is 
@@ -932,7 +969,8 @@ commitment(Spec, Msg, Opts) ->
 commitments(ID, Link, Opts) when ?IS_LINK(Link) ->
     commitments(ID, hb_cache:ensure_loaded(Link, Opts), Opts);
 commitments(CommitterID, Msg, Opts) when is_binary(CommitterID) ->
-    commitments(#{ <<"committer">> => CommitterID }, Msg, Opts);
+    Committer = hb_committer:uri(CommitterID, Opts),
+    commitments(#{ <<"committer">> => Committer }, Msg, Opts);
 commitments(Spec = #{ <<"type">> := <<"unsigned">> }, Msg, Opts) ->
     % Unsigned is a special case: Match all of the commitments with a committer
     % first, remove them, then call `commitments` again with the remainder of
@@ -964,30 +1002,32 @@ commitments(_Spec, _Msg, _Opts) ->
 commitment_devices(#{ <<"commitments">> := Commitments }, Opts) ->
     lists:map(
         fun(CommMsg) ->
-            hb_ao:get(<<"commitment-device">>, CommMsg, Opts)
+            hb_maps:get(<<"commitment-device">>, CommMsg, not_found, Opts)
         end,
         maps:values(Commitments)
     );
 commitment_devices(_Msg, _Opts) ->
     [].
 
-%% @doc Implements a standard pattern in which the target for an operation is
-%% found by looking for a `target' key in the request. If the target is `self',
-%% or not present, the operation is performed on the original message. Otherwise,
-%% the target names a key of the request, and the operation is performed on the
-%% value of that key. A `target' that names a key the request lacks gives
-%% `{error, not_found}'.
-find_target(Self, Req, Opts) ->
+%% @doc Return the message that an operation acts on. The value of `SubjectKey'
+%% in the request is the key of the request that contains the message. If that
+%% value is `self', or the request has no `SubjectKey', the message is `Self'.
+%% A key that the request lacks gives `{error, not_found}'.
+find_subject(SubjectKey, Self, Req, Opts) ->
 	GetOpts = Opts#{
         <<"hashpath">> => ignore,
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
     },
-    case hb_maps:get(<<"target">>, Req, <<"self">>, GetOpts) of
+    case hb_maps:get(SubjectKey, Req, <<"self">>, GetOpts) of
         <<"self">> -> {ok, Self};
         Key ->
-            case hb_maps:find(Key, Req, GetOpts) of
-                {ok, Target} -> {ok, Target};
-                error -> {error, not_found}
+            case hb_private:is_private(Key) of
+                true -> {error, not_found};
+                false ->
+                    case hb_maps:find(Key, Req, GetOpts) of
+                        {ok, Target} -> {ok, Target};
+                        error -> {error, not_found}
+                    end
             end
     end.
 
@@ -1007,39 +1047,6 @@ minimize(Map, ExtraKeys) ->
         maps:map(fun(_K, V) -> minimize(V) end, Map)
     ).
 
-%% @doc Return a map with only the keys that necessary, without those that can
-%% be regenerated.
-normalize(Map, Opts) when is_map(Map) orelse is_list(Map) ->
-    NormalizedMap = hb_ao:normalize_keys(Map, Opts),
-    FilteredMap = filter_default_keys(NormalizedMap),
-    hb_maps:with(matchable_keys(FilteredMap), FilteredMap);
-normalize(Other, _Opts) ->
-    Other.
-
-%% @doc Remove keys from a map that have the default values found in the tx
-%% record.
-filter_default_keys(Map) ->
-    DefaultsMap = default_tx_message(),
-    maps:filter(
-        fun(Key, Value) ->
-            case hb_maps:find(hb_ao:normalize_key(Key), DefaultsMap) of
-                {ok, Value} -> false;
-                _ -> true
-            end
-        end,
-        Map
-    ).
-
-%% @doc Get the normalized fields and default values of the tx record.
-default_tx_message() ->
-    hb_maps:from_list(default_tx_list()).
-
-%% @doc Get the ordered list of fields as AO-Core keys and default values of
-%% the tx record.
-default_tx_list() ->
-    Keys = lists:map(fun hb_ao:normalize_key/1, record_info(fields, tx)),
-    lists:zip(Keys, tl(tuple_to_list(#tx{}))).
-
 %%% Tests
 
 %% @doc Selective verification retains valid partial commitments and checks
@@ -1050,6 +1057,9 @@ normalize_commitments_modes_test() ->
     [SignedA, SignedB, UnsignedA, UnsignedB] =
         [ commit(Msg, Opts, #{ <<"type">> => Type, <<"committed">> => [Key] })
         || Type <- [<<"signed">>, <<"unsigned">>], Key <- [<<"a">>, <<"b">>] ],
+    % An unsigned commitment needs no listener for the `http-server' of `Opts'.
+    ?assertEqual(UnsignedA, commit(Msg, #{ <<"http-server">> => <<"stopped">> },
+        #{ <<"type">> => <<"unsigned">>, <<"committed">> => [<<"a">>] })),
     Commitments = lists:foldl(
         fun(M, Acc) -> maps:merge(Acc, maps:get(<<"commitments">>, M)) end,
         #{},
@@ -1072,7 +1082,7 @@ normalize_commitments_modes_test() ->
          {unsigned, [SignedA, SignedB, UnsignedA]},
          {all, [SignedA, UnsignedA]}, {fast, [SignedA, UnsignedA]}]
     ),
-    % Adding an unsigned commitment names all fields, not just signed fields.
+    % Adding an unsigned commitment covers all fields, not just signed fields.
     Added = normalize_commitments(SignedA#{ <<"extra">> => 3 }, Opts, all),
     ?assertEqual(id(#{ <<"a">> => 1, <<"b">> => 1, <<"extra">> => 3 }, unsigned, Opts),
         id(Added, unsigned, Opts)),

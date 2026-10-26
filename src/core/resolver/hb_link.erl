@@ -19,11 +19,11 @@
 %% - All lazily-loadable values are in-memory.
 %% - All links are represented by their URIs.
 %% - All submaps are represented as links, optionally offloading their local
-%%   values to the cache.
+%%   values to the cache. In `keep' mode, they stay in memory.
 %% - All other values are left unchanged (including their potential types).
 %%
-%% The response is a non-recursive, fully loaded message. It may still contain
-%% types, but all submessages are guaranteed to be linkified.
+%% The response is a fully loaded message. It may still contain types. Outside
+%% `keep' mode it is non-recursive: all of its submessages are linkified.
 normalize(Msg, Opts) when is_map(Opts) ->
     normalize(Msg, hb_opts:get(linkify_mode, offload, Opts), Opts).
 
@@ -45,18 +45,18 @@ normalize(OtherVal, _Mode, _Opts) ->
 
 %% @doc Normalize the value of a key, returning it as it appears in the
 %% normalized message.
+normalize_value(_Key, V, keep, _Opts) when is_map(V) or is_list(V) ->
+    % The submessage stays in local memory, without a link.
+    V;
 normalize_value(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
     ?event(debug_linkify, {linkifying_submessage, Key}),
     % The value is a submessage that we have in local memory.
     % We must offload it such that it is cached, and
     % referenced by a link.
-    % We start by normalizing the child message, generating
-    % its IDs by proxy. The cache writes the child as given
-    % and offloads its own submessages, so this pass only
-    % derives the ID.
-    NormChild = normalize(V, discard, Opts),
-    % Generate the ID of the normalized child message.
-    ID = hb_message:id(NormChild, all, Opts),
+    % Generate the ID of the child message as it is held, with its own
+    % submessages: `hb_message:id/3' normalizes them. The cache writes the
+    % child as given and offloads its own submessages.
+    ID = hb_message:id(V, all, Opts),
     % If we are in `offload' mode, we write the message to the
     % cache. If we are in `discard' mode, we simply drop the
     % nested message.

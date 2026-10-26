@@ -39,23 +39,25 @@ schema() ->
 %% `load_schema' with `entry_already_exists_in_schema'. A `persistent_term'
 %% flag lets callers wait for init to finish: `singleton/2' returns as soon
 %% as the spawned process is registered, which is before `init/1' completes.
+%% All packages of this device share the flag and the controller, as the
+%% `graphql' library keeps one schema. The schema calls the module of the
+%% package that ran `init/1'.
 ensure_started() -> ensure_started(#{}).
 ensure_started(Opts) ->
-    Mod = callback_module(),
-    case persistent_term:get({Mod, ready}, false) of
+    case persistent_term:get({graphql_controller, ready}, false) of
         true -> ok;
         false ->
             hb_name:singleton(
                 graphql_controller,
                 fun() ->
                     init(Opts),
-                    persistent_term:put({Mod, ready}, true),
+                    persistent_term:put({graphql_controller, ready}, true),
                     receive stop -> ok end
                 end
             ),
             case hb_util:wait_until(
                     fun() ->
-                        persistent_term:get({Mod, ready}, false)
+                        persistent_term:get({graphql_controller, ready}, false)
                     end,
                     ?START_TIMEOUT
                 ) of
@@ -105,8 +107,8 @@ handle(_Base, RawReq, Opts) ->
             {ok, _} -> RawReq;
             error ->
                 % Parse the query, assuming that the request body is a JSON
-                % object with the necessary fields. Any other body carries
-                % no query.
+                % object with the necessary fields. Its fields are set over
+                % the keys of the request. Any other body carries no query.
                 Body = hb_maps:get(<<"body">>, RawReq, <<>>, Opts),
                 try hb_json:decode(Body) of
                     Object when is_map(Object) ->
@@ -118,7 +120,7 @@ handle(_Base, RawReq, Opts) ->
                                 #{},
                                 Opts
                             ),
-                        Decoded;
+                        hb_maps:merge(RawReq, Decoded, Opts);
                     _ -> #{}
                 catch error:_ -> #{}
                 end
@@ -203,12 +205,27 @@ handle(_Base, RawReq, Opts) ->
             catch
                 throw:Error:Stacktrace ->
                     ?event({graphql_error, {error, Error}, {trace, Stacktrace}}),
-                    {error, Error}
+                    query_error(Error, Opts)
             end;
         {error, Error} ->
             ?event({graphql_error, {error, Error}}),
-            {error, Error}
+            query_error(Error, Opts)
     end.
+
+%% @doc Return parsing and validation failures in the GraphQL response format.
+query_error(Error, Opts) ->
+    Errors =
+        case Error of
+            {error, Details} -> graphql:format_errors(#{}, Details);
+            {_Phase, {_Line, Module, Reason}} ->
+                [#{ message => iolist_to_binary(Module:format_error(Reason)) }]
+        end,
+    {error, #{
+        <<"status">> => 400,
+        <<"content-type">> => <<"application/json">>,
+        <<"body">> =>
+            hb_json:encode(typed_binaries(#{ errors => Errors }, Opts))
+    }}.
 
 %% @doc The variables of a request under the names the document declares: the
 %% request has them lowercase, and GraphQL variable names are case-sensitive.
@@ -224,8 +241,8 @@ declared_variables(FunEnv, Vars) ->
     ).
 
 %% @doc Give each binary in a GraphQL response that is not UTF-8 text as its
-%% base64url, typed `binary' in the `ao-types' of the object that holds it, as
-%% `json@1.0' does. Every response name is kept, including one that starts
+%% base64url, typed `binary' in the `ao-types' of the object that contains it,
+%% as `json@1.0' does. Every response name is kept, including one that starts
 %% with `priv': the names are the query's fields and aliases, not message keys.
 typed_binaries(Map, Opts) when is_map(Map) ->
     Typed = maps:map(fun(_, Value) -> typed_binaries(Value, Opts) end, Map),
@@ -401,7 +418,6 @@ test_query(Node, Query, Variables, OperationName, Opts) ->
             #{
                 <<"path">> => <<"~query@1.0/graphql">>,
                 <<"content-type">> => <<"application/json">>,
-                <<"codec-device">> => <<"json@1.0">>,
                 <<"body">> => hb_json:encode(UnencodedPayload)
             },
             Opts
@@ -409,6 +425,73 @@ test_query(Node, Query, Variables, OperationName, Opts) ->
     hb_json:decode(hb_maps:get(<<"body">>, Res, <<>>, Opts)).
 
 %%% Tests
+
+graphql_request_errors_test() ->
+    Opts = #{ <<"store">> => [hb_test_utils:test_store()],
+        <<"priv-wallet">> => ar_wallet:new(), <<"port">> => 0 },
+    Node = hb_http_server:start_node(Opts),
+    try
+        lists:foreach(
+            fun(Query) ->
+                {ok, 400, Headers, Body} = hackney:request(
+                    post,
+                    <<Node/binary, "/~query@1.0/graphql">>,
+                    [{<<"content-type">>, <<"application/json">>}],
+                    hb_json:encode(#{ <<"query">> => Query }),
+                    [with_body]
+                ),
+                ?assertEqual(<<"application/json">>,
+                    proplists:get_value(<<"content-type">>, Headers)),
+                #{ <<"errors">> := [#{ <<"message">> := Message }] } =
+                    hb_json:decode(Body),
+                ?assert(byte_size(Message) > 0)
+            end,
+            [<<"{ notAField }">>, <<"query {">>, <<"{ ? }">>]
+        )
+    after
+        cowboy:stop_listener(hb_opts:address(Opts))
+    end.
+
+%% @doc A second package of this device answers GraphQL queries after the first
+%% package loaded the schema.
+second_package_test() ->
+    {ok, Opts, _} = dev_query:test_setup(),
+    [#{ files := Files } = Group] =
+        hb_packager:scan(
+            [<<"src/preloaded">>],
+            #{ <<"device-roots">> => [<<"dev_query">>] }
+        ),
+    % Package the device with one more source file: its modules get new names.
+    Pkg =
+        hb_packager:package(
+            Group#{ files => Files#{ <<"second.txt">> => <<"second">> } },
+            Opts
+        ),
+    {ok, ImplID} =
+        hb_cache:write(
+            hb_packager:impl_message(Pkg, <<"spec-id">>, Opts),
+            Opts
+        ),
+    NodeOpts =
+        Opts#{ <<"trusted-devices">> => #{ <<"second-query@1.0">> => ImplID } },
+    Req =
+        #{
+            <<"path">> => <<"graphql/body">>,
+            <<"query">> =>
+                <<"{ message(keys: [{name: \"basic\", ",
+                    "value: \"binary-value\"}]) { id } }">>
+        },
+    {ok, Body} =
+        hb_ao:resolve(#{ <<"device">> => <<"query@1.0">> }, Req, NodeOpts),
+    % The second package uses the controller and the schema of the first.
+    ?assertEqual(
+        {ok, Body},
+        hb_ao:resolve(
+            #{ <<"device">> => <<"second-query@1.0">> },
+            Req,
+            NodeOpts
+        )
+    ).
 
 lookup_test() ->
     {ok, Opts, #{ <<"nested">> := NestedID }} = dev_query:test_setup(),
@@ -504,7 +587,6 @@ lookup_with_vars_test() ->
         #{
             <<"path">> => <<"~query@1.0/graphql">>,
             <<"content-type">> => <<"application/json">>,
-            <<"codec-device">> => <<"json@1.0">>,
             <<"body">> =>
                 hb_json:encode(#{
                     <<"query">> => 
@@ -573,7 +655,6 @@ lookup_without_opname_test() ->
             #{
                 <<"path">> => <<"~query@1.0/graphql">>,
                 <<"content-type">> => <<"application/json">>,
-                <<"codec-device">> => <<"json@1.0">>,
                 <<"body">> =>
                     hb_json:encode(#{
                         <<"query">> => 

@@ -112,7 +112,7 @@ debug_trace(Mod, Func, Line, Opts) ->
 term(X) -> term(X, #{}).
 term(X, Opts) -> term(X, Opts, 0).
 term(X, Opts, Indent) ->
-    try do_term(X, Opts, Indent)
+    try do_term(redact_private(X), Opts, Indent)
     catch A:B:C ->
         Mode = hb_opts:get(mode, prod, Opts),
         PrintFailPreference = hb_opts:get(debug_print_fail_mode, quiet, Opts),
@@ -212,6 +212,15 @@ do_term(MsgList, Opts, Indent) when is_list(MsgList) ->
 do_term(X, Opts, Indent) ->
     indent("~80p", [X], Opts, Indent).
 
+%% @doc Replace the value of a tuple `{Key, Value}' whose `Key' starts with
+%% `priv', such as an event's `{priv_wallet, Wallet}', with `redacted'.
+redact_private(Pair = {Key, _}) ->
+    case hb_private:is_private(Key) of
+        true -> {Key, redacted};
+        false -> Pair
+    end;
+redact_private(X) -> X.
+
 %% @doc Helper function to format tuples with arity greater than 2.
 tuple(Tuple, Opts, Indent) ->
     to_lines(lists:map(
@@ -281,13 +290,17 @@ list_lines(MsgList, Footer, Opts, Indent) ->
                 IndentedFooterList ++
                 indent("}", [], Opts, Indent);
         true ->
+            % Reuse a multiline Line. Formatting its Msg again formats every
+            % nested list twice.
             "\n" ++
             lists:flatten(lists:map(
-                fun({N, Msg}) ->
-                    {_, Line} = list_item(multiline, N, Msg, Opts, Indent),
-                    Line
+                fun({{_N, _Msg}, {multiline, Line}}) -> Line;
+                   ({{N, Msg}, {short, _}}) ->
+                        {_, Line} =
+                            list_item(multiline, N, Msg, Opts, Indent),
+                        Line
                 end,
-                Numbered
+                lists:zip(Numbered, Lines)
             )) ++
             IndentedFooterList ++
             indent("}", [], Opts, Indent)
@@ -404,11 +417,16 @@ error(ErrorMsg, Opts) ->
     Stacktrace = hb_maps:get(<<"stacktrace">>, ErrorMsg, <<"[No trace]">>, Opts),
     hb_util:bin(
         [
-            <<"Termination type: '">>, Type,
-            <<"'\n\nStacktrace:\n\n">>, Stacktrace,
-            <<"\n\nError details:\n\n">>, Details
+            <<"Termination type: '">>, error_value(Type, Opts),
+            <<"'\n\nStacktrace:\n\n">>, error_value(Stacktrace, Opts),
+            <<"\n\nError details:\n\n">>, error_value(Details, Opts)
         ]
     ).
+
+%% @doc Format a value of an error message as a string. A binary is returned
+%% as is. Any other term is printed by `term/2'.
+error_value(Bin, _Opts) when is_binary(Bin) -> Bin;
+error_value(Term, Opts) -> term(Term, Opts).
 
 %% @doc Take a series of strings or a combined string and format as a
 %% single string with newlines and indentation to the given level. Note: This
@@ -1111,6 +1129,16 @@ private_message_test() ->
             )
         end,
         [0, 1, 3]
+    ),
+    % A tuple whose first element starts with `priv' prints without its value.
+    ?assertEqual(
+        "priv_wallet: redacted",
+        term({priv_wallet, <<"private-marker">>})
+    ),
+    % `error/2' prints a message in `details' without its private keys.
+    ?assertEqual(
+        ?MODULE:error(#{ <<"details">> => #{} }, #{}),
+        ?MODULE:error(#{ <<"details">> => #{ <<"priv">> => 1 } }, #{})
     ).
 
 private_trace_test() ->
@@ -1178,6 +1206,27 @@ bounded_format(Render) ->
     after
         exit(Pid, kill),
         erlang:demonitor(Ref, [flush])
+    end.
+
+%% @doc A nested list is formatted once for each list element, not once per
+%% branch of the list formatter.
+nested_list_format_calls_test() ->
+    Nested = fun(Depth) ->
+        lists:foldl(fun(_, Acc) -> [Acc] end, 1, lists:seq(1, Depth))
+    end,
+    ?assertEqual(
+        "\nList [1] {\n  1 => \n    List [1] {\n      1 => "
+        "[[[[[[[[[[[[[[1]]]]]]]]]]]]]]\n    }\n}",
+        term(Nested(16), #{}, 0)
+    ),
+    try
+        erlang:trace_pattern({?MODULE, list_item, 4}, true, [call_count]),
+        _ = term(Nested(26), #{}, 0),
+        {call_count, Calls} =
+            erlang:trace_info({?MODULE, list_item, 4}, call_count),
+        ?assert(Calls < 1000)
+    after
+        erlang:trace_pattern({?MODULE, list_item, 4}, false, [call_count])
     end.
 
 truncate_no_truncation_test() ->

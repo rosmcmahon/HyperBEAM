@@ -5,7 +5,7 @@
 -export([ceil_int/2, floor_int/2]).
 -export([id/1, id/2, native_id/1, human_id/1, human_int/1, to_hex/1]).
 -export([is_human_id/1]).
--export([secret_key_to_committer/1, remove_scheme_prefix/1]).
+-export([remove_scheme_prefix/1]).
 -export([key_to_atom/1, key_to_atom/2, binary_to_strings/1]).
 -export([encode/1, decode/1, decode/2, safe_encode/1, safe_decode/1]).
 -export([is_printable_string/1]).
@@ -30,7 +30,7 @@
 -export([all_atoms/0, binary_is_atom/1]).
 -export([lowercase_key/1]).
 -export([base58_encode/1, base58_decode/1, atom_to_dashed_binary/1]).
--export([committer/1, committer_address/1]).
+-export([committer_address/1]).
 -include("include/hb.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
@@ -229,10 +229,6 @@ lowercase_key(Key) -> Key.
 lowercase_byte(C) when C >= $A, C =< $Z -> C bor 32;
 lowercase_byte(C) -> C.
 
-%% @doc Build a committer address from a shared secret.
-secret_key_to_committer(Key) ->
-    human_id(hb_crypto:sha256(Key)).
-
 %% @doc Remove a `scheme:' prefix from a binary key.
 remove_scheme_prefix(KeyID) ->
     case binary:split(KeyID, <<":">>) of
@@ -280,9 +276,13 @@ key_to_atom(Key, Mode) ->
     end.
 
 %% @doc Convert a human readable ID to a native binary ID. If the ID is already
-%% a native binary ID, it is returned as is.
+%% a native binary ID, it is returned as is. The last of the 43 characters of a
+%% human readable ID has 2 bits that its 32 bytes do not use, so 4 forms decode
+%% to the same bytes: any form but the one that `human_id/1' gives raises.
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
-    decode(Bin);
+    Native = decode(Bin),
+    Bin = encode(Native),
+    Native;
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 32 ->
     Bin;
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
@@ -300,33 +300,14 @@ human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
 human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
     Bin.
 
-%% @doc Convert a committer given by a node's configuration, a process
-%% definition or Lua code to its URI. An Arweave address has no URI scheme, so
-%% it becomes the URI of its `did:pkh:' committer. A query after the address,
-%% such as the `?hint=' of a scheduler, is kept. Any other binary without a URI
-%% scheme is not a committer. We return it as it is, so that it matches no
-%% signer, and log it as an `invalid_committer' event. A URI or any other term
-%% is returned as it is.
-committer(Value) when is_binary(Value) ->
-    case hb_uri:scheme(Value) of
-        {ok, _Scheme, _Rest} -> Value;
-        _ ->
-            [Address | _] = binary:split(Value, <<"?">>),
-            case is_human_id(Address) of
-                true -> ?ARWEAVE_COMMITTER(Value);
-                false ->
-                    ?event(committer, {invalid_committer, Value}),
-                    Value
-            end
-    end;
-committer(Value) ->
-    Value.
-
 %% @doc Convert a committer to the form that Lua and AOS code read. The
-%% `did:pkh:' committer of an Arweave address becomes the address. Any other
+%% `did-ar@1.0' committer of an Arweave address becomes the address. Any other
 %% committer is returned as it is.
-committer_address(?ARWEAVE_COMMITTER(Address)) -> Address;
-committer_address(Committer) -> Committer.
+committer_address(Committer) ->
+    case hb_committer:address(Committer) of
+        {ok, Address} -> Address;
+        error -> Committer
+    end.
 
 %% @doc Check whether a binary is a human-readable ID: the base64url encoding
 %% of 32 bytes, as `human_id/1' returns it.
@@ -474,6 +455,13 @@ deep_merge(Map1, Map2, Opts) when is_map(Map1), is_map(Map2) ->
 deep_set(_Path, undefined, Msg, _Opts) -> Msg;
 deep_set(Path, Value, Msg, Opts) when not is_list(Path) ->
     deep_set(hb_path:term_to_path_parts(Path, Opts), Value, Msg, Opts);
+deep_set(Path, Value, List, Opts) when is_list(List) ->
+    % A set in a list gives a list while its keys stay numbered from 1.
+    Set = deep_set(Path, Value, list_to_numbered_message(List), Opts),
+    case is_ordered_list(Set, Opts) of
+        true -> message_to_ordered_list(Set, Opts);
+        false -> Set
+    end;
 deep_set([Key], unset, Msg, Opts) ->
     hb_maps:remove(Key, Msg, Opts);
 deep_set([Key], Value, Msg, Opts) ->
@@ -487,7 +475,7 @@ deep_set([Key], Value, Msg, Opts) ->
 deep_set([Key|Rest], Value, Map, Opts) ->
     SubMap =
         case hb_maps:get(Key, Map, #{}, Opts) of
-            Existing when is_map(Existing) -> Existing;
+            Existing when is_map(Existing); is_list(Existing) -> Existing;
             _ -> #{}
         end,
     hb_maps:put(Key, deep_set(Rest, Value, SubMap, Opts), Map, Opts).
@@ -510,10 +498,10 @@ deep_get([Key|Rest], Msg, Default, Opts) ->
 
 %% @doc Find the target path to route for a request message.
 find_target_path(Msg, Opts) ->
-    case hb_ao:get(<<"route-path">>, Msg, not_found, Opts) of
+    case hb_maps:get(<<"route-path">>, Msg, not_found, Opts) of
         not_found ->
             ?event({find_target_path, {msg, Msg}, not_found}),
-            case hb_ao:get(<<"path">>, Msg, no_path, Opts) of
+            case hb_maps:get(<<"path">>, Msg, no_path, Opts) of
                 no_path -> no_path;
                 Path -> {<<"path">>, Path}
             end;
@@ -620,15 +608,15 @@ list_replace(List, Key, Value) ->
 %% @doc Take a list and return a list of unique elements. The function is
 %% order-preserving.
 unique(List) ->
-    Unique =
+    {Unique, _} =
         lists:foldl(
-            fun(Item, Acc) ->
-                case lists:member(Item, Acc) of
-                    true -> Acc;
-                    false -> [Item | Acc]
+            fun(Item, {Acc, Seen}) ->
+                case maps:is_key(Item, Seen) of
+                    true -> {Acc, Seen};
+                    false -> {[Item | Acc], Seen#{ Item => true }}
                 end
             end,
-            [],
+            {[], #{}},
             List
         ),
     lists:reverse(Unique).

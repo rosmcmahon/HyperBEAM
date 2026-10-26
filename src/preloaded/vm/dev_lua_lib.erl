@@ -38,14 +38,15 @@ install(Base, State, Opts) ->
                 ?event(no_ao_table),
                 #{};
             {ok, ExistingTable, _} ->
+                % The table keeps its functions, which `dev_lua:decode/2' drops.
                 ?event({existing_ao_table, ExistingTable}),
-                dev_lua:decode(ExistingTable, Opts)
+                ExistingTable
         end,
     ?event({base_ao_table, BaseAOTable}),
     {ok, State2} =
         luerl:set_table_keys_dec(
             [ao],
-            dev_lua:encode(BaseAOTable, Opts),
+            BaseAOTable,
             State
         ),
     set_functions(Base, State2, Opts).
@@ -100,17 +101,30 @@ set_functions(Base, State, Opts) ->
                             % private data of the Lua state.
                             ImportOpts =
                                 luerl:get_private(<<"node-message">>, ImportState),
-                            % Decode the arguments from the Lua environment.
+                            % Decode the arguments from the Lua environment. A
+                            % table key that `hb_ao:normalize_key/2' has no
+                            % clause for, such as `1.5', is a bad argument,
+                            % which `pcall' catches. Other errors can depend on
+                            % this node, and are raised.
                             Args =
-                                lists:map(
-                                    fun(Arg) ->
-                                        dev_lua:decode(
-                                            luerl:decode(Arg, ImportState),
-                                            ImportOpts
+                                try
+                                    lists:map(
+                                        fun(Arg) ->
+                                            dev_lua:decode(
+                                                luerl:decode(Arg, ImportState),
+                                                ImportOpts
+                                            )
+                                        end,
+                                        RawArgs
+                                    )
+                                catch
+                                    error:function_clause ->
+                                        luerl_lib:badarg_error(
+                                            FuncName,
+                                            RawArgs,
+                                            ImportState
                                         )
-                                    end,
-                                    RawArgs
-                                ),
+                                end,
                             % Call the function with the decoded arguments.
                             {Res, ResState} =
                                 Func(
@@ -157,7 +171,9 @@ resolve([SingletonMsg], ExecState, ExecOpts) ->
 resolve(Msgs, ExecState, ExecOpts) when is_list(Msgs) ->
     resolve({many, Msgs}, ExecState, ExecOpts);
 resolve({many, Msgs}, ExecState, ExecOpts) ->
-    MaybeAsMsgs = lists:map(fun convert_as/1, Msgs),
+    % The messages are what the device executes; private keys in them are
+    % caller input from Lua.
+    MaybeAsMsgs = lists:map(fun convert_as/1, hb_private:reset(Msgs)),
     try hb_ao:resolve_many(MaybeAsMsgs, ExecOpts) of
         {Status, Res} ->
             ?event({resolved_msgs, {status, Status}, {res, Res}, {exec_opts, ExecOpts}}),
@@ -169,11 +185,15 @@ resolve({many, Msgs}, ExecState, ExecOpts) ->
             {[<<"error">>, Error], ExecState}
     end.
 
-%% @doc A wrapper for `hb_ao''s `get' functionality.
+%% @doc A wrapper for `hb_ao''s `get' functionality. A key that the message
+%% does not have gives Lua's `nil'.
 get([Key, Base], ExecState, ExecOpts) ->
     ?event({ao_core_get, {base, Base}, {key, Key}}),
     NewRes =
-        committers(Key, hb_ao:get(convert_as(Key), convert_as(Base), ExecOpts)),
+        committers(
+            Key,
+            hb_ao:get(convert_as(Key), convert_as(Base), nil, ExecOpts)
+        ),
     ?event({ao_core_get_result, {result, NewRes}}),
     {[NewRes], ExecState}.
 
@@ -190,7 +210,10 @@ convert_as([<<"as">>, Device, RawMsg]) ->
 convert_as(Other) ->
     Other.
 
-%% @doc Wrapper for `hb_ao''s `set' functionality.
+%% @doc Wrapper for `hb_ao''s `set' functionality. Setting a key to Lua's `nil'
+%% removes it.
+set([Base, Key, nil], ExecState, ExecOpts) ->
+    set([Base, Key, unset], ExecState, ExecOpts);
 set([Base, Key, Value], ExecState, ExecOpts) ->
     ?event({ao_core_set, {base, Base}, {key, Key}, {value, Value}}),
     NewRes = hb_ao:set(Base, Key, Value, ExecOpts),

@@ -22,9 +22,9 @@
 %%%                   node operators to prioritize their stores for search.
 %%%     read/3:       Read the data at the given location, using a request map
 %%%                   of the form `#{ <<"read">> => Path }`. A location that
-%%%                   holds a value returns `{ok, Value}'. A location with keys
+%%%                   has a value returns `{ok, Value}'. A location with keys
 %%%                   below it returns `{composite, Children}'. A child that
-%%%                   holds a value is given as a `{Key, Value}' pair, and a
+%%%                   has a value is given as a `{Key, Value}' pair, and a
 %%%                   child with keys below it as its `Key'.
 %%%     write/3:      Write a request map of the form `#{ Path => Value }`.
 %%%     list/3:       For a path with keys below it, return child keys using a
@@ -47,6 +47,17 @@
 %%% store is tried. If none of the given store messages are able to execute a
 %%% requested service, the store manager will return the strongest terminal
 %%% result observed, or `{error, not_found}`.
+%%%
+%%% If a store raises, it is stopped and started again, and the call is
+%%% retried, up to its `max-retries' (default 1). An exception that remains,
+%%% or one from the store's normalization pipeline (below), is a failure with
+%%% the exception in it: `{failure, {Class, Reason, Stacktrace}}'. A store's
+%%% `store-failure' applies to every failure: `skip' (the default) tries the
+%%% next store, and `throw' raises the failure to the caller without trying
+%%% the rest of the stores: an exception again as it was, and any other
+%%% failure with `throw/1'. `store-failure' is read from the store message
+%%% first, then from the node's options. If a store does not export the
+%%% function, it is skipped, and this is not a failure.
 %%%
 %%% A store message may additionally specify a normalization pipeline, called
 %%% upon its paths and values during store invocation. These pipelines allow
@@ -174,18 +185,20 @@ find(StoreOpts) ->
 do_find(StoreOpts = #{ <<"store-module">> := Mod }) ->
     Name = maps:get(<<"name">>, StoreOpts, Mod),
     LookupName = {store, Mod, Name},
-    case get(LookupName) of
-        undefined ->
-            try persistent_term:get(LookupName) of
-                Instance1 ->
-                    EnsuredInstance = ensure_instance_alive(StoreOpts, Instance1),
-                    put(LookupName, EnsuredInstance),
-                    EnsuredInstance
-            catch
-                error:badarg -> spawn_instance(StoreOpts)
-            end;
-        InstanceMessage ->
-            ensure_instance_alive(StoreOpts, InstanceMessage)
+    case live(get(LookupName)) of
+        {error, not_found} ->
+            % Find the store's live instance, or start the store once.
+            {ok, Instance} =
+                hb_name:ok_or_atomic_apply(
+                    LookupName,
+                    fun() ->
+                        live(persistent_term:get(LookupName, undefined))
+                    end,
+                    fun() -> {ok, spawn_instance(StoreOpts)} end
+                ),
+            put(LookupName, Instance),
+            Instance;
+        {ok, Instance} -> Instance
     end.
 
 %% @doc Create a new instance of a store and return its term.
@@ -207,15 +220,16 @@ spawn_instance(StoreOpts = #{ <<"store-module">> := Mod }) ->
         ok
     end.
 
-%% @doc Handle a found instance message. If it contains a PID, we check if it
-%% is alive. If it does not, we return it as is.
-ensure_instance_alive(StoreOpts, InstanceMessage = #{ <<"pid">> := Pid }) ->
+%% @doc Return `{ok, InstanceMessage}', or `{error, not_found}' if it is
+%% `undefined' or contains the PID of a process that has exited.
+live(undefined) -> {error, not_found};
+live(InstanceMessage = #{ <<"pid">> := Pid }) ->
     case is_process_alive(Pid) of
-        true -> InstanceMessage;
-        false -> spawn_instance(StoreOpts)
+        true -> {ok, InstanceMessage};
+        false -> {error, not_found}
     end;
-ensure_instance_alive(_, InstanceMessage) ->
-    InstanceMessage.
+live(InstanceMessage) ->
+    {ok, InstanceMessage}.
 
 %%% Library wrapper implementations.
 
@@ -454,7 +468,8 @@ do_call_function([Store = #{<<"access">> := Access} | Rest], Function, Args, Fai
             do_call_function(Rest, Function, Args, Failure, Error)
     end;
 do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, Failure, Error) ->
-    % Attempt to invoke the function. If it fails, try the next store.
+    % Attempt to invoke the function. If it returns an error, try the next
+    % store. If it returns a failure or raises, apply its `store-failure'.
     try invoke(Mod, Store, Function, Args) of
         ok ->
             ok;
@@ -463,13 +478,7 @@ do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, 
         {composite, _} = Result ->
             Result;
         {failure, _} = Result ->
-            do_call_function(
-                Rest,
-                Function,
-                Args,
-                strongest_failure(Failure, Result),
-                Error
-            );
+            handle_failure(Store, Rest, Function, Args, Failure, Error, Result);
         {error, not_found} ->
             do_call_function(Rest, Function, Args, Failure, Error);
         {error, _} = Result ->
@@ -482,8 +491,32 @@ do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, 
             );
         Other ->
             normalize_result(Other)
-    catch _:_:_ ->
-        do_call_function(Rest, Function, Args, Failure, Error)
+    catch Class:Reason:Stacktrace ->
+        Raised = {failure, {Class, Reason, Stacktrace}},
+        handle_failure(Store, Rest, Function, Args, Failure, Error, Raised)
+    end.
+
+%% @doc Apply a store's `store-failure' to its failure, reading it from the
+%% store message first, then from the node's options. With `skip' (the
+%% default), keep the strongest failure and try the next store. With `throw',
+%% raise the failure to the caller: an exception again as it was, and any
+%% other failure with `throw/1'.
+handle_failure(Store, Rest, Function, Args = [_, Opts], Failure, Error, Result) ->
+    OptsFailure = hb_opts:get(<<"store-failure">>, skip, Opts),
+    StoreFailure = maps:get(<<"store-failure">>, Store, OptsFailure),
+    case {hb_util:atom(StoreFailure), Result} of
+        {skip, _} ->
+            do_call_function(
+                Rest,
+                Function,
+                Args,
+                strongest_failure(Failure, Result),
+                Error
+            );
+        {throw, {failure, {Class, Reason, Stacktrace}}} ->
+            erlang:raise(Class, Reason, Stacktrace);
+        {throw, _} ->
+            throw(Result)
     end.
 
 %% @doc Invoke a store function through the normalization pipeline its store
@@ -657,7 +690,8 @@ execute_normalizer(Setting, Store, Term, Opts) ->
 %% @doc Apply a store function, checking if the store returns a retry request or
 %% errors. If it does, attempt to start the store again and retry, up to the
 %% given maximum number of times. A store that does not export the function
-%% is skipped, not restarted.
+%% is skipped, not restarted. If an exception remains when the retries end, it
+%% is returned as a failure with the exception in it.
 apply_store_function(Mod, Store, Function, Args) ->
     MaxAttempts = maps:get(<<"max-retries">>, Store, ?DEFAULT_RETRIES) + 1,
     apply_store_function(Mod, Store, Function, Args, MaxAttempts).
@@ -689,7 +723,7 @@ apply_store_function(Mod, Store, Function, Args, AttemptsRemaining) ->
             true ->
                 retry(
                     Mod, Store, Function, Args, AttemptsRemaining,
-                    {error, not_found}
+                    {failure, {Class, Reason, Stacktrace}}
                 );
             false -> {error, not_found}
         end
@@ -914,7 +948,7 @@ implicit_children_test_() ->
             ok = write(Store, #{ <<"parent/child/value">> => <<"data">> }, #{}),
             ?assertEqual({ok, [<<"child">>]}, list(Store, <<"parent">>, #{})),
             % Reading a path with keys below it returns them, with the value of
-            % each key that holds one.
+            % each key that has one.
             ?assertEqual(
                 {composite, [<<"child">>]},
                 read(Store, <<"parent">>, #{})
@@ -936,17 +970,44 @@ implicit_children_test_() ->
         end}
     ]).
 
-%% @doc An unsupported operation leaves a store's existing data intact.
+%% @doc An unsupported operation leaves a store's existing data intact, and is
+%% not a failure. If a store raises, the caller gets a failure. With
+%% `store-failure' `throw', a failure is raised to the caller, whether the
+%% store raised or returned it.
 unsupported_operation_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile),
     ok = write(Store, #{ <<"key">> => <<"value">> }, #{}),
     Instance = find(Store),
+    Throw = #{ <<"store-failure">> => throw },
     ?assertEqual(
         {error, not_found},
-        match(Store, #{ <<"key">> => <<"value">> }, #{})
+        match(Store, #{ <<"key">> => <<"value">> }, Throw)
     ),
     ?assertEqual(Instance, find(Store)),
     ?assertEqual({ok, <<"value">>}, read(Store, <<"key">>, #{})),
+    % If a store's `list-batch-size' is not an integer, a batch list raises.
+    Fs = hb_test_utils:test_store(hb_store_fs),
+    ok = write(Fs, #{ <<"group/key">> => <<"value">> }, #{}),
+    Raising = Fs#{ <<"list-batch-size">> => <<"none">> },
+    Batch = #{ <<"list">> => <<"group">>, <<"limit">> => batch },
+    ?assertMatch({failure, {error, badarg, _}}, list(Raising, Batch, #{})),
+    % `store-failure' is read from the store message before the options.
+    ?assertError(
+        badarg,
+        list(
+            [Raising#{ <<"store-failure">> => throw }, Fs],
+            Batch,
+            #{ <<"store-failure">> => skip }
+        )
+    ),
+    % If its read raises, here on a `subindex' that is not a message, a
+    % gateway store returns a failure.
+    Gateway =
+        #{ <<"store-module">> => hb_store_gateway, <<"subindex">> => none },
+    ?assertThrow(
+        {failure, failure},
+        read(Gateway, hb_util:human_id(crypto:strong_rand_bytes(32)), Throw)
+    ),
     stop(Store).
 
 write_req(Key, Value) ->
@@ -1411,6 +1472,13 @@ prefix_pipeline_test() ->
 %% @doc Resetting a store preserves visibility for existing readers.
 reset_shared_instance_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile),
+    % Two processes that first use a store at once find one instance of it.
+    ?assertMatch([I, I], hb_pmap:parallel_map([Store, Store], fun find/1, 2)),
+    % After its owner is killed, two Erlang processes at once find one instance.
+    #{ <<"pid">> := Owner } = find(Store),
+    exit(Owner, kill),
+    false = is_process_alive(Owner),
+    ?assertMatch([J, J], hb_pmap:parallel_map([Store, Store], fun find/1, 2)),
     ok = write(Store, #{ <<"before">> => <<"old">> }, #{}),
     {PID, Ref} =
         spawn_monitor(
@@ -1463,7 +1531,7 @@ normalize_without_body_store_test() ->
         )
     ).
 
-%% @doc Listed keys and paired values retain scalar singleton semantics.
+%% @doc Listed keys and paired values normalize as single values.
 normalize_children_test() ->
     Opts = #{ <<"store">> => [], <<"linkify-mode">> => false },
     lists:foreach(

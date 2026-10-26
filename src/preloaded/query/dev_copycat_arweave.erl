@@ -188,15 +188,17 @@ is_tx_indexed(TXID, Opts) ->
 
 %% @doc List indexed blocks and transactions in the given range.
 %% Returns JSON with block heights as keys, each containing indexed and not-indexed lists.
-list_index(Request, From, undefined, Opts) ->
-    list_index(Request, From, 0, Opts);
+list_index(_Request, _From, undefined, _Opts) ->
+    {error, <<"`mode=list` requires `to`.">>};
 list_index(_Request, From, To, _Opts) when From < To ->
     {ok, #{
         <<"content-type">> => <<"application/json">>,
         <<"body">> => hb_json:encode(#{})
     }};
 list_index(Request, From, To, Opts) ->
-    Result = list_index_blocks(Request, From, To, Opts, #{}),
+    % A list reports the index state, so it does not refetch cached headers.
+    Result =
+        list_index_blocks(Request#{ <<"reindex">> => false }, From, To, Opts, #{}),
     JSON = hb_json:encode(Result),
     {ok, #{
         <<"content-type">> => <<"application/json">>,
@@ -696,7 +698,8 @@ index_pending(Request, IndexMode, Opts) ->
             Name = {copycat_pending, Store},
             Base = #{
                 <<"device">> => #{
-                    info => fun() -> #{ grouper => fun() -> Name end } end,
+                    device_info =>
+                        fun() -> #{ grouper => fun() -> Name end } end,
                     index =>
                         fun(_, #{ <<"request">> := Req, <<"mode">> := Mode,
                                 <<"options">> := IndexOpts }) ->
@@ -940,12 +943,25 @@ index_full_bundle_item(ItemID, ItemBinary, ItemStartOffset, IndexMode, Store, Op
         byte_size(ItemBinary)
     ) of
         ok ->
-            CacheRes = index_item(EncodedItemID, fun() ->
+            LocalOpts = hb_store:scope(Opts, local),
+            % An item that its codec refuses is refused on every pass, so we
+            % skip it and still index its bundle.
+            Converted =
                 case {IndexMode, ParseResult} of
                     {full, {ok, _, Parsed}} ->
-                        LocalOpts = hb_store:scope(Opts, local),
-                        Msg = hb_message:convert(
-                            Parsed, <<"structured@1.0">>, <<"ans104@1.0">>, LocalOpts),
+                        index_item(EncodedItemID, fun() ->
+                            {ok,
+                                hb_message:convert(
+                                    Parsed,
+                                    <<"structured@1.0">>,
+                                    <<"ans104@1.0">>,
+                                    LocalOpts)}
+                        end, refused);
+                    _ -> ok
+                end,
+            CacheRes = index_item(EncodedItemID, fun() ->
+                case Converted of
+                    {ok, Msg} ->
                         % An item whose signature does not verify is not
                         % indexed: the cache would write it without its
                         % commitment.
@@ -957,7 +973,7 @@ index_full_bundle_item(ItemID, ItemBinary, ItemStartOffset, IndexMode, Store, Op
                                 LocalOpts
                             ),
                         ok;
-                    _ -> ok
+                    Other -> Other
                 end
             end, error),
             DescendantRes =
@@ -982,6 +998,7 @@ index_full_bundle_item(ItemID, ItemBinary, ItemStartOffset, IndexMode, Store, Op
                 end,
             case {CacheRes, DescendantRes} of
                 {ok, {ok, DescendantCount}} -> {ok, 1 + DescendantCount};
+                {refused, {ok, DescendantCount}} -> {ok, DescendantCount};
                 {_, {error, _} = Error} -> Error;
                 _ -> {error, 'item-index-failed'}
             end;
@@ -1240,7 +1257,6 @@ block_transaction_pages_test() ->
     Request = fun(Vars) ->
         {ok, Reply} = hb_http:post(Node, #{ <<"path">> => <<"~query@1.0/graphql">>,
             <<"content-type">> => <<"application/json">>,
-            <<"codec-device">> => <<"json@1.0">>,
             <<"body">> => hb_json:encode(#{ <<"query">> => Query,
                 <<"variables">> => Vars }) }, #{}),
         hb_json:decode(hb_maps:get(<<"body">>, Reply))
@@ -1357,9 +1373,9 @@ index_ids_test_parallel() ->
     assert_item_read(
         <<"bXEgFm4K2b5VD64skBNAlS3I__4qxlM3Sm4Z5IXj3h8">>,
         Opts),
-    % This bundle previously triggered the ANS-104 tag-section boundary bug:
-    % the decoder ran past the declared tag bytes into the JSON body and
-    % crashed with a badmatch on the body content (the `"address":"0x..."'
+    % This bundle tests the ANS-104 tag-section boundary: a decoder that runs
+    % past the declared tag bytes into the JSON body crashes with a
+    % badmatch on the body content (the `"address":"0x..."'
     % string). With the strict tag-section boundary enforced, the item is
     % decoded and indexed correctly.
     ?assertMatch(
@@ -1693,6 +1709,14 @@ list_index_test_parallel() ->
             <<"WbRAQbeyjPHgopBKyi0PLeKWvYZr3rgZvQ7QY3ASJS4">>
         ], maps:get(<<"indexed">>, BlockInfo)),
     ?assertEqual([ ], maps:get(<<"not-indexed">>, BlockInfo)),
+    % A list without `to' is refused, not read down to block 0.
+    ?assertMatch(
+        {error, _},
+        hb_ao:resolve(
+            <<"~copycat@1.0/arweave&from=", BlockBin/binary, "&mode=list">>,
+            Opts
+        )
+    ),
     ok.
 
 %% @doc Reindexing bypasses cached headers while retaining request directives.
@@ -2130,7 +2154,13 @@ pending_range_isolates_bad_child_test() ->
     Nested = ar_bundles:sign_item(#tx{data = [Bad, Good]}, ar_wallet:new()),
     Opts = pending_bundle_children([Nested]),
     ?assertMatch({ok, _}, hb_cache:read(hb_util:encode(Good#tx.id),
-        hb_store:scope(Opts, local))).
+        hb_store:scope(Opts, local))),
+    % An item whose `ao-types' its codec refuses is skipped alone.
+    Refused = ar_bundles:sign_item(
+        #tx{ tags = [{<<"ao-types">>, <<"integer=(\"a\")">>}] }, ar_wallet:new()),
+    {undefined, Bundle} = ar_bundles:serialize_bundle(list, [Refused, Good], false),
+    ?assertEqual({ok, 1}, index_full_bundle_bytes(Bundle, 0, full,
+        hb_store_arweave:store_from_opts(Opts), Opts)).
 
 pending_bundle_children(Rejected) ->
     pending_bundle_children(Rejected, hb_store_volatile).
@@ -2146,7 +2176,7 @@ pending_bundle_children(Rejected, StoreModule) ->
         Wallet
     ),
     % A binary child large enough to encode as an item again: a smaller one
-    % decodes to a tag value and the bundle no longer verifies as signed.
+    % decodes to a tag value and the bundle does not verify as signed.
     Binary = binary:copy(<<"pending-binary-child">>, 256),
     BinaryChild = hb_message:convert(Binary, <<"ans104@1.0">>, DefaultOpts),
     {undefined, BundleData} =
@@ -2238,7 +2268,7 @@ pending_bundle_children(Rejected, StoreModule) ->
     RootMsg =
         hb_message:convert(
             RootTX, <<"structured@1.0">>, <<"tx@1.0">>, DefaultOpts),
-    % A node keeps no commitment that does not verify, so a remote holds the
+    % A node keeps no commitment that does not verify, so a remote has the
     % bundle only when every child verifies; the bytes of a bundle with a
     % rejected child are read from the network, as they are in production.
     case Rejected of

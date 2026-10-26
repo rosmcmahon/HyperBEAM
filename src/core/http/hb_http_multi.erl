@@ -8,7 +8,7 @@
 %%% - `multirequest-nodes': A list of nodes to request from.
 %%% - `multirequest-responses': The number of responses to gather.
 %%% - `multirequest-stop-after': Whether to stop after the required number of
-%%%   responses.
+%%%   responses, or if the caller is killed.
 %%% - `multirequest-parallel': Whether to run the requests in parallel.
 %%% - `multirequest-admissible': A message to resolve against the response.
 %%% - `multirequest-admissible-status': The statuses that are admissible.
@@ -25,7 +25,7 @@
 %%% `reference', if set. Acceptance means the configured checks passed; without
 %%% a content predicate it does not establish that the returned content is valid.
 -module(hb_http_multi).
--export([request/5]).
+-export([request/5, multirequest_keys/2]).
 -include("include/hb.hrl").
 
 %% @doc Dispatch the same HTTP request to many nodes. Can be configured to
@@ -51,22 +51,12 @@ request(Config, Method, Path, Message, Opts) ->
         admissible_status := Statuses,
         parallel := Parallel
     } = multirequest_opts(Config, Message, Opts),
-    MultirequestMsg =
-        hb_message:without_unless_signed(
-            lists:filter(
-                fun(<<"multirequest-", _/binary>>) -> true; (_) -> false end,
-                hb_maps:keys(Message)
-            ),
-            Message,
-            Opts
-        ),
     ?event(debug_multi,
         {multirequest_opts_parsed,
             {config, Config},
             {method, Method},
             {path, Path},
-            {raw_message, Message},
-            {message_to_send, MultirequestMsg}
+            {raw_message, Message}
         }),
     {AdmissibleResults, AllResponses} =
         if Parallel =/= false ->
@@ -77,7 +67,7 @@ request(Config, Method, Path, Message, Opts) ->
                 StopAfter,
                 Method,
                 Path,
-                MultirequestMsg,
+                Message,
                 Admissible,
                 Statuses,
                 Opts
@@ -88,7 +78,7 @@ request(Config, Method, Path, Message, Opts) ->
                 Responses,
                 Method,
                 Path,
-                MultirequestMsg,
+                Message,
                 Admissible,
                 Statuses,
                 Opts
@@ -120,13 +110,19 @@ multirequest_opts(Config, Message, Opts) ->
 
 %% @doc Get a value for a multirequest option from the config or message.
 multirequest_opt(Key, Config, Message, Default, Opts) ->
-    hb_ao:get_first(
-        [
-            {Message, <<"multirequest-", Key/binary>>},
-            {Config, Key}
-        ],
-        Default,
-        Opts#{ <<"hashpath">> => ignore }
+    hb_maps:get(
+        <<"multirequest-", Key/binary>>,
+        Message,
+        hb_maps:get(Key, Config, Default, Opts),
+        Opts
+    ).
+
+%% @doc Return the `multirequest-*' keys of a message, which configure a
+%% multirequest on this node.
+multirequest_keys(Message, Opts) ->
+    lists:filter(
+        fun(<<"multirequest-", _/binary>>) -> true; (_) -> false end,
+        hb_maps:keys(Message, Opts)
     ).
 
 %% @doc Check if a response is admissible, according to the configuration. A
@@ -192,24 +188,27 @@ parallel_multirequest(true, Nodes, Responses, StopAfter, Method, Path, Message, 
     parallel_multirequest(length(Nodes), Nodes, Responses, StopAfter, Method, Path, Message, Admissible, Statuses, Opts);
 parallel_multirequest(MaxWorkers, Nodes, Responses, StopAfter, Method, Path, Message, Admissible, Statuses, Opts) ->
     Ref = make_ref(),
-    {Workers, Queue} = start_workers(MaxWorkers, Ref, Nodes, Method, Path, Message, Opts),
+    {Workers, Queue} = start_workers(MaxWorkers, Ref, Nodes, StopAfter, Method, Path, Message, Opts),
     parallel_responses([], [], Workers, Queue, {Method, Path, Message}, Ref, Responses, StopAfter, Admissible, Statuses, Opts).
 
-%% @doc Start a new fleet of workers, returning the list of worker PIDs.
-start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
+%% @doc Start a new fleet of workers, returning the list of worker PIDs. If
+%% `StopAfter' is `true', link each worker to the calling process, so that the
+%% worker stops if the caller is killed.
+start_workers(Count, Ref, Nodes, StopAfter, Method, Path, Message, Opts) ->
     Parent = self(),
     {NewWorkerNodes, NewRemainingNodes} =
         lists:split(min(Count, length(Nodes)), Nodes),
     {
         lists:map(
             fun(Node) ->
-                spawn(
+                spawn_opt(
                     fun() ->
                         Res = node_request(Method, Node, Path, Message, Opts),
                         receive no_reply -> stopping
                         after 0 -> Parent ! {Ref, self(), {Node, Res}}
                         end
-                    end
+                    end,
+                    [link || StopAfter == true]
                 )
             end,
             NewWorkerNodes
@@ -219,7 +218,7 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
 
 %% @doc Request a message from one node. A request that raises is a failure,
 %% which is not admissible. The reply is whole: the admissibility checks read
-%% its `status', and `request/5' takes the value that it names in `ao-result'.
+%% its `status', and `request/5' takes the value that its `ao-result' selects.
 node_request(Method, Node, Path, Message, Opts) ->
     ReplyOpts = Opts#{ <<"http-only-result">> => false },
     try hb_http:request(Method, Node, Path, Message, ReplyOpts)
@@ -322,7 +321,7 @@ parallel_responses(AdmissibleRes, AllRes, Procs, _, _, Ref, 0, false, _Admissibl
     empty_inbox(Ref),
     {AdmissibleRes, AllRes};
 parallel_responses(AdmissibleRes, AllRes, Procs, _, _, Ref, 0, true, _Admissible, _Statuses, _Opts) ->
-    lists:foreach(fun(P) -> exit(P, kill) end, Procs),
+    lists:foreach(fun(P) -> unlink(P), exit(P, kill) end, Procs),
     empty_inbox(Ref),
     {AdmissibleRes, AllRes};
 parallel_responses(AdmissibleRes, AllRes, Procs, Queue, {Method, Path, Message}, Ref, Awaiting, StopAfter, Admissible, Statuses, Opts) ->
@@ -339,7 +338,7 @@ parallel_responses(AdmissibleRes, AllRes, Procs, Queue, {Method, Path, Message},
                             0 -> {WorkersWithoutPid, Queue};
                             _ ->
                                 {RefilledWorkers, RemainingQueue} =
-                                    start_workers(1, Ref, Queue, Method, Path, Message, Opts),
+                                    start_workers(1, Ref, Queue, StopAfter, Method, Path, Message, Opts),
                                 {RefilledWorkers ++ WorkersWithoutPid, RemainingQueue}
                         end,
                     parallel_responses(
@@ -357,7 +356,7 @@ parallel_responses(AdmissibleRes, AllRes, Procs, Queue, {Method, Path, Message},
                 );
             false ->
                 {RefilledWorkers, NewQueue} =
-                    start_workers(1, Ref, Queue, Method, Path, Message, Opts),
+                    start_workers(1, Ref, Queue, StopAfter, Method, Path, Message, Opts),
                 parallel_responses(
                     AdmissibleRes,
                     NewAllRes,
@@ -446,6 +445,23 @@ multirequest_test_() ->
                           <<"admissible">> => Admissible})),
                 % The `admissible' message does not run on a request that fails.
                 ?assertNot(receive admissible_ran -> true after 0 -> false end)
+            end},
+            {"parallel caller killed", fun() ->
+                Caller = spawn(fun() ->
+                    receive go -> ok end,
+                    multi([maps:get(slow2, N)],
+                        #{<<"parallel">> => true, <<"stop-after">> => true})
+                end),
+                erlang:trace(Caller, true, [procs]),
+                Caller ! go,
+                Worker = receive {trace, Caller, spawn, W, _} -> W end,
+                Monitor = erlang:monitor(process, Worker),
+                exit(Caller, kill),
+                % Killing the caller stops its worker before the peer replies.
+                ?assertEqual(killed,
+                    receive {'DOWN', Monitor, process, Worker, Reason} -> Reason
+                    after 500 -> running
+                    end)
             end}
         ]} end}.
 

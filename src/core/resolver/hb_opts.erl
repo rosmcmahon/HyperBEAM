@@ -66,7 +66,7 @@
     <<"name">> => <<"cache-mainnet/lmdb">>,
     <<"store-module">> => hb_store_lmdb
 }).
-%% The published Arweave offset index: a mined transaction holding
+%% The published Arweave offset index: a mined transaction with
 %% 8,560,638,056 packed rows mapping ANS-104 data item IDs to their weave
 %% byte ranges, read in place by `hb_store_arlmdb'. Offset resolution
 %% through it is served by Arweave peers alone. The store pipeline maps
@@ -93,7 +93,7 @@
         <<"preloaded-store">> =>
             {"HB_PRELOADED_STORE", fun preloaded_store_from_env/1},
         <<"port">> => {"HB_PORT", fun erlang:list_to_integer/1, "8734"},
-        <<"mode">> => {"HB_MODE", fun list_to_existing_atom/1},
+        <<"mode">> => {"HB_MODE", fun("debug") -> debug; ("prod") -> prod end},
         <<"paranoid-verify">> =>
             {"HB_PARANOID", fun topic_list_to_atoms/1, "false"},
         % Acceptable values for paranoid_verify:
@@ -244,10 +244,6 @@ raw_default_message() ->
         <<"bundler-ans104">> => <<"https://up.arweave.net:443">>,
         % Location of the wallet keyfile on disk that this node will use.
         <<"priv-key-location">> => <<"hyperbeam-key.json">>,
-        % The time-to-live that should be specified when we register
-        % ourselves as a scheduler on the network.
-        % Default: 7 days.
-        <<"scheduler-location-ttl">> => (60 * 60 * 24 * 7) * 1000,
         % Generated LMDB store of preloaded device artifacts.
         <<"preloaded-store">> =>
             #{
@@ -301,7 +297,6 @@ raw_default_message() ->
         <<"commitment-device">> => <<"httpsig@1.0">>,
         % Dev options
         <<"mode">> => debug,
-        <<"profiling">> => true,
         % Every modification to `Opts' called directly by the node operator
         % should be recorded here.
         <<"node-history">> => [],
@@ -349,19 +344,11 @@ raw_default_message() ->
                 <<"template">> => <<"/state.*">>,
                 <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
             },
-            % GraphQL: race all gateways, take the first 200.
+            % GraphQL: send queries to the default gateway.
             #{
                 <<"template">> => <<"/graphql">>,
                 <<"nodes">> =>
                     [
-                        #{
-                            <<"prefix">> => <<"https://ao-search-gateway.goldsky.com">>,
-                            <<"opts">> => ?DEFAULT_HTTP_OPTS
-                        },
-                        #{
-                            <<"prefix">> => <<"https://arweave-search.goldsky.com">>,
-                            <<"opts">> => ?DEFAULT_HTTP_OPTS
-                        },
                         #{
                             <<"prefix">> => ?DEFAULT_GATEWAY,
                             <<"opts">> => ?DEFAULT_HTTP_OPTS
@@ -484,11 +471,11 @@ raw_default_message() ->
                 ?DEFAULT_PRIMARY_STORE,
                 #{
                     <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-mainnet">>
+                    <<"name">> => <<"cache-mainnet/fs">>
                 },
                 #{
                     <<"store-module">> => hb_store_arweave,
-                    <<"name">> => <<"cache-arweave">>,
+                    <<"name">> => <<"cache-mainnet/arweave">>,
                     <<"index-store">> =>
                         [?DEFAULT_PRIMARY_STORE, ?DEFAULT_OFFSET_INDEX],
                     <<"local-store">> => [?DEFAULT_PRIMARY_STORE],
@@ -499,16 +486,18 @@ raw_default_message() ->
         <<"attested-store">> =>
             #{
                 <<"store-module">> => hb_store_lmdb,
-                <<"name">> => <<"cache-attested">>
+                <<"name">> => <<"cache-mainnet/attested">>
             },
         <<"priv-store">> =>
             [
                 #{
                     <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-priv">>
+                    <<"name">> => <<"cache-mainnet/priv">>
                 }
             ],
         % default_index => #{ <<"device">> => <<"hyperbuddy@1.0">> },
+        % The device of the `info' of a message, whose page a browser receives.
+        <<"docs-device">> => <<"docs@1.0">>,
         % Should we use the latest cached state of a process when computing?
         <<"process-now-from-cache">> => false,
         % Maximum age, in seconds, for `/now' to serve from the process cache.
@@ -708,8 +697,8 @@ load_paths([P | Rest], Opts, Acc) ->
 %% @doc Convert a path to a device from its file extension. If no extension is
 %% provided, we default to `flat@1.0'.
 path_to_device(Path) ->
-    case binary:split(hb_util:bin(Path), <<".">>, []) of
-        [_, Extension] ->
+    case filename:extension(hb_util:bin(Path)) of
+        <<".", Extension/binary>> ->
             ?event(debug_node_msg,
                 {path_to_device,
                     {path, Path},
@@ -771,21 +760,52 @@ load_bin(Device, Bin, Opts) ->
         {
             ok,
             mimic_default_types(
-                hb_cache:ensure_all_loaded(
-                    hb_message:convert(
-                        Bin,
-                        <<"structured@1.0">>,
-                        Device,
-                        Opts#{ <<"linkify-mode">> => false }
-                    ),
-                    Opts
-                ),
+                hb_cache:ensure_all_loaded(decode(Device, Bin, Opts), Opts),
                 false,
                 Opts
             )
         }
     catch error:B -> {error, B}
     end.
+
+%% @doc Decode a config file to a message, with its private keys. A JSON file
+%% is decoded from the TABM that `json@1.0''s `deserialize' gives, as
+%% `hb_http:decode/3' decodes a JSON request body: `json@1.0''s `from' gives
+%% the TABM without the private keys.
+decode(<<"json@1.0">>, Bin, Opts) ->
+    {ok, TABM} = hb_ao:raw(<<"json@1.0">>, <<"deserialize">>, Bin, #{}, Opts),
+    decode_tabm(TABM, Opts);
+decode(Device, Bin, Opts) ->
+    hb_message:convert(
+        Bin,
+        <<"structured@1.0">>,
+        Device,
+        Opts#{ <<"linkify-mode">> => false }
+    ).
+
+%% @doc Decode a TABM with `structured@1.0', and the map or list of each of its
+%% private keys as a TABM too: `to' keeps those as they are, and the private
+%% values of a config file are TABMs.
+decode_tabm(TABM, Opts) ->
+    {ok, Msg} = hb_ao:raw(<<"structured@1.0">>, <<"to">>, TABM, #{}, Opts),
+    decode_private(Msg, Opts).
+
+%% @doc Decode the map or list of each private key of a message, at any depth,
+%% with `decode_tabm/2'.
+decode_private(Msg, Opts) when is_map(Msg) ->
+    maps:map(
+        fun(Key, Value) when is_map(Value) orelse is_list(Value) ->
+            case hb_private:is_private(Key) of
+                true -> decode_tabm(Value, Opts);
+                false -> decode_private(Value, Opts)
+            end;
+           (_Key, Value) -> Value
+        end,
+        Msg
+    );
+decode_private(List, Opts) when is_list(List) ->
+    [ decode_private(Value, Opts) || Value <- List ];
+decode_private(Value, _Opts) -> Value.
 
 %% @doc Mimic the types of the default message for a given map.
 mimic_default_types(Map, _Mode, Opts) ->
@@ -820,7 +840,8 @@ coerce_value(_DefaultValue, Value) ->
 
 %% @doc Find a given identity from the `identities' map, and return the options
 %% merged with the sub-options for that identity.
-as(Identity, Opts) ->
+as(RawIdentity, Opts) ->
+    Identity = hb_committer:uri(RawIdentity, Opts),
     case identities(hb_http_server:with_node_committer(Opts)) of
         #{ Identity := SubOpts } ->
             ?event({found_identity_sub_opts_are, SubOpts}),
@@ -841,7 +862,7 @@ address(Default, Opts) ->
     end.
 
 %% @doc Return the URI of the `priv-wallet' in `Opts'. Request execution `Opts'
-%% hold no wallet, so for them we return the `committer' option. If neither is
+%% have no wallet, so for them we return the `committer' option. If neither is
 %% set, we return the URI of `Default'.
 committer(Opts) -> committer(undefined, Opts).
 committer(Default, Opts) ->
@@ -852,11 +873,10 @@ committer(Default, Opts) ->
         Wallet -> uri(Wallet, Opts)
     end.
 
-%% @doc Return the URI of a wallet.
+%% @doc Return the URI of a wallet: the URI of its committer that
+%% `hb_committer:uri/2' gives.
 uri(Wallet, Opts) ->
-    ToURI = #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
-    {ok, URI} = hb_ao:raw(Wallet, ToURI, Opts),
-    URI.
+    hb_committer:uri(Wallet, Opts).
 
 %% @doc Find all known IDs and their sub-options from the `priv_ids' map. Allows
 %% the identities to be named, or based on addresses. The results are normalized
@@ -1030,7 +1050,21 @@ global_get_test() ->
     ?assertEqual(false, ?MODULE:get(debug_log)),
     ?assertEqual(<<"logs">>, ?MODULE:get(log_dir)),
     ?assertEqual(5, ?MODULE:get(log_max_files)),
-    ?assertEqual(52428800, ?MODULE:get(log_max_bytes)).
+    ?assertEqual(52428800, ?MODULE:get(log_max_bytes)),
+    % No default store's directory is inside another's.
+    Stores =
+        ?MODULE:get(store) ++ ?MODULE:get(priv_store) ++
+            [?MODULE:get(attested_store)],
+    ?assertEqual(
+        [],
+        [
+            {Outer, Inner}
+        ||
+            #{ <<"name">> := Outer } <- Stores,
+            #{ <<"name">> := Inner } <- Stores,
+            string:prefix(Inner, <<Outer/binary, "/">>) =/= nomatch
+        ]
+    ).
 
 local_get_test() ->
     Local = #{ <<"only">> => local },
@@ -1069,6 +1103,8 @@ load_flat_test() ->
     % await-inprogress: false
     {ok, Conf} = load("test/config.flat", #{}),
     ?event({loaded, {explicit, Conf}}),
+    % A `.' in a directory of the path does not change the file's codec.
+    ?assertEqual({ok, Conf}, load("./test/config.flat", #{})),
     % Ensure we convert types as expected.
     ?assertEqual(1234, hb_maps:get(<<"port">>, Conf)),
     % A binary
@@ -1085,6 +1121,11 @@ load_json_test() ->
     ?assertEqual(<<"https://ao.computer">>, hb_maps:get(<<"node-host">>, Conf)),
     % An atom, where the key contained a header-key `-' rather than a `_'.
     ?assertEqual(false, hb_maps:get(<<"await-inprogress">>, Conf)),
+    % A private key is kept, and its value is decoded as the others are.
+    ?assertMatch(
+        [#{ <<"store-module">> := hb_store_fs }],
+        hb_maps:get(<<"priv-store">>, Conf)
+    ),
     % Ensure that a store with `ao-types' is loaded correctly.
     ?assertMatch(
         [#{ <<"store-module">> := hb_store_fs }|_],
@@ -1180,6 +1221,11 @@ as_identity_test() ->
     ?assertMatch(
         {ok, #{ <<"priv-wallet">> := TestWallet1, <<"test-key">> := 1 }},
         as(hb_test_utils:committer(TestWallet1), Opts)
+    ),
+    % `as/2' finds an identity by the address of its wallet, as by its URI.
+    ?assertMatch(
+        {ok, #{ <<"priv-wallet">> := TestWallet1, <<"test-key">> := 1 }},
+        as(hb:address(TestWallet1), Opts)
     ),
     ?assertMatch(
         {ok, #{ <<"priv-wallet">> := TestWallet2, <<"test-key">> := 2 }},

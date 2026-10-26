@@ -2,6 +2,7 @@
 %%% (potentially multi-layer) paths as their keys, and a normal TABM binary as 
 %%% their value.
 -module(dev_flat).
+-specification("../../../specs/flat@1.0.md").
 -export([from/3, to/3, commit/3, verify/3, deserialize/3]).
 %%% Testing utilities
 -export([serialize/1, serialize/2, deserialize/1]).
@@ -65,10 +66,18 @@ from(Map, Req, Opts) when is_map(Map) ->
     {ok, binary() | #{ _ => _ }}.
 to(Bin, _, _Opts) when is_binary(Bin) -> {ok, Bin};
 to(List, Req, Opts) when is_list(List) ->
+    % `structured@1.0' gives the list as a numbered message, marked as a list.
     to(
-        (hb_util:list_to_numbered_message(List))#{
-            <<"ao-types">> => <<"list=(\".\")">>
-        },
+        hb_message:convert(
+            List,
+            tabm,
+            #{
+                <<"device">> => <<"structured@1.0">>,
+                <<"encode-types">> => [<<"list">>],
+                <<"bundle">> => true
+            },
+            Opts
+        ),
         Req,
         Opts
     );
@@ -102,7 +111,7 @@ serialize(Map) when is_map(Map) ->
     serialize(Map, #{}).
 
 serialize(Map, Opts) when is_map(Map) ->
-    Flattened = hb_message:convert(Map, <<"flat@1.0">>, #{}),
+    Flattened = hb_message:convert(hb_private:reset(Map), <<"flat@1.0">>, #{}),
     {ok,
         iolist_to_binary(lists:foldl(
                 fun(Key, Acc) ->

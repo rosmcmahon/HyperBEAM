@@ -21,6 +21,7 @@
 %%% Additionally, this device implements the standard computation device keys,
 %%% allowing it to be used as an element of an execution stack pipeline, etc.
 -module(dev_patch).
+-specification("../../../specs/patch@1.0.md").
 -export([all/3, patches/3]).
 %%% `execution-device` standard hooks:
 -export([init/3, compute/3, normalize/3, snapshot/3]).
@@ -124,6 +125,8 @@ move(Mode, Base, Req, Opts) ->
             ),
         ?event({patch_from, PatchFrom}),
         ?event({patch_to, PatchTo}),
+        true ?= not hb_private:is_private_path(PatchTo, Opts) orelse
+            {error, <<"Private patch path.">>},
         % Get the source of the patches from the message. Makes the `maybe'
         % statement return `{error, not_found}' if the source is not found.
         {ok, Source} ?= hb_ao:resolve(FromMsg, PatchFrom, Opts),
@@ -177,7 +180,7 @@ move(Mode, Base, Req, Opts) ->
                 Opts
             ),
         % If the `mode` is `patches`, we need to remove the `method` key from
-        % them, if present.
+        % them, if present, and apply them in the numeric order of their keys.
         ToWriteMod =
             case Mode of
                 all -> ToWrite;
@@ -195,7 +198,10 @@ move(Mode, Base, Req, Opts) ->
                             Res
                         end,
                         #{},
-                        ToWrite
+                        maps:iterator(
+                            ToWrite,
+                            fun(A, B) -> hb_util:int(A) =< hb_util:int(B) end
+                        )
                     )
             end,
         ?event({to_write, ToWriteMod}),
@@ -231,7 +237,9 @@ uninitialized_patch_test() ->
                     <<"prices">> => #{
                         <<"apple">> => 1000
                     }
-                }
+                },
+                <<"3">> => #{ <<"method">> => <<"PATCH">>, <<"n">> => 3 },
+                <<"10">> => #{ <<"method">> => <<"PATCH">>, <<"n">> => 10 }
             }
         },
         <<"other-message">> => <<"other-value">>,
@@ -252,7 +260,9 @@ uninitialized_patch_test() ->
     ?assertMatch(
         not_found,
         hb_ao:get(<<"results/outbox/1">>, ResolvedState, #{})
-    ).
+    ),
+    % Patches apply in the numeric order of their keys: `10' after `3'.
+    ?assertEqual(10, hb_ao:get(<<"n">>, ResolvedState, #{})).
 
 patch_to_submessage_test() ->
     InitState = #{

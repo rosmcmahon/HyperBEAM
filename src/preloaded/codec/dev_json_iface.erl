@@ -35,9 +35,8 @@
 %%%             /Results/Data</pre>
 -module(dev_json_iface).
 -implements(<<"json-iface@1.0">>).
+-specification("../../../specs/json-iface@1.0.md").
 -export([init/3, compute/3, to/3, from/3]).
-%%% Public interface helpers:
--export([message_to_json_struct/2, json_to_message/2]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -86,7 +85,7 @@ prep_call(RawM1, RawM2, Opts) ->
 
 %% @doc Encode a JSON-Struct as a JSON string. As in `json@1.0', a binary that
 %% is not UTF-8 text is given as its base64url, typed `binary' in the
-%% `ao-types' of the object that holds it.
+%% `ao-types' of the object that contains it.
 struct_to_json(Struct, Opts) ->
     hb_json:encode(
         hb_message:convert(
@@ -111,7 +110,7 @@ denormalize_message(Message, Opts) ->
                 Message#{
                     <<"owner">> => hb_util:committer_address(PrimarySigner),
                     <<"signature">> =>
-                        hb_ao:get(<<"signature">>, Commitment, <<>>, Opts)
+                        hb_maps:get(<<"signature">>, Commitment, <<>>, Opts)
                 }
         end,
     NormOwnerMsg#{
@@ -137,9 +136,9 @@ message_to_json_struct(RawMsg, Features, Opts) ->
                 {ok, _, Commitment} =
                     hb_message:commitment(Signer, RawMsg, Opts),
                 CommitmentSignature =
-                    hb_ao:get(<<"signature">>, Commitment, <<>>, Opts),
+                    hb_maps:get(<<"signature">>, Commitment, <<>>, Opts),
                 CommitmentKey =
-                    hb_ao:get_first(
+                    hb_maps:get_first(
                         [
                             {Commitment, <<"public-key">>},
                             {Commitment, <<"owner">>}
@@ -156,7 +155,7 @@ message_to_json_struct(RawMsg, Features, Opts) ->
                         };
                     false ->
                         CommitmentOwner =
-                            hb_ao:get_first(
+                            hb_maps:get_first(
                                 [
                                     {Commitment, <<"key">>},
                                     {Commitment, <<"public-key">>},
@@ -209,7 +208,7 @@ message_to_json_struct(RawMsg, Features, Opts) ->
         % NOTE: When sent to ao "Owner" is the wallet address
         <<"Owner">> => Owner,
         <<"From">> => case ?IS_ID(From) of true -> safe_to_id(From); false -> From end,
-        <<"Tags">> => prepare_tags(TABM, Opts),
+        <<"Tags">> => prepare_tags(TABM, RawMsg, Opts),
         <<"Target">> => safe_to_id(Target),
         <<"Data">> => Data,
         <<"Signature">> =>
@@ -231,7 +230,7 @@ to(Base, Req, Opts) ->
     }.
 %% @doc Prepare the tags of a message as a key-value list, for use in the 
 %% construction of the JSON-Struct message.
-prepare_tags(Msg, Opts) ->
+prepare_tags(Msg, RawMsg, Opts) ->
     % Prepare an ANS-104 message for JSON-Struct construction.
     case hb_message:commitment(#{ <<"commitment-device">> => <<"ans104@1.0">> }, Msg, Opts) of
         {ok, _, Commitment} ->
@@ -241,22 +240,33 @@ prepare_tags(Msg, Opts) ->
                     ?event({using_original_tags, Res}),
                     Res;
                 error -> 
-                    prepare_header_case_tags(Msg, Opts)
+                    prepare_header_case_tags(Msg, RawMsg, Opts)
             end;
         _ ->
-            prepare_header_case_tags(Msg, Opts)
+            prepare_header_case_tags(Msg, RawMsg, Opts)
     end.
 
 %% @doc Convert a message without an `original-tags' field into a list of
-%% key-value pairs, with the keys in HTTP header-case.
-prepare_header_case_tags(TABM, Opts) ->
+%% key-value pairs, with the keys in HTTP header-case. A key with a list
+%% in the message gives a pair for each element of the list, because AOS reads
+%% several values of one tag as repeated tags.
+prepare_header_case_tags(TABM, RawMsg, Opts) ->
     % Prepare a non-ANS-104 message for JSON-Struct construction. 
-    lists:map(
+    lists:flatmap(
         fun({Name, Value}) ->
-            #{
-                <<"name">> => header_case_string(maybe_list_to_binary(Name)),
-                <<"value">> => maybe_list_to_binary(Value)
-            }
+            Values =
+                case hb_maps:get(Name, RawMsg, Value, Opts) of
+                    List when is_list(List) -> List;
+                    _ -> [Value]
+                end,
+            [
+                #{
+                    <<"name">> => header_case_string(maybe_list_to_binary(Name)),
+                    <<"value">> => maybe_list_to_binary(Element)
+                }
+            ||
+                Element <- Values
+            ]
         end,
         hb_maps:to_list(
             hb_maps:without(
@@ -505,7 +515,7 @@ preprocess_results(Msg, Opts) ->
     ).
 
 %% @doc Convert a message with tags into a map of their key-value pairs. AOS
-%% JSON holds the tags under `Tags'.
+%% JSON contains the tags under `Tags'.
 tags_to_map(Msg, Opts) ->
     RawTags = hb_maps:get(<<"Tags">>, Msg, [], Opts),
     TagList =
@@ -586,7 +596,11 @@ generate_stack(File, _Mode, RawOpts) ->
                 <<"type">> => <<"Process">>,
                 <<"image">> => Image,
                 <<"scheduler">> => hb:address(),
-                <<"authority">> => hb:address()
+                <<"authority">> =>
+                    [
+                        <<"E3FJ53E6xtAzcftBpaw2E1H4ZM9h6qy6xz9NXh5lhEQ">>,
+                        hb:address()
+                    ]
             }, Opts)
     },
     {ok, Req} = hb_ao:resolve(Base, <<"init">>, Opts),
@@ -620,7 +634,37 @@ basic_aos_call_test_() ->
 			),
 		?event({res, Res}),
 		Data = hb_ao:get(<<"results/data">>, Res, #{}),
-		?assertEqual(<<"2">>, Data)
+		?assertEqual(<<"2">>, Data),
+		% AOS trusts a message signed by the second of the process's two
+		% authorities.
+		{ok, Trusted} =
+			hb_ao:resolve(
+				Msg,
+				generate_aos_msg(
+					ProcID,
+					<<"return tostring(ao.isTrusted({ Owner = '",
+						(hb:address())/binary, "' }))">>
+				),
+				#{}
+			),
+		?assertEqual(<<"true">>, hb_ao:get(<<"results/data">>, Trusted, #{})),
+		% `json-iface@1.0' does not run the `device' of a message's commitment.
+		AOSMsg = generate_aos_msg(ProcID, <<"return 1+1">>),
+		Body = maps:get(<<"body">>, AOSMsg),
+		Commitments =
+			maps:map(
+				fun(_, C) -> C#{ <<"device">> => <<"manifest@1.0">> } end,
+				maps:get(<<"commitments">>, Body)
+			),
+		{ok, WithDevice} =
+			hb_ao:resolve(
+				Msg,
+				AOSMsg#{
+					<<"body">> => Body#{ <<"commitments">> => Commitments }
+				},
+				#{}
+			),
+		?assertEqual(<<"2">>, hb_ao:get(<<"results/data">>, WithDevice, #{}))
 	end}.
 
 aos_stack_benchmark_test_() ->

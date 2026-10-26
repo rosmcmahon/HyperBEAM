@@ -1,13 +1,13 @@
 %%% @doc An Arweave path manifest resolution device. Follows the v1 schema:
 %%% https://specs.ar.io/?tx=lXLd0OPwo-dJLB_Amz5jgIeDhiOkjXuM3-r0H_aiNj0
 -module(dev_manifest).
--export([index/3, info/0, request/3]).
+-export([index/3, device_info/0, request/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Use the `route/4' function as the handler for all requests, aside
 %% from `keys' and `set', which are handled by the default resolver.
-info() ->
+device_info() ->
     #{
         default => fun route/4,
         excludes => [keys, set, committers]
@@ -321,7 +321,7 @@ resolve_test_parallel() ->
     ?assertMatch(
         {ok, #{ <<"body">> := <<"Page 2">>}}, 
         hb_http:get(Node, << LegacyManifestID/binary, "/nested/page2" >>, Opts)),
-    % A legacy manifest named by an `ao:' URI is cast in the same way.
+    % A legacy manifest given by an `ao:' URI is cast in the same way.
     ?assertMatch(
         {ok, #{ <<"body">> := <<"Page 1">> }},
         hb_http:get(Node, << "/ao:", LegacyManifestID/binary, "/index" >>, Opts)

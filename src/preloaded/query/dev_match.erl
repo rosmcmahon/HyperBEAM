@@ -3,7 +3,7 @@
 %%% `offset', `id' and `commitment-device', not the indexed messages themselves.
 %%% `offset' is a weave byte position, `-1' for an unknown position, or
 %%% `infinity' for a pending position. `id' identifies a signed commitment;
-%%% `commitment-device' names its device. Unknown IDs and devices are empty
+%%% `commitment-device' is its device. Unknown IDs and devices are empty
 %%% binaries. Store pipelines supply this representation independently of
 %%% how a store encodes its entries.
 %%%
@@ -22,8 +22,8 @@
 %%% '''
 %%% Templates exclude private keys and top-level commitments. Structured
 %%% values are converted to TABM and the top-level `ao-types' field is removed;
-%%% top-level scalar types are not distinguished by matching. Other public keys,
-%%% including `device', are predicates.
+%%% the types of top-level literals are not distinguished by matching. Other
+%%% public keys, including `device', are predicates.
 %%% The request may add `predicates': a list of messages with `name' and
 %%% `values'. Values within each predicate are ORed; predicates and the base's
 %%% pairs are ANDed. An empty values list matches nothing. Ordinary template
@@ -57,10 +57,10 @@
 %%%
 %%% Indexed pairs comprise the body's public fields without its commitments,
 %%% plus values computed with only the indexed ID's commitment present.
-%%% `match-paths' maps names to paths resolved on the
+%%% `match-paths' maps each name to a path resolved on the
 %%% body; `match-all-paths' indexes each list element under its configured name
-%%% (a non-list result contributes one value). Successfully resolved names
-%%% replace the corresponding body fields. Node options take precedence over
+%%% (a non-list result contributes one value). A name that resolves replaces
+%%% the body field of the same name. Node options take precedence over
 %%% the handler's configuration. Defaults are an empty `match-paths' and a
 %%% `match-all-paths' message mapping `committer' to `committers~message@1.0'.
 %%% Computations use raw AO-Core resolution: `KEY~DEVICE' selects a device;
@@ -72,10 +72,13 @@
 %%% setting, a locally supplied `store' takes its place; with neither local
 %%% option, the global `match-index' applies. The selected value may be a store
 %%% message or list, `false' for no index, or `true' to use the node's `store'.
-%%% Each alternative names a group `~match@1.0/<normalized-name>=<value-path>'.
-%%% The value path is a binary's hashpath or a nested message's uncommitted ID.
-%%% Writes have empty values and entry keys with an additional `path' naming
-%%% the group. `hb_store' applies prefix handling and `to-key' to these keys.
+%%% The group of each alternative is
+%%% `~match@1.0/<normalized-name>=<value-path>', with the name escaped as a
+%%% single path component. The value path is a binary's hashpath or a nested
+%%% message's uncommitted ID.
+%%% Writes have empty values and entry keys with an additional `path' that
+%%% gives the group. `hb_store' applies prefix handling and `to-key' to these
+%%% keys.
 %%% The encoder also receives binary group paths and pathless entry messages
 %%% for list bounds. List results pass through `from-key' to become entries.
 %%% A `from-list' pipeline can decode the entire batch instead, using `entries'
@@ -119,7 +122,9 @@
 %%% `member' maps that maximum to `infinity'. The pipeline must supply any
 %%% known commitment device, for example with `/set&commitment-device=ans104@1.0'.
 -module(dev_match).
--export([info/0, all/3, index/3, locate/3, row/3, member/3, entry/3, key/3]).
+-specification("../../../specs/match@1.0.md").
+-export([device_info/0]).
+-export([all/3, index/3, locate/3, row/3, member/3, entry/3, key/3]).
 -export([entries/3, members/3, check/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -134,10 +139,12 @@
 -define(DEFAULT_ALL_PATHS,
     #{ <<"committer">> => <<"committers~message@1.0">> }
 ).
+%% The most rows that a `members' request decodes.
+-define(MAX_MEMBERS, 1000).
 
-%% @doc Default all non-message@1.0 and device keys to match a single key in the
-%% index.
-info() ->
+%% @doc Default all keys other than `message@1.0' and device keys to match a
+%% single key in the index.
+device_info() ->
     #{
         excludes => [<<"set">>, <<"remove">>, <<"id">>, <<"verify">>],
         default => fun match/4
@@ -180,7 +187,7 @@ store(Opts) ->
 group(Name, Value, Opts) ->
     <<
         ?PREFIX/binary,
-        (hb_ao:normalize_key(Name))/binary, "=",
+        (hb_escape:encode_path_component(hb_ao:normalize_key(Name)))/binary, "=",
         (value_path(Value, Opts))/binary
     >>.
 
@@ -242,7 +249,7 @@ parse(Offset, <<ID:43/binary, Device/binary>>) ->
 parse(Offset, ID) ->
     #{ <<"offset">> => Offset, <<"id">> => ID, <<"commitment-device">> => <<>> }.
 
-%% @doc The position of a key: its offset and ID. An empty ID names an
+%% @doc The position of a key: its offset and ID. An empty ID is an
 %% offset boundary, closing the offset when reading down.
 position(desc, #{ <<"offset">> := Offset, <<"id">> := <<>> }) ->
     {Offset, ?LAST_ID};
@@ -252,7 +259,7 @@ position(_Direction, #{ <<"offset">> := Offset, <<"id">> := ID }) ->
 %%% Writing the index.
 
 %% @doc Write the message in the request's `body' under each of its pairs,
-%% per ID the request names, at the offset of its `priv/offset': a weave
+%% per ID the request gives, at the offset of its `priv/offset': a weave
 %% offset, `infinity', or `-1' when it carries none. A node without stores
 %% of the index, or with none that takes the keys, writes nothing. Only the
 %% kernel's `cache-write' hook is served: it marks its request in a private
@@ -347,8 +354,8 @@ pairs(Handler, Msg, Names, Opts) ->
             Element <- elements(List)
         ].
 
-%% @doc The pairs a map of paths names, each the value its path resolves to
-%% on the message. The node's options hold the map, else the hook's handler
+%% @doc The pairs that a map of paths gives, each the value its path resolves to
+%% on the message. The node's options give the map, else the hook's handler
 %% message, else the default.
 %% A computed key may select its device with `KEY~DEVICE'. Without `~DEVICE',
 %% indexing attempts to load each message's device, subject to the node's
@@ -463,7 +470,7 @@ groups(Base, Req, Opts) ->
             Name <- [hb_maps:get(<<"name">>, Predicate, not_found, Opts)]
         ].
 
-%% @doc The pairs a base message names: every key but its commitments and
+%% @doc The pairs of a base message: every key but its commitments and
 %% private keys, in the wire form the index is written from.
 template(Base, Opts) ->
     hb_maps:to_list(
@@ -695,8 +702,8 @@ first_of(desc, Heads) ->
 
 %% @doc One store's page of a group's keys from the cursor, in the
 %% direction: the batch the store finds without further work. A batch
-%% holding nothing past the cursor ends the store's part, so a store's
-%% batch must hold a key past it while any remains. A store without the
+%% with nothing past the cursor ends the store's part, so a store's
+%% batch must contain a key past it while any remains. A store without the
 %% group has none.
 page(Direction, Group, Cursor, Exclusive, Store, Opts) ->
     Request =
@@ -732,7 +739,7 @@ resume_offset_row(Rows, Request, Cursor, Store, Opts) ->
             end
     end.
 
-%% @doc The key a store's page is read from: a cursor naming no ID stands
+%% @doc The key a store's page is read from: a cursor with no ID stands
 %% for every key of its offset, so reading down it closes with the byte
 %% above every ID. Exclusive offset bounds seek past all IDs at that offset.
 from(asc, #{ <<"id">> := <<>> } = Cursor, true) ->
@@ -769,7 +776,10 @@ row(#{ <<"offset">> := Offset }, {_, _, OffsetBits}) ->
         _ -> <<Max:OffsetBits>>
     end;
 row(Body, {KeyBits, ValueBits, _OffsetBits}) ->
-    [Name, ValuePath] = binary:split(Body, <<"=">>),
+    % A value path contains no `=', so the name ends at the last one.
+    {At, 1} = lists:last(binary:matches(Body, <<"=">>)),
+    <<Escaped:At/binary, "=", ValuePath/binary>> = Body,
+    Name = hb_escape:decode_path_component(Escaped),
     <<KeyHash:KeyBits/bitstring, _/bitstring>> =
         crypto:hash(sha256, <<?PREFIX/binary, Name/binary>>),
     <<ValueHash:ValueBits/bitstring, _/bitstring>> = hb_util:decode(ValuePath),
@@ -792,8 +802,28 @@ member(Base, Req, Opts) ->
         end
     end.
 
-%% @doc Decode a batch of packed rows, retaining its configured device.
+%% @doc Decode a batch of packed rows, retaining its configured device. A batch
+%% gives a non-zero `offset-size' and has at most `?MAX_MEMBERS' rows.
 members(Base, Req, Opts) ->
+    case {sizes(Req, Opts), hb_maps:get(<<"body">>, Base, [], Opts)} of
+        {{_, _, 0}, _} ->
+            {error,
+                #{
+                    <<"status">> => 400,
+                    <<"body">> => <<"Offset size is 0.">>
+                }
+            };
+        {_, Rows} when length(Rows) > ?MAX_MEMBERS ->
+            {error,
+                #{
+                    <<"status">> => 400,
+                    <<"body">> => <<"Too many rows.">>
+                }
+            };
+        _ -> decode_members(Base, Req, Opts)
+    end.
+
+decode_members(Base, Req, Opts) ->
     Device = hb_maps:get(<<"commitment-device">>, Req, <<>>, Opts),
     lists:foldr(
         fun(Row, Acc) ->
@@ -1101,7 +1131,7 @@ alignment_test() ->
     ).
 
 %% @doc Each signed ID is indexed under its own committer, and a
-%% `match-all-paths' map in the node's options names the pair over the
+%% `match-all-paths' map in the node's options gives the pair over the
 %% hook's handler message's.
 paths_test() ->
     Opts = test_opts(),

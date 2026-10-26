@@ -5,7 +5,8 @@
 %%% are found in this module, while the codec functions are relayed to the 
 %%% `dev_httpsig_conv' module.
 -module(dev_httpsig).
--device_libraries([lib_arweave_common]).
+-specification("../../../specs/httpsig@1.0.md").
+-device_libraries([lib_arweave_common, lib_secret]).
 %%% Codec API functions
 -export([to/3, to_hint/3, from/3]).
 %%% Uni-directional codec support (_to_ binary/header+body components), but not 
@@ -53,7 +54,7 @@ serialize(Msg, #{ <<"format">> := <<"components">> }, Opts) ->
     % Convert to HTTPSig via TABM through calling `hb_message:convert` rather
     % than executing `to/3` directly. This ensures that our responses are 
     % normalized.
-    {ok, EncMsg} = hb_message:convert(Msg, <<"httpsig@1.0">>, Opts),
+    EncMsg = hb_message:convert(Msg, <<"httpsig@1.0">>, Opts),
     {ok,
         #{
             <<"body">> => hb_maps:get(<<"body">>, EncMsg, <<>>),
@@ -63,8 +64,7 @@ serialize(Msg, #{ <<"format">> := <<"components">> }, Opts) ->
 serialize(Msg, _Req, Opts) ->
     % We assume the default format of `binary` if none of the prior clauses
     % match.
-    HTTPSig = hb_message:convert(Msg, <<"httpsig@1.0">>, Opts), 
-    {ok, dev_httpsig_conv:encode_http_msg(HTTPSig, Opts) }.
+    {ok, dev_httpsig_conv:encode_http_msg(Msg, Opts) }.
 
 -spec verify(
     #{ _ => _ },
@@ -87,7 +87,7 @@ verify(Base, Req, RawOpts) ->
     end.
 
 %% @doc Verify a commitment whose committed keys the base carries. We
-%% regenerate the signature base, and the committer named by the `keyid'
+%% regenerate the signature base, and the committer that the `keyid' gives
 %% verifies the signature against it.
 do_verify(Base, Req, Opts) ->
     {ok, EncMsg, EncComm, _} = normalize_for_encoding(Base, Req, Opts),
@@ -121,7 +121,7 @@ strong_key(_Req) ->
 
 %% @doc Load the committer from a `keyid' and ask it to verify the signature of
 %% a signature base. The request is the commitment. Its `priv' message is given
-%% to the committer, as it holds the verifier's key material, such as a
+%% to the committer, as it contains the verifier's key material, such as a
 %% secret. The `keyid' must be the URI of the committer. A `keyid' in any
 %% other form does not verify.
 committer_verifies(KeyID, SigBase, Req, Opts) ->
@@ -136,10 +136,12 @@ committer_verifies(KeyID, SigBase, Req, Opts) ->
                         #{ <<"owner">> => hb_util:decode(Key) };
                     _ -> #{}
                 end,
+            % A committer refuses a commitment that keeps its device.
+            Commitment = maps:remove(<<"commitment-device">>, Req),
             {ok, Verified} =
                 hb_ao:raw(
                     hb_private:set_priv(Committer, hb_private:from_message(Req)),
-                    (maps:merge(Req, Raw))#{
+                    (maps:merge(Commitment, Raw))#{
                         <<"path">> => <<"verify">>,
                         <<"body">> => SigBase,
                         <<"signature">> =>
@@ -171,14 +173,9 @@ committer(#{ <<"committer">> := URI }, Opts) when is_binary(URI) ->
         committer(#{ <<"committer">> => Committer }, Opts)
     end;
 committer(#{ <<"committer">> := Committer }, Opts) ->
-    maybe
-        {ok, URI} ?=
-            hb_ao:raw(
-                Committer,
-                #{ <<"path">> => <<"to">>, <<"type">> => <<"uri">> },
-                Opts
-            ),
-        {ok, Committer, URI}
+    case hb_committer:uri(Committer, Opts) of
+        URI when is_binary(URI) -> {ok, Committer, URI};
+        _ -> {error, not_found}
     end;
 committer(_Req, _Opts) ->
     {error, not_found}.
@@ -285,7 +282,7 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
         }
     };
 commit(BaseMsg, Req = #{ <<"type">> := <<"hmac-sha256">> }, RawOpts) ->
-    % Find the committer of the request and the URI that names it. If the
+    % Find the committer of the request and its URI. If the
     % request gives no committer, we use the committer of unsigned commitments.
     Opts = opts(RawOpts),
     {ok, CommitterMsg, KeyID} =
@@ -391,28 +388,11 @@ to_hint(Msg, Req, Opts) ->
     end.
 
 %% @doc Derive the set of keys to commit to from a `commit` request and a 
-%% base message.
+%% base message: the keys that the request lists, or every key of the message.
 keys_to_commit(_Base, #{ <<"committed">> := Explicit}, _Opts) ->
-    % Case 1: Explicitly provided keys to commit.
     hb_util:list_to_numbered_message(Explicit);
-keys_to_commit(Base = #{ <<"commitments">> := Commitments }, _Req, Opts)
-        when ?IS_EMPTY_MESSAGE(Commitments) ->
-    default_keys_to_commit(Base, Opts);
-keys_to_commit(Base, _Req, Opts) when not is_map_key(<<"commitments">>, Base) ->
-    default_keys_to_commit(Base, Opts);
 keys_to_commit(Base, _Req, Opts) ->
-    % Extract the set of committed keys from the message.
-    case hb_message:committed(Base, #{ <<"committers">> => <<"all">> }, opts(Opts)) of
-        [] ->
-            % Case 3: Default to all keys in the TABM-encoded message, aside
-            % metadata.
-            default_keys_to_commit(Base, Opts);
-        Keys ->
-            % Case 2: Replicate the raw keys that the existing commitments have
-            % used. This leads to a message whose commitments can be 'stacked'
-            % and represented together in HTTPSig format.
-            hb_util:list_to_numbered_message(Keys)
-    end.
+    default_keys_to_commit(Base, Opts).
 
 default_keys_to_commit(Base, Opts) ->
     hb_util:list_to_numbered_message(
@@ -442,7 +422,8 @@ add_content_digest(Msg, _Opts) ->
 %% normalized for encoding. The components of the signature follow the order
 %% of the keys that the commitment lists. When `Ordered' is false, as for a
 %% commitment made without a `committed' list in its request, they follow the
-%% order of the keys of the encoded message.
+%% order of the keys of the encoded message. Every key of the message is
+%% encoded: the message contains only the keys of the commitment.
 -spec normalize_for_encoding(
     #{ _ => _ },
     #{ committed => [_], _ => _ },
@@ -453,8 +434,6 @@ normalize_for_encoding(Msg, Commitment, Opts) ->
 normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
     % Extract the requested keys to include in the signature base.
     RawInputs = committed_keys(Commitment, Opts),
-    Inputs = input_keys(RawInputs),
-    ?event_debug({inputs, {list, Inputs}}),
     % A commitment is over every key it lists. A committed key that the
     % message lacks cannot be left out of the signature base silently: the
     % commitment would then be encoded over a message that its signature does
@@ -470,30 +449,19 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
                 }
             )
     end,
-    % Filter the message to the requested keys and their types, then encode it.
-    MsgWithOnlyInputs =
-        with_types(
-            maps:with(
-                Inputs,
-                Msg
-            ),
-            Inputs,
-            Msg,
-            Opts
-        ),
-    ?event_debug({msg_with_only_inputs, {priv_msg, maps:without([<<"commitments">>], MsgWithOnlyInputs)}}),
+    % Encode the message without its commitments.
     {ok, EncodedWithSigInfo} =
         to(
-            maps:without([<<"commitments">>], MsgWithOnlyInputs),
+            maps:without([<<"commitments">>], Msg),
             #{
                 <<"bundle">> =>
                     hb_util:atom(maps:get(<<"bundle">>, Commitment, false))
             },
             Opts
         ),
-    % Remove the signature and signature-input keys from the encoded message,
-    % convert the `body' key to a `content-digest' key, if present.
-    Encoded = add_content_digest(EncodedWithSigInfo, Opts),
+    % `to/3' adds the `content-digest' key of a binary body, so remove the
+    % `body' key from the encoded message.
+    Encoded = maps:without([<<"body">>], EncodedWithSigInfo),
     % Transform the list of requested keys to their `httpsig@1.0' equivalents.
     EncodedKeys = maps:keys(Encoded),
     EncodedKeysWithBodyKey =
@@ -521,15 +489,17 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
     % Calculate the keys that have been removed from the message, as a result
     % of being added to the body. These keys will need to be removed from the
     % `committed' list and re-added where the `content-digest' was in the
-    % `from_siginfo_keys' call. A `content-digest' key of the message is always
-    % in the body: the header of that name is the digest of the body.
+    % `from_siginfo_keys' call. A `content-digest' or `ao-body-key' key of the
+    % message is always in the body: the headers `content-digest' and
+    % `ao-body-key' give the digest and the key of the body.
     BodyKeys =
         lists:filter(
             fun(Key) ->
                 Key =:= <<"content-digest">> orelse
+                    Key =:= <<"ao-body-key">> orelse
                     not key_present(Key, Encoded) orelse
                     (Key =:= <<"content-type">> andalso
-                        maps:get(Key, MsgWithOnlyInputs, undefined) =/=
+                        maps:get(Key, Msg, undefined) =/=
                             maps:get(Key, Encoded, undefined))
             end,
             RawInputs
@@ -547,7 +517,7 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
         ),
     ?event_debug(debug_httpsig,
         {normalized_for_encoding,
-            {raw_inputs, Inputs},
+            {raw_inputs, RawInputs},
             {inputs_for_encoding, Components},
             {final_for_commitment_message, KeysForCommitment},
             {encoded_message, Encoded}
@@ -602,32 +572,6 @@ committed_keys(Commitment, Opts) ->
 %% against the keys of the message.
 input_keys(RawInputs) ->
     lists:map(fun hb_ao:normalize_key/1, RawInputs).
-
-%% @doc The committed values with the message's `ao-types' entries for their
-%% keys and for `.', which marks the message as a list. Whether or not a
-%% commitment lists `ao-types', it covers the types of its values and whether
-%% its message is a list.
-with_types(Values, Keys, #{ <<"ao-types">> := Types }, Opts) ->
-    % Unsigned IDs run this function, so `structured@1.0' is called raw: a
-    % resolution would read the cache and compute IDs.
-    {ok, AllTypes} =
-        hb_ao:raw(<<"structured@1.0">>, <<"decode-types">>, Types, #{}, Opts),
-    case maps:with([<<".">> | Keys], AllTypes) of
-        NoTypes when map_size(NoTypes) =:= 0 -> Values;
-        AllTypes -> Values#{ <<"ao-types">> => Types };
-        CommittedTypes ->
-            {ok, EncodedTypes} =
-                hb_ao:raw(
-                    <<"structured@1.0">>,
-                    <<"encode-types">>,
-                    CommittedTypes,
-                    #{},
-                    Opts
-                ),
-            Values#{ <<"ao-types">> => EncodedTypes }
-    end;
-with_types(Values, _Keys, _Msg, _Opts) ->
-    Values.
 
 %% @doc The keys a commitment lists that the message does not carry.
 missing_keys(Msg, Commitment, Opts) ->
@@ -732,8 +676,31 @@ commitment_identity_test() ->
     Msg = #{ <<"body">> => <<"authenticated">> },
     Victim = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
     Signed = hb_message:commit(Msg, Opts),
+    % The unsigned commitment hashes the body once.
+    erlang:trace_pattern({hb_crypto, sha256, 1}, true, [call_time]),
+    erlang:trace(self(), true, [call]),
     Unsigned = hb_message:commit(Msg, Opts, #{ <<"type">> => <<"unsigned">> }),
-    % An unsigned commitment is named by the committer of unsigned commitments.
+    {call_time, [{_, Hashes, _, _}]} =
+        erlang:trace_info({hb_crypto, sha256, 1}, call_time),
+    erlang:trace_pattern({hb_crypto, sha256, 1}, false, [call_time]),
+    ?assertEqual(1, Hashes),
+    % `commitment_devices/2' does not run the `device' of a commitment.
+    Device =
+        #{ <<"commitment-device">> => fun(_, _, _) -> {ok, <<"ran">>} end },
+    ?assertEqual(
+        [<<"httpsig@1.0">>],
+        hb_message:commitment_devices(
+            Signed#{
+                <<"commitments">> =>
+                    maps:map(
+                        fun(_, C) -> C#{ <<"device">> => Device } end,
+                        maps:get(<<"commitments">>, Signed)
+                    )
+            },
+            Opts
+        )
+    ),
+    % The `keyid' of an unsigned commitment is `?UNSIGNED_COMMITTER'.
     ?assertMatch(
         [#{ <<"keyid">> := ?UNSIGNED_COMMITTER }],
         maps:values(maps:get(<<"commitments">>, Unsigned))
@@ -751,8 +718,9 @@ commitment_identity_test() ->
             }
         )
     ),
-    % The `keyid' of a signed commitment is the `did:pkh:' URI of its key. The
-    % commitment carries the key as its `public-key', and has no `owner'.
+    % The `keyid' of a signed commitment is the URI of the committer of its
+    % key. The commitment carries the key as its `public-key', and has no
+    % `owner'.
     Committer = hb_test_utils:committer(maps:get(<<"priv-wallet">>, Opts)),
     [SignedCommitment] = maps:values(maps:get(<<"commitments">>, Signed)),
     ?assertMatch(
@@ -876,7 +844,7 @@ commitment_identity_test() ->
 public_key_hmac_is_not_authority_test() ->
     #{ <<"owner">> := Pub } = ar_wallet:new(),
     Opts = #{ <<"priv-wallet">> => ar_wallet:new() },
-    ID = hb_util:secret_key_to_committer(Pub),
+    ID = lib_secret:to_committer(Pub),
     Committed = hb_message:commit(
         #{ <<"body">> => <<"public-key-hmac">> }, Opts,
         #{
@@ -961,6 +929,8 @@ committed_id_test() ->
     Opts = #{ <<"priv-wallet">> => hb:wallet() },
     Signed = hb_message:commit(Msg, Opts),
     ?assert(hb_message:verify(Signed, all, Opts)),
+    % The type of `basic' is committed: as an atom, it does not verify.
+    ?assertNot(hb_message:verify(Signed#{ <<"basic">> => value }, all, Opts)),
     ?event_debug({signed_msg, Signed}),
     UnsignedID = hb_message:id(Signed, none),
     SignedID = hb_message:id(Signed, all),
@@ -970,16 +940,35 @@ committed_id_test() ->
     % key that is the escaped form of one of them.
     Committed =
         hb_message:commit(
-            #{ <<"a b">> => <<"1">>, <<"a%20b">> => <<"2">> },
+            #{ <<"a b">> => 1, <<"a%20b">> => <<"2">> },
             Opts,
             #{ <<"committed">> => [<<"a b">>] }
         ),
-    ?assert(hb_message:verify(Committed#{ <<"a%20b">> => <<"3">> }, all, Opts)).
+    ?assert(hb_message:verify(Committed#{ <<"a%20b">> => <<"3">> }, all, Opts)),
+    % The type of `a b' is committed: as a binary, it does not verify.
+    ?assertNot(
+        hb_message:verify(Committed#{ <<"a b">> => <<"1">> }, all, Opts)
+    ),
+    % Both forms of a signed message contain its signature as a header.
+    HTTPSigSigned =
+        hb_message:commit(Msg#{ <<"device">> => <<"httpsig@1.0">> }, Opts),
+    ?assertMatch(
+        {ok, <<"basic: value\r\ndevice: httpsig@1.0\r\nsignature: ", _/binary>>},
+        hb_ao:resolve(HTTPSigSigned, <<"serialize">>, Opts)
+    ),
+    ?assertMatch(
+        {ok, #{ <<"headers">> := #{ <<"signature">> := _ } }},
+        hb_ao:resolve(
+            HTTPSigSigned,
+            #{ <<"path">> => <<"serialize">>, <<"format">> => <<"components">> },
+            Opts
+        )
+    ).
 
 commit_secret_key_test() ->
     Msg = #{ <<"basic">> => <<"value">> },
     Opts = #{ <<"priv-wallet">> => hb:wallet() },
-    ID = hb_util:secret_key_to_committer(<<"test-secret">>),
+    ID = lib_secret:to_committer(<<"test-secret">>),
     CommittedMsg =
         hb_message:commit(
             Msg,
@@ -997,7 +986,7 @@ commit_secret_key_test() ->
         ),
     ?event_debug({committed_msg, CommittedMsg}),
     Committers = hb_message:signers(CommittedMsg, #{}),
-    % The commitment of a secret is named by its `hmac:secret:' committer.
+    % The commitment of a secret has its `hmac:secret:' committer as its signer.
     ?assertEqual([<<"hmac:secret:", ID/binary>>], Committers),
     ?event_debug({committers, Committers}),
     ?assert(

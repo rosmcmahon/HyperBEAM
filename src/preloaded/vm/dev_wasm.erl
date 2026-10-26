@@ -35,14 +35,16 @@
 %%% </pre>
 -module(dev_wasm).
 -implements(<<"wasm-64@1.0">>).
--export([info/2, init/3, compute/3, import/3, terminate/3, snapshot/3, normalize/3]).
+-specification("../../../specs/wasm-64@1.0.md").
+-export([device_info/2]).
+-export([init/3, compute/3, import/3, terminate/3, snapshot/3, normalize/3]).
 %%% API for other devices:
 -export([instance/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Export all functions aside the `instance/3' function.
-info(_Base, _Opts) ->
+device_info(_Base, _Opts) ->
     #{
         excludes => [instance]
     }.
@@ -276,7 +278,7 @@ compute(RawM1, M2, Opts) ->
                             % stores it as the slot's results. The trap does
                             % not unwind the instance's globals, so the
                             % instance is replaced with a new one of the
-                            % image holding the memory as the trap left it:
+                            % image loaded with the memory as the trap left it:
                             % the same steps a restore from a snapshot takes.
                             ok = reset(M1, M2, Opts),
                             {error, Res};
@@ -296,7 +298,7 @@ compute(RawM1, M2, Opts) ->
     end.
 
 %% @doc Replace an instance whose call trapped with a new instance of the
-%% image, holding the memory as the trapped call left it. The trapped call
+%% image, loaded with the memory as the trapped call left it. The trapped call
 %% keeps the instance's globals, such as the stack pointer, where the call
 %% stopped, while a restore from a snapshot starts at a new instance, so
 %% the process goes on from the new instance on every node. The worker's
@@ -486,7 +488,7 @@ undefined_import_stub(Base, Req, Opts) ->
             Opts
         ),
     UndefinedCallsPath =
-        <<"state/results/", Prefix/binary, "/undefined-calls">>,
+        <<"results/", Prefix/binary, "/undefined-calls">>,
     Res = hb_ao:set(
         Base,
         #{
@@ -582,6 +584,27 @@ basic_execution_64_test() ->
     ?assertEqual(
         {ok, [120.0]},
         test_run_wasm("test/test-64.wasm", <<"fac">>, [5.0], #{})
+    ),
+    {ok, Base} =
+        hb_ao:resolve(cache_wasm_image("test/test-64.wasm"), <<"init">>, #{}),
+    % A call that gives fewer parameters than the function takes is an error,
+    % not a crash of the node's VM.
+    ?assertMatch(
+        {error, _},
+        hb_ao:resolve(Base#{ <<"function">> => <<"fac">> }, <<"compute">>, #{})
+    ),
+    % A function name longer than a fixed buffer is an error, not a crash of
+    % the node's VM.
+    ?assertMatch(
+        {error, _},
+        hb_ao:resolve(
+            Base#{
+                <<"function">> => binary:copy(<<"a">>, 512),
+                <<"parameters">> => [5.0]
+            },
+            <<"compute">>,
+            #{}
+        )
     ).
 
 imported_function_test() ->
@@ -660,6 +683,20 @@ state_export_and_restore_test() ->
     ?assertEqual(
         {ok, [4]},
         hb_ao:resolve(NewBase, <<"compute/results/output">>, #{})
+    ),
+    % An import that no stdlib device answers is recorded beside the results.
+    ?assertMatch(
+        {ok, [#{ <<"module">> := <<"my_lib">>, <<"func">> := <<"mul">> } | _]},
+        hb_ao:resolve(
+            hb_maps:without([<<"stdlib">>], Req, #{}),
+            <<"compute/results/undefined-calls">>,
+            #{}
+        )
+    ),
+    % Parameters that are not numbers make the call an error.
+    ?assertEqual(
+        {error, <<"invalid-parameters">>},
+        hb_ao:resolve(Req#{ <<"parameters">> => [<<"a">>] }, <<"compute">>, #{})
     ).
 
 %%% Test helpers

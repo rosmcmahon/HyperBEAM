@@ -17,9 +17,16 @@
 %% @doc Start a scheduling server for a given computation. Once the server has
 %% started it attempts to register on the message ID for the process definition.
 %% If there is already a scheduler registered on the message ID, it will return
-%% the existing PID and log a warning.
+%% the existing PID and log a warning. If the read of the latest assignment
+%% raises, the server does not start, and the exception is raised again in the
+%% caller.
 start(ProcID, Proc, Opts) ->
     ?event(scheduling, {starting_scheduling_server, {proc_id, ProcID}}),
+    case hb_opts:get(scheduling_mode, disabled, Opts) of
+        disabled ->
+            throw({scheduling_disabled_on_node, {requested_for, ProcID}});
+        _ -> ok
+    end,
     Ref = make_ref(),
     Caller = self(),
     spawn(
@@ -44,14 +51,9 @@ start(ProcID, Proc, Opts) ->
             % Write the process to the cache. We are the provider-of-last-resort
             % for this data.
             dev_scheduler_cache:write_spawn(Proc, Opts),
-            case hb_opts:get(scheduling_mode, disabled, Opts) of
-                disabled ->
-                    throw({scheduling_disabled_on_node, {requested_for, ProcID}});
-                _ -> ok
-            end,
             HashpathAlg = hb_path:hashpath_alg(Proc, Opts),
             {CurrentSlot, BaseStateHashpath} =
-                case dev_scheduler_cache:latest(ProcID, Opts) of
+                try dev_scheduler_cache:latest(ProcID, Opts) of
                     not_found ->
                         ?event({starting_new_schedule, {proc_id, ProcID}}),
                         {-1, undefined};
@@ -72,6 +74,9 @@ start(ProcID, Proc, Opts) ->
                                 #{ hashpath_alg => HashpathAlg, opts => Opts }
                             )
                         }
+                catch Class:Reason:Stacktrace ->
+                    Caller ! {error, Ref, Class, Reason, Stacktrace},
+                    exit(normal)
                 end,
             ?event(
                 {scheduler_got_process_info,
@@ -101,7 +106,9 @@ start(ProcID, Proc, Opts) ->
         end
     ),
     receive
-        {ok, Ref, ServerPID} -> ServerPID
+        {ok, Ref, ServerPID} -> ServerPID;
+        {error, Ref, Class, Reason, Stacktrace} ->
+            erlang:raise(Class, Reason, Stacktrace)
     end.
 
 %% @doc Determine the appropriate list of keys to use to commit assignments for
@@ -134,16 +141,23 @@ commitment_wallets(ProcMsg, Opts) ->
 %% @doc Returns the commitment specification which should be used to commit
 %% assignments for a process.
 commitment_spec(Proc, Opts) ->
-    hb_ao:get(
-        <<"scheduler-commitment-spec">>,
-        {as, <<"message@1.0">>, Proc},
+    Default =
         hb_opts:get(
             scheduler_default_commitment_spec,
             <<"ans104@1.0">>,
             Opts
         ),
-        Opts
-    ).
+    case
+        hb_ao:get(
+            <<"scheduler-commitment-spec">>,
+            {as, <<"message@1.0">>, Proc},
+            Default,
+            Opts
+        )
+    of
+        Spec when is_binary(Spec) -> Spec;
+        _ -> Default
+    end.
 
 %% @doc Call the appropriate scheduling server to assign a message.
 schedule(AOProcID, Message) when is_binary(AOProcID) ->
@@ -241,7 +255,7 @@ do_assign(State, Message, ReplyPID) ->
                 <<"epoch">> => <<"0">>,
                 <<"slot">> => NextSlot,
                 <<"block-height">> => Height,
-                <<"block-hash">> => hb_util:human_id(Hash),
+                <<"block-hash">> => Hash,
                 <<"block-timestamp">> => Timestamp,
                 % Note: Local time on the SU, not Arweave
                 <<"timestamp">> => scheduler_time(),
@@ -270,7 +284,7 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(starting_message_write),
             ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
-            % The store may hold the write in memory: commit it before the
+            % The store may keep the write in memory: commit it before the
             % slot is confirmed. A failed commit raises, and `assign/3' keeps
             % the previous slot without answering the client.
             ok = dev_scheduler_cache:flush(Opts),

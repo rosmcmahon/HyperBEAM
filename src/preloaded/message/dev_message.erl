@@ -1,19 +1,20 @@
 %%% @doc The identity device: For non-reserved keys, it simply returns a key 
 %%% from the message as it is found in the message's underlying Erlang map. 
 %%% Private keys (`priv[.*]') are not included.
-%%% Reserved keys are: `id', `commitments', `committers', `keys', `path', 
-%%% `set', `remove', and `verify'. Their function comments describe the 
+%%% Reserved keys are: `id', `commitments', `committers', `info', `keys',
+%%% `path', `set', `remove', and `verify'. Their function comments describe the
 %%% behaviour of the device when these keys are set.
 -module(dev_message).
+-specification("../../../specs/message@1.0.md").
 %%% Base AO-Core reserved keys:
--export([info/0, keys/1, keys/2]).
+-export([device_info/0, keys/1, keys/2]).
 -export([set/3, set_path/3, remove/3, get/4]).
 %%% Commitment-specific keys:
 -export([id/1, id/2, id/3]).
 -export([commit/3, committed/3, committers/1, committers/2, committers/3, verify/3]).
 -export([with_commitments/3]).
 %%% Non-protocol enforced keys:
--export([index/3]).
+-export([index/3, info/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 -define(DEFAULT_ID_DEVICE, <<"httpsig@1.0">>).
@@ -31,8 +32,8 @@
     <<"verify">>
 ]).
 
-%% @doc Return the info for the identity device.
-info() ->
+%% @doc Return the options of the identity device.
+device_info() ->
     #{
         default => fun dev_message:get/4
     }.
@@ -70,6 +71,38 @@ index(Msg, Req, Opts) ->
                 },
                 Opts
             )
+    end.
+
+%% @doc Return the info of the device of a message, or of the device in the
+%% request's `for' key. The info is a message for the node's `docs-device', so
+%% a browser that requests it receives that device's page. It has the schema
+%% of the device's module (`hb_types') and the device's signed specification.
+%% The info follows the implementation of the device that the node loads, so
+%% it is not stored. A device's own `info/3' answers in place of this function.
+-spec info(#{ device => _ }, #{ for => binary() }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _}.
+info(Base, Req, Opts) ->
+    For =
+        hb_maps:get(
+            <<"for">>,
+            Req,
+            hb_maps:get(<<"device">>, Base, <<"message@1.0">>, Opts),
+            Opts
+        ),
+    maybe
+        {ok, Module} ?= hb_device_load:reference(For, Opts),
+        {ok, Schema} ?= hb_device_load:schema(Module, Opts),
+        {ok, Spec} ?= hb_device_load:spec(For, Opts),
+        {ok,
+            #{
+                <<"device">> =>
+                    hb_opts:get(docs_device, <<"docs@1.0">>, Opts),
+                <<"for">> => For,
+                <<"schema">> => Schema,
+                <<"specification">> => Spec,
+                <<"cache-control">> => <<"no-store">>
+            }
+        }
     end.
 
 %% @doc Return the ID of a message, using the `committers' list if it exists.
@@ -258,7 +291,9 @@ committers(_, _, _) ->
 
 %% @doc Commit to a message, using the `commitment-device' key to specify the
 %% device that should be used to commit to the message. If the key is not set,
-%% the default device (`httpsig@1.0') is used.
+%% the default device (`httpsig@1.0') is used. A request with a `committed'
+%% list commits those keys of the message; a request without one commits every
+%% key.
 -spec commit(
     #{ _ => _ },
     #{ 'commitment-device' => binary(), type => binary(),
@@ -266,8 +301,9 @@ committers(_, _, _) ->
     #{ _ => _ }
 ) -> {ok, #{ commitments := #{ _ => _ }, _ => _ }}.
 commit(Self, Req, Opts) ->
-    {ok, Base} = hb_message:find_target(Self, Req, Opts),
-    % The empty key names no key, so no codec carries a commitment to it.
+    {ok, Base} =
+        hb_message:find_subject(<<"message-subject">>, Self, Req, Opts),
+    % No codec carries a commitment to an empty key, so we refuse it.
     case is_map_key(<<>>, Base) of
         true -> throw({invalid_key, <<>>});
         false -> ok
@@ -298,9 +334,23 @@ commit(Self, Req, Opts) ->
             Req#{ <<"device">> => AttDev },
             CommitOpts
         ),
+    % A commitment is made over the keys that the request lists, else over the
+    % keys that any commitment of the message lists, else over every key of the
+    % message. The device is given the message with those keys alone, as
+    % `verify/3' gives it.
+    Covered =
+        case keys_to_commit(Base, Req, Opts) of
+            all -> Base;
+            Keys ->
+                hb_maps:with(
+                    [<<"commitments">>, <<"priv">> | Keys],
+                    Base,
+                    Opts
+                )
+        end,
     Loaded =
         ensure_commitments_loaded(
-            hb_message:convert(Base, tabm, SourceSpec, CommitOpts),
+            hb_message:convert(Covered, tabm, SourceSpec, CommitOpts),
             Opts
         ),
     {ok, Committed} =
@@ -323,28 +373,44 @@ committed_keys(Commitment, Opts) ->
         Opts
     ).
 
+%% @doc Return the keys that a commitment is made over: the keys that the
+%% request lists, else the keys that any commitment of the message lists, else
+%% `all': every key of the message.
+keys_to_commit(Base, Req, Opts) ->
+    case hb_maps:find(<<"committed">>, Req, Opts) of
+        {ok, _} -> committed_keys(Req, Opts);
+        error ->
+            Committed =
+                hb_message:committed(Base, #{ <<"ids">> => <<"any">> }, Opts),
+            case Committed of
+                [] -> all;
+                Keys -> Keys
+            end
+    end.
+
 %% @doc Verify a message. By default, all commitments are verified. The
 %% `committers' key in the request can be used to specify that only the 
 %% commitments from specific committers should be verified. Similarly, specific
 %% commitments can be specified using the `ids' key. Each takes `all', `none',
 %% one address or ID, or a list of them. A message that lacks a committer or
-%% commitment the request names does not verify, nor does `committers=all'
-%% on a message without committers. The request is kept whole: `target' may
-%% name any of its keys as the message to verify, and its private element
-%% goes to the commitment device.
+%% commitment the request lists does not verify, nor does `committers=all'
+%% on a message without committers. The request is kept whole: its
+%% `message-subject' may select any of its keys as the message to verify, and
+%% its private element goes to the commitment device.
 -spec verify(
     #{ _ => _ },
     #{
         committers => binary() | [binary()],
         ids => binary() | [binary()],
-        target => binary(),
+        'message-subject' => binary(),
         _ => _
     },
     #{ _ => _ }
 ) -> {ok, boolean()}.
 verify(Self, Req, Opts) ->
     % Get the target message of the verification request.
-    {ok, RawBase} = hb_message:find_target(Self, Req, Opts),
+    {ok, RawBase} =
+        hb_message:find_subject(<<"message-subject">>, Self, Req, Opts),
     CommitmentBase = ensure_commitments_loaded(RawBase, Opts),
     Commitments = maps:get(<<"commitments">>, CommitmentBase, #{}),
     % A request with neither `committers' nor `ids' verifies every
@@ -378,7 +444,7 @@ verify(Self, Req, Opts) ->
             )
     end.
 
-%% @doc Whether a message has what a verification request names: each
+%% @doc Whether a message has what a verification request gives: each
 %% committer and commitment it lists, and a committer if it asks for `all'.
 has_named(Base, Req, Opts) ->
     {ok, Committers} = committers(Base, #{}, Opts),
@@ -388,7 +454,9 @@ has_named(Base, Req, Opts) ->
         <<"none">> -> true;
         NamedCommitters ->
             lists:all(
-                fun(Committer) -> lists:member(Committer, Committers) end,
+                fun(Committer) ->
+                    lists:member(hb_committer:uri(Committer, Opts), Committers)
+                end,
                 lists:flatten([NamedCommitters])
             )
     end andalso
@@ -483,7 +551,7 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
 
 %% @doc Execute a function for a single commitment in the context of its
 %% parent message. A commitment device whose `verify' is this module's own
-%% `verify' holds no commitment scheme of its own: the device of a commitment
+%% `verify' has no commitment scheme of its own: the device of a commitment
 %% is read from the commitment itself, so dispatching would call this
 %% function with the same commitment again, without end. Such a commitment
 %% does not verify.
@@ -512,7 +580,8 @@ verify_commitment(Base, Commitment, Opts) ->
 %% ID, and the message read must have the base's unsigned ID: a commitment
 %% that is not found, or that is over another message, is refused. On the
 %% empty message, the commitments are attached to the message that the first
-%% of them is over.
+%% of them is over, with the keys that it lacks from the messages that the
+%% others are over.
 with_commitments(Base, Req, Opts) ->
     Loaded = ensure_commitments_loaded(Base, Opts),
     read_commitments(
@@ -524,18 +593,19 @@ with_commitments(Base, Req, Opts) ->
         Opts
     ).
 
-%% @doc Read each commitment by its ID and attach it to the message. The
-%% message read by the ID must have the given unsigned ID. The empty message is
-%% replaced by the first message read.
+%% @doc Read each commitment by its ID and attach it to the message, with the
+%% keys of the message read that the message lacks. The message read by the ID
+%% must have the given unsigned ID, unless that is `any'. The empty message is
+%% replaced by the first message read, and the unsigned ID becomes `any'.
 read_commitments([], Msg, _UnsignedID, _Opts) -> {ok, Msg};
 read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
     case hb_cache:read(ID, Opts) of
         {ok, Read = #{ <<"commitments">> := #{ ID := Commitment } }} ->
             case hb_message:id(Read, none, Opts) of
-                UnsignedID ->
+                ReadID when ReadID == UnsignedID; UnsignedID == any ->
                     read_commitments(
                         IDs,
-                        Msg#{
+                        (maps:merge(Read, Msg))#{
                             <<"commitments">> =>
                                 (maps:get(<<"commitments">>, Msg, #{}))#{
                                     ID => Commitment
@@ -544,8 +614,8 @@ read_commitments([ID | IDs], Msg, UnsignedID, Opts) ->
                         UnsignedID,
                         Opts
                     );
-                ReadID when ?IS_EMPTY_MESSAGE(Msg) ->
-                    read_commitments(IDs, Read, ReadID, Opts);
+                _ when ?IS_EMPTY_MESSAGE(Msg) ->
+                    read_commitments(IDs, Read, any, Opts);
                 _ ->
                     {error,
                         #{
@@ -577,7 +647,8 @@ committed(Self, Req, Opts) ->
     % Get the target message of the verification request and ensure its 
     % commitments are loaded.
     {ok, RawBase} =
-        hb_message:find_target(
+        hb_message:find_subject(
+            <<"message-subject">>,
             Self,
             Req,
             Opts
@@ -644,7 +715,9 @@ with_relevant_commitments(Base, Req, Opts) ->
 %% the returned list will be the union of the two lists. In each case, they
 %% may specify `all' or `none' for each group. `any' selects every
 %% commitment, as `all' does. If no specifiers are provided,
-%% the default is `all' for commitments -- also implying `all' for committers.
+%% the default is `none' for both commitments and committers. With `none' for
+%% both, the returned list holds the unsigned commitments of the default
+%% commitment device, if there are any.
 commitment_ids_from_request(Base, Req, Opts) ->
     Commitments = maps:get(<<"commitments">>, Base, #{}),
     ReqCommitters =
@@ -692,7 +765,8 @@ commitment_ids_from_request(Base, Req, Opts) ->
                     if is_list(RawCommitterAddrs) -> RawCommitterAddrs;
                     true -> [RawCommitterAddrs]
                     end,
-                commitment_ids_from_committers(CommitterAddrs, Commitments, Opts)
+                URIs = [hb_committer:uri(C, Opts) || C <- CommitterAddrs],
+                commitment_ids_from_committers(URIs, Commitments, Opts)
         end,
     Res =
         case FromCommitterAddrs ++ FromCommitmentIDs of
@@ -795,6 +869,7 @@ set(Base, NewValuesMsg, Opts) ->
 			fun(Key) ->
 				not lists:member(Key, ?DEVICE_KEYS ++ [<<"set-mode">>]) andalso
 					(hb_maps:get(Key, NewValuesMsg, undefined, Opts) =/= undefined)
+					andalso not hb_private:is_private_path(Key, Opts)
 			end,
 			NewValuesKeys
 		),
@@ -1118,7 +1193,7 @@ key_from_device_test() ->
     {ok, ID} = hb_cache:write(#{ <<"a">> => not_found }, #{}),
     ?assertEqual(
         {ok, not_found},
-        hb_ao:resolve(ID, <<"a">>, #{})
+        hb_ao:resolve(<<"ao:", ID/binary>>, <<"a">>, #{})
     ),
     ?assertEqual({ok, 1}, hb_ao:resolve(#{ <<"a">> => 1 }, <<"a">>, #{})),
     % A key named `get' is read like any other.
@@ -1129,6 +1204,23 @@ key_from_device_test() ->
     ?assertEqual(
         hb_ao:resolve(Msg, <<"with-commitments">>, NoCache),
         hb_ao:resolve(Msg, <<"with-commitments">>, #{})
+    ),
+    % `with_commitments' maps to the same function, and is computed too.
+    Underscored = #{ <<"with_commitments">> => 3 },
+    ?assertEqual(
+        hb_ao:resolve(Underscored, <<"with_commitments">>, NoCache),
+        hb_ao:resolve(Underscored, <<"with_commitments">>, #{})
+    ),
+    % The device answers the key `info': it is not read from the message.
+    ?assertNot(
+        hb_device:is_direct_key_access(#{ <<"info">> => 4 }, <<"info">>, #{})
+    ),
+    % The `info' of a message is the info of its device, for `docs@1.0'.
+    ?assertMatch(
+        {ok,
+            #{ <<"device">> := <<"docs@1.0">>, <<"for">> := <<"message@1.0">> }
+        },
+        hb_ao:resolve(#{ <<"info">> => <<"literal">> }, <<"info">>, #{})
     ).
 
 remove_test() ->
@@ -1263,6 +1355,13 @@ set_new_key_drops_commitments_test() ->
             Opts
         )
     ),
+    % A parent's cache write keeps both keys and both commitments.
+    {ok, ParentID} = hb_cache:write(#{ <<"c">> => PartiallySigned }, Opts),
+    {ok, Child} = hb_cache:read(<<ParentID/binary, "/c">>, Opts),
+    ?assertEqual(
+        PartiallySigned,
+        hb_private:reset(hb_cache:ensure_all_loaded(Child, Opts))
+    ),
     {ok, Set} = hb_ao:resolve(
         PartiallySigned,
         #{ <<"path">> => <<"set">>, <<"b">> => <<"3">> },
@@ -1364,12 +1463,23 @@ test_verify(KeyType) ->
             #{ <<"hashpath">> => ignore }
         )
     ),
-    % A `target' naming a key the request lacks is refused, not answered.
+    % A request's `target', such as an item's, does not select the message.
+    ?assertEqual({ok, true},
+        hb_ao:resolve(
+            Signed,
+            #{ <<"path">> => <<"verify">>, <<"target">> => <<"process-id">> },
+            #{ <<"hashpath">> => ignore }
+        )
+    ),
+    % A `message-subject' that gives a key the request lacks is refused.
     ?assertError(
         {badmatch, {error, not_found}},
         hb_ao:resolve(
             Signed,
-            #{ <<"path">> => <<"verify">>, <<"target">> => <<"missing">> },
+            #{
+                <<"path">> => <<"verify">>,
+                <<"message-subject">> => <<"missing">>
+            },
             #{ <<"hashpath">> => ignore }
         )
     ),
@@ -1382,7 +1492,7 @@ test_verify(KeyType) ->
     ),
     % A commitment relabelled `json@1.0' is verified by the `httpsig@1.0'
     % codec its device names -- `true' for an `httpsig@1.0' signature. A
-    % commitment relabelled `message@1.0' or `meta@1.0' names a device
+    % commitment relabelled `message@1.0' or `meta@1.0' has a device
     % with no commitment scheme of its own and does not verify.
     [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Signed)),
     Relabelled =
@@ -1440,7 +1550,7 @@ vacuous_signed_commitment_test_() ->
     ].
 
 %% @doc Committing to a message keeps its private element as it is: a link in
-%% it is not loaded, even when the node does not hold its message.
+%% it is not loaded, even when the node does not have its message.
 commit_keeps_private_links_test() ->
     Opts = #{ <<"store">> => hb_test_utils:test_store() },
     Missing =

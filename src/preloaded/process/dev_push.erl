@@ -1,10 +1,12 @@
 %%% @doc `push@1.0' takes a message or slot number, evaluates it, and recursively
 %%% pushes the resulting messages to other processes. The `push'ing mechanism
-%%% continues until the there are no remaining messages to push.
+%%% continues until there are no remaining messages to push, or until it
+%%% reaches its `max-depth' (see `push/3').
 -module(dev_push).
+-specification("../../../specs/push@1.0.md").
 -device_libraries([lib_process]).
 %%% Public API
--export([push/3]).
+-export([push/3, schedule/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -22,12 +24,13 @@
 %%                    process and the call returns immediately. When
 %%                    `false' or absent, the push runs synchronously.
 %% `/max-depth':     Bounds the recursive `/push' fan-out from one source
-%%                    slot's outbox. The source slot's outbox is ALWAYS
-%%                    scheduled on each target (the target's next slot
-%%                    advances) -- `max-depth' only controls whether we
+%%                    slot's outbox. Each outbox entry is scheduled once
+%%                    on its target -- `max-depth' only controls whether we
 %%                    then drive that next slot's `/push' synchronously
 %%                    to fan further downstream:
-%%                       omitted - unbounded recursion.
+%%                       omitted - the node's `push_max_depth' option:
+%%                                 30 by default, or `infinity' to
+%%                                 recurse until no messages remain.
 %%                       `0'     - schedule on each target then stop.
 %%                                 The target's compute is NOT invoked
 %%                                 here; its own scheduler-driven `/push'
@@ -37,13 +40,16 @@
 %%                       `N > 0' - recurse, with the inner `/push'
 %%                                 inheriting `max-depth = N - 1'.
 %%                                 Unwinds at most `N' levels deep.
+%%                    A request's `max-depth' can only lower the node's
+%%                    `push_max_depth': a higher value, or `infinity',
+%%                    gives the node's `push_max_depth'.
 -spec push(
     #{ _ => _ },
     #{
         slot => integer(),
         body => #{ _ => _ },
         async => boolean(),
-        'max-depth' => integer(),
+        'max-depth' => integer() | infinity,
         _ => _
     },
     #{ _ => _ }
@@ -102,21 +108,6 @@ is_async(Process, Req, Opts) ->
 do_push(PrimaryProcess, Assignment, Opts) ->
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
     ID = lib_process:process_id(PrimaryProcess, #{}, Opts),
-    UncommittedID =
-        lib_process:process_id(
-            PrimaryProcess,
-            #{ <<"commitments">> => <<"none">> },
-            Opts
-        ),
-    BaseID = calculate_base_id(PrimaryProcess, Opts),
-    ?event(debug,
-        {push_computing_outbox,
-            {process_id, ID},
-            {base_id, BaseID},
-            {process_uncommitted_id, UncommittedID},
-            {slot, Slot}
-        }
-    ),
     ?event(push, {push_computing_outbox, {process_id, ID}, {slot, Slot}}),
     {Status, Result} =
         try
@@ -162,11 +153,17 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             X when X > 0 -> Result;
             _ -> #{}
         end,
-    % Read the optional `max-depth' bound on recursive fan-out. `undefined'
-    % means unbounded; a non-negative integer decrements at each downstream
-    % `/push' and skips the recursion (target still scheduled) when it
-    % reaches `0'.
-    MaxDepth = parse_max_depth(hb_maps:get(<<"max-depth">>, Assignment, undefined, Opts)),
+    % Read the bound on recursive fan-out: the lower of the request's
+    % `max-depth' and the node's `push_max_depth' option. `infinity' is no
+    % bound; an integer decrements at each downstream `/push' and skips the
+    % recursion (target still scheduled) when it reaches `0'.
+    MaxDepth =
+        min(
+            parse_max_depth(
+                hb_maps:get(<<"max-depth">>, Assignment, infinity, Opts)
+            ),
+            parse_max_depth(hb_opts:get(push_max_depth, 30, Opts))
+        ),
     ?event(push_depth, {depth, IncludeDepth, {assignment, Assignment}}),
     ?event(push,
         {push_compute_result,
@@ -195,51 +192,18 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             ?event(push, {push_found_outbox, {outbox, Outbox}}),
             Downstream =
                 map_in_order(
-                    fun(Key, RawMsgToPush = #{ <<"target">> := Target }) ->
-                        MsgToPush =
-                            case maybe_evaluate_message(RawMsgToPush, Opts) of
-                                {ok, R} -> R;
-                                Err ->
-                                    #{
-                                        <<"resolve">> => <<"error">>,
-                                        <<"target">> => ID,
-                                        <<"status">> => 400,
-                                        <<"outbox-index">> => Key,
-                                        <<"reason">> => Err,
-                                        <<"source">> => RawMsgToPush
-                                    }
-                            end,
-                        case hb_cache:read(Target, Opts) of
-                            {ok, DownstreamProcess} ->
-                                push_result_message(
-                                    DownstreamProcess,
-                                    MsgToPush,
-                                    #{
-                                        <<"process">> => ID,
-                                        <<"slot">> => Slot,
-                                        <<"outbox-key">> => Key,
-                                        <<"result-depth">> => IncludeDepth,
-                                        <<"max-depth">> => MaxDepth,
-                                        <<"from-base">> => BaseID,
-                                        <<"from-uncommitted">> => UncommittedID,
-                                        <<"from-scheduler">> =>
-                                            hb_ao:get(
-                                                <<"scheduler">>,
-                                                PrimaryProcess,
-                                                Opts
-                                            ),
-                                        <<"from-authority">> =>
-                                            hb_ao:get(
-                                                <<"authority">>,
-                                                PrimaryProcess,
-                                                Opts
-                                            )
-                                    },
-                                    Opts
-                                );
-                            {error, not_found} ->
-                                target_process_not_found(Target)
-                        end;
+                    fun(Key, MsgToPush = #{ <<"target">> := _ }) ->
+                        push_result_message(
+                            MsgToPush,
+                            #{
+                                <<"process">> => ID,
+                                <<"slot">> => Slot,
+                                <<"outbox-key">> => Key,
+                                <<"result-depth">> => IncludeDepth,
+                                <<"max-depth">> => MaxDepth
+                            },
+                            Opts
+                        );
                        (Key, Msg) ->
                             #{
                                 <<"response">> => <<"error">>,
@@ -260,9 +224,9 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                 <<"slot">> => Slot,
                 <<"process">> => ID
             })};
-        {Err, Error} when Err == error; Err == failure ->
-            ?event(push, {push_failed_to_find_outbox, {error, Error}}, Opts),
-            {error, Error}
+        {Err, _} when Err == error; Err == failure ->
+            ?event(push, {push_failed_to_find_outbox, {error, Result}}, Opts),
+            {error, Result}
     end.
 
 target_process_not_found(Target) ->
@@ -335,7 +299,7 @@ maybe_evaluate_message(Message, Opts) ->
 %% about the origin of the message: The process that originated the message,
 %% the slot number from which it was sent, and the outbox key of the message,
 %% and the depth to which downstream results should be included in the message.
-push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
+push_result_message(MsgToPush, Origin, Opts) ->
     NormMsgToPush = hb_ao:normalize_keys(MsgToPush, Opts),
     case hb_ao:get(<<"target">>, NormMsgToPush, undefined, Opts) of
         undefined ->
@@ -353,25 +317,48 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
                 },
                 Opts
             ),
-            case schedule_result(TargetProcess, MsgToPush, Origin, Opts) of
+            case hb_ao:resolve(
+                #{
+                    <<"device">> => <<"push@1.0">>,
+                    <<"process">> => maps:get(<<"process">>, Origin)
+                },
+                #{
+                    <<"path">> => <<"schedule">>,
+                    <<"slot">> => hb_util:int(maps:get(<<"slot">>, Origin)),
+                    <<"outbox-key">> =>
+                        hb_util:bin(maps:get(<<"outbox-key">>, Origin))
+                },
+                Opts#{
+                    <<"cache-control">> => <<"always">>,
+                    <<"hashpath">> => update,
+                    <<"async-cache">> => false,
+                    <<"await-inprogress">> => true
+                }
+            ) of
                 {ok, Assignment} ->
                     % Analyze the result of the message push.
                     NextSlotOnProc = hb_ao:get(<<"slot">>, Assignment, Opts),
                     PushedMsg = hb_ao:get(<<"body">>, Assignment, Opts),
+                    PushTarget =
+                        case hb_ao:get(<<"resolve">>, PushedMsg, Opts) of
+                            <<"error">> ->
+                                hb_ao:get(<<"target">>, PushedMsg, Opts);
+                            _ -> TargetID
+                        end,
                     % Get the ID of the message that was pushed. We already have
                     % the 'origin' message, but we need the signed ID.
                     PushedMsgID = hb_message:id(PushedMsg, all, Opts),
                     ?event(push_short,
                         {pushed_message_to,
-                            {process, TargetID},
+                            {process, PushTarget},
                             {slot, NextSlotOnProc}
                         }
                     ),
-                    case push_downstream(TargetID, NextSlotOnProc, Origin, Opts) of
+                    case push_downstream(PushTarget, NextSlotOnProc, Origin, Opts) of
                         {ok, Downstream} ->
                             #{
                                 <<"id">> => PushedMsgID,
-                                <<"target">> => TargetID,
+                                <<"target">> => PushTarget,
                                 <<"slot">> => NextSlotOnProc,
                                 <<"resulted-in">> => Downstream
                             };
@@ -379,10 +366,13 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
                             ?event(push, {push_failed, {error, Error}}, Opts),
                             #{
                                 <<"response">> => <<"error">>,
-                                <<"target">> => TargetID,
+                                <<"id">> => PushedMsgID,
+                                <<"target">> => PushTarget,
+                                <<"slot">> => NextSlotOnProc,
                                 <<"reason">> => Error
                             }
                     end;
+                {error, Error = #{ <<"response">> := <<"error">> }} -> Error;
                 {error, Error} ->
                     ?event(push, {push_failed, {error, Error}}, Opts),
                     #{
@@ -419,13 +409,16 @@ push_downstream(TargetID, NextSlotOnProc, Origin, Opts) ->
 
 %% @doc Push a downstream message on a remote node if a route can be found to
 %% perform the action. If no route is found, we execute the action locally.
+%% The path gives the remote node the decremented `max-depth'.
 push_downstream_remote(TargetID, NextSlotOnProc, Origin, RawOpts) ->
     Path =
         <<
             "/",
             TargetID/binary,
             "/push&slot=",
-            (hb_util:bin(NextSlotOnProc))/binary
+            (hb_util:bin(NextSlotOnProc))/binary,
+            "&max-depth=",
+            (hb_util:bin(next_depth(maps:get(<<"max-depth">>, Origin))))/binary
         >>,
     RouteReq =
         #{
@@ -485,8 +478,7 @@ push_downstream_remote(TargetID, NextSlotOnProc, Origin, RawOpts) ->
     end.
 
 %% @doc Push a resulting message recursively, executing the action on this node.
-%% We decrement `result-depth' (and, when set, `max-depth') so the recursion
-%% naturally winds down.
+%% We decrement `result-depth' and `max-depth' (`infinity' stays `infinity').
 push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts) ->
     ?event(push,
         {push_downstream_local,
@@ -495,38 +487,36 @@ push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts) ->
             {origin, Origin}
         }
     ),
-    BaseReq =
+    Req =
         #{
             <<"path">> => <<"push">>,
             <<"slot">> => NextSlotOnProc,
             <<"result-depth">> =>
-                hb_maps:get(<<"result-depth">>, Origin, 1, Opts) - 1
+                hb_maps:get(<<"result-depth">>, Origin, 1, Opts) - 1,
+            <<"max-depth">> => next_depth(maps:get(<<"max-depth">>, Origin))
         },
-    Req =
-        case parse_max_depth(hb_maps:get(<<"max-depth">>, Origin, undefined, Opts)) of
-            undefined -> BaseReq;
-            N when is_integer(N), N > 0 ->
-                BaseReq#{ <<"max-depth">> => N - 1 }
-        end,
     hb_ao:resolve(
-        {as, <<"process@1.0">>, TargetID},
+        {as, <<"process@1.0">>, <<"ao:", TargetID/binary>>},
         Req,
         Opts#{ <<"cache-control">> => <<"always">> }
     ).
 
-%% @doc Normalise the `max-depth' value supplied by the caller. Accepts a
-%% non-negative integer (verbatim or as a binary), returns `undefined' when
-%% the value is absent or unparseable.
-parse_max_depth(undefined) -> undefined;
+%% @doc Normalise a `max-depth' or `push_max_depth' value. Accepts a
+%% non-negative integer (verbatim or as a binary), and returns `infinity' for
+%% any other value.
 parse_max_depth(N) when is_integer(N), N >= 0 -> N;
 parse_max_depth(Bin) when is_binary(Bin) ->
     try hb_util:int(Bin) of
         N when is_integer(N), N >= 0 -> N;
-        _ -> undefined
+        _ -> infinity
     catch
-        _:_ -> undefined
+        _:_ -> infinity
     end;
-parse_max_depth(_) -> undefined.
+parse_max_depth(_) -> infinity.
+
+%% @doc Return the `max-depth' of the next `/push'.
+next_depth(infinity) -> infinity;
+next_depth(MaxDepth) -> MaxDepth - 1.
 
 %% @doc Augment the message with from-* keys, if it doesn't already have them.
 normalize_message(MsgToPush, Opts) ->
@@ -589,6 +579,93 @@ calculate_base_id(GivenProcess, Opts) ->
         ),
     ?event(debug_base, {push_generated_base, {id, BaseID}, {base, BaseProcess}}),
     BaseID.
+
+%% @doc Schedule one message of a slot's outbox on its target process, and
+%% return the target's assignment. The assignment is stored as the result of
+%% this key, so a repeat push of the slot returns it instead of scheduling the
+%% message again.
+-spec schedule(
+    #{ process := binary() },
+    #{ slot := integer(), 'outbox-key' := binary() },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _}.
+schedule(Base, Req, Opts) ->
+    maybe
+        ProcessID = hb_maps:get(<<"process">>, Base, [], Opts),
+        Key = hb_maps:get(<<"outbox-key">>, Req, [], Opts),
+        ExecutionOpts = lib_process:execution_opts(Opts),
+        {ok, Process} ?= hb_cache:read(ProcessID, ExecutionOpts),
+        {ok, Result} ?=
+            hb_ao:resolve(
+                {as, <<"process@1.0">>, Process},
+                #{
+                    <<"path">> => <<"compute/results">>,
+                    <<"slot">> => hb_maps:get(<<"slot">>, Req, [], Opts)
+                },
+                ExecutionOpts
+            ),
+        Outbox =
+            hb_ao:normalize_keys(
+                hb_private:reset(hb_ao:get(<<"outbox">>, Result, Opts))
+            ),
+        RawMsg = hb_maps:get(Key, Outbox, [], Opts),
+        MsgToPush =
+            case maybe_evaluate_message(RawMsg, Opts) of
+                {ok, R} -> R;
+                Err ->
+                    #{
+                        <<"resolve">> => <<"error">>,
+                        <<"target">> => ProcessID,
+                        <<"status">> => 400,
+                        <<"outbox-index">> => Key,
+                        <<"reason">> => Err,
+                        <<"source">> => RawMsg
+                    }
+            end,
+        Target = hb_ao:get(<<"target">>, RawMsg, Opts),
+        {ok, Assignment} ?=
+            case hb_cache:read(Target, Opts) of
+                {ok, TargetProcess} ->
+                    schedule_result(
+                        TargetProcess,
+                        MsgToPush,
+                        #{
+                            <<"process">> => ProcessID,
+                            <<"from-base">> => calculate_base_id(Process, Opts),
+                            <<"from-uncommitted">> =>
+                                lib_process:process_id(
+                                    Process,
+                                    #{ <<"commitments">> => <<"none">> },
+                                    Opts
+                                ),
+                            <<"from-scheduler">> =>
+                                hb_ao:get(
+                                    <<"scheduler">>,
+                                    Process,
+                                    undefined,
+                                    Opts
+                                ),
+                            <<"from-authority">> =>
+                                hb_ao:get(
+                                    <<"authority">>,
+                                    Process,
+                                    undefined,
+                                    Opts
+                                )
+                        },
+                        Opts
+                    );
+                {error, not_found} -> {error, target_process_not_found(Target)}
+            end,
+        {ok,
+            hb_ao:set(
+                Assignment,
+                <<"cache-control">>,
+                <<"store">>,
+                Opts#{ <<"hashpath">> => ignore }
+            )
+        }
+    end.
 
 %% @doc Add the necessary keys to the message to be scheduled, then schedule it.
 %% If the remote scheduler does not support the given codec, it will be
@@ -755,7 +832,7 @@ apply_security(authority, Msg, TargetProcess, Codec, Opts) ->
             % committers. Sign with all local valid keys.
             commit_result(
                 Msg,
-                lists:map(fun hb_util:committer/1, Authorities),
+                [hb_committer:uri(A, Opts) || A <- Authorities],
                 Codec,
                 Opts
             );
@@ -765,10 +842,11 @@ apply_security(authority, Msg, TargetProcess, Codec, Opts) ->
             ?event(push, {found_authority, {authority, Authority}}, Opts),
             commit_result(
                 Msg,
-                lists:map(
-                    fun hb_util:committer/1,
-                    hb_util:binary_to_strings(Authority)
-                ),
+                [
+                    hb_committer:uri(A, Opts)
+                ||
+                    A <- hb_util:binary_to_strings(Authority)
+                ],
                 Codec,
                 Opts
             )
@@ -876,7 +954,13 @@ find_type(Req, Opts) ->
         Opts
     ).
 
+%% @doc Return the node and the path that a scheduler's `location' gives. If
+%% `hb_hostname:is_blocked/2' blocks its host, throw `blocked_host'.
 parse_redirect(Location, Opts) ->
+    case hb_hostname:is_blocked(Location, Opts) of
+        true -> throw(blocked_host);
+        false -> ok
+    end,
     Parsed = uri_string:parse(Location),
     Node =
         uri_string:recompose(
@@ -954,7 +1038,8 @@ test_full_push() ->
         <<"cache-control">> => <<"always">>,
         <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
         % Exercise the `push_result' paranoid check against a real signed push.
-        <<"paranoid-verify">> => [push_result]
+        <<"paranoid-verify">> => [push_result],
+        <<"push-max-depth">> => 2
     },
     Base = hb_process_test_vectors:aos_process(Opts),
     hb_cache:write(Base, Opts),
@@ -979,7 +1064,16 @@ test_full_push() ->
             <<"path">> => <<"push">>,
             <<"slot">> => StartingMsgSlot
         },
-    {ok, _} = hb_ao:resolve(Base, Res, Opts),
+    {ok, Pushed} = hb_ao:resolve(Base, Res, Opts),
+    % A push with no `max-depth' stops at the node's `push_max_depth' of 2.
+    ?assertEqual(
+        <<"skipped">>,
+        hb_util:deep_get(
+            <<"1/resulted-in/1/resulted-in/1/resulted-in">>,
+            Pushed,
+            Opts
+        )
+    ),
     ?assertEqual(
         {ok, <<"Done.">>},
         hb_ao:resolve(Base, <<"now/results/data">>, Opts)
@@ -1114,15 +1208,10 @@ test_multi_process_push() ->
             Opts
         ),
     ?event(push, {push_result, PushResult}),
-    % The pushed message holds the AOS `Tags' as keys, not as a `tags' list.
-    ?assertEqual(
-        not_found,
-        hb_ao:get(
-            <<"tags">>,
-            hb_util:deep_get(<<"1/id">>, PushResult, Opts),
-            Opts
-        )
-    ),
+    % The pushed message contains the AOS `Tags' as keys, not as a `tags' list.
+    {ok, Pushed} =
+        hb_cache:read(hb_util:deep_get(<<"1/id">>, PushResult, Opts), Opts),
+    ?assertEqual(not_found, hb_ao:get(<<"tags">>, Pushed, Opts)),
     ?assertEqual(
         {ok, <<"GOT PONG">>},
         hb_ao:resolve(Sender, <<"now/results/data">>, Opts)
@@ -1240,7 +1329,7 @@ test_push_prompts_encoding_change_disabled() ->
     Res =
         hb_ao:resolve_many(
             [
-                <<"QQiMcAge5ZtxcUV7ruxpi16KYRE8UBP0GAAqCIJPXz0">>,
+                <<"ao:QQiMcAge5ZtxcUV7ruxpi16KYRE8UBP0GAAqCIJPXz0">>,
                 {as, <<"process@1.0">>, <<>>},
                 Msg
             ],
@@ -1441,18 +1530,21 @@ test_cron_depth_zero_push() ->
     Proc2ID = hb_message:id(Proc2, all, SharedOpts),
     Store1 = [hb_test_utils:test_store(hb_store_lmdb), ReadOnlyShared],
     Store2 = [hb_test_utils:test_store(hb_store_lmdb), ReadOnlyShared],
+    % Each node allows the internal host of the other's scheduler.
     Node1 = hb_http_server:start_node(#{
         <<"priv-wallet">> => Wallet1,
-        <<"store">> => Store1
+        <<"store">> => Store1,
+        <<"hosts-block-internal">> => false
     }),
     Node2 = hb_http_server:start_node(#{
         <<"priv-wallet">> => Wallet2,
-        <<"store">> => Store2
+        <<"store">> => Store2,
+        <<"hosts-block-internal">> => false
     }),
     share_location_record(Wallet1, Node1, Node2),
     share_location_record(Wallet2, Node2, Node1),
-    {ok, _} = hb_http:post(Node1, <<"/schedule">>, Proc1, Opts),
-    {ok, _} = hb_http:post(Node2, <<"/schedule">>, Proc2, Opts),
+    {ok, _} = hb_http:post(Node1, <<"//schedule">>, Proc1, Opts),
+    {ok, _} = hb_http:post(Node2, <<"//schedule">>, Proc2, Opts),
     Trust = <<
         "ao.authorities = { \"", Address1/binary, "\",\"", Address2/binary,
         "\" }; ao.addAssignable('all', function (msg) return true end); ",
@@ -1597,25 +1689,27 @@ test_oracle_push() ->
     ?assertMatch({ok, _}, ComputeRes).
 
 %% @doc `parse_max_depth/1' contract: accept non-negative integers verbatim
-%% or as binaries; reject everything else as `undefined' (unbounded).
+%% or as binaries; read everything else as `infinity'.
 test_parse_max_depth() ->
-    ?assertEqual(undefined, parse_max_depth(undefined)),
+    ?assertEqual(infinity, parse_max_depth(undefined)),
     ?assertEqual(0, parse_max_depth(0)),
     ?assertEqual(7, parse_max_depth(7)),
     ?assertEqual(0, parse_max_depth(<<"0">>)),
     ?assertEqual(42, parse_max_depth(<<"42">>)),
-    ?assertEqual(undefined, parse_max_depth(<<"not-a-number">>)),
-    ?assertEqual(undefined, parse_max_depth(-1)),
-    ?assertEqual(undefined, parse_max_depth(<<>>)),
-    ?assertEqual(undefined, parse_max_depth(false)),
-    ?assertEqual(undefined, parse_max_depth(true)).
+    ?assertEqual(infinity, parse_max_depth(<<"infinity">>)),
+    ?assertEqual(infinity, parse_max_depth(<<"not-a-number">>)),
+    ?assertEqual(infinity, parse_max_depth(-1)),
+    ?assertEqual(infinity, parse_max_depth(<<>>)),
+    ?assertEqual(infinity, parse_max_depth(false)),
+    ?assertEqual(infinity, parse_max_depth(true)).
 
 %% @doc `max-depth = 0' on the outer push: the outbox of the source slot is
 %% still scheduled on each target (target's `slot/current' advances), but the
 %% recursive `/push' is skipped, so the response carries an explicit
 %% `resulted-in: <<"skipped">>' marker and the target's compute is not invoked.
 test_max_depth_zero_schedules_only() ->
-    {Sender, Receiver, MsgSlot, Opts} = setup_two_process_message(),
+    {Sender, Receiver, MsgSlot, Opts} =
+        setup_two_process_message([<<"authority">>]),
     {ok, ReceiverSlotBefore} =
         hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
     {ok, PushResult} =
@@ -1639,7 +1733,41 @@ test_max_depth_zero_schedules_only() ->
     %% always runs, even when push_downstream is short-circuited.
     {ok, ReceiverSlotAfter} =
         hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
-    ?assert(ReceiverSlotAfter > ReceiverSlotBefore).
+    ?assert(ReceiverSlotAfter > ReceiverSlotBefore),
+    % A push of a slot that is not yet scheduled returns the compute's error.
+    ?assertMatch(
+        {error, #{ <<"phase">> := <<"get-schedule">> }},
+        hb_ao:resolve(
+            Receiver,
+            #{ <<"path">> => <<"push">>, <<"slot">> => ReceiverSlotAfter + 1 },
+            Opts
+        )
+    ),
+    % A Sender with no `authority' sends a message with no `from-authority'.
+    ?assertEqual(
+        undefined,
+        hb_ao:get(
+            <<"schedule/assignments/2/body/from-authority">>,
+            Receiver,
+            undefined,
+            Opts
+        )
+    ),
+    % A second push of the slot schedules nothing more on the receiver.
+    {ok, _} =
+        hb_ao:resolve(
+            Sender,
+            #{
+                <<"path">> => <<"push">>,
+                <<"slot">> => MsgSlot,
+                <<"max-depth">> => 0
+            },
+            Opts
+        ),
+    ?assertEqual(
+        {ok, ReceiverSlotAfter},
+        hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts)
+    ).
 
 %% @doc `max-depth = 1' on the outer push: the outbox is scheduled and the
 %% target's `/push' runs once (depth 1 -> depth 0). When that target's own
@@ -1733,15 +1861,29 @@ test_compute_push_hook_idempotent() ->
 %% Ping message on the Sender that targets the Receiver. Returns
 %% `{Sender, Receiver, MsgSlot, Opts}' so individual tests can drive
 %% `/push' (or `/compute&push') against the staged message and observe the
-%% resulting downstream behaviour.
+%% resulting downstream behaviour. The Sender holds none of the keys in
+%% `SenderWithout'.
 setup_two_process_message() ->
+    setup_two_process_message([]).
+setup_two_process_message(SenderWithout) ->
     hb_process_test_vectors:init(),
     Opts = #{
         <<"priv-wallet">> => ar_wallet:new(),
         <<"cache-control">> => [],
         <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)]
     },
-    Sender = hb_process_test_vectors:aos_process(Opts),
+    Sender =
+        hb_message:commit(
+            hb_maps:without(
+                SenderWithout,
+                hb_message:uncommitted(
+                    hb_process_test_vectors:aos_process(Opts),
+                    Opts
+                ),
+                Opts
+            ),
+            Opts
+        ),
     {ok, _} = hb_cache:write(Sender, Opts),
     {ok, _} =
         hb_ao:resolve(Sender, #{
@@ -1845,7 +1987,7 @@ test_nested_push_prompts_encoding_change() ->
     Res2 =
         hb_ao:resolve_many(
             [
-                hb_message:id(Base, all, Opts),
+                <<"ao:", (hb_message:id(Base, all, Opts))/binary>>,
                 {as, <<"process@1.0">>, <<>>},
                 Msg
             ],

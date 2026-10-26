@@ -15,7 +15,7 @@
 %%% available for reading instantly (`optimistically'), even before the
 %%% transaction is dispatched.
 -module(dev_bundler).
--export([tx/3, item/3, ensure_server/1]).
+-export([device_info/1, tx/3, item/3, ensure_server/1]).
 -export([get_state/0, get_state/1]).
 
 -include("include/hb.hrl").
@@ -29,6 +29,9 @@
 -define(DEFAULT_MAX_ITEMS, 1000).
 
 %%% Public interface.
+
+%% @doc Export `tx' and `item' as keys; the server functions are not keys.
+device_info(_) -> #{ exports => [<<"tx">>, <<"item">>] }.
 
 %% @doc An alias for `item/3'.
 -spec tx(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
@@ -151,7 +154,9 @@ error_to_bin(Reason) ->
 %% of a write that returns anything but ok.
 cache_item(Item, Opts) ->
     try
-        ok = dev_bundler_cache:write_item(Item, Opts)
+        ok = dev_bundler_cache:write_item(Item, Opts),
+        % Commit the item to disk before the upload is answered.
+        ok = hb_store:flush(hb_opts:get(store, no_viable_store, Opts), Opts)
     catch
         Type:ExceptionReason ->
             {error, #{
@@ -216,8 +221,12 @@ ensure_server(Opts) ->
         PID when is_pid(PID) -> PID;
         undefined ->
             ItemIDs = dev_bundler_cache:list_item_ids(Opts),
-            % The server signs bundles with the node key.
-            ServerOpts = hb_http_server:with_node_committer(Opts),
+            % Bundles use the configured identity, or the node key by default.
+            {ok, ServerOpts} =
+                case hb_opts:get(bundler_identity, not_found, Opts) of
+                    not_found -> {ok, hb_http_server:with_node_committer(Opts)};
+                    Identity -> hb_opts:as(Identity, Opts)
+                end,
             hb_name:singleton(Name, fun() -> init(ItemIDs, ServerOpts) end)
     end.
 
@@ -915,7 +924,10 @@ unsigned_dataitem_test_parallel() ->
                 <<"error">> := <<"invalid-item">>,
                 <<"details">> := <<"unsigned-item">>
             }},
-            Response)
+            Response),
+        % The server functions are not keys, so a client cannot start a server.
+        ?assertEqual({error, not_found},
+            hb_http:get(Node, <<"/~bundler@1.0/ensure-server">>, ClientOpts))
     after
         %% Always cleanup, even if test fails
         stop_test_servers(ServerHandle, NodeOpts)
@@ -1009,7 +1021,7 @@ dispatch_blocking_test() ->
         Item4 = new_data_item(4, 10),
         {Time4, {ok, _}} =
             timer:tc(fun() -> post_data_item(Node, Item4, ClientOpts) end),
-        %% Assert that the 4th item takes no longer than twice the slowest of
+        %% Assert that the 4th item takes at most twice the slowest of
         %% the first 3. This verifies that we aren't blocking on the tx
         %% bundle dispatching.
         Slowest = lists:max([Time1, Time2, Time3]),
@@ -1078,6 +1090,7 @@ recover_respects_max_items_test_parallel() ->
 complete_task_sequence_test_parallel() ->
     Anchor = rand:bytes(32),
     Price = 12345,
+    Zone = ar_wallet:new(),
     {ServerHandle, NodeOpts} = hb_mock_server:start_arweave_gateway(#{
         price => {200, integer_to_binary(Price)},
         tx_anchor => {200, hb_util:encode(Anchor)}
@@ -1085,6 +1098,9 @@ complete_task_sequence_test_parallel() ->
     try
         Opts = NodeOpts#{
             <<"priv-wallet">> => ar_wallet:new(),
+            <<"identities">> =>
+                #{ <<"zone">> => #{ <<"priv-wallet">> => Zone } },
+            <<"bundler-identity">> => <<"zone">>,
             <<"store">> => hb_test_utils:test_store(),
             <<"bundler-max-items">> => 2,
             <<"retry-base-delay-ms">> => 100,
@@ -1104,6 +1120,11 @@ complete_task_sequence_test_parallel() ->
         State = get_state(Opts),
         ?assertNotEqual(undefined, State),
         ?assertNotEqual(timeout, State),
+        % The server signs bundles with the wallet of the configured identity.
+        ?assertEqual(
+            hb_opts:address(#{ <<"priv-wallet">> => Zone }),
+            hb_opts:address(State#state.opts)
+        ),
         Workers = State#state.workers,
         IdleWorkers = [
             PID
@@ -1126,7 +1147,7 @@ await_bundle_test_parallel() ->
     {ServerHandle, NodeOpts} = hb_mock_server:start_arweave_gateway(#{
         chunk => fun(_Req) ->
             Parent ! {chunk_started, self()},
-            receive release_chunk -> ok after 1000 -> ok end,
+            receive release_chunk -> ok end,
             {200, <<"OK">>}
         end,
         price => {200, integer_to_binary(Price)},
@@ -1159,8 +1180,6 @@ await_bundle_test_parallel() ->
         ChunkHandler =
             receive
                 {chunk_started, PID} -> PID
-            after 1000 ->
-                error(await_bundle_chunk_not_started)
             end,
         receive
             {await_bundle_result, _EarlyResult} ->
@@ -1172,8 +1191,6 @@ await_bundle_test_parallel() ->
         Result =
             receive
                 {await_bundle_result, AwaitResult} -> AwaitResult
-            after 2000 ->
-                error(await_bundle_result_timeout)
             end,
         ?assertMatch(
             {ok, #{

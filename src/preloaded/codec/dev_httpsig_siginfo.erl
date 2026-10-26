@@ -109,7 +109,7 @@ derived_commitment_id(Sig) ->
 
 %% @doc Generate the `signature-input' of a commitment: the inner list of its
 %% components, with the other keys of the commitment as its parameters, sorted.
-%% The `alg' parameter holds the `commitment-device' and `type' of the
+%% The `alg' parameter contains the `commitment-device' and `type' of the
 %% commitment. The `@signature-params' line of a signature base is this list,
 %% so the signature covers every parameter that is sent. HTTPSig derives the
 %% committer of a commitment from its `keyid', so it does not send it.
@@ -355,9 +355,18 @@ decode_param(Bin) ->
 %% lists as they are, in order and percent-encoded: those devices verify them.
 to_siginfo_keys(Msg, Commitment = #{
         <<"commitment-device">> := <<"httpsig@1.0">> }, Opts) ->
+    % The commitment is encoded over the keys of the message that it lists.
+    Keys =
+        lists:map(
+            fun hb_ao:normalize_key/1,
+            hb_util:message_to_ordered_list(
+                maps:get(<<"committed">>, Commitment, []),
+                Opts
+            )
+        ),
     {ok, _EncMsg, EncComm, _} =
         dev_httpsig:normalize_for_encoding(
-            linkify(Msg, Commitment, Opts),
+            maps:with(Keys, linkify(Msg, Commitment, Opts)),
             Commitment,
             Opts
         ),
@@ -392,7 +401,9 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
     %    specifiers from the other keys and decode them. A `content-digest'
     %    key of the message is one of the body keys. A key of the body that
     %    is also a component of its own, such as a message that a commitment
-    %    covers by its link, keeps the place of that component.
+    %    covers by its link, keeps the place of that component. The
+    %    `ao-body-key' component gives the key of the body: the message's own
+    %    `ao-body-key' is one of the body keys.
     ComponentKeys =
         fun(<<"content-type">>) ->
                 ContentType =
@@ -401,6 +412,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
                     false -> [<<"content-type">>];
                     _ -> []
                 end;
+           (<<"ao-body-key">>) -> [];
            (<<"@", Key/binary>>) -> [hb_escape:decode(Key)];
            (Key) -> [hb_escape:decode(Key)]
         end,
@@ -416,8 +428,8 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
             end,
             SigInfoCommitted
         ),
-    % 2. Replace the `body' key again with the value of the `ao-body-key' key,
-    %    if present.
+    % 2. Replace the `body' key again with the value of the `ao-body-key'
+    %    header, if its component is present.
     ?event_debug(
         {from_siginfo_keys,
             {body_keys, BodyKeys},
@@ -426,7 +438,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
         }
     ),
     ListWithoutBodyKey =
-        case lists:member(<<"ao-body-key">>, WithBody) of
+        case lists:member(<<"ao-body-key">>, SigInfoCommitted) of
             true ->
                 WithOrigBodyKey =
                     hb_util:list_replace(
@@ -435,7 +447,7 @@ from_siginfo_keys(HTTPEncMsg, BodyKeys, SigInfoCommitted) ->
                         maps:get(<<"ao-body-key">>, HTTPEncMsg)
                     ),
                 ?event_debug({with_orig_body_key, WithOrigBodyKey}),
-                WithOrigBodyKey -- [<<"ao-body-key">>];
+                WithOrigBodyKey;
             false ->
                 WithBody
         end,

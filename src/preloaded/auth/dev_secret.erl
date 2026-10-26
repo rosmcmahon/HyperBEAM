@@ -114,7 +114,7 @@
 %%%     except that it expects the key to store to be provided either directly
 %%%     via the `key' parameter as a `keyid' field in the cookie Structured-Fields
 %%%     map. Support for loading the key from the cookie is provided such that
-%%%     a previously-generated secret by the user can have its persistence mode
+%%%     an existing secret of the user can have its persistence mode
 %%%     changed.
 %%% 
 %%% /list
@@ -139,7 +139,9 @@
 %%% /export
 %%%     Parameters:
 %%%     - `keyids' (optional): A list of `keyid's to export, or `all' to
-%%%       export all secrets for which the request passes authentication.
+%%%       export all secrets for which the request passes authentication. A
+%%%       controller that authorizes the export must sign `keyids'. To export
+%%%       every secret that it controls, it signs `keyids => all'.
 %%% 
 %%%     Exports a given secret or set of secrets. If multiple secrets are
 %%%     requested, the result is a message with form `keyid => #{ `key` =>
@@ -150,8 +152,8 @@
 %%%     A secret will be exported if:
 %%%     - The given request passes each requested secret's `access-control'
 %%%       message; or
-%%%     - The request passes each requested secret's `controllers' parameter
-%%%       checks.
+%%%     - The secret's controllers signed the request's `keyids', and `keyids'
+%%%       contains the secret's `keyid' or is `all'.
 %%% 
 %%% /sync
 %%%     Parameters:
@@ -173,7 +175,7 @@
 %%%     `keyid's of the imported secrets.
 %%% '''
 -module(dev_secret).
--device_libraries([lib_meta]).
+-device_libraries([lib_meta, lib_process, lib_secret]).
 -export([generate/3, import/3, list/3, commit/3, export/3, sync/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
@@ -188,9 +190,15 @@
 generate(Base, Request, Opts) ->
     case request_to_wallets(Base, Request, Opts) of
         [] ->
-            % No wallets found, create a new one.
-            Wallet = ar_wallet:new(),
-            register_wallet(Wallet, Base, Request, Opts);
+            % No wallets found, create a new one from the pool. The pool
+            % bounds concurrent generation; a timed-out request must not
+            % generate a wallet in the request process.
+            case ar_wallet:request_pooled_wallet(?DEFAULT_KEY_TYPE) of
+                {ok, Wallet} ->
+                    register_wallet(Wallet, Base, Request, Opts);
+                timeout ->
+                    {error, <<"Wallet generation timed out.">>}
+            end;
         [WalletDetails] ->
             % The wallet is keyed by the `keyid' of its access secret.
             Committer =
@@ -200,7 +208,7 @@ generate(Base, Request, Opts) ->
             {
                 ok,
                 (hb_maps:get(<<"access-control">>, WalletDetails, #{}, Opts))#{
-                    <<"cache-control">> => [<<"no-store">>],
+                    <<"cache-control">> => <<"no-store">>,
                     <<"body">> =>
                         <<"secret:", Committer/binary>>
                 }
@@ -356,7 +364,7 @@ persist_registered_wallet(WalletDetails, RespBase, Opts) ->
     Committer = hb_maps:get(<<"committer">>, WalletDetails, undefined, Opts),
     KeyID = <<"secret:", Committer/binary>>,
     Base = RespBase#{
-        <<"body">> => KeyID, <<"cache-control">> => [<<"no-store">>]
+        <<"body">> => KeyID, <<"cache-control">> => <<"no-store">>
     },
     % Determine how to persist the wallet.
     case hb_maps:get(<<"persist">>, WalletDetails, <<"in-memory">>, Opts) of
@@ -364,31 +372,52 @@ persist_registered_wallet(WalletDetails, RespBase, Opts) ->
             ?event({priv_wallet_details, WalletDetails}),
             % Find the necessary wallet details to set the cookie on the client.
             JSONKey = hb_maps:get(<<"wallet">>, WalletDetails, undefined, Opts),
-            % Don't store, set the cookie in the response.
+            % Don't store, set the cookie in the response. The key is a
+            % credential: page scripts may not read its cookie, and browsers
+            % send it only over HTTPS, from this site's pages.
             hb_ao:resolve(
                 Base#{ <<"device">> => <<"cookie@1.0">> },
                 #{
                     <<"path">> => <<"store">>,
-                    <<"wallet-", Address/binary>> => hb_escape:encode_quotes(JSONKey)
+                    <<"wallet-", Address/binary>> =>
+                        #{
+                            <<"value">> => hb_escape:encode_quotes(JSONKey),
+                            <<"attributes">> =>
+                                #{
+                                    <<"path">> => <<"/">>,
+                                    <<"samesite">> => <<"strict">>
+                                },
+                            <<"flags">> => [<<"httponly">>, <<"secure">>]
+                        }
                 },
                 Opts
             );
         PersistMode ->
-            % Store wallet and return auth response with wallet info.
-            store_wallet(
-                hb_util:key_to_atom(PersistMode, existing),
-                KeyID,
-                WalletDetails,
-                Opts
-            ),
-            ?event(
-                {stored_and_returning,
-                    {auth_response, Base},
-                    {priv_wallet_details, WalletDetails}
-                }
-            ),
-            % Return auth response with wallet info added.
-            {ok, Base}
+            case find_wallet(KeyID, Opts) of
+                not_found ->
+                    % Store wallet and return auth response with wallet info.
+                    store_wallet(
+                        hb_util:key_to_atom(PersistMode, existing),
+                        KeyID,
+                        WalletDetails,
+                        Opts
+                    ),
+                    ?event(
+                        {stored_and_returning,
+                            {auth_response, Base},
+                            {priv_wallet_details, WalletDetails}
+                        }
+                    ),
+                    % Return auth response with wallet info added.
+                    {ok, Base};
+                _ ->
+                    ?event(
+                        {register_wallet_error,
+                            {reason, wallet_keyid_already_hosted}
+                        }
+                    ),
+                    {error, <<"Wallet keyid already hosted on node.">>}
+            end
     end.
 
 %% @doc List all hosted wallets
@@ -492,7 +521,7 @@ load_and_verify({secret, KeyID, _}, _Base, Request, Opts) ->
     case find_wallet(KeyID, Opts) of
         not_found -> {error, <<"Wallet not hosted on node.">>};
         WalletDetails ->
-            case verify_controllers(WalletDetails, Request, Opts) of
+            case verify_controllers(WalletDetails, KeyID, Request, Opts) of
                 true ->
                     % If the request is already signed by an exporter
                     % return the request as-is with the wallet.
@@ -510,26 +539,36 @@ load_and_verify({secret, KeyID, _}, _Base, Request, Opts) ->
     end.
 
 %% @doc Validate if a calling message has the required `controllers' for the
-%% given wallet.
-verify_controllers(WalletDetails, Request, Opts) ->
+%% given wallet. Count a controller only if it signed `keyids', and `keyids'
+%% contains the wallet's `keyid' or is `all'. A commitment over other keys,
+%% such as `hashpath', does not authorize an export.
+verify_controllers(WalletDetails, KeyID, Request, Opts) ->
     RequiredControllers =
         hb_util:int(hb_maps:get(<<"required-controllers">>, WalletDetails, 1, Opts)),
     Controllers =
-        lists:map(
-            fun hb_util:committer/1,
-            parse_controllers(
-                hb_maps:get(<<"controllers">>, WalletDetails, [], Opts),
-                Opts
-            )
-        ),
-    PresentControllers =
-        lists:filter(
-            fun(Signer) ->
-                lists:member(Signer, Controllers)
-            end,
-            hb_message:signers(Request, Opts)
-        ),
-    length(PresentControllers) >= RequiredControllers.
+        [
+            hb_committer:uri(Controller, Opts)
+        ||
+            Controller <-
+                parse_controllers(
+                    hb_maps:get(<<"controllers">>, WalletDetails, [], Opts),
+                    Opts
+                )
+        ],
+    SigningControllers =
+        [
+            Controller
+        ||
+            Controller <- lists:usort(Controllers),
+            {ok, Signed} <- [lib_meta:authorized([Controller], Request, Opts)],
+            is_listed_key(KeyID, hb_maps:get(<<"keyids">>, Signed, [], Opts))
+        ],
+    length(SigningControllers) >= RequiredControllers.
+
+%% @doc Whether a `keyids' value contains the given `keyid', or is `all'.
+is_listed_key(_KeyID, <<"all">>) -> true;
+is_listed_key(KeyID, KeyIDs) when is_list(KeyIDs) -> lists:member(KeyID, KeyIDs);
+is_listed_key(_KeyID, _KeyIDs) -> false.
 
 %% @doc Verify a wallet for a given request.
 verify_auth(WalletDetails, Req, Opts) ->
@@ -586,6 +625,14 @@ commit_message(Message, #{ <<"wallet">> := Key }, Opts) ->
     #{ _ => _ }
 ) -> {ok, [_]} | {error, binary()}.
 export(Base, Request, Opts) ->
+    % A reply that is not a bundle gives each wallet as a link, which writes
+    % the wallet, with its key, to the node's cache.
+    case hb_util:bool(hb_ao:get(<<"accept-bundle">>, Request, false, Opts)) of
+        true -> do_export(Base, Request, Opts);
+        false -> {error, <<"An export is sent only as a bundle.">>}
+    end.
+
+do_export(Base, Request, Opts) ->
     PrivOpts = priv_store_opts(Opts),
     ModReq =
         case hb_ao:get(<<"keyids">>, Request, not_found, Opts) of
@@ -604,7 +651,7 @@ export(Base, Request, Opts) ->
                     fun(Wallet) ->
                         Loaded = hb_cache:ensure_all_loaded(Wallet, PrivOpts),
                         ?event({exported, {priv_wallet, Loaded}}),
-                        Loaded
+                        Loaded#{ <<"cache-control">> => <<"no-store">> }
                     end,
                     Wallets
                 )
@@ -642,7 +689,10 @@ sync(_Base, Request, Opts) ->
             (hb_message:commit(
                 #{ <<"keyids">> => Wallets },
                 SignAsOpts
-            ))#{ <<"path">> => <<"/~secret@1.0/export">> },
+            ))#{
+                <<"path">> => <<"/~secret@1.0/export">>,
+                <<"accept-bundle">> => <<"true">>
+            },
         ?event({sync, {export_req, ExportRequest}}),
         case hb_http:get(Node, ExportRequest, SignAsOpts) of
             {ok, ExportResponse} ->
@@ -679,7 +729,7 @@ secrets_to_keyids(Secrets) when is_list(Secrets) ->
     [ hd(secrets_to_keyids(Secret)) || Secret <- Secrets ];
 secrets_to_keyids(Secret) when is_binary(Secret) ->
     ?event({secrets_to_keyids, {priv_secret, Secret}}),
-    KeyID = hb_util:secret_key_to_committer(Secret),
+    KeyID = lib_secret:to_committer(Secret),
     [ {secret, <<"secret:", KeyID/binary>>, Secret} ].
 
 %% @doc Parse the exportable setting for a wallet and return a list of the
@@ -701,13 +751,20 @@ parse_controllers(Address, _Opts) when is_binary(Address) -> [Address].
 
 %% @doc Store a wallet in the appropriate location.
 store_wallet(in_memory, KeyID, Details, Opts) ->
-    % Get existing wallets
-    CurrentWallets = hb_opts:get(priv_wallet_hosted, #{}, Opts),
-    % Add new wallet
-    UpdatedWallets = CurrentWallets#{ KeyID => Details },
-    ?event({wallet_store, {priv_updated_wallets, UpdatedWallets}}),
-    % Update the node's options with the new wallets.
-    hb_http_server:set_opts(Opts#{ <<"priv-wallet-hosted">> => UpdatedWallets }),
+    hb_http_server:update_opts(
+        fun(NodeMsg) ->
+            % Get existing wallets from the node message.
+            CurrentWallets = hb_opts:get(priv_wallet_hosted, #{}, NodeMsg),
+            % Add new wallet
+            UpdatedWallets = CurrentWallets#{ KeyID => Details },
+            ?event({wallet_store, {priv_updated_wallets, UpdatedWallets}}),
+            % Update the node's options with the new wallets.
+            hb_http_server:set_opts(
+                NodeMsg#{ <<"priv-wallet-hosted">> => UpdatedWallets }
+            )
+        end,
+        Opts
+    ),
     ok;
 store_wallet(non_volatile, KeyID, Details, Opts) ->
     % Find the private store of the node.
@@ -789,8 +846,14 @@ test_wallet_generate_and_verify(GeneratePath, ExpectedName, CommitParams) ->
     Node = hb_http_server:start_node(#{
         <<"priv-wallet">> => ar_wallet:new()
     }),
+    NodeMsg = hb_http_server:get_opts(),
     % Generate wallet with specified parameters
     {ok, GenResponse} = hb_http:get(Node, GeneratePath, #{}),
+    % Only `priv-wallet-hosted' changes in the node message.
+    ?assertEqual(
+        NodeMsg,
+        maps:without([<<"priv-wallet-hosted">>], hb_http_server:get_opts())
+    ),
     % Should get wallet name in body, wallet-address, and auth cookie
     ?assertMatch(#{<<"body">> := _}, GenResponse),
     WalletAddr = maps:get(<<"wallet-address">>, GenResponse),
@@ -817,7 +880,7 @@ test_wallet_generate_and_verify(GeneratePath, ExpectedName, CommitParams) ->
         maps:merge(
             #{
                 <<"device">> => <<"secret@1.0">>,
-                <<"path">> => <<"commit">>,
+                <<"path">> => <<"//commit">>,
                 <<"body">> => <<"Test message">>,
                 <<"priv">> => Priv
             },
@@ -829,7 +892,7 @@ test_wallet_generate_and_verify(GeneratePath, ExpectedName, CommitParams) ->
     % transport commitments.
     hb_test_utils:assert_hashpath_reply(
         SignedMessage,
-        ?ARWEAVE_COMMITTER(WalletAddr),
+        hb_committer:uri(WalletAddr),
         <<"Test message">>
     ).
 
@@ -925,10 +988,22 @@ commit_with_cookie_wallet_test() ->
         hb_http:get(Node, <<"/~secret@1.0/generate?persist=client">>, #{}),
     WalletName = maps:get(<<"wallet-address">>, GenResponse),
     #{ <<"priv">> := Priv } = GenResponse,
+    % Page scripts, other sites and plain HTTP do not get the wallet's cookie.
+    ?assertMatch(
+        #{
+            <<"attributes">> :=
+                #{ <<"path">> := <<"/">>, <<"samesite">> := <<"strict">> },
+            <<"flags">> := [<<"httponly">>, <<"secure">>]
+        },
+        hb_maps:get(
+            hb_util:lowercase_key(<<"wallet-", WalletName/binary>>),
+            maps:get(<<"cookie">>, Priv)
+        )
+    ),
     % Use the cookie to sign a message (no wallet parameter needed).
     TestMessage = #{
         <<"device">> => <<"secret@1.0">>,
-        <<"path">> => <<"commit">>,
+        <<"path">> => <<"//commit">>,
         <<"body">> => <<"Test data">>,
         <<"priv">> => Priv
     },
@@ -937,7 +1012,7 @@ commit_with_cookie_wallet_test() ->
     % transport commitments.
     hb_test_utils:assert_hashpath_reply(
         SignedMessage,
-        ?ARWEAVE_COMMITTER(WalletName),
+        hb_committer:uri(WalletName),
         <<"Test data">>
     ).
 
@@ -958,6 +1033,7 @@ export_wallet_test() ->
             Node,
             #{
                 <<"path">> => <<"/~secret@1.0/export/1">>,
+                <<"accept-bundle">> => <<"true">>,
                 <<"priv">> => Priv
             },
             #{}
@@ -965,8 +1041,13 @@ export_wallet_test() ->
     ?event({export_test, {export_response, ExportResponse}}),
     % Should return wallet details including key, auth, exportable, persist.
     ?assertMatch(#{<<"wallet">> := _, <<"persist">> := <<"in-memory">>}, ExportResponse),
+    % The exported key gives `e' in its fewest octets, as RFC 7518 requires.
+    #{ <<"e">> := E } = hb_json:decode(maps:get(<<"wallet">>, ExportResponse)),
+    ?assertEqual(<<"AQAB">>, E),
     ?assert(maps:is_key(<<"access-control">>, ExportResponse)),
     ?assert(maps:is_key(<<"controllers">>, ExportResponse)),
+    % A reply with the wallet's key has the header `cache-control: no-store'.
+    ?assertEqual(<<"no-store">>, maps:get(<<"cache-control">>, ExportResponse)),
     % Should return the correct wallet address in the response.
     ?assertEqual(WalletAddress, maps:get(<<"address">>, ExportResponse)),
     AccessControl = maps:get(<<"access-control">>, ExportResponse),
@@ -999,7 +1080,10 @@ export_requires_distinct_controllers_test() ->
         fun(Signed) ->
             hb_http:get(
                 Node,
-                Signed#{ <<"path">> => <<"/~secret@1.0/export">> },
+                Signed#{
+                    <<"path">> => <<"/~secret@1.0/export">>,
+                    <<"accept-bundle">> => <<"true">>
+                },
                 #{}
             )
         end,
@@ -1042,7 +1126,8 @@ export_non_volatile_wallet_test() ->
                 Node,
                 #{
                     <<"device">> => <<"secret@1.0">>,
-                    <<"path">> => <<"export/1">>,
+                    <<"path">> => <<"//export/1">>,
+                    <<"accept-bundle">> => <<"true">>,
                     <<"priv">> => Priv
                 },
                 #{}
@@ -1088,7 +1173,10 @@ export_individual_batch_wallets_test() ->
                     <<"keyids">> => [WalletKeyID1, WalletKeyID2]
                 },
                 AdminOpts
-            ))#{ <<"path">> => <<"/~secret@1.0/export">> },
+            ))#{
+                <<"path">> => <<"/~secret@1.0/export">>,
+                <<"accept-bundle">> => <<"true">>
+            },
             #{}
         ),
 
@@ -1102,7 +1190,10 @@ export_individual_batch_wallets_test() ->
                 <<"keyids">> => [WalletKeyID1]
             },
             AdminOpts
-        ))#{ <<"path">> => <<"/~secret@1.0/export">> },
+        ))#{
+            <<"path">> => <<"/~secret@1.0/export">>,
+            <<"accept-bundle">> => <<"true">>
+        },
         #{}
     ),
     
@@ -1175,7 +1266,10 @@ export_batch_all_wallets_test() ->
                     <<"keyids">> => <<"all">>
                 },
                 AdminOpts
-            ))#{ <<"path">> => <<"/~secret@1.0/export">> },
+            ))#{
+                <<"path">> => <<"/~secret@1.0/export">>,
+                <<"accept-bundle">> => <<"true">>
+            },
             #{}
         ),
     ?event({export_batch_test, {export_response, ExportResponse}}),
@@ -1199,7 +1293,7 @@ export_batch_all_wallets_test() ->
 sync_wallets_test() ->
     % Remove all previous cached wallets.
     hb_store:reset(hb_opts:get(priv_store, no_wallet_store, #{})),
-    % Start a node that holds the key of the second node's wallet admin as its
+    % Start a node with the key of the second node's wallet admin as its
     % `admin' identity.
     AdminWallet = ar_wallet:new(),
     Node =
@@ -1261,7 +1355,7 @@ sync_wallets_test() ->
         )
     ),
     % Test sync to the first node from the second, signed as `admin'. The
-    % response holds the `keyid' of the imported wallet, and not its key.
+    % response contains the `keyid' of the imported wallet, and not its key.
     {ok, SyncResponse} = Sync(<<"admin">>),
     ?assertEqual([WalletKeyID], export_response_to_list(SyncResponse, #{})),
     % The first node keeps its own key.
@@ -1346,6 +1440,7 @@ stored_access_control_verifies_test() ->
             Node,
             #{
                 <<"path">> => <<"/~secret@1.0/export/1">>,
+                <<"accept-bundle">> => <<"true">>,
                 <<"priv">> => Priv
             },
             #{}
@@ -1375,7 +1470,7 @@ stored_access_control_verifies_test() ->
     SignRequest =
         #{
             <<"device">> => <<"secret@1.0">>,
-            <<"path">> => <<"commit">>,
+            <<"path">> => <<"//commit">>,
             <<"keyids">> => [KeyID],
             <<"body">> => <<"Test message">>
         },
@@ -1391,6 +1486,6 @@ stored_access_control_verifies_test() ->
         hb_http:post(Node, SignRequest#{ <<"priv">> => Priv }, #{}),
     hb_test_utils:assert_hashpath_reply(
         SignedMessage,
-        ?ARWEAVE_COMMITTER(WalletAddr),
+        hb_committer:uri(WalletAddr),
         <<"Test message">>
     ).

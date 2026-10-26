@@ -7,7 +7,7 @@
 %%% optional string `count'. Supported filters are `ids', `tags', `owners',
 %%% `recipients' and `block'. Tag names address message keys. Values within a
 %%% tag are ORed; separate tags and other filters are ANDed. Owners are
-%%% Arweave addresses, matched by their `did:pkh:' committers; indexed
+%%% Arweave addresses, matched by the URIs of their committers; indexed
 %%% recipients use the commitment's `field-target'.
 %%% Without these selecting filters,
 %%% queries enumerate confirmed base-layer TXs from block headers, optionally
@@ -44,7 +44,9 @@
 %%%
 %%% Indexed pagination orders by offset and ID and returns `member=' cursors.
 %%% One ID at two offsets can produce two edges. Unreadable entries are omitted
-%%% from the edges, without refilling the page. `hasNextPage' reflects remaining
+%%% from the edges, and the next matches take their place until the page has
+%%% `first' edges, the index has no more, or the page has read
+%%% `query-arweave-max-index-count' matches. `hasNextPage' reflects remaining
 %%% index matches, not their readability. `count' ignores `after' and counts
 %%% matches across the query's ranges, capped by `query-arweave-max-index-count'
 %%% (default 1000); it is neither an uncapped total nor a count of readable
@@ -57,7 +59,8 @@
 %%% cursor-only ID pages with known positions omit message reads. IDs without
 %%% positions must be readable before they can supply an edge.
 %%% Without an Arweave offset store, that path cannot order or filter by weave
-%%% position.
+%%% position. If reading an entry gives an error other than `not_found', the
+%%% page fails with that error.
 %%%
 %%% With selecting filters, `block' bounds are inclusive heights translated
 %%% to weave byte ranges.
@@ -102,6 +105,7 @@
 %%% Other unsupported fields may return a placeholder or a GraphQL type error.
 %%% Schema acceptance does not imply filter support.
 -module(dev_query_arweave).
+-device_libraries([lib_arweave_common]).
 %%% AO-Core API:
 -export([query/4]).
 -include_lib("eunit/include/eunit.hrl").
@@ -112,7 +116,7 @@
 -define(DEFAULT_MAX_PAGE_SIZE, 100).
 %% The cursor of an index-served edge: its match's key in the index.
 -define(MEMBER_CURSOR, "member=").
-%% The most matches a page's `count' reads by default.
+%% The most matches a page reads by default, for its `count' or its edges.
 -define(DEFAULT_MAX_INDEX_COUNT, 1000).
 %% The bytes read past an offset when the item's header runs beyond its
 %% chunk: signature, owner, target, anchor and tags, which ANS-104 caps at
@@ -147,7 +151,7 @@ query(#{ <<"count">> := Count }, <<"count">>, _Args, _Opts) ->
     {ok, Count};
 query(#{ <<"matches">> := Matches, <<"terminal">> := Terminal },
         <<"edges">>, _Args, Opts) ->
-    % The edges of an index-served page, read only when asked for. The
+    % The edges of a block-TX page, read only when asked for. The
     % terminal page of a forced-next-page read marks its last cursor.
     Edges = match_edges(Matches, Opts),
     Marked =
@@ -329,7 +333,7 @@ query(Msg, <<"data">>, _Args, _Opts) ->
     {ok, Msg};
 query(Msg, <<"size">>, _Args, Opts) ->
     Size =
-        case find_field_key(<<"field-data_size">>, Msg, Opts) of
+        case find_field_key(<<"field-data-size">>, Msg, Opts) of
             {ok, null} -> indexed_data_size(Msg, Opts);
             {ok, DeclaredSize} -> DeclaredSize
         end,
@@ -466,7 +470,7 @@ indexed_l1_size(ID, Opts) ->
         no_store -> null;
         Store ->
             case hb_store_arweave:read_offset(Store, ID, Opts) of
-                {ok, #{ <<"codec-device">> := <<"tx@1.0">>,
+                {ok, #{ <<"codec">> := <<"tx@1.0">>,
                     <<"length">> := Length }} -> Length;
                 _ -> null
             end
@@ -526,7 +530,7 @@ read_id(#{ <<"offset">> := _, <<"cursor">> := Cursor },
 read_id(#{ <<"node">> := _ } = Edge, _Opts) ->
     [Edge];
 read_id(AnnotatedID, Opts) ->
-    case match_message(AnnotatedID, Opts) of
+    case read_match(AnnotatedID, Opts) of
         {ok, Msg} ->
             [AnnotatedID#{ <<"node">> =>
                 hb_private:set(Msg, <<"query-match">>, AnnotatedID, Opts)
@@ -1022,14 +1026,16 @@ index_connection(Predicates, Args, Opts) ->
             end,
         Ranges = index_ranges(Direction, Args, Opts),
         PageSize = page_size(Args, Opts),
-        {ok, Matches} ?=
-            index_matches(Predicates, Ranges, After, PageSize + 1, Opts),
-        More = length(Matches) > PageSize,
+        {ok, Read, Edges, More} ?=
+            index_edges(Predicates, Ranges, After, PageSize, 0, Opts),
         ForceNextPage = force_next_page(Args, Opts),
         Page =
             #{
-                <<"matches">> => lists:sublist(Matches, PageSize),
-                <<"terminal">> => ForceNextPage andalso not More,
+                <<"edges">> =>
+                    case ForceNextPage andalso not More of
+                        true -> force_terminal_cursor(Edges);
+                        false -> Edges
+                    end,
                 <<"predicates">> => Predicates,
                 <<"ranges">> => Ranges,
                 <<"pageInfo">> =>
@@ -1040,9 +1046,47 @@ index_connection(Predicates, Args, Opts) ->
                 true ->
                     Cap = hb_opts:get(query_arweave_max_index_count,
                         ?DEFAULT_MAX_INDEX_COUNT, Opts),
-                    Page#{ <<"count">> => hb_util:bin(min(length(Matches), Cap)) };
+                    Page#{ <<"count">> => hb_util:bin(min(Read, Cap)) };
                 false -> Page
             end}
+    end.
+
+%% @doc Read the edges of a page from the index, with the number of matches
+%% read and whether the index has more past them. The next matches take the
+%% place of those whose items cannot be read, until the page has `Size'
+%% edges, the index has no more, or the page has read
+%% `query-arweave-max-index-count' matches.
+index_edges(Predicates, Ranges, After, Size, Read, Opts) ->
+    maybe
+        {ok, Matches} ?=
+            index_matches(Predicates, Ranges, After, Size + 1, Opts),
+        Page = lists:sublist(Matches, Size),
+        Edges = match_edges(Page, Opts),
+        More = length(Matches) > Size,
+        Total = Read + length(Page),
+        Cap =
+            hb_opts:get(
+                query_arweave_max_index_count,
+                ?DEFAULT_MAX_INDEX_COUNT,
+                Opts
+            ),
+        Missing = min(Size - length(Edges), Cap - Total),
+        case More andalso Missing > 0 of
+            false -> {ok, Total, Edges, More};
+            true ->
+                maybe
+                    {ok, AllRead, Rest, RestMore} ?=
+                        index_edges(
+                            Predicates,
+                            Ranges,
+                            maps:get(<<"member">>, lists:last(Page)),
+                            Missing,
+                            Total,
+                            Opts
+                        ),
+                    {ok, AllRead, Edges ++ Rest, RestMore}
+                end
+        end
     end.
 
 %% @doc The query's AND predicates, each with alternative values. Owners use
@@ -1170,7 +1214,7 @@ block_transactions(Height, Range = #{ <<"direction">> := Direction }, After, Lim
 
 %% @doc The match the page resumes after, from the cursor of an
 %% index-served edge with its terminal marker dropped; a cursor of another
-%% form names a cached item, from which only `cached_transactions' resumes.
+%% form gives a cached item, from which only `cached_transactions' resumes.
 index_cursor(Args, Opts) ->
     case hb_maps:get(<<"after">>, Args, null, Opts) of
         Unset when Unset =:= null; Unset =:= undefined; Unset =:= <<>> ->
@@ -1220,7 +1264,7 @@ index_ranges(Direction, Args, Opts) ->
         || Range <- Bounds ].
 
 %% @doc The matches of a page: the ranges read in order from the cursor,
-%% which lies in the range holding its key.
+%% which lies in the range that contains its key.
 index_matches(Predicates, Ranges, After, Limit, Opts) ->
     % A cursor among the messages the weave never held resumes their range
     % alone: the second of the two an open ascending page reads.
@@ -1336,7 +1380,7 @@ match_edges(Matches, Opts) ->
     Read =
         hb_pmap:parallel_map(
             [maps:remove(<<"block-result">>, Match) || Match <- Matches],
-            fun(Match) -> match_message(Match, Opts) end,
+            fun(Match) -> read_match(Match, Opts) end,
             hb_opts:get(arweave_chunk_fetch_concurrency, 10, Opts)
         ),
     block_edges(lists:filtermap(
@@ -1359,6 +1403,15 @@ match_edges(Matches, Opts) ->
 %% @doc Preserve block-page cursors, or encode a match index member.
 match_cursor(#{ <<"cursor">> := Cursor }) -> Cursor;
 match_cursor(#{ <<"member">> := Member }) -> <<?MEMBER_CURSOR, Member/binary>>.
+
+%% @doc Read the message of a match. If the read gives an error other than
+%% `not_found', throw the error, so that the page fails.
+read_match(Match, Opts) ->
+    case match_message(Match, Opts) of
+        {error, not_found} -> {error, not_found};
+        {error, _} = Error -> throw(Error);
+        Read -> Read
+    end.
 
 %% @doc L1 metadata needs only its native header, not an expanded bundle.
 %% Other messages read by ID, or decode their header at a weave offset.
@@ -1386,7 +1439,7 @@ l1_message(ID, Opts) ->
 %% fetch, and every byte a gateway serves when the chunk closes the bundle,
 %% as the weave's padding follows it -- or from a longer read when the
 %% header runs into the next chunk. The data is left out: neither the index
-%% nor the header holds its length.
+%% nor the header gives its length.
 header(Offset, Device, Opts) ->
     Tail =
         hb_ao:resolve(
@@ -1527,7 +1580,7 @@ match(<<"owners">>, Owners, Opts) ->
     {ok, matching_commitments(<<"committer">>, owner_committers(Owners), Opts)};
 match(<<"owner">>, Owner, Opts) ->
     Res =
-        matching_commitments(<<"committer">>, ?ARWEAVE_COMMITTER(Owner), Opts),
+        matching_commitments(<<"committer">>, hb_committer:uri(Owner), Opts),
     ?event({match_owner, Owner, Res}),
     {ok, Res};
 match(<<"recipients">>, Recipients, Opts) ->
@@ -1572,7 +1625,7 @@ annotate_offsets([ID|IDs], StoreOpts, Ordinals, Opts) ->
                         <<"id">> => ID,
                         <<"offset">> => StartOffset,
                         <<"commitment-device">> =>
-                            hb_maps:get(<<"codec-device">>, Location, <<>>, Opts),
+                            hb_maps:get(<<"codec">>, Location, <<>>, Opts),
                         <<"length">> => Length
                     }
                 };
@@ -1641,9 +1694,9 @@ do_filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
     Filtered.
 
 %% @doc Convert the owners of a GraphQL query, which are Arweave addresses, to
-%% their `did:pkh:' committers.
+%% the URIs of their committers.
 owner_committers(null) -> null;
-owner_committers(Owners) -> [?ARWEAVE_COMMITTER(Owner) || Owner <- Owners].
+owner_committers(Owners) -> [hb_committer:uri(Owner) || Owner <- Owners].
 
 %% @doc Return the IDs of the messages whose commitments carry a field:
 %% their committer, or their target.
@@ -1865,6 +1918,21 @@ unmined_pages_test() ->
     Descending = Pages(<<"HEIGHT_DESC">>, null, []),
     ?assertEqual(3, length(lists:usort(Descending))),
     ?assertEqual(lists:reverse(Descending), Pages(<<"HEIGHT_ASC">>, null, [])),
+    % The node cannot read this item; a page takes the next match in its place.
+    {ok, _} =
+        hb_cache:write(
+            hb_private:set(
+                hb_message:commit(#{ <<"type">> => <<"Unmined">> }, Opts),
+                <<"offset">>,
+                10,
+                Opts
+            ),
+            Opts#{
+                <<"store">> => [hb_test_utils:test_store()],
+                <<"match-index">> => maps:get(<<"store">>, Opts)
+            }
+        ),
+    ?assertEqual(Descending, Pages(<<"HEIGHT_DESC">>, null, [])),
     ?assertMatch(
         #{ <<"data">> := #{ <<"transactions">> := #{
             <<"count">> := <<"2">>,
@@ -1884,7 +1952,7 @@ unmined_pages_test() ->
 
 %% @doc A page served from the published index on Arweave, its items
 %% read from the weave: the twenty-four items of `action=Battle.Begin'
-%% page out in each order under cursors naming their keys, every item
+%% page out in each order under cursors with their keys, every item
 %% carrying the tag it was found by, the count is the whole set's, and the
 %% last page closes.
 published_pages_test_() ->

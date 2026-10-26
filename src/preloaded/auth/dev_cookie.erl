@@ -34,6 +34,7 @@
 %%% `/from': Converts a message containing encoded cookies into a message
 %%% containing the cookies parsed and normalized.
 -module(dev_cookie).
+-export([device_info/1]).
 %%% Public cookie manipulation API.
 -export([get_cookie/3, store/3, extract/3, reset/2, reset/3]).
 %%% Public message codec API.
@@ -46,6 +47,9 @@
 -export([opts/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
+
+%% @doc Exclude the `opts' utility from the keys of the device.
+device_info(_) -> #{ excludes => [<<"opts">>] }.
 
 %% @doc Get the private store options to use for functions in the cookie device.
 opts(Opts) -> hb_private:opts(Opts).
@@ -96,7 +100,7 @@ finalize(Base, Request, Opts) ->
 ) -> {ok, _} | {error, not_found}.
 get_cookie(Base, Req, RawOpts) ->
     Opts = opts(RawOpts),
-    {ok, Cookies} = extract(Base, Req, Opts),
+    {ok, Cookies} = cookies(Base, Req, RawOpts),
     Key = hb_maps:get(<<"key">>, Req, undefined, Opts),
     case hb_maps:get(Key, Cookies, undefined, Opts) of
         undefined -> {error, not_found};
@@ -109,12 +113,20 @@ get_cookie(Base, Req, RawOpts) ->
             end
     end.
 
-%% @doc Return the parsed and normalized cookies from a message.
+%% @doc Return the parsed and normalized cookies from a message. A request to
+%% the `extract' key gets the caller's own cookies, so its result is not stored.
 -spec extract(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 extract(Msg, Req, Opts) ->
+    {ok, Cookies} = cookies(Msg, Req, Opts),
+    case hb_maps:is_key(<<"path">>, Req, Opts) of
+        true -> {ok, Cookies#{ <<"cache-control">> => <<"no-store">> }};
+        false -> {ok, Cookies}
+    end.
+
+%% @doc Return the parsed and normalized cookies from a message.
+cookies(Msg, Req, Opts) ->
     {ok, MsgWithCookie} = from(Msg, Req, Opts),
-    Cookies = hb_private:get(<<"cookie">>, MsgWithCookie, #{}, Opts),
-    {ok, Cookies}.
+    {ok, hb_private:get(<<"cookie">>, MsgWithCookie, #{}, Opts)}.
 
 %% @doc Set the keys in the request message in the cookies of the caller. Removes
 %% a set of base keys from the request message before setting the remainder as
@@ -123,7 +135,7 @@ extract(Msg, Req, Opts) ->
 store(Base, Req, RawOpts) ->
     Opts = opts(RawOpts),
     ?event({store, {priv_base, Base}, {priv_req, Req}}),
-    {ok, ExistingCookies} = extract(Base, Req, Opts),
+    {ok, ExistingCookies} = cookies(Base, Req, RawOpts),
     ?event({store, {priv_existing_cookies, ExistingCookies}}),
     {ok, ResetBase} = reset(Base, Opts),
     ?event({store, {priv_reset_base, ResetBase}}),
@@ -140,8 +152,10 @@ store(Base, Req, RawOpts) ->
             hb_private:reset(Req),
             Opts
         ),
-    ?event({store, {priv_msg_to_set, MsgToSet}}),
-    NewCookies = hb_maps:merge(ExistingCookies, MsgToSet, Opts),
+    % Load the request's values from the node's stores, not the private store.
+    LoadedMsgToSet = hb_cache:ensure_all_loaded(MsgToSet, RawOpts),
+    ?event({store, {priv_msg_to_set, LoadedMsgToSet}}),
+    NewCookies = hb_maps:merge(ExistingCookies, LoadedMsgToSet, Opts),
     NewBase = hb_private:set(ResetBase, <<"cookie">>, NewCookies, Opts),
     {ok, NewBase}.
 
@@ -187,12 +201,12 @@ reset(Base, _Req, Opts) ->
 to(Msg, Req, Opts) ->
     ?event({to, {priv_msg, Msg}, {priv_req, Req}}),
     CookieOpts = opts(Opts),
-    LoadedMsg = ensure_cookie_loaded(Msg, CookieOpts),
+    LoadedMsg = ensure_cookie_loaded(Msg, Opts),
     ?event({to, {priv_loaded_msg, LoadedMsg}}),
     do_to(LoadedMsg, Req, CookieOpts).
 do_to(Msg, Req = #{ <<"format">> := <<"set-cookie">> }, Opts) when is_map(Msg) ->
     ?event({to_set_cookie, {priv_msg, Msg}, {priv_req, Req}}),
-    {ok, ExtractedParsedCookies} = extract(Msg, Req, Opts),
+    {ok, ExtractedParsedCookies} = cookies(Msg, Req, Opts),
     {ok, ResetBase} = reset(Msg, Opts),
     SetCookieLines =
         maps:values(
@@ -208,7 +222,7 @@ do_to(Msg, Req = #{ <<"format">> := <<"set-cookie">> }, Opts) when is_map(Msg) -
     {ok, MsgWithSetCookie};
 do_to(Msg, Req = #{ <<"format">> := <<"cookie">> }, Opts) when is_map(Msg) ->
     ?event({to_cookie, {priv_msg, Msg}, {priv_req, Req}}),
-    {ok, ExtractedParsedCookies} = extract(Msg, Req, Opts),
+    {ok, ExtractedParsedCookies} = cookies(Msg, Req, Opts),
     {ok, ResetBase} = reset(Msg, Opts),
     CookieLines =
         hb_maps:values(
@@ -273,7 +287,21 @@ to_set_cookie_line(Key, RawCookie) ->
             [] -> <<>>;
             Flags -> << "; ", (join(Flags, <<"; ">>))/binary >>
         end,
-    << ValueBin/binary, AttributesBin/binary, FlagsBin/binary >>.
+    Line = << ValueBin/binary, AttributesBin/binary, FlagsBin/binary >>,
+    ensure_no_control_bytes(Line, Cookie),
+    Line.
+
+%% @doc Throw `cookie_to_error' when a cookie line contains a control byte, as a
+%% CR or LF adds a header or ends the response headers.
+ensure_no_control_bytes(Bin, Cookie) ->
+    case is_control_byte_free(Bin) of
+        true -> ok;
+        false -> error({cookie_to_error, {invalid_cookie, Cookie}})
+    end.
+
+is_control_byte_free(<<>>) -> true;
+is_control_byte_free(<<Byte, _/binary>>) when Byte < 32; Byte =:= 127 -> false;
+is_control_byte_free(<<_, Rest/binary>>) -> is_control_byte_free(Rest).
 
 %% @doc Convert a single cookie into a `cookie' header component. These
 %% components can be joined to form a `cookie' header line. This function
@@ -291,7 +319,7 @@ to_cookie_line(Key, Cookie) ->
 ) -> {ok, #{ _ => _ }}.
 from(Msg, Req, Opts) ->
     CookieOpts = opts(Opts),
-    LoadedMsg = ensure_cookie_loaded(Msg, CookieOpts),
+    LoadedMsg = ensure_cookie_loaded(Msg, Opts),
     do_from(LoadedMsg, Req, CookieOpts).
 do_from(Msg, Req, Opts) when is_map(Msg) ->
     {ok, ResetBase} = reset(Msg, Opts),
@@ -309,8 +337,8 @@ do_from(CookiesMsg, _Req, _Opts) ->
 
 %% @doc Convert the `cookie' key into a parsed cookie message. `cookie' headers
 %% are in the format of `key1=value1; key2=value2; ...'. There are no attributes
-%% or flags, so we split on `;' and return a map of key-value pairs. We also
-%% decode the values, in case they are URI-encoded.
+%% or flags, so we split on `;' and return a map of key-value pairs. The values
+%% are kept as they are, and parts without a `=' are skipped.
 from_cookie(#{ <<"cookie">> := Cookie }, Req, Opts) ->
     from_cookie(Cookie, Req, Opts);
 from_cookie(Cookies, Req, Opts) when is_list(Cookies) ->
@@ -325,17 +353,13 @@ from_cookie(Cookies, Req, Opts) when is_list(Cookies) ->
         ),
     {ok, MergedParsed};
 from_cookie(Cookie, _Req, _Opts) when is_binary(Cookie) ->
-    BinaryCookiePairs = [
-        Pair || Pair <- split(semicolon, Cookie), binary:match(Pair, <<"=">>) =/= nomatch
-    ],
     KeyValList =
-        lists:map(
-            fun(BinaryCookiePair) ->
-                {[Key, Value], _Rest} = split(pair, BinaryCookiePair),
-                {Key, hb_escape:decode(Value)}
-            end,
-            BinaryCookiePairs
-        ),
+        [
+            {Key, Value}
+        ||
+            Pair <- split(semicolon, Cookie),
+            {[Key, Value], _Rest} <- [split(pair, Pair)]
+        ],
     NormalizedMessage = maps:from_list(KeyValList),
     {ok, NormalizedMessage};
 from_cookie(_MsgWithoutCookie, _Req, _Opts) ->
@@ -362,15 +386,18 @@ from_set_cookie(Lines, Req, Opts) when is_list(Lines) ->
             Lines
         ),
     {ok, MergedParsed};
-from_set_cookie(Line, _Req, Opts) when is_binary(Line) ->
-    {[Key, Value], Rest} = split(pair, Line),
-    ValueDecoded = hb_escape:decode(Value),
+from_set_cookie(Line, Req, Opts) when is_binary(Line) ->
+    from_set_cookie(split(pair, Line), Req, Opts);
+from_set_cookie({[_Text], _Rest}, _Req, _Opts) ->
+    % The line has no `key=value' pair, so it sets no cookie (RFC 6265, 5.2).
+    {ok, #{}};
+from_set_cookie({[Key, Value], Rest}, _Req, Opts) ->
     % If there is no remaining binary after the pair, we have a simple key-value
     % pair, returning just the binary as the value. Otherwise, we split the
     % remaining binary into attributes and flags and return a message with the
     % value and those parsed elements.
     case Rest of
-        <<>> -> {ok, #{ Key => ValueDecoded }};
+        <<>> -> {ok, #{ Key => Value }};
         _ ->
             AllAttrs = split(semicolon, Rest),
             % We partition the attributes into pairs and flags, where flags are
@@ -417,19 +444,20 @@ from_set_cookie(Line, _Req, Opts) when is_binary(Line) ->
                 true -> #{}
                 end,
             MaybeAllAttributes = hb_maps:merge(MaybeAttributes, MaybeFlags, Opts),
-            {ok, #{ Key => MaybeAllAttributes#{ <<"value">> => ValueDecoded }}}
+            {ok, #{ Key => MaybeAllAttributes#{ <<"value">> => Value }}}
     end.
 
 %%% Internal helpers
 
 %% @doc Load only the parts of the message needed by the cookie codec.
-ensure_cookie_loaded(Msg, Opts) ->
+ensure_cookie_loaded(Msg, RawOpts) ->
+    Opts = opts(RawOpts),
     LoadedMsg = hb_cache:ensure_loaded(Msg, Opts),
     load_private_cookie(
         load_cookie_source(
             <<"set-cookie">>,
-            load_cookie_source(<<"cookie">>, LoadedMsg, Opts),
-            Opts
+            load_cookie_source(<<"cookie">>, LoadedMsg, RawOpts),
+            RawOpts
         ),
         Opts
     ).
@@ -520,11 +548,15 @@ join(Binaries, Separator) ->
 
 %% @doc Split a binary by a separator type (`pair', `lines', or `attributes').
 %% Separator types that are plural return a list of all parts. Singular types
-%% return a single part and the remainder of the binary.
+%% return a single part and the remainder of the binary. `pair' splits the text
+%% before the first `;' at its first `='. It returns `[Key, Value]', or
+%% `[Text]' if the text has no `='.
 split(pair, Bin) ->
-    [Key, ValueRest] = binary:split(Bin, <<"=">>),
-    {_, Value, Rest} = hb_util:split_depth_string_aware_single($;, ValueRest),
-    {[Key, unquote(Value)], trim_leading(Rest)};
+    {_, Pair, Rest} = hb_util:split_depth_string_aware_single($;, Bin),
+    case binary:split(Pair, <<"=">>) of
+        [Key, Value] -> {[Key, unquote(Value)], trim_leading(Rest)};
+        [Text] -> {[Text], trim_leading(Rest)}
+    end;
 split(lines, Bin) ->
     lists:map(fun trim_leading/1, hb_util:split_depth_string_aware($,, Bin));
 split(semicolon, Bin) ->

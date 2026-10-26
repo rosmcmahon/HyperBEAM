@@ -26,7 +26,7 @@
 %%% commitment, or an empty binary when absent, as used by Arweave GraphQL.
 -module(dev_query).
 %%% Message matching API:
--export([info/1, only/3, all/3, base/3]).
+-export([device_info/1, only/3, all/3, base/3]).
 %%% GraphQL API:
 -export([graphql/3, has_results/3, recipient/3]).
 %%% Test setup:
@@ -35,15 +35,16 @@
 -include("include/hb.hrl").
 
 %%% Keys that should typically be excluded from searches: the request's
-%%% `commitments', the device's parameters, and the keys that the node's
-%%% HTTP server sets on every request.
+%%% `commitments', the device's parameters, the keys that the node's HTTP
+%%% server sets on every request, and the caller's `ao-peer' and `user-agent'.
 -define(
     DEFAULT_EXCLUDES,
     [<<"path">>, <<"commitments">>, <<"return">>, <<"exclude">>, <<"only">>,
-        <<"method">>, <<"accept">>, <<"accept-bundle">>, <<"host">>]
+        <<"method">>, <<"accept">>, <<"accept-bundle">>, <<"host">>,
+        <<"ao-peer">>, <<"user-agent">>]
 ).
 
-info(_Opts) ->
+device_info(_Opts) ->
     #{
         excludes => [<<"committers">>, <<"keys">>, <<"set">>],
         default => fun default/4
@@ -106,10 +107,10 @@ all(Base, Req, Opts) ->
     match(Req, Base, Req, Opts).
 
 %% @doc Search the node's store for all of the keys and values in the base
-%% message, aside from the `commitments' and `path' keys.
+%% message, aside from the `commitments', `path' and `device' keys.
 -spec base(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 base(Base, Req, Opts) ->
-    match(Base, Base, Req, Opts).
+    match(hb_maps:without([<<"device">>], Base, Opts), Base, Req, Opts).
 
 %% @doc Search only for the (list of) key(s) specified in `only' in the request.
 %% The `only' key can be a binary, a map, or a list of keys. See the moduledoc
@@ -318,6 +319,11 @@ test_setup() ->
 basic_test() ->
     {ok, Opts, _} = test_setup(),
     {ok, [ID]} = hb_ao:resolve(<<"~query@1.0/all?basic=binary-value">>, Opts),
+    % `base' matches the keys of the base message, without its `device'.
+    ?assertEqual(
+        {ok, [ID]},
+        hb_ao:resolve(<<"~query@1.0&basic=binary-value/base">>, Opts)
+    ),
     {ok, Read} = hb_cache:read(ID, Opts),
     ?assertEqual(<<"binary-value">>, hb_maps:get(<<"basic">>, Read)),
     ?assertEqual(<<"binary-value-2">>, hb_maps:get(<<"basic-2">>, Read)),
@@ -439,4 +445,13 @@ http_test() ->
             Opts
         ),
     ?assertEqual(<<"binary-value">>, hb_maps:get(<<"basic">>, Msg, Opts)),
+    % `all' leaves out the caller's `ao-peer' and `user-agent'.
+    ?assertEqual(
+        {ok, 1},
+        hb_http:get(
+            Node,
+            <<"~query@1.0/all?basic=binary-value&return=count">>,
+            Opts
+        )
+    ),
     ok.

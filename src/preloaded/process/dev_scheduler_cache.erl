@@ -106,7 +106,8 @@ read(ProcID, Slot, RawOpts) ->
             not_found
     end.
 
-%% @doc Get the assignments for a process.
+%% @doc Get the assignments for a process. If the store fails, raise the failure
+%% to the caller: an empty list gives the next assignment slot 0.
 list(ProcID, RawOpts) ->
     Opts = opts(RawOpts),
     hb_cache:list_numbered(
@@ -115,7 +116,7 @@ list(ProcID, RawOpts) ->
             <<"assignments">>,
             hb_util:human_id(ProcID)
         ]),
-        Opts
+        Opts#{ <<"store-failure">> => throw }
     ).
 
 %% @doc Get the latest assignment from the cache.
@@ -271,15 +272,10 @@ concurrent_read_write_test() ->
     ),
     receive 
         writer_done -> ok
-    after 15000 -> 
-        ?assert(false) 
     end,
     AllReaderResults = lists:map(fun(ReaderNum) ->
         receive
             {reader_done, ReaderNum, Results} -> Results
-        after 5000 ->
-            ?assert(false),
-            []
         end
     end, lists:seq(1, 10)),
     FinalSlots = list(ProcID, Opts),

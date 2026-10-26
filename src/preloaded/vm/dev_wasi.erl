@@ -5,6 +5,7 @@
 %%% functions for accessing the filesystem as imported functions by WASM
 %%% modules.
 -module(dev_wasi).
+-specification("../../../specs/wasi@1.0.md").
 -export([init/3, compute/1, stdout/1]).
 -export([path_open/3, fd_write/3, fd_read/3, clock_time_get/3]).
 -include("include/hb.hrl").
@@ -144,7 +145,7 @@ fd_write(S, Instance, [FDnum, Ptr, Vecs, RetPtr], BytesWritten, Opts) ->
     {ok, Data} = hb_beamr_io:read(Instance, VecPtr, Len),
     Before =
         binary:part(
-            OrigData = hb_ao:get(<<"data">>, FD, Opts),
+            OrigData = hb_ao:get(<<"vfs/", Filename/binary>>, S, Opts),
             0,
             StartOffset
         ),
@@ -167,7 +168,7 @@ fd_write(S, Instance, [FDnum, Ptr, Vecs, RetPtr], BytesWritten, Opts) ->
     fd_write(
         S2,
         Instance,
-        [FD, Ptr + 16, Vecs - 1, RetPtr],
+        [FDnum, Ptr + 16, Vecs - 1, RetPtr],
         BytesWritten + byte_size(Data),
         Opts
     ).

@@ -15,9 +15,10 @@
 %%% </pre>
 
 -module(dev_scheduler).
+-specification("../../../specs/scheduler@1.0.md").
 -device_libraries([lib_process, lib_scheduler_formats]).
 %%% AO-Core API functions:
--export([info/0]).
+-export([device_info/0]).
 %%% Local scheduling functions:
 -export([schedule/3, router/4]).
 %%% CU-flow functions:
@@ -46,7 +47,7 @@ start() ->
 
 %% @doc This device uses a default_handler to route requests to the correct
 %% function.
-info() -> 
+device_info() -> 
     #{
         exports =>
             [
@@ -63,7 +64,7 @@ info() ->
 
 %% @doc General utility functions that are available to other modules.
 parse_schedulers(SchedLoc) when is_list(SchedLoc) ->
-    lists:map(fun hb_util:committer/1, SchedLoc);
+    lists:map(fun hb_committer:uri/1, SchedLoc);
 parse_schedulers(SchedLoc) when is_binary(SchedLoc) ->
     parse_schedulers(
         binary:split(
@@ -557,16 +558,14 @@ find_server(ProcID, Base, ToSched, Opts) ->
                     ?event({no_pid_in_local_registry, ProcID}),
                     Proc = find_process_message(ProcID, Base, ToSched, Opts),
                     ?event({found_process, {process, Proc}, {base, Base}}),
+                    % Only the process gives its scheduler. A process that
+                    % is itself scheduled is `Proc' here.
                     SchedLoc =
                         hb_ao:get_first(
                             [
                                 {Proc, <<"scheduler">>},
                                 {Proc, <<"scheduler-location">>}
-                            ] ++
-                            case ToSched of
-                                undefined -> [];
-                                _ -> [{ToSched, <<"scheduler-location">>}]
-                            end,
+                            ],
                             not_found,
                             Opts#{ <<"hashpath">> => ignore }
                         ),
@@ -640,7 +639,11 @@ find_process_message(ProcID, Base, ToSched, Opts) ->
                             end
                     end
             end;
-        P -> P
+        P ->
+            case hb_message:id(P, all, Opts) of
+                ProcID -> P;
+                _ -> throw({process_not_available, ProcID})
+            end
     end.
 
 %% @doc Determine if a scheduler is local. If so, return the PID and options.
@@ -867,7 +870,16 @@ get_schedule(Base, Req, Opts) ->
             ?event({redirect_received, {redirect, Redirect}}),
             case hb_opts:get(scheduler_follow_redirects, true, Opts) of
                 true ->
-                    case get_remote_schedule(ProcID, From, To, Redirect, Opts) of
+                    case
+                        get_remote_schedule(
+                            ProcID,
+                            find_process_message(ProcID, Base, undefined, Opts),
+                            From,
+                            To,
+                            Redirect,
+                            Opts
+                        )
+                    of
                         {ok, Res} ->
                             case uri_string:percent_decode(Format) of
                                 <<"application/aos-2">> ->
@@ -892,7 +904,7 @@ get_schedule(Base, Req, Opts) ->
 
 %% @doc Get a schedule from a remote scheduler, but first read all of the 
 %% assignments from the local cache that we already know about.
-get_remote_schedule(RawProcID, From, To, Redirect, Opts) ->
+get_remote_schedule(RawProcID, Proc, From, To, Redirect, Opts) ->
     % If we are responding to a legacy scheduler request we must add one to the
     % `from' slot to account for the fact that the legacy scheduler gives us
     % the slots _after_ the stated nonce.
@@ -907,6 +919,7 @@ get_remote_schedule(RawProcID, From, To, Redirect, Opts) ->
     ),
     do_get_remote_schedule(
         ProcID,
+        Proc,
         FromLocalCache,
         From + length(FromLocalCache),
         To,
@@ -916,7 +929,7 @@ get_remote_schedule(RawProcID, From, To, Redirect, Opts) ->
 
 %% @doc Get a schedule from a remote scheduler, unless we already have already
 %% read all of the assignments from the local cache.
-do_get_remote_schedule(ProcID, LocalAssignments, From, To, _, Opts)
+do_get_remote_schedule(ProcID, _, LocalAssignments, From, To, _, Opts)
         when (To =/= undefined) andalso (From >= To) ->
     % We already have all of the assignments from the local cache. Return them
     % as a bundle. We set the 'more' to `undefined' to indicate that there may
@@ -935,7 +948,15 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, _, Opts)
             {original_to, To}
         }),
     Res;
-do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
+do_get_remote_schedule(
+        ProcID,
+        Proc,
+        LocalAssignments,
+        From,
+        To,
+        Redirect,
+        Opts
+    ) ->
     % We don't have all of the assignments from the local cache, so we need to
     % fetch the rest from the remote scheduler.
     Node = node_from_redirect(Redirect, Opts),
@@ -1007,8 +1028,10 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                     {ok, NormSched} = 
                         case Variant of
                             <<"ao.N.1">> ->
-                                cache_remote_schedule(Variant, ProcID, Res, Opts),
-                                {ok, Res};
+                                {ok, Checked} =
+                                    check_remote_schedule(ProcID, Proc, Res, Opts),
+                                cache_remote_schedule(Variant, ProcID, Checked, Opts),
+                                {ok, Checked};
                             <<"ao.TN.1">> ->
                                 JSONRes =
                                     hb_json:decode(
@@ -1123,15 +1146,76 @@ cache_remote_schedule(_, ProcID, Schedule, Opts) ->
         false -> Cacher()
     end.
 
-%% @doc Get the node URL from a redirect.
+%% @doc Return a schedule from a remote scheduler with the assignments before
+%% the first that none of the process's schedulers signed. If we refuse an
+%% assignment, we log it, and set `continues' to `true' so that a client does
+%% not take the assignments returned as the whole schedule.
+check_remote_schedule(ProcID, Proc, Schedule, Opts) ->
+    Schedulers =
+        parse_schedulers(
+            hb_ao:get_first(
+                [
+                    {Proc, <<"scheduler">>},
+                    {Proc, <<"scheduler-location">>}
+                ],
+                [],
+                Opts
+            )
+        ),
+    Assignments =
+        hb_util:message_to_ordered_list(
+            hb_ao:normalize_keys(
+                hb_ao:get(
+                    <<"assignments">>,
+                    Schedule,
+                    Opts#{ <<"hashpath">> => ignore }
+                ),
+                Opts
+            )
+        ),
+    case
+        lists:splitwith(
+            fun(Assignment) ->
+                lists:any(
+                    fun(Scheduler) ->
+                        hb_message:verify(Assignment, [Scheduler], Opts)
+                    end,
+                    Schedulers
+                )
+            end,
+            Assignments
+        )
+    of
+        {_, []} -> {ok, Schedule};
+        {Signed, [Refused | _]} ->
+            ?event(warning,
+                {refusing_remote_assignment,
+                    {proc_id, ProcID},
+                    {slot, hb_maps:get(<<"slot">>, Refused, undefined, Opts)},
+                    {signers, hb_message:signers(Refused, Opts)}
+                }
+            ),
+            lib_scheduler_formats:assignments_to_bundle(
+                ProcID,
+                Signed,
+                true,
+                Opts
+            )
+    end.
+
+%% @doc Get the node URL from a redirect. If `hb_hostname:is_blocked/2'
+%% blocks the host of its `location', throw `blocked_host'.
 node_from_redirect(Redirect, Opts) ->
+    Location = hb_ao:get(<<"location">>, Redirect, Opts),
+    case hb_hostname:is_blocked(Location, Opts) of
+        true -> throw(blocked_host);
+        false -> ok
+    end,
     uri_string:recompose(
         (
             hb_maps:remove(
                 query,
-                uri_string:parse(
-                    hb_ao:get(<<"location">>, Redirect, Opts)
-                ),
+                uri_string:parse(Location),
 				Opts
             )
         )#{path => <<"/">>}
@@ -1166,9 +1250,7 @@ filter_json_assignments(JSONRes, To, From, Opts) ->
 post_remote_schedule(RawProcID, Redirect, OnlyCommitted, Opts) ->
     RemoteOpts = Opts#{ <<"http-client">> => httpc },
     ProcID = without_hint(RawProcID),
-    Location = hb_ao:get(<<"location">>, Redirect, Opts),
-    Parsed = uri_string:parse(Location),
-    Node = uri_string:recompose((hb_maps:remove(query, Parsed, Opts))#{path => <<"/">>}),
+    Node = node_from_redirect(Redirect, Opts),
     Variant = hb_ao:get(<<"variant">>, Redirect, <<"ao.N.1">>, Opts),
     case Variant of
         <<"ao.N.1">> ->
@@ -1364,7 +1446,7 @@ find_target_id(Base, Req, Opts) ->
 %% 1. A key in `Req' with the value `self', indicating that the entire message
 %%    is the subject.
 %% 2. A key in `Req' with another value, present in that message.
-%% 3. The body of the message.
+%% 3. The body of `Req', if it is a message.
 %% 4. The message itself.
 find_message_to_schedule(Base, Req, Opts) ->
     Subject =
@@ -1378,7 +1460,14 @@ find_message_to_schedule(Base, Req, Opts) ->
         <<"base">> -> Base;
         <<"self">> -> Req;
         not_found ->
-            hb_ao:get(<<"body">>, Req, Req, Opts#{ <<"hashpath">> => ignore });
+            % If `Req' has no body, or its body is a literal, such as the data
+            % of an ANS-104 item, schedule `Req' itself.
+            case
+                hb_ao:get(<<"body">>, Req, Opts#{ <<"hashpath">> => ignore })
+            of
+                Body when is_map(Body) -> Body;
+                _ -> Req
+            end;
         Subject ->
             hb_ao:get(Subject, Req, Opts#{ <<"hashpath">> => ignore })
     end.
@@ -1483,6 +1572,19 @@ register_new_process_test_parallel() ->
     Opts = #{ <<"priv-wallet">> => hb:wallet() },
     Base = hb_message:commit(test_process(Opts), Opts),
     ?event({test_registering_new_process, {msg, Base}}),
+    % A node with `scheduling-mode: disabled' starts no scheduler.
+    ?assertThrow(
+        {scheduling_disabled_on_node, _},
+        hb_ao:resolve(
+            Base,
+            #{
+                <<"method">> => <<"POST">>,
+                <<"path">> => <<"schedule">>,
+                <<"body">> => Base
+            },
+            #{ <<"scheduling-mode">> => disabled }
+        )
+    ),
     ?assertMatch({ok, _},
         hb_ao:resolve(
             Base,
@@ -1503,6 +1605,35 @@ register_new_process_test_parallel() ->
             hb_ao:get(<<"processes">>, hb_ao:get(status, Base))
         )
     ).
+
+%% @doc A base that carries process A must not provide the process definition
+%% for a schedule request addressed to an unrelated process B.
+schedule_does_not_borrow_another_process_test_parallel() ->
+    start(),
+    Opts = #{ <<"priv-wallet">> => hb:wallet() },
+    A = hb_message:commit(test_process(), Opts),
+    B =
+        hb_message:commit(
+            (test_process())#{ <<"test-random-seed">> => <<"target-b">> },
+            Opts
+        ),
+    BID = hb_util:human_id(hb_message:id(B, all, Opts)),
+    Base = #{ <<"device">> => <<"scheduler@1.0">>, <<"process">> => A },
+    Req = #{
+        <<"path">> => <<"schedule">>,
+        <<"method">> => <<"POST">>,
+        <<"target">> => BID,
+        <<"body">> =>
+            hb_message:commit(
+                #{ <<"type">> => <<"Message">>, <<"test-key">> => <<"x">> },
+                Opts
+            )
+    },
+    ?assertThrow(
+        {process_not_available, BID},
+        hb_ao:resolve(Base, Req, Opts)
+    ),
+    ?assertEqual(not_found, dev_scheduler_cache:read(BID, 0, Opts)).
 
 schedule_message_and_get_slot_test_parallel() ->
     start(),
@@ -1527,7 +1658,19 @@ schedule_message_and_get_slot_test_parallel() ->
     ?event({getting_schedule, {msg, Res}}),
     ?assertMatch({ok, #{ <<"current">> := CurrentSlot }}
             when CurrentSlot > 0,
-        hb_ao:resolve(Base, Res, #{})).
+        hb_ao:resolve(Base, Res, #{})),
+    % If the store cannot list the slots after a restart (its `from-list'
+    % raises), the request fails, and slot 0 is not assigned again.
+    Server = dev_scheduler_registry:find(hb_util:id(Base, all)),
+    Monitor = monitor(process, Server),
+    dev_scheduler_server:stop(Server),
+    receive {'DOWN', Monitor, process, Server, _} -> ok end,
+    [Store | _] = hb_opts:get(store, [], #{}),
+    Raising = Store#{ <<"from-list">> => <<"~json@1.0/deserialize">> },
+    ?assertError(
+        function_clause,
+        hb_ao:resolve(Base, Req, #{ <<"store">> => Raising })
+    ).
 
 redirect_to_hint_test_parallel() ->
     start(),
@@ -1722,7 +1865,27 @@ http_post_schedule() ->
             Opts
         ),
     ?assertEqual(<<"test-message">>, hb_ao:get(<<"body/inner">>, Res2, Opts)),
-    ?assertMatch({ok, #{ <<"current">> := 1 }}, http_get_slot(N, PMsg)).
+    ?assertMatch({ok, #{ <<"current">> := 1 }}, http_get_slot(N, PMsg)),
+    % An ANS-104 item with a literal `body' is scheduled as itself.
+    Item =
+        hb_message:commit(
+            #{
+                <<"target">> => hb_message:id(PMsg, all, Opts),
+                <<"body">> => <<"test-data">>
+            },
+            Opts,
+            <<"ans104@1.0">>
+        ),
+    {ok, Res3} =
+        hb_http:post(
+            N,
+            Item#{ <<"path">> => <<"/~scheduler@1.0/schedule">> },
+            Opts#{ <<"http-codec">> => <<"ans104@1.0">> }
+        ),
+    ?assertEqual(
+        hb_message:id(Item, signed, Opts),
+        hb_message:id(hb_ao:get(<<"body">>, Res3, Opts), signed, Opts)
+    ).
 
 http_get_schedule_test_parallel_() ->
 	{timeout, 20, fun() ->
@@ -1761,7 +1924,7 @@ http_get_schedule_test_parallel_() ->
 				{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 3),
 				Assignments = hb_ao:get(<<"assignments">>, Schedule, Opts),
 				?assertEqual(
-					4, % 4 assignments: a bundle holds no unsigned commitments.
+					4, % 4 assignments: a bundle has no unsigned commitments.
 					hb_maps:size(hb_private:reset(Assignments), Opts)
 				)
 			end}.
@@ -1885,6 +2048,94 @@ http_get_json_schedule_test_parallel_() ->
 					length(hb_maps:get(<<"edges">>, Assignments))
 				)
 			end}.
+
+%% @doc A node that reads a schedule from the process's scheduler on another
+%% node caches the assignment that the scheduler signed, and not one that
+%% another wallet signed, whether the read has the process in its base or
+%% has the process's ID and the node has the process in its cache. Its reply
+%% over HTTP stops before the assignment that another wallet signed.
+http_cache_remote_schedule_test_parallel_() ->
+    {timeout, 30, fun http_cache_remote_schedule/0}.
+http_cache_remote_schedule() ->
+    {SchedNode, SchedOpts} = http_init(),
+    {Node, Opts} = http_init(#{ <<"scheduler-async-remote-cache">> => false }),
+    {Node2, Opts2} =
+        http_init(
+            #{
+                <<"scheduler-async-remote-cache">> => false,
+                <<"hosts-block-internal">> => false
+            }
+        ),
+    PMsg = hb_message:commit(test_process(SchedOpts), SchedOpts),
+    ProcID = hb_util:human_id(hb_message:id(PMsg, all, SchedOpts)),
+    % The scheduler assigns slot 0, and its store has a slot 1 that another
+    % wallet signed.
+    {ok, _} =
+        hb_ao:resolve(
+            PMsg,
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> => PMsg
+            },
+            SchedOpts
+        ),
+    Forged =
+        hb_message:commit(
+            #{
+                <<"variant">> => <<"ao.N.1">>,
+                <<"process">> => ProcID,
+                <<"slot">> => 1
+            },
+            #{ <<"priv-wallet">> => ar_wallet:new() }
+        ),
+    ok = dev_scheduler_cache:write(ProcID, Forged, SchedOpts),
+    Location =
+        hb_message:commit(
+            #{
+                <<"type">> => <<"location">>,
+                <<"url">> => SchedNode,
+                <<"nonce">> => 1,
+                <<"time-to-live">> => 60 * 60 * 1000
+            },
+            SchedOpts
+        ),
+    {ok, _} = hb_http:post(Node, <<"/~location@1.0/known">>, Location, #{}),
+    {ok, _} = hb_http:post(Node2, <<"/~location@1.0/known">>, Location, #{}),
+    % A node that blocks internal hosts does not contact the scheduler.
+    ?assertThrow(blocked_host, hb_ao:resolve(PMsg, <<"slot">>, Opts)),
+    % The read has the process in its base, and the node does not have it.
+    % The read allows internal hosts, as `Node2' does.
+    {ok, _} =
+        hb_ao:resolve(
+            PMsg,
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"GET">>,
+                <<"from">> => 0,
+                <<"to">> => 1
+            },
+            Opts#{ <<"hosts-block-internal">> => false }
+        ),
+    ?assertMatch({ok, _}, dev_scheduler_cache:read(ProcID, 0, Opts)),
+    ?assertEqual(not_found, dev_scheduler_cache:read(ProcID, 1, Opts)),
+    % The read has the process's ID, and the node has the process.
+    {ok, _} = hb_cache:write(PMsg, Opts2),
+    {ok, Schedule} = http_get_schedule(Node2, PMsg, 0, 1),
+    % The reply stops before slot 1, and says that the schedule continues.
+    ?assertEqual(
+        {[<<"0">>], true},
+        {
+            hb_maps:keys(
+                hb_private:reset(
+                    hb_ao:get(<<"assignments">>, Schedule, Opts2)
+                )
+            ),
+            hb_ao:get(<<"continues">>, Schedule, Opts2)
+        }
+    ),
+    ?assertMatch({ok, _}, dev_scheduler_cache:read(ProcID, 0, Opts2)),
+    ?assertEqual(not_found, dev_scheduler_cache:read(ProcID, 1, Opts2)).
 
 %%% Benchmarks
 

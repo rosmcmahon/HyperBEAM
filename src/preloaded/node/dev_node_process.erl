@@ -5,13 +5,14 @@
 %%% Definitions of singleton processes are expected to be found with their 
 %%% names in the `node_processes' section of the node message.
 -module(dev_node_process).
--export([info/1]).
+-specification("../../../specs/node-process@1.0.md").
+-export([device_info/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Register a default handler for the device. Inherits `keys' and `set'
 %% from the default device.
-info(_Opts) ->
+device_info(_Opts) ->
     #{
         default => fun lookup/4,
         excludes => [<<"committers">>, <<"set">>, <<"keys">>]
@@ -36,10 +37,21 @@ lookup(Name, _Base, Req, Opts) ->
         {ok, ProcessID} ->
             hb_cache:read(ProcessID, Opts);
         {error, not_found} ->
-            case hb_ao:get(<<"spawn">>, Req, true, Opts) of
-                true ->
-                    spawn_register(Name, Opts);
-                false ->
+            case {
+                hb_ao:get(<<"spawn">>, Req, true, Opts),
+                hb_opts:get(node_processes, #{}, Opts)
+            } of
+                {true, #{ Name := _ }} ->
+                    % Spawn one process for lookups of the name at once.
+                    hb_name:ok_or_atomic_apply(
+                        {?MODULE, Name},
+                        fun() ->
+                            lookup(Name, #{}, #{ <<"spawn">> => false }, Opts)
+                        end,
+                        fun() -> spawn_register(Name, Opts) end
+                    );
+                _ ->
+                    % A node process without a definition cannot be spawned.
                     {error, not_found}
             end
     end.
@@ -170,20 +182,22 @@ lookup_no_spawn_test() ->
 
 lookup_spawn_test() ->
     {Name, Opts} = generate_test_opts(),
-    Res1 = {_, Process1} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"node-process@1.0">> },
-            Name,
-            Opts
+    % Two first lookups of the name at once give one process.
+    [Res1 = {_, Process1}, {ok, Process2}] =
+        hb_pmap:parallel_map(
+            [Name, Name],
+            fun(N) ->
+                hb_ao:resolve(
+                    #{ <<"device">> => <<"node-process@1.0">> },
+                    N,
+                    Opts
+                )
+            end,
+            2
         ),
     ?assertMatch(
         {ok, #{ <<"device">> := <<"process@1.0">> }},
         Res1
-    ),
-    {ok, Process2} = hb_ao:resolve(
-        #{ <<"device">> => <<"node-process@1.0">> },
-        Name,
-        Opts
     ),
     LoadedProcess1 = 
         hb_message:normalize_commitments(

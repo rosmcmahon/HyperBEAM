@@ -3,10 +3,19 @@
 %%% bring trusted results into the local node, or as the `Execution-Device' of
 %%% an AO process.
 -module(dev_delegated_compute).
+-specification("../../../specs/delegated-compute@1.0.md").
 -device_libraries([lib_process, lib_scheduler_formats]).
 -export([init/3, compute/3, normalize/3, snapshot/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+%% The keys with which a request, or the message that it relays, steers
+%% `relay@1.0'.
+-define(RELAY_KEYS, [
+    <<"peer">>, <<"relay-route">>, <<"route-path">>, <<"relay-path">>,
+    <<"relay-method">>, <<"relay-body">>, <<"relay-device">>,
+    <<"relay-commit-request">>, <<"commit-request">>
+]).
 
 %% @doc Initialize or normalize the compute-lite device. For now, we don't
 %% need to do anything special here.
@@ -66,7 +75,7 @@ load_state(Snapshot, Opts) ->
     #{ _ => _ },
     #{ type => binary(), slot => integer(), 'process-id' => binary(), _ => _ },
     #{ _ => _ }
-) -> {ok, #{ _ => _ }} | {error, _}.
+) -> {ok, #{ _ => _ }} | {failure, _}.
 compute(Base, Req, Opts) ->
     OutputPrefix =
         hb_ao:get(
@@ -152,7 +161,10 @@ do_dryrun(ProcID, Req, Opts) ->
     ),
     extract_json_res(Response, Opts).
 
-do_relay(Method, Path, Body, Headers, Opts) ->
+do_relay(Method, Path, Body, RawHeaders, Opts) ->
+    % The headers go to the compute server. They do not choose where the relay
+    % goes: a snapshot's keys come from a caller.
+    Headers = hb_maps:without(?RELAY_KEYS, RawHeaders, Opts),
     ContentType =
         hb_maps:get(
             <<"content-type">>,
@@ -170,7 +182,7 @@ do_relay(Method, Path, Body, Headers, Opts) ->
         },
         Headers#{
             <<"path">> => <<"call">>,
-            <<"target">> => <<"payload">>,
+            <<"relay-subject">> => <<"payload">>,
             <<"payload">> =>
                 Headers#{
                     <<"path">> => Path,
@@ -179,10 +191,13 @@ do_relay(Method, Path, Body, Headers, Opts) ->
                     <<"content-type">> => ContentType
                 }
         },
-        Opts#{ <<"relay-block-internal">> => false }
+        Opts#{ <<"hosts-block-internal">> => false }
     ).
 
-%% @doc Extract the JSON response from the delegated compute response.
+%% @doc Extract the JSON response from the delegated compute response. An
+%% answer that is not a result, an error status, or no answer at all means
+%% that the server did not compute the message. That depends on the server
+%% this node uses, not on the process, so it is a failure of this node.
 extract_json_res(Response, Opts) ->
     case Response of 
         {ok, Res} ->
@@ -191,10 +206,29 @@ extract_json_res(Response, Opts) ->
                 delegated_compute_res_metadata,
                 {req, hb_maps:without([<<"body">>], Res, Opts)}
             }),
-            {ok, JSONRes};
+            case is_result(hb_json:decode(JSONRes, Opts)) of
+                true -> {ok, JSONRes};
+                false ->
+                    {failure,
+                        #{
+                            <<"status">> => 502,
+                            <<"reason">> =>
+                                <<"Delegated compute answer is not a result.">>,
+                            <<"body">> => JSONRes
+                        }
+                    }
+            end;
         {Err, Error} when Err == error; Err == failure ->
-            {error, Error}
+            {failure, Error}
     end.
+
+%% @doc Return whether a decoded answer of the server is a result, which holds
+%% `Output', `Messages' or `Error'. An `Error' is the process's own error, the
+%% same on every node.
+is_result(#{ <<"Output">> := _ }) -> true;
+is_result(#{ <<"Messages">> := _ }) -> true;
+is_result(#{ <<"Error">> := _ }) -> true;
+is_result(_) -> false.
 
 get_process_id(Base, Req, Opts) ->
     RawProcessID = lib_process:process_id(Base, #{}, Opts),
@@ -236,8 +270,8 @@ handle_relay_response(Base, Req, Opts, Response, OutputPrefix, ProcessID, Slot) 
                     Opts
                 )
             };
-        {error, Error} ->
-            {error, Error}
+        {failure, Failure} ->
+            {failure, Failure}
     end.
 
 %% @doc Generate a snapshot of a running computation by calling the 
@@ -265,7 +299,7 @@ snapshot(Msg, Req, Opts) ->
             Opts#{
                 <<"hashpath">> => ignore,
                 <<"cache-control">> => [<<"no-store">>, <<"no-cache">>],
-                <<"relay-block-internal">> => false
+                <<"hosts-block-internal">> => false
             }
         ),
     ?event({snapshotting_result, Res}),

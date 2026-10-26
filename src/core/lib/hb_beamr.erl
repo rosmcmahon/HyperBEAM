@@ -66,6 +66,12 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% An image is WASM if it starts with the WASM magic. An AOT image is machine
+%% code for the host, so only the `aot' mode, which the node's options give,
+%% loads one.
+-define(IS_WASM(Bin),
+    (byte_size(Bin) >= 4 andalso binary_part(Bin, 0, 4) =:= <<0, "asm">>)).
+
 %% @doc Load the driver for the WASM executor.
 load_driver() ->
     case erl_ddll:load(code:priv_dir(hb), ?MODULE) of
@@ -79,6 +85,11 @@ load_driver() ->
 %% (wasm or aot) to indicate the type of WASM module being loaded.
 start(WasmBinary) when is_binary(WasmBinary) ->
     start(WasmBinary, wasm).
+start(WasmBinary, Mode)
+        when is_binary(WasmBinary)
+        andalso Mode =/= aot
+        andalso not ?IS_WASM(WasmBinary) ->
+    {error, <<"Failed to load module: image is not WASM.">>};
 start(WasmBinary, Mode) when is_binary(WasmBinary) ->
     ?event({loading_module, {bytes, byte_size(WasmBinary)}, Mode}),
     Self = self(),
@@ -200,7 +211,7 @@ call(WASM, FuncRef, Args, ImportFun, StateMsg, Opts)
             ?event({waiting_for_call_result, self(), WASM}),
             monitor_call(WASM, ImportFun, StateMsg, Opts);
         false ->
-            {error, {invalid_args, Args}}
+            {error, <<"invalid-parameters">>, StateMsg}
     end.
 
 %% @doc Stub import function for the WASM executor.
@@ -209,7 +220,8 @@ stub(Base, _Req, _Opts) ->
     {ok, [0], Base}.
 
 %% @doc Synchonously monitor the WASM executor for a call result and any
-%% imports that need to be handled.
+%% imports that need to be handled. An import that raises stops the executor,
+%% and its exception is raised to the caller.
 monitor_call(WASM, ImportFun, StateMsg, Opts) ->
     receive
         {execution_result, Result} ->
@@ -231,20 +243,16 @@ monitor_call(WASM, ImportFun, StateMsg, Opts) ->
                     ),
                 ?event({import_ret, Module, Func, {args, Args}, {res, Res}}),
                 dispatch_response(WASM, Res),
-                monitor_call(WASM, ImportFun, StateReq, Opts)
+                StateReq
+            of
+                NextState -> monitor_call(WASM, ImportFun, NextState, Opts)
             catch
                 Err:Reason:Stack ->
-                    % Signal the WASM executor to stop.
+                    % The executor waits for the import's response: stop it.
+                    % A stopped executor sends no further messages.
                     ?event({import_error, Err, Reason, Stack}),
                     stop(WASM),
-                    % The driver is going to send us an error message, so we 
-                    % need to clear it from the mailbox, even if we already 
-                    % know that the import failed.
-                    receive
-                        {error, _} -> ok
-                    %after 0 -> ok
-                    end,
-                    {error, Err, Reason, Stack, StateMsg}
+                    erlang:raise(Err, Reason, Stack)
             end;
         {error, Error} ->
             ?event({wasm_error, Error}),
@@ -294,10 +302,15 @@ deserialize(WASM, Bin) when is_pid(WASM) andalso is_binary(Bin) ->
     Res.
 
 %% @doc Replace the WASM instance of a worker with a new instance of the
-%% image, holding the given memory: the state a restore from a snapshot
+%% image, loaded with the given memory: the state a restore from a snapshot
 %% gives. The worker keeps its pid, so every holder of the instance
 %% continues with a live, freshly initialized instance, with its globals at
 %% their start values.
+reset(_WASM, WasmBinary, Mode, _Memory)
+        when is_binary(WasmBinary)
+        andalso Mode =/= aot
+        andalso not ?IS_WASM(WasmBinary) ->
+    {error, <<"Failed to load module: image is not WASM.">>};
 reset(WASM, WasmBinary, Mode, Memory)
         when is_pid(WASM)
         andalso is_binary(WasmBinary)
@@ -325,7 +338,13 @@ simple_wasm_test() ->
     {ok, File} = file:read_file("test/test.wasm"),
     {ok, WASM, _Imports, _Exports} = start(File),
     {ok, [Result]} = call(WASM, "fac", [5.0]),
-    ?assertEqual(120.0, Result).
+    ?assertEqual(120.0, Result),
+    % A module with an export whose signature is longer than 256 bytes
+    % starts: its signature does not overflow the buffer and end the VM.
+    {ok, WideFile} = file:read_file("test/test-wide.wasm"),
+    ?assertMatch({ok, _, _, _}, start(WideFile)),
+    % An image that is not WASM does not start in the `wasm' mode.
+    ?assertMatch({error, _}, start(<<"not a wasm image">>, wasm)).
 
 %% @doc Test that imported functions can be called from the WASM module.
 imported_function_test() ->
@@ -400,3 +419,22 @@ trap_keeps_instance_usable_test() ->
     {ok, Mem} = serialize(WASM),
     ok = reset(WASM, File, wasm, Mem),
     ?assertEqual({ok, [120.0]}, call(WASM, "fac", [5.0])).
+
+%% @doc An imported function of no results is called, and the driver sizes
+%% its import message to the terms it sends.
+void_import_test() ->
+    % A module that imports `env.f' of type () -> () and exports `run',
+    % which calls it. The byte sequence is the module's sections: type,
+    % import, function, export and code.
+    Module =
+        <<
+            0, "asm", 1, 0, 0, 0,
+            1, 4, 1, 16#60, 0, 0,
+            2, 9, 1, 3, "env", 1, "f", 16#00, 0,
+            3, 2, 1, 0,
+            7, 7, 1, 3, "run", 16#00, 1,
+            16#0A, 6, 1, 4, 0, 16#10, 0, 16#0B
+        >>,
+    {ok, WASM, _Imports, _Exports} = start(Module),
+    ?assertEqual({ok, []}, call(WASM, "run", [])),
+    stop(WASM).

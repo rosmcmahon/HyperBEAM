@@ -11,7 +11,9 @@
 %%% Specs are read from a module's BEAM by `extract/1' and compiled into a
 %%% <em>schema</em>: a map from each normalized key to its accepted argument
 %%% and result schemas, in declaration order. `hb_device_load:schema/2'
-%%% memoises them.
+%%% memoises them. The keys of a message type are a list of `#{ name,
+%%% presence, type }', so the name of a key is a value, never a key: a schema
+%%% is a message that the cache stores and every codec encodes as it is.
 %%% Clauses and union members are tried in declaration order, including
 %%% coercion. A clause selects the base, request and result schemas together.
 %%% Functions sharing a normalized name describe the same AO-Core key; helper
@@ -43,12 +45,12 @@
 %%% ordered by the bounds and their members as declared.
 %%%
 %%% `device' is always kept in the base and `path' in the request, so a
-%%% projection cannot detach an execution from its device or key. Scalar
+%%% projection cannot detach an execution from its device or key. Single-value
 %%% types coerce through the `hb_util' converters; lists, tuples, unions,
 %%% ranges and literals apply recursively. A value that cannot be coerced to
 %%% its type throws `{invalid_type, Path, Schema, Value}'; a required key that
-%%% is absent throws `{required_key_missing, Path}'. `Path' names the key from
-%%% the input that holds it: `base/deep/slot' or `request/slot'. A linked
+%%% is absent throws `{required_key_missing, Path}'. `Path' gives the key from
+%%% the input that contains it: `base/deep/slot' or `request/slot'. A linked
 %%% value that cannot be loaded throws `necessary_message_not_found' with its
 %%% path in the same form.
 %%%
@@ -61,8 +63,8 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% The built-in types that coerce and check as scalars, named as their
-%% normalized kinds are.
+%% The built-in single-value types, which coerce and check by their
+%% normalized names.
 -define(SCALARS,
     #{
         integer => true, non_neg_integer => true, pos_integer => true,
@@ -172,7 +174,7 @@ implicit_request(Schema) ->
 %% @doc A bare `_' argument declares that the function reads nothing from
 %% the message: it is projected to the implicit keys alone.
 top_level_schema(#{ <<"kind">> := <<"wildcard">> }) ->
-    message_type(#{}, none);
+    message_type([], none);
 top_level_schema(Schema) ->
     Schema.
 
@@ -194,23 +196,34 @@ implicit_key(
     Schema = #{ <<"kind">> := <<"message">>, <<"keys">> := Keys },
     Key,
     Presence
-) when not is_map_key(Key, Keys) ->
-    Schema#{
-        <<"keys">> =>
-            Keys#{
-                Key => #{ <<"presence">> => Presence, <<"type">> => any_type() }
-            }
-    };
+) ->
+    case find_key(Key, Keys) of
+        {value, _Field} ->
+            Schema;
+        false ->
+            Field =
+                #{
+                    <<"name">> => Key,
+                    <<"presence">> => Presence,
+                    <<"type">> => any_type()
+                },
+            Schema#{ <<"keys">> => [Field | Keys] }
+    end;
 implicit_key(Schema, _Key, _Presence) ->
     Schema.
+
+%% @doc Find the field of a key in the keys of a message type.
+find_key(Key, Keys) ->
+    lists:search(fun(#{ <<"name">> := Name }) -> Name =:= Key end, Keys).
 
 %% @doc The overlay a result spec declares: `base' or `request' when the
 %% result message -- directly, or inside a tuple or union such as
 %% `{ok, Result}' -- has a `...' key of that literal or alias type.
-overlay(
-    #{ <<"kind">> := <<"message">>, <<"keys">> := #{ <<"...">> := Field } }
-) ->
-    overlay_marker(maps:get(<<"type">>, Field));
+overlay(#{ <<"kind">> := <<"message">>, <<"keys">> := Keys }) ->
+    case find_key(<<"...">>, Keys) of
+        {value, Field} -> overlay_marker(maps:get(<<"type">>, Field));
+        false -> none
+    end;
 overlay(#{ <<"kind">> := <<"tuple">>, <<"items">> := Items }) ->
     first_overlay(Items);
 overlay(#{ <<"kind">> := <<"union">>, <<"members">> := Members }) ->
@@ -338,10 +351,10 @@ substitute(List, Env) when is_list(List) ->
     [substitute(Item, Env) || Item <- List];
 substitute(Value, _Env) -> Value.
 
-%% @doc Compile an abstract type into a schema. `TypeEnv' holds the module's
+%% @doc Compile an abstract type into a schema. `TypeEnv' contains the module's
 %% own types, `VarEnv' the schemas bound to the type variables of the one being
 %% expanded, and `Seen' the types under expansion, so that a recursive type
-%% becomes an alias rather than a loop.
+%% becomes an alias, not a loop.
 parse_type({ann_type, _, [_Var, Type]}, TypeEnv, VarEnv, Seen) ->
     parse_type(Type, TypeEnv, VarEnv, Seen);
 parse_type({var, _, '_'}, _TypeEnv, _VarEnv, _Seen) ->
@@ -391,10 +404,10 @@ parse_type({type, _, map, Fields}, TypeEnv, VarEnv, Seen) ->
                     },
                 case key_name(KeyAst, TypeEnv, VarEnv, Seen) of
                     <<"_">> -> {KeyAcc, Field};
-                    Key -> {KeyAcc#{ Key => Field }, WildAcc}
+                    Key -> {KeyAcc ++ [Field#{ <<"name">> => Key }], WildAcc}
                 end
             end,
-            {#{}, none},
+            {[], none},
             Fields
         ),
     message_type(Keys, Wildcard);
@@ -444,7 +457,7 @@ field_presence(map_field_exact) -> required;
 field_presence(map_field_assoc) -> optional.
 
 %% @doc The message key a map field's key type names. A literal key is the
-%% key itself; `_' is the wildcard; any other type is named by its printed
+%% key itself; `_' is the wildcard; the key of any other type is its printed
 %% form, so that it can never match a real key.
 key_name({atom, _, Atom}, _TypeEnv, _VarEnv, _Seen) ->
     normalize_name(Atom);
@@ -514,8 +527,8 @@ apply_schema(
     % admits. A key kept as given is put back unchanged, so a message the
     % schema does not alter stays the same term.
     {Varied, Changed} =
-        maps:fold(
-            fun(Key, Field, Acc) ->
+        lists:foldl(
+            fun(Field = #{ <<"name">> := Key }, Acc) ->
                 apply_key(Key, Field, Message, Acc, Opts)
             end,
             apply_wildcard(Wildcard, Keys, Message, Opts),
@@ -571,7 +584,7 @@ apply_schema(
             throw({invalid_type, <<>>, Schema, Value})
     end;
 apply_schema(Type, Value, Opts) ->
-    % A scalar, literal or range: keep a value of the type, else coerce it.
+    % A single-value type, literal or range: keep a value of it, else coerce it.
     case check_type(Type, Value) of
         true ->
             {Value, false};
@@ -595,7 +608,7 @@ apply_wildcard(Field, Keys, Message, Opts) ->
     maps:fold(
         fun(Key, _Value, Acc) -> apply_key(Key, Field, Message, Acc, Opts) end,
         {#{}, false},
-        maps:without(maps:keys(Keys), Message)
+        maps:without([Key || #{ <<"name">> := Key } <- Keys], Message)
     ).
 
 %% @doc Vary one declared key of a message onto the accumulated result.
@@ -794,10 +807,11 @@ check_type(#{ <<"kind">> := <<"message">>, <<"keys">> := Keys }, Value)
         when is_map(Value) ->
     lists:all(
         fun
-            ({Key, #{ <<"presence">> := required }}) -> is_map_key(Key, Value);
+            (#{ <<"name">> := Key, <<"presence">> := required }) ->
+                is_map_key(Key, Value);
             (_Field) -> true
         end,
-        maps:to_list(Keys)
+        Keys
     );
 check_type(#{ <<"kind">> := <<"message">> }, _Value) -> false;
 check_type(#{ <<"kind">> := <<"tuple">>, <<"items">> := Items }, Value) ->
@@ -867,7 +881,13 @@ boolean_type() ->
 %% @doc A message schema requiring one key of a type, and nothing else.
 required(Key, Type) ->
     message_type(
-        #{ Key => #{ <<"presence">> => required, <<"type">> => Type } },
+        [
+            #{
+                <<"name">> => Key,
+                <<"presence">> => required,
+                <<"type">> => Type
+            }
+        ],
         none
     ).
 
@@ -889,7 +909,7 @@ map_wildcards_test() ->
     ?assertMatch(
         #{
             <<"kind">> := <<"message">>,
-            <<"keys">> := #{ <<"a">> := _ },
+            <<"keys">> := [#{ <<"name">> := <<"a">> }],
             <<"wildcard">> := #{ <<"presence">> := optional }
         },
         Lazy
@@ -927,13 +947,13 @@ unaltered_message_is_identical_test() ->
         #{ <<"device">> => <<"test@1.0">>, <<"a">> => 1, <<"b">> => <<"x">> },
     Schema =
         message_type(
-            #{
-                <<"a">> =>
-                    #{
-                        <<"presence">> => required,
-                        <<"type">> => scalar_type(<<"integer">>)
-                    }
-            },
+            [
+                #{
+                    <<"name">> => <<"a">>,
+                    <<"presence">> => required,
+                    <<"type">> => scalar_type(<<"integer">>)
+                }
+            ],
             #{ <<"presence">> => optional, <<"type">> => wildcard_type() }
         ),
     {Varied, _} = apply_schema(implicit_base(Schema), Message, #{}),
@@ -957,20 +977,24 @@ nested_projection_drops_commitments_test() ->
     ?assert(hb_message:verify(Signed, [Signer], Opts)),
     Keep = #{ <<"presence">> => optional, <<"type">> => wildcard_type() },
     ChildSchema = message_type(
-        #{
-            <<"slot">> => #{
+        [
+            #{
+                <<"name">> => <<"slot">>,
                 <<"presence">> => required,
                 <<"type">> => scalar_type(<<"integer">>)
             },
-            <<"commitments">> => Keep
-        },
+            Keep#{ <<"name">> => <<"commitments">> }
+        ],
         none
     ),
     Schema = message_type(
-        #{
-            <<"child">> =>
-                #{ <<"presence">> => required, <<"type">> => ChildSchema }
-        },
+        [
+            #{
+                <<"name">> => <<"child">>,
+                <<"presence">> => required,
+                <<"type">> => ChildSchema
+            }
+        ],
         Keep
     ),
     {Varied, _} = apply_schema(Schema, Signed, Opts),
@@ -1043,9 +1067,8 @@ wildcard_commitments(Operation) ->
                 {
                     Projection#{
                         <<"keys">> =>
-                            (maps:get(<<"keys">>, Projection))#{
-                                <<"slot">> => Integer
-                            }
+                            maps:get(<<"keys">>, Projection) ++
+                                [Integer#{ <<"name">> => <<"slot">> }]
                     },
                     Signed,
                     #{ <<"slot">> => Slot },
@@ -1054,10 +1077,12 @@ wildcard_commitments(Operation) ->
             optional_absent ->
                 {
                     message_type(
-                        #{
-                            <<"absent">> =>
-                                Integer#{ <<"presence">> => optional }
-                        },
+                        [
+                            Integer#{
+                                <<"name">> => <<"absent">>,
+                                <<"presence">> => optional
+                            }
+                        ],
                         #{
                             <<"presence">> => optional,
                             <<"type">> => wildcard_type()
@@ -1195,13 +1220,13 @@ explicit_wildcard_loading(Presence, Type) ->
     Missing = {link, <<"ni:%2f%2f%2fsha-256;not-present">>, #{}},
     Schema =
         message_type(
-            #{
-                <<"scheduler">> =>
-                    #{
-                        <<"presence">> => Presence,
-                        <<"type">> => Type
-                    }
-            },
+            [
+                #{
+                    <<"name">> => <<"scheduler">>,
+                    <<"presence">> => Presence,
+                    <<"type">> => Type
+                }
+            ],
             none
         ),
     {Varied, false} = apply_schema(Schema, #{ <<"scheduler">> => Link }, Opts),
@@ -1236,7 +1261,7 @@ optional_wildcard_preserves_links_and_sequences_materialize_test() ->
     Link = {link, ValuePath, #{}},
     WildcardSchema =
         message_type(
-            #{},
+            [],
             #{ <<"presence">> => optional, <<"type">> => wildcard_type() }
         ),
     {Varied, _} =

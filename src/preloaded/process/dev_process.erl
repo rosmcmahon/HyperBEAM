@@ -42,7 +42,8 @@
 -module(dev_process).
 -device_libraries([lib_process, lib_process_cache]).
 %%% Public API
--export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
+-export([device_info/1]).
+-export([as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
 -export([target_slot/2]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
@@ -58,15 +59,15 @@
 -define(DEFAULT_SNAPSHOT_TIME, 60).
 -endif.
 
-%% @doc When the info key is called, we should return the process exports.
-info(_Base) ->
+%% @doc Return the options of the device: the `worker', `grouper' and `await'
+%% functions of its executions, and the keys that it exports.
+device_info(_Base) ->
     #{
         worker => fun dev_process_worker:server/3,
         grouper => fun dev_process_worker:group/3,
         await => fun dev_process_worker:await/5,
         exports =>
             [
-                <<"info">>,
                 <<"as">>,
                 <<"compute">>,
                 <<"now">>,
@@ -171,15 +172,17 @@ snapshot(RawBase, _Req, Opts) ->
 
 %% @doc Before computation begins, a boot phase is required. This phase
 %% allows devices on the execution stack to initialize themselves. We set the
-%% private `initialized' key to `true' to indicate that the state holds the
+%% private `initialized' key to `true' to indicate that the state contains the
 %% live state of its execution devices. The key is never stored, so a state
 %% read from the cache is not initialized.
 init(Base, Req, Opts) ->
     ?event({init_called, {base, Base}, {req, Req}}),
+    % If the process does not set `requires-determinism', set it to `true',
+    % such that its execution devices give the same result on every node.
     {ok, Initialized} =
         lib_process:run_as(
             <<"execution">>,
-            Base,
+            hb_maps:merge(#{ <<"requires-determinism">> => true }, Base, Opts),
             #{ <<"path">> => <<"init">> },
             Opts
         ),
@@ -394,7 +397,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
         Opts
     ),
     case Res of
-        {ok, NewProcStateMsg} ->
+        {ok, NewProcStateMsg} when is_map(NewProcStateMsg) ->
             % We have now transformed slot n -> n + 1. Increment the current slot.
             NewProcStateMsgWithSlot =
                 hb_ao:set(
@@ -452,8 +455,9 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             % caller polls `/now' or `/compute'.
             maybe_trigger_push(State, Slot, InitReq, Opts),
             {ok, ProcStateWithSnapshot};
-        {error, Error} ->
-            % An error occurred while computing the slot. The slot's
+        {Status, Error} when Status == ok; Status == error ->
+            % An error occurred while computing the slot, or its result is
+            % not a message, so it cannot be the process state. The slot's
             % message leaves the state as it found it: the error becomes
             % the slot's results over the inbound state, the slot is
             % stored as usual, and computing carries on to the next slot
@@ -529,7 +533,8 @@ prepare_next_slot(ProcID, State, RawReq, Opts) ->
 %% the compute path that produced this slot.
 %%
 %% `push' values:
-%%   `true' / `<<"true">>'  - push, no `max-depth' set (unbounded recursion).
+%%   `true' / `<<"true">>'  - push with no `max-depth' set, so the node's
+%%                            `push_max_depth' option bounds the recursion.
 %%   non-negative integer N - push with `max-depth = N', so the fan-out
 %%                            unwinds at most N levels deep. See `dev_push'
 %%                            for `max-depth = 0' semantics: each outbox
@@ -703,26 +708,28 @@ now(RawBase, Req, Opts) ->
     ProcessID = lib_process:process_id(Base, #{}, Opts),
     case hb_opts:get(process_now_from_cache, false, Opts) of
         false ->
-            {ok, CurrentSlot} =
-                hb_ao:resolve(
-                    Base,
-                    #{ <<"path">> => <<"slot/current">> },
+            maybe
+                {ok, CurrentSlot} ?=
+                    hb_ao:resolve(
+                        Base,
+                        #{ <<"path">> => <<"slot/current">> },
+                        Opts
+                    ),
+                ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
+                lib_process_cache:refresh(
+                    ProcessID,
+                    hb_util:int(CurrentSlot),
                     Opts
                 ),
-            ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
-            lib_process_cache:refresh(
-                ProcessID,
-                hb_util:int(CurrentSlot),
-                Opts
-            ),
-            hb_ao:resolve(
-                Base,
-                (hb_maps:with([<<"push">>], Req, Opts))#{
-                    <<"path">> => <<"compute">>,
-                    <<"slot">> => CurrentSlot
-                },
-                Opts
-            );
+                hb_ao:resolve(
+                    Base,
+                    (hb_maps:with([<<"push">>], Req, Opts))#{
+                        <<"path">> => <<"compute">>,
+                        <<"slot">> => CurrentSlot
+                    },
+                    Opts
+                )
+            end;
         CacheParam ->
             % We are serving the latest known state from the cache, rather
             % than computing it.
@@ -830,31 +837,9 @@ ensure_loaded(Base, Req, Opts) ->
                     % the public component of a message) into memory.
                     % Do not update the hashpath while we do this, and remove
                     % the snapshot key after we have normalized the message.
-                    Process = 
-                        hb_maps:get(
-                            <<"process">>,
-                            SnapshotMsg,
-                            undefined,
-                            Opts
-                        ),
-                    #{ <<"commitments">> := HmacCommits} =
-                        hb_message:with_commitments(
-                            #{ <<"type">> => <<"hmac-sha256">>},
-                            Process,
-                            Opts
-                        ),
-                    #{ <<"commitments">> := SignCommits } =
-                        hb_message:with_commitments(ProcID, Process, Opts),
-                    UpdateProcess =
-                        hb_maps:put(
-                            <<"commitments">>,
-                            hb_maps:merge(HmacCommits, SignCommits),
-                            Process,
-                            Opts
-                        ),
                     SnapshotReq =
                         hb_private:set(
-                            SnapshotMsg#{ <<"process">> => UpdateProcess },
+                            SnapshotMsg,
                             <<"initialized">>,
                             <<"true">>,
                             Opts
@@ -894,12 +879,20 @@ ensure_loaded(Base, Req, Opts) ->
                             {slot, TargetSlot}
                         }
                     ),
-                    {ok, _} =
-                        hb_cache:write(
+                    % A process runs from its committed keys only, whether the
+                    % request gives the process itself or carries it.
+                    {ok, Process} =
+                        hb_message:with_only_committed(
                             hb_maps:get(<<"process">>, Base, Base, Opts),
-                            lib_process:cache_opts(Opts)
+                            Opts
                         ),
-                    init(Base, Req, Opts)
+                    {ok, _} =
+                        hb_cache:write(Process, lib_process:cache_opts(Opts)),
+                    init(
+                        lib_process:ensure_process_key(Process, Opts),
+                        Req,
+                        Opts
+                    )
             end
     end.
 

@@ -17,15 +17,16 @@
 %%%                                 if the record is valid and newer than the
 %%%                                 known nonce for the signer.
 -module(dev_location).
--export([info/0, read/2, node/3, known/3, all/3]).
+-device_libraries([lib_process]).
+-export([device_info/0, read/2, node/3, known/3, all/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--define(DEFAULT_TTL, 28 * 24 * 60 * 60). % 28 days.
+-define(DEFAULT_TTL, 28 * 24 * 60 * 60 * 1000). % 28 days, in milliseconds.
 -define(DEFAULT_CODEC, <<"httpsig@1.0">>).
 
 %% @doc Handle all requests aside `known` with the `location/4' resolver.
-info() ->
+device_info() ->
     #{
         excludes => [
             <<"committers">>,
@@ -72,7 +73,7 @@ read(Address, Variant, Opts) ->
         {ok, Cached}
     else
         _ ->
-            case hb_client_gateway:location(Address, Variant, Opts) of
+            case gateway_location(Address, Variant, Opts) of
                 {ok, Location} ->
                     dev_location_cache:write(Location, Opts),
                     {ok, Location};
@@ -87,12 +88,39 @@ read(Address, Variant, Opts) ->
             end
     end.
 
+%% @doc Read the location record of an address from a gateway. A gateway may
+%% answer a query with a record that another wallet signed, so we return the
+%% record only if the address is its sole signer. We compare the signers with
+%% the URI of the address, so the address matches in any of its forms.
+gateway_location(Address, Variant, Opts) ->
+    maybe
+        {ok, Location} ?= hb_client_gateway:location(Address, Variant, Opts),
+        Signers = hb_message:signers(Location, Opts),
+        true ?=
+            Signers =:= [hb_committer:uri(Address, Opts)]
+            orelse {error, <<"Address is not the sole signer of the record.">>},
+        {ok, Location}
+    end.
+
 %% @doc Find the latest known nonce for an address by checking the local cache
 %% first and then the gateway.
 latest_known_nonce(Address, Opts) ->
     case read(Address, Opts) of
         {ok, Location} -> hb_maps:get(<<"nonce">>, Location, -1, Opts);
         _ -> -1
+    end.
+
+%% @doc Read the node's location record from the cache. If the `location_url'
+%% option is set, return `{error, not_found}' for a record with another `url'.
+read_current(Self, Opts) ->
+    maybe
+        {ok, Cached} ?= dev_location_cache:read(Self, Opts),
+        URL = hb_opts:get(location_url, not_found, Opts),
+        true ?=
+            URL =:= not_found orelse
+                URL =:= hb_maps:get(<<"url">>, Cached, not_found, Opts) orelse
+                {error, not_found},
+        {ok, Cached}
     end.
 
 %% @doc Find the target to be used for during a request.
@@ -140,7 +168,11 @@ node(Base, RawReq, RawOpts) ->
     ),
     Signers = hb_message:signers(OnlyCommitted, Opts),
     Self = hb_opts:committer(hb:wallet(), Opts),
-    IsOperator = lists:member(Self, Signers),
+    % A pushed result is signed by the node, but it is not a request from the
+    % operator.
+    IsOperator =
+        lists:member(Self, Signers) andalso
+            not lib_process:is_pushed(OnlyCommitted, Opts),
     ExistingNonce = latest_known_nonce(Self, Opts),
     RequestedNonce = hb_maps:get(<<"nonce">>, OnlyCommitted, not_found, Opts),
     case {IsOperator, RequestedNonce} of
@@ -148,7 +180,7 @@ node(Base, RawReq, RawOpts) ->
             % A non-operator has requested that we generate a new location record.
             % First we check if we have a valid location record already and if
             % so return that instead.
-            case dev_location_cache:read(Self, Opts) of
+            case read_current(Self, Opts) of
                 {ok, Location} ->
                     {ok, Location};
                 {error, not_found} ->
@@ -235,12 +267,7 @@ default_url(Opts) ->
 %% `location_notify' option. Finally, we will return the signed location record
 %% to the caller.
 generate_new_location(Nonce, Base, OnlyCommitted, Opts) ->
-    DefaultTTL =
-        hb_opts:get(
-            location_ttl,
-            hb_opts:get(scheduler_location_ttl, 1000 * 60 * 60, Opts),
-            Opts
-        ),
+    DefaultTTL = hb_opts:get(location_ttl, ?DEFAULT_TTL, Opts),
     TimeToLive =
         case hb_maps:get(<<"time-to-live">>, Base, not_found, Opts) of
             not_found ->
@@ -256,13 +283,27 @@ generate_new_location(Nonce, Base, OnlyCommitted, Opts) ->
     % Construct the new scheduler location message.
     DefaultCodec = hb_opts:get(location_codec, ?DEFAULT_CODEC, Opts),
     Codec =
-        case hb_maps:get(<<"require-codec">>, Base, not_found, Opts) of
+        case hb_maps:get(<<"commitment-device">>, Base, not_found, Opts) of
             not_found ->
-                hb_maps:get(<<"require-codec">>, OnlyCommitted, DefaultCodec, Opts);
+                hb_maps:get(
+                    <<"commitment-device">>,
+                    OnlyCommitted,
+                    DefaultCodec,
+                    Opts
+                );
             CodecValue ->
                 CodecValue
         end,
-    generate_new_location(URL, Nonce, TimeToLive, Codec, Opts).
+    case is_binary(Codec) of
+        true ->
+            generate_new_location(URL, Nonce, TimeToLive, Codec, Opts);
+        false ->
+            {error,
+                #{
+                    <<"status">> => 400,
+                    <<"body">> => <<"Commitment device must be a codec name.">>
+                }}
+    end.
 generate_new_location(URL, Nonce, TTL, Codec, Opts) ->
     NewSchedulerLocation =
         #{
@@ -271,8 +312,7 @@ generate_new_location(URL, Nonce, TTL, Codec, Opts) ->
             <<"type">> => <<"location">>,
             <<"url">> => URL,
             <<"nonce">> => Nonce,
-            <<"time-to-live">> => TTL,
-            <<"codec-device">> => Codec
+            <<"time-to-live">> => TTL
         },
     Signed = hb_message:commit(NewSchedulerLocation, Opts, Codec),
     dev_location_cache:write(Signed, Opts),
@@ -331,13 +371,14 @@ write_foreign(Base, RawReq, Opts) ->
             )
             orelse {error, <<"Invalid location record type.">>},
         true ?=
-            (hb_maps:get(<<"url">>, MaybeLocation, Opts) =/= not_found)
+            (hb_maps:get(<<"url">>, MaybeLocation, not_found, Opts) =/= not_found)
             orelse {error, <<"Missing location record URL.">>},
         true ?=
-            (hb_maps:get(<<"nonce">>, MaybeLocation, Opts) =/= not_found)
+            (hb_maps:get(<<"nonce">>, MaybeLocation, not_found, Opts) =/= not_found)
             orelse {error, <<"Missing location record nonce.">>},
         true ?=
-            (hb_maps:get(<<"time-to-live">>, MaybeLocation, Opts) =/= not_found)
+            (hb_maps:get(<<"time-to-live">>, MaybeLocation, not_found, Opts)
+                =/= not_found)
             orelse {error, <<"Missing location record time-to-live.">>},
         Nonce = hb_util:int(hb_ao:get(<<"nonce">>, MaybeLocation, 0, Opts)),
         SignerChecks =
@@ -459,12 +500,43 @@ register_scheduler_test() ->
                 <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
                 <<"method">> => <<"POST">>,
                 <<"nonce">> => 1,
-                <<"require-codec">> => <<"ans104@1.0">>
+                <<"commitment-device">> => <<"ans104@1.0">>
             },
             Opts
         ),
     {ok, Res} = hb_http:post(Node, Base, Opts),
-    ?assertMatch(#{ <<"url">> := Location } when is_binary(Location), Res).
+    ?assertMatch(#{ <<"url">> := Location } when is_binary(Location), Res),
+    ?assert(
+        lists:member(
+            <<"ans104@1.0">>,
+            hb_message:commitment_devices(Res, Opts)
+        )
+    ).
+
+%% @doc `known' refuses a signed location record that has no nonce.
+known_requires_nonce_test() ->
+    Opts =
+        #{
+            <<"store">> => [hb_test_utils:test_store()],
+            <<"priv-wallet">> => ar_wallet:new()
+        },
+    Record =
+        hb_message:commit(
+            #{
+                <<"type">> => <<"location">>,
+                <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
+                <<"time-to-live">> => 60 * 60 * 1000
+            },
+            Opts
+        ),
+    ?assertEqual(
+        {error, <<"Missing location record nonce.">>},
+        hb_ao:resolve(
+            #{ <<"device">> => <<"location@1.0">> },
+            Record#{ <<"path">> => <<"known">>, <<"method">> => <<"POST">> },
+            Opts
+        )
+    ).
 
 %% @doc Test that unsigned GET calls to `node' return the same location record
 %% once one has been generated.
@@ -479,6 +551,8 @@ unsigned_get_node_is_idempotent_test() ->
     FirstLocation = hb_ao:get(<<"body">>, FirstRes, FirstRes, #{}),
     Address = hb_test_utils:committer(Wallet),
     {ok, CachedAfterFirst} = dev_location_cache:read(Address, Opts),
+    % The cached record keeps the signature of the node that signed it.
+    ?assertEqual([Address], hb_message:signers(CachedAfterFirst, Opts)),
     timer:sleep(10),
     {ok, SecondRes} = hb_http:get(Node, <<"/~location@1.0/node">>, #{}),
     SecondLocation = hb_ao:get(<<"body">>, SecondRes, SecondRes, #{}),
@@ -493,6 +567,17 @@ unsigned_get_node_is_idempotent_test() ->
     ?assertEqual(
         hb_maps:get(<<"url">>, FirstLocation, not_found, #{}),
         hb_maps:get(<<"url">>, SecondLocation, not_found, #{})
+    ),
+    % If the node's `location-url' changes, an unsigned GET gives a new record.
+    hb_http_server:set_opts(
+        (hb_http_server:get_opts())#{
+            <<"location-url">> => <<"https://new.example">>
+        }
+    ),
+    {ok, ThirdRes} = hb_http:get(Node, <<"/~location@1.0/node">>, #{}),
+    ?assertMatch(
+        #{ <<"url">> := <<"https://new.example">> },
+        hb_ao:get(<<"body">>, ThirdRes, ThirdRes, #{})
     ).
 
 %% @doc Test that a scheduler location is registered on boot.
@@ -520,7 +605,7 @@ register_location_on_boot_test() ->
                         <<"path">> => <<"node">>,
                         <<"method">> => <<"POST">>,
                         <<"target">> => <<"self">>,
-                        <<"require-codec">> => <<"ans104@1.0">>,
+                        <<"commitment-device">> => <<"ans104@1.0">>,
                         <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
                         <<"hook">> => #{
                             <<"result">> => <<"ignore">>,
@@ -562,4 +647,14 @@ register_location_on_boot_test() ->
             <<"nonce">> := Nonce
         } when Nonce > 0,
         RemoteLocation
+    ),
+    % Records for an operator's request and an unsigned GET: 28 days in ms.
+    {ok, PeerLocation} =
+        hb_http:get(NotifiedPeer, <<"/~location@1.0/node">>, #{}),
+    ?assertEqual(
+        [2419200000, 2419200000],
+        [
+            hb_maps:get(<<"time-to-live">>, CurrentBody, not_found, #{}),
+            hb_maps:get(<<"time-to-live">>, PeerLocation, not_found, #{})
+        ]
     ).

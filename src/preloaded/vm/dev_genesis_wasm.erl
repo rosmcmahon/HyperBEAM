@@ -2,14 +2,16 @@
 %%% processes, using HyperBEAM infrastructure. This allows existing `legacynet'
 %%% AO process definitions to be used in HyperBEAM.
 -module(dev_genesis_wasm).
+-specification("../../../specs/genesis-wasm@1.0.md").
 -device_libraries([lib_process, lib_process_cache]).
 -export([init/3, compute/3, normalize/3, snapshot/3, import/3]).
--export([latest_checkpoint/2]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
 
 %%% Timeout for legacy CU status check.
 -define(STATUS_TIMEOUT, 100).
+%%% Timeout for the legacy CU to start.
+-define(START_TIMEOUT, 30000).
 
 %% @doc Initialize the device.
 -spec init(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
@@ -50,8 +52,10 @@ normalize(Msg, Req, Opts) ->
     #{ _ => _ }
 ) -> {ok, #{ _ => _ }} | {error, _}.
 compute(Msg, Req, Opts) ->
+    % Give an assignment its `hash-chain', and the state the next one.
+    {Msg2, Req2} = add_hash_chain(Msg, Req, Opts),
     % Validate whether the genesis-wasm feature is enabled.
-    case delegate_request(Msg, Req, Opts) of
+    case delegate_request(Msg2, Req2, Opts) of
         {ok, Res} ->
             % Resolve the `patch@1.0' device.
             {ok, Msg4} =
@@ -72,7 +76,43 @@ compute(Msg, Req, Opts) ->
             {ok, Msg};
         {error, Error} ->
             % Return the error.
-            {error, Error}
+            {error, Error};
+        {failure, Failure} ->
+            % The server did not compute the message, which is a failure of
+            % this node.
+            {failure, Failure}
+    end.
+
+%% @doc Give an assignment the `hash-chain' that the CU checks: its own, the
+%% state's, or the process ID at slot 0. Set the state's `hash-chain' to the
+%% chain of the next assignment, as the CU computes it: the SHA-256 of the
+%% assignment's signed ID followed by its chain. After a skipped slot the CU
+%% hashes its `original-assignment-id', the same signed ID. Other requests are
+%% returned unchanged.
+add_hash_chain(State, Req, Opts) ->
+    case hb_ao:get(<<"type">>, Req, not_found, Opts) of
+        <<"Assignment">> ->
+            HashChain =
+                case hb_maps:get_first(
+                    [{Req, <<"hash-chain">>}, {State, <<"hash-chain">>}],
+                    Opts
+                ) of
+                    not_found -> lib_process:process_id(State, #{}, Opts);
+                    Found -> Found
+                end,
+            NextHashChain =
+                hb_util:human_id(
+                    hb_crypto:sha256_chain(
+                        hb_util:native_id(hb_message:id(Req, signed, Opts)),
+                        hb_util:native_id(HashChain)
+                    )
+                ),
+            {
+                hb_ao:set(State, #{ <<"hash-chain">> => NextHashChain }, Opts),
+                Req#{ <<"hash-chain">> => HashChain }
+            };
+        _ ->
+            {State, Req}
     end.
 
 %% @doc Snapshot the state of the process via the `delegated-compute@1.0' device.
@@ -89,8 +129,9 @@ delegate_request(Msg, Req, Opts) ->
         true ->
             do_compute(Msg, Req, Opts);
         false ->
-            % Return an error if the genesis-wasm feature is disabled.
-            {error, #{
+            % This node cannot compute the message if the genesis-wasm
+            % feature is disabled.
+            {failure, #{
                 <<"status">> => 500,
                 <<"message">> =>
                     <<"HyperBEAM was not compiled with genesis-wasm@1.0 on "
@@ -141,6 +182,7 @@ do_compute(State, Req, Opts) ->
             % Issue an event and return the error.
             ?event({genesis_wasm_compute_error, Error}),
             {error, Error};
+        {failure, Failure} -> {failure, Failure};
         {skip, DoubleSkip = #{ <<"skip">> := true }} ->
             ?event(dedup_short,
                 {dedup_error,
@@ -150,28 +192,21 @@ do_compute(State, Req, Opts) ->
             ),
             {error, State};
         {skip, ExitState} ->
+            % The CU needs a signed message at every slot. A skipped slot
+            % sends its assignment as that message, the same on every node.
+            % The CU drops the repeated message itself if it has `from-process'.
             ReqWithoutCommitments = hb_message:uncommitted_deep(Req, Opts),
             Req2 =
-                hb_message:commit(
-                    ReqWithoutCommitments#{
-                        <<"path">> => 
-                            hb_maps:get(<<"path">>, Req, <<"compute">>, Opts),
-                        <<"slot">> =>
-                            hb_maps:get(<<"slot">>, Req, -1, Opts),
-                        <<"skip">> => true,
-                        <<"original-assignment-id">> => 
-                            hb_message:id(Req, signed, Opts),
-                        <<"body">> => 
-                            hb_message:commit(
-                                #{
-                                    <<"timestamp">> => 
-                                        os:system_time(millisecond)
-                                },
-                                Opts
-                            )
-                    },
-                    Opts
-                ),
+                ReqWithoutCommitments#{
+                    <<"path">> =>
+                        hb_maps:get(<<"path">>, Req, <<"compute">>, Opts),
+                    <<"slot">> =>
+                        hb_maps:get(<<"slot">>, Req, -1, Opts),
+                    <<"skip">> => true,
+                    <<"original-assignment-id">> =>
+                        hb_message:id(Req, signed, Opts),
+                    <<"body">> => Req
+                },
             ?event(dedup_short,
                 {skip,
                     {cause, dedup},
@@ -191,7 +226,8 @@ delegated_opts(Opts) ->
         <<"delegated-compute-peer">> => <<"http://localhost:", Port/binary>>
     }.
 
-%% @doc Ensure the local `genesis-wasm@1.0' is live. If it not, start it.
+%% @doc Ensure the local `genesis-wasm@1.0' is live. If it is not, start it,
+%% and return `false' if it does not answer within `?START_TIMEOUT' ms.
 ensure_started(Opts) ->
     % Check if the `genesis-wasm@1.0' device is already running. The presence
     % of the registered name implies its availability.
@@ -365,16 +401,14 @@ ensure_started(Opts) ->
             hb_name:register(<<"genesis-wasm@1.0">>, PID),
             ?event({genesis_wasm_starting, {pid, PID}}),
             % Wait for the device to start.
-            hb_util:until(
+            hb_util:wait_until(
                 fun() ->
-                    receive after 2000 -> ok end,
                     Status = is_genesis_wasm_server_running(Opts),
                     ?event({genesis_wasm_boot_wait, {received_status, Status}}),
                     Status
-                end
-            ),
-            ?event({genesis_wasm_started, {pid, PID}}),
-            true
+                end,
+                ?START_TIMEOUT
+            )
     end.
 
 %% @doc Find either a specific checkpoint by its ID, or find the most recent
@@ -440,10 +474,15 @@ latest_checkpoint(ProcID, TrustedSigners, Opts) ->
     Variables =
         #{
             <<"ProcID">> => ProcID,
-            % GraphQL finds the items of a `did:pkh:' committer of an Arweave
-            % address by the address.
+            % GraphQL finds the items of the committer of an Arweave address
+            % by the address.
             <<"TrustedSigners">> =>
-                [Address || ?ARWEAVE_COMMITTER(Address) <- TrustedSigners]
+                [
+                    Address
+                ||
+                    SignerURI <- TrustedSigners,
+                    {ok, Address} <- [hb_committer:address(SignerURI)]
+                ]
         },
     case hb_client_gateway:query(Query, Variables, Opts) of
         {error, Reason} ->
@@ -456,13 +495,14 @@ latest_checkpoint(ProcID, TrustedSigners, Opts) ->
             end
     end.
 
-%% @doc Return the committers named by the `genesis-wasm-import-authorities'
+%% @doc Return the committers in the `genesis-wasm-import-authorities'
 %% option.
 import_authorities(Opts) ->
-    lists:map(
-        fun hb_util:committer/1,
-        hb_opts:get(genesis_wasm_import_authorities, [], Opts)
-    ).
+    [
+        hb_committer:uri(Authority, Opts)
+    ||
+        Authority <- hb_opts:get(genesis_wasm_import_authorities, [], Opts)
+    ].
 
 %% @doc Validate whether a checkpoint message is signed by a trusted snapshot
 %% authority and is for a `ao.TN.1' process or has `execution-device' set to
@@ -535,11 +575,12 @@ do_import(Proc, CheckpointMessage, Opts) ->
             }}
     end.
 
-%% @doc Check if the genesis-wasm server is running, using the cached process ID
-%% if available.
+%% @doc Check if the genesis-wasm server is running. A `true' status is kept
+%% for the calling process, so later checks in it do not ask the server again.
 is_genesis_wasm_server_running(Opts) ->
     case get(genesis_wasm_pid) of
-        undefined ->
+        true -> true;
+        _ ->
             ?event(genesis_wasm_pinging_server),
             Parent = self(),
             PID = spawn(
@@ -557,8 +598,7 @@ is_genesis_wasm_server_running(Opts) ->
                 ?event({genesis_wasm_status_check, timeout}),
                 erlang:exit(PID, kill),
                 false
-            end;
-        _ -> true
+            end
     end.
 
 %% @doc Check if the genesis-wasm server is running by requesting its status
@@ -648,7 +688,19 @@ signed_checkpoint_import_test() ->
     {ok, 2, Cached} = lib_process_cache:latest(ProcID, Opts),
     Snapshot = hb_maps:get(<<"snapshot">>, Cached, Opts),
     ?assert(hb_message:verify(Snapshot, all, Opts)),
-    ?assertEqual(CheckpointID, hb_message:id(Snapshot, signed, Opts)).
+    ?assertEqual(CheckpointID, hb_message:id(Snapshot, signed, Opts)),
+    % `latest-checkpoint' is not a key of the device.
+    ?assertEqual(
+        {error, not_found},
+        hb_ao:resolve(
+            #{ <<"device">> => <<"genesis-wasm@1.0">> },
+            #{
+                <<"path">> => <<"latest-checkpoint">>,
+                <<"genesis-wasm-import-authorities">> => []
+            },
+            Opts
+        )
+    ).
 
 %% @doc Genesis requests stay on their configured server, independently of
 %% the routing table used by standalone delegated computation.
@@ -735,7 +787,7 @@ routing_test_node(Parent) ->
             <<"request">> => fun(_, #{ <<"request">> := Req }, _) ->
                 Port = integer_to_binary(ranch:get_port(ID)),
                 Parent ! {routing_request,
-                    <<"http://localhost:", Port/binary, "/">>, Req},
+                    <<"http://127.0.0.1:", Port/binary, "/">>, Req},
                 {error, #{
                     <<"status">> => 200,
                     <<"content-type">> => <<"application/json">>,
@@ -836,6 +888,16 @@ checkpoint_roundtrip(Opts) ->
         #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts),
     ?assertEqual(<<"41">>, hb_ao:get(<<"results/data">>, State, Opts)),
     {Meta, Memory} = test_snapshot(State, Opts),
+    % The state gives slot 2 the chain that the CU computes from slot 1.
+    ?assertEqual(
+        hb_util:human_id(
+            hb_crypto:sha256_chain(
+                hb_util:native_id(hb_maps:get(<<"assignmentId">>, Meta)),
+                hb_util:native_id(hb_maps:get(<<"hashChain">>, Meta))
+            )
+        ),
+        hb_ao:get(<<"hash-chain">>, State, Opts)
+    ),
     Checkpoint = hb_message:commit(#{
         <<"type">> => <<"Checkpoint">>,
         <<"process">> => ProcID,
@@ -912,8 +974,8 @@ import_legacy_checkpoint() ->
         <<"priv-wallet">> => hb:wallet(),
         <<"genesis-wasm-import-authorities">> =>
             [
-                ?ARWEAVE_COMMITTER(<<"fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY">>),
-                ?ARWEAVE_COMMITTER(<<"WjnS-s03HWsDSdMnyTdzB1eHZB2QheUWP_FVRVYxkXk">>)
+                hb_committer:uri(<<"fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY">>),
+                hb_committer:uri(<<"WjnS-s03HWsDSdMnyTdzB1eHZB2QheUWP_FVRVYxkXk">>)
             ]
     },
     % Process with 12 slots
