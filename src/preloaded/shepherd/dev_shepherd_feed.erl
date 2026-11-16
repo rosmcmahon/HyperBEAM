@@ -183,20 +183,16 @@ gql_node(ID, TABM, Opts) ->
         _ -> skip
     end.
 
-%% @doc The size of an item's data. Items carry their data; transaction
-%% headers carry `data-size' instead.
+%% @doc The size of an item's data: a transaction header's signed
+%% `field-data-size', or the size of the data that an item carries.
 data_size(TABM, Commitment, Opts) ->
-    case hb_maps:get(data_key(Commitment, Opts), TABM, not_found, Opts) of
-        Data when is_binary(Data) -> byte_size(Data);
-        _ ->
-            hb_util:int(
-                hb_maps:get(
-                    <<"data-size">>,
-                    TABM,
-                    hb_maps:get(<<"field-data-size">>, Commitment, 0, Opts),
-                    Opts
-                )
-            )
+    case hb_maps:find(<<"field-data-size">>, Commitment, Opts) of
+        {ok, Size} -> hb_util:int(Size);
+        error ->
+            case hb_maps:get(data_key(Commitment, Opts), TABM, not_found, Opts) of
+                Data when is_binary(Data) -> byte_size(Data);
+                _ -> 0
+            end
     end.
 
 %% @doc The key of an item's data: the value of its `ao-data-key' tag, which
