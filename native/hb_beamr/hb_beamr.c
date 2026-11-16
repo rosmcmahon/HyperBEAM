@@ -6,6 +6,7 @@
 // Declare the atoms used in Erlang driver communication
 ErlDrvTermData atom_ok;
 ErlDrvTermData atom_error;
+ErlDrvTermData atom_trap;
 ErlDrvTermData atom_import;
 ErlDrvTermData atom_execution_result;
 
@@ -31,6 +32,7 @@ static ErlDrvData wasm_driver_start(ErlDrvPort port, char *buff) {
     DRV_DEBUG("info.erts_version: %s", info.erts_version);
     DRV_DEBUG("info.otp_release: %s", info.otp_release);
     Proc* proc = driver_alloc(sizeof(Proc));
+    memset(proc, 0, sizeof(Proc));
     proc->port = port;
     DRV_DEBUG("Port: %p", proc->port);
     proc->port_term = driver_mk_port(proc->port);
@@ -167,6 +169,9 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         DRV_DEBUG("Import response received. Providing...");
         if (proc->current_import) {
             DRV_DEBUG("Decoding import response from Erlang...");
+            int result_type, result_count;
+            ei_get_type(buff, &index, &result_type, &result_count);
+            proc->current_import->result_count = result_count;
             proc->current_import->result_terms = decode_list(buff, &index);
             proc->current_import->error_message = NULL;
 
@@ -320,6 +325,7 @@ static ErlDrvEntry wasm_driver_entry = {
 DRIVER_INIT(wasm_driver) {
     atom_ok = driver_mk_atom("ok");
     atom_error = driver_mk_atom("error");
+    atom_trap = driver_mk_atom("trap");
     atom_import = driver_mk_atom("import");
     atom_execution_result = driver_mk_atom("execution_result");
     return &wasm_driver_entry;

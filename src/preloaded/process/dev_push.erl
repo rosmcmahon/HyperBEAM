@@ -6,14 +6,68 @@
 -specification("../../../specs/push@1.0.md").
 -device_libraries([lib_process]).
 %%% Public API
--export([push/3, schedule/3]).
+-export([push/3, schedule/3, pending/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+%% @doc List computed outbox coordinates without a cached delivery assignment.
+%% An optional `process' restricts the query to one source. Reading this index
+%% neither computes nor delivers messages. Each entry can be sent to `schedule',
+%% or its source slot can be drained with `push'.
+pending(_Base, Req, Opts) ->
+    IndexOpts = lib_process:scoped_opts(Opts),
+    Root = <<"~push@1.0/outbox">>,
+    Processes =
+        case hb_maps:get(<<"process">>, Req, undefined, Opts) of
+            undefined -> lists:sort(hb_cache:list(Root, IndexOpts));
+            ProcessID -> [ProcessID]
+        end,
+    Entries = [
+        #{
+            <<"process">> => ProcessID,
+            <<"slot">> => Slot,
+            <<"outbox-key">> => Key
+        }
+    || ProcessID <- Processes,
+        Path <- [[Root, hb_escape:encode_path_component(ProcessID)]],
+        Slot <- lists:sort(hb_cache:list_numbered(Path, IndexOpts)),
+        Keys <- [hb_cache:list(Path ++ [hb_util:bin(Slot)], IndexOpts)],
+        Key <-
+            lists:sort(
+                fun(A, B) -> order(A) =< order(B) end,
+                [hb_escape:decode_path_component(K) || K <- Keys]
+            ),
+        pending_assignment(ProcessID, Slot, Key, Opts)
+    ],
+    {ok, #{
+        <<"count">> => length(Entries),
+        <<"entries">> => hb_util:list_to_numbered_message(Entries),
+        <<"cache-control">> => <<"no-store">>
+    }}.
+
+%% @doc Use the same exact inputs as `schedule', without executing it.
+pending_assignment(ProcessID, Slot, Key, Opts) ->
+    case
+        hb_cache:read_resolved(
+            #{ <<"device">> => <<"push@1.0">>, <<"process">> => ProcessID },
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"slot">> => Slot,
+                <<"outbox-key">> => Key
+            },
+            Opts
+        )
+    of
+        miss -> true;
+        {hit, {ok, _Assignment}} -> false;
+        {hit, Error} -> error({'push-receipt-unavailable', Error})
+    end.
 
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
 %% it if it does not exist). Otherwise, the message specified by the given
-%% `slot' key will be pushed.
+%% `slot' key will be pushed. `all' drains the source's indexed pending slots
+%% in ascending order. `push' is an alias for `slot'.
 %%
 %% Optional parameters:
 %% `/result-depth':  The depth to which the full contents of the result
@@ -46,7 +100,7 @@
 -spec push(
     #{ _ => _ },
     #{
-        slot => integer(),
+        slot => integer() | binary(),
         body => #{ _ => _ },
         async => boolean(),
         'max-depth' => integer() | infinity,
@@ -57,7 +111,16 @@
 push(Base, Req, Opts) ->
     Process = lib_process:as_process(Base, Opts),
     ?event(push, {push_base, {base, Process}, {req, Req}}, Opts),
-    case hb_ao:get(<<"slot">>, {as, <<"message@1.0">>, Req}, no_slot, Opts) of
+    case
+        hb_ao:get_first(
+            [
+                {{as, <<"message@1.0">>, Req}, <<"slot">>},
+                {{as, <<"message@1.0">>, Req}, <<"push">>}
+            ],
+            no_slot,
+            Opts
+        )
+    of
         no_slot ->
             case schedule_initial_message(Process, Req, Opts) of
                 {ok, Assignment} ->
@@ -83,7 +146,7 @@ push(Base, Req, Opts) ->
                     end;
                 {error, Res} -> {error, Res}
             end;
-        _ -> push_with_mode(Process, Req, Opts)
+        Slot -> push_with_mode(Process, Req#{ <<"slot">> => Slot }, Opts)
     end.
 
 push_with_mode(Process, Req, Opts) ->
@@ -105,6 +168,37 @@ is_async(Process, Req, Opts) ->
     ) =:= <<"true">>.
 
 %% @doc Push a message or slot number, including its downstream results.
+do_push(Process, Req = #{ <<"slot">> := <<"all">> }, Opts) ->
+    ProcessID = lib_process:process_id(Process, #{}, Opts),
+    {ok, Pending} = pending(Process, #{ <<"process">> => ProcessID }, Opts),
+    Entries = hb_maps:values(hb_maps:get(<<"entries">>, Pending, Opts), Opts),
+    Slots =
+        lists:usort(
+            [
+                hb_maps:get(<<"slot">>, Entry, Opts)
+            || Entry <- Entries
+            ]
+        ),
+    Results =
+        maps:from_list(
+            [
+                {
+                    hb_util:bin(Slot),
+                    case do_push(Process, Req#{ <<"slot">> => Slot }, Opts) of
+                        {ok, Result} -> Result;
+                        {error, Error} ->
+                            #{ <<"response">> => <<"error">>, <<"reason">> => Error }
+                    end
+                }
+            || Slot <- Slots
+            ]
+        ),
+    {ok, #{
+        <<"process">> => ProcessID,
+        <<"count">> => length(Slots),
+        <<"slots">> => Results,
+        <<"cache-control">> => <<"no-store">>
+    }};
 do_push(PrimaryProcess, Assignment, Opts) ->
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
     ID = lib_process:process_id(PrimaryProcess, #{}, Opts),
@@ -300,7 +394,7 @@ maybe_evaluate_message(Message, Opts) ->
 %% the slot number from which it was sent, and the outbox key of the message,
 %% and the depth to which downstream results should be included in the message.
 push_result_message(MsgToPush, Origin, Opts) ->
-    NormMsgToPush = hb_ao:normalize_keys(MsgToPush, Opts),
+    NormMsgToPush = process_target(hb_ao:normalize_keys(MsgToPush, Opts), Opts),
     case hb_ao:get(<<"target">>, NormMsgToPush, undefined, Opts) of
         undefined ->
             ?event(push,
@@ -528,6 +622,17 @@ normalize_message(MsgToPush, Opts) ->
         Opts#{ <<"hashpath">> => ignore }
     ).
 
+%% @doc Give a message to push the ID of the process that it targets. A ledger
+%% gives an account as the URI of its committer, and the address of an Arweave
+%% committer is the ID of the process at that address.
+process_target(Msg, Opts) when is_map(Msg) ->
+    case hb_committer:address(hb_maps:get(<<"target">>, Msg, not_found, Opts)) of
+        {ok, Address} -> Msg#{ <<"target">> => Address };
+        error -> Msg
+    end;
+process_target(Msg, _Opts) ->
+    Msg.
+
 %% @doc Find the target process ID for a message to push.
 target_process(MsgToPush, Opts) ->
     case hb_ao:get(<<"target">>, MsgToPush, Opts) of
@@ -552,7 +657,9 @@ split_target(RawTarget) ->
 
 %% @doc Calculate the base ID for a process. The base ID is not just the 
 %% uncommitted process ID. It also excludes the `authority' and `scheduler'
-%% keys.
+%% keys. A push signs the base ID as the origin of what it sends, so the ID is
+%% read from the base message itself, never from the answer of its device: a
+%% key that a message may carry is not a key that its device may choose.
 calculate_base_id(GivenProcess, Opts) ->
     Process =
         case
@@ -571,12 +678,7 @@ calculate_base_id(GivenProcess, Opts) ->
             #{ <<"authority">> => unset, <<"scheduler">> => unset },
             Opts#{ <<"hashpath">> => ignore }
         ),
-    {ok, BaseID} =
-        hb_ao:resolve(
-            BaseProcess,
-            #{ <<"path">> => <<"id">>, <<"committers">> => <<"none">> },
-            Opts
-        ),
+    BaseID = hb_message:id(BaseProcess, none, Opts),
     ?event(debug_base, {push_generated_base, {id, BaseID}, {base, BaseProcess}}),
     BaseID.
 
@@ -608,7 +710,7 @@ schedule(Base, Req, Opts) ->
             hb_ao:normalize_keys(
                 hb_private:reset(hb_ao:get(<<"outbox">>, Result, Opts))
             ),
-        RawMsg = hb_maps:get(Key, Outbox, [], Opts),
+        RawMsg = process_target(hb_maps:get(Key, Outbox, [], Opts), Opts),
         MsgToPush =
             case maybe_evaluate_message(RawMsg, Opts) of
                 {ok, R} -> R;
@@ -770,11 +872,15 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
     end.
 
 %% @doc Set the necessary keys in order for the recipient to know where the
-%% message came from.
+%% message came from. `message@1.0' sets them, whatever the device of the
+%% message, so that they are at its top level, where a check for a pushed
+%% result reads them.
 augment_message(Origin, ToSched, Opts) ->
     ?event(push, {adding_keys, {origin, Origin}, {to, ToSched}}, Opts),
-    hb_message:uncommitted(
-        hb_ao:set(
+    {ok, Augmented} =
+        hb_ao:raw(
+            <<"message@1.0">>,
+            <<"set">>,
             ToSched,
             #{
                 <<"data-protocol">> => <<"ao">>,
@@ -786,9 +892,9 @@ augment_message(Origin, ToSched, Opts) ->
                 <<"from-scheduler">> => maps:get(<<"from-scheduler">>, Origin),
                 <<"from-authority">> => maps:get(<<"from-authority">>, Origin)
             },
-            Opts#{ <<"hashpath">> => ignore }
-        )
-    ).
+            Opts
+        ),
+    hb_message:uncommitted(Augmented).
 
 %% @doc Apply the recipient's security policy to the message. Observes the 
 %% following parameters in order to calculate the appropriate security policy:
@@ -932,7 +1038,8 @@ remote_schedule_result(Location, SignedReq, Opts) ->
     % Store a copy of the message for ourselves.
     {ok, _} = hb_cache:write(SignedReq, Opts),
     ?event(push, {remote_schedule_result, {path, Path}}, Opts),
-    case hb_http:post(Node, Path, hb_maps:without([<<"path">>], SignedReq, Opts), Opts) of
+    PostOpts = Opts#{ <<"http-client-validate-accessible">> => true },
+    case hb_http:post(Node, Path, hb_maps:without([<<"path">>], SignedReq, Opts), PostOpts) of
         {ok, Res} ->
             ?event(push, {remote_schedule_result, {res, Res}}, Opts),
             case hb_ao:get(<<"status">>, Res, 200, Opts) of
@@ -971,6 +1078,172 @@ parse_redirect(Location, Opts) ->
     {Node, hb_maps:get(path, Parsed, undefined, Opts)}.
 
 %%% Tests
+
+%% @doc A composed read drains cached and fresh slots without redelivery.
+push_all_pending_test_() ->
+    {timeout, 90, fun test_push_all_pending/0}.
+
+test_push_all_pending() ->
+    {Sender, Receiver, _Slot, Opts} = setup_two_process_message(),
+    ProcessID = lib_process:process_id(Sender, #{}, Opts),
+    ReceiverID = lib_process:process_id(Receiver, #{}, Opts),
+    {ok, _} = hb_ao:resolve(Sender, <<"now">>, Opts),
+    {ok, Before} = hb_ao:resolve(Receiver, <<"slot/current">>, Opts),
+    Script = <<"Send({ Target = \"", ReceiverID/binary, "\" })">>,
+    {ok, _} = hb_process_test_vectors:schedule_aos_call(Sender, Script, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Path =
+        <<"/", ProcessID/binary,
+            "/now/push=all&max-depth=0&async=false&result-depth=0">>,
+    try
+        % The first slot was computed by a reader; the second is still queued.
+        {ok, Result} = hb_http:get(Node, Path, Opts),
+        ?assertEqual(3, hb_ao:get(<<"count">>, Result, Opts)),
+        ?assertEqual(
+            {ok, Before + 2},
+            hb_ao:resolve(Receiver, <<"slot/current">>, Opts)
+        ),
+        ?assertEqual(
+            Before + 1,
+            hb_ao:get(<<"slots/1/1/slot">>, Result, Opts)
+        ),
+        ?assertEqual(
+            Before + 2,
+            hb_ao:get(<<"slots/2/1/slot">>, Result, Opts)
+        ),
+        % The undeliverable boot notification stays pending across retries.
+        {ok, Retry} = hb_http:get(Node, Path, Opts),
+        ?assertEqual(1, hb_ao:get(<<"count">>, Retry, Opts)),
+        ?assertEqual(
+            {ok, Before + 2},
+            hb_ao:resolve(Receiver, <<"slot/current">>, Opts)
+        ),
+        % A bounded-stale compute can still drain previously computed output.
+        {ok, _} =
+            hb_process_test_vectors:schedule_aos_call(Sender, Script, Opts),
+        {ok, _} = hb_ao:resolve(Sender, <<"now">>, Opts),
+        {ok, Cached} =
+            hb_http:get(
+                Node,
+                <<"/", ProcessID/binary,
+                    "/compute&max-age=10/push&slot=all&max-depth=0",
+                    "&async=false&result-depth=0">>,
+                Opts
+            ),
+        ?assertEqual(2, hb_ao:get(<<"count">>, Cached, Opts)),
+        ?assertEqual(
+            {ok, Before + 3},
+            hb_ao:resolve(Receiver, <<"slot/current">>, Opts)
+        )
+    after
+        cowboy:stop_listener(
+            hb:address(hb_opts:get(priv_wallet, undefined, Opts))
+        )
+    end.
+
+%% @doc Computing a slot records pending work before anyone attempts delivery.
+pending_outbox_test_() ->
+    [{timeout, 60, fun() -> test_pending_outbox(Store) end}
+     || Store <- [hb_store_fs, hb_store_lmdb]].
+
+test_pending_outbox(StoreModule) ->
+    {Sender, Receiver, Slot, BaseOpts} = setup_two_process_message(),
+    Opts = BaseOpts#{
+        <<"process-store">> => [hb_test_utils:test_store(StoreModule)],
+        <<"attested-store">> => [hb_test_utils:test_store(StoreModule)]
+    },
+    ProcessID = lib_process:process_id(Sender, #{}, Opts),
+    Push = #{ <<"device">> => <<"push@1.0">> },
+    Query = #{ <<"path">> => <<"pending">>, <<"process">> => ProcessID },
+    ?assertEqual(
+        0,
+        hb_ao:get(
+            <<"count">>,
+            hb_util:ok(hb_ao:resolve(Push, Query, Opts)),
+            Opts
+        )
+    ),
+    Compute = #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+    {ok, _} = hb_ao:resolve(Sender, Compute, Opts),
+    {ok, Pending} = hb_ao:resolve(Push, Query, Opts),
+    % AOS also emits a boot notification in slot zero.
+    ?assertEqual(2, hb_ao:get(<<"count">>, Pending, Opts)),
+    ?assertMatch(
+        #{
+            <<"process">> := ProcessID,
+            <<"slot">> := Slot,
+            <<"outbox-key">> := <<"1">>
+        },
+        hb_ao:get(<<"entries/2">>, Pending, Opts)
+    ),
+    % Cached computation and reopening the store leave pending work visible.
+    {ok, _} = hb_ao:resolve(Sender, Compute, Opts),
+    Store = hb_opts:get(process_store, [], Opts),
+    ?assertEqual([], hb_cache:list(<<"~push@1.0/outbox">>, BaseOpts)),
+    hb_store:flush(Store, Opts),
+    hb_store:stop(Store),
+    hb_store:start(Store),
+    ?assertEqual(
+        2,
+        hb_ao:get(
+            <<"count">>,
+            hb_util:ok(hb_ao:resolve(Push, Query, Opts)),
+            Opts
+        )
+    ),
+    {ok, Before} = hb_ao:resolve(Receiver, <<"slot/current">>, Opts),
+    PushReq =
+        #{
+            <<"path">> => <<"push">>,
+            <<"slot">> => Slot,
+            <<"max-depth">> => 0
+        },
+    {ok, _} = hb_ao:resolve(Sender, PushReq, Opts),
+    ?assertEqual(
+        1,
+        hb_ao:get(
+            <<"count">>,
+            hb_util:ok(hb_ao:resolve(Push, Query, Opts)),
+            Opts
+        )
+    ),
+    % Repeated reads and pushes cannot cause another delivery.
+    {ok, _} = hb_ao:resolve(Sender, Compute, Opts),
+    {ok, _} = hb_ao:resolve(Sender, PushReq, Opts),
+    ?assertEqual(
+        {ok, Before + 1},
+        hb_ao:resolve(Receiver, <<"slot/current">>, Opts)
+    ),
+    ?assertEqual(
+        1,
+        hb_ao:get(
+            <<"count">>,
+            hb_util:ok(hb_ao:resolve(Push, Query, Opts)),
+            Opts
+        )
+    ),
+    % The boot notification has no available target process: failure does not
+    % clear it, nor does retrying it resurrect the successfully delivered slot.
+    {ok, _} = hb_ao:resolve(Sender, PushReq#{ <<"slot">> => 0 }, Opts),
+    {ok, Remaining} = hb_ao:resolve(Push, Query, Opts),
+    ?assertEqual(1, hb_ao:get(<<"count">>, Remaining, Opts)),
+    ?assertEqual(0, hb_ao:get(<<"entries/1/slot">>, Remaining, Opts)),
+    % The same node-local index is available over the ordinary HTTP API.
+    Node = hb_http_server:start_node(Opts),
+    try
+        {ok, Remote} =
+            hb_http:get(
+                Node,
+                <<"/~push@1.0/pending?process=", ProcessID/binary>>,
+                Opts
+            ),
+        ?assertEqual(1, hb_ao:get(<<"count">>, Remote, Opts)),
+        ?assertEqual(0, hb_ao:get(<<"entries/1/slot">>, Remote, Opts))
+    after
+        cowboy:stop_listener(
+            hb:address(hb_opts:get(priv_wallet, undefined, Opts))
+        )
+    end.
 
 %% The test groups run sequentially with respect to each other but each
 %% group is internally parallel. Splitting keeps the WASM-heavy core

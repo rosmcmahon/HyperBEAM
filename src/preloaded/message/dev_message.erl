@@ -261,8 +261,8 @@ id_device(#{ <<"commitments">> := Commitments }, Opts) ->
 id_device(_, _) ->
     {ok, ?DEFAULT_ID_DEVICE}.
 
-%% @doc Return the committers of a message. A committer is listed once, however
-%% many commitments it made.
+%% @doc Return the committers of a message, in sorted order. A committer is
+%% listed once, however many commitments it made.
 committers(Base) -> committers(Base, #{}).
 committers(Base, Req) -> committers(Base, Req, #{}).
 -spec committers(
@@ -285,7 +285,7 @@ committers(#{ <<"commitments">> := Commitments }, _, NodeOpts) ->
             ),
             NodeOpts
         ),
-    {ok, hb_util:unique(Committers)};
+    {ok, lists:usort(Committers)};
 committers(_, _, _) ->
     {ok, []}.
 
@@ -550,11 +550,11 @@ verify_ids(IDsToVerify, Commitments, CommitmentBase, Req, Opts) ->
     {ok, Res}.
 
 %% @doc Execute a function for a single commitment in the context of its
-%% parent message. A commitment device whose `verify' is this module's own
-%% `verify' has no commitment scheme of its own: the device of a commitment
-%% is read from the commitment itself, so dispatching would call this
-%% function with the same commitment again, without end. Such a commitment
-%% does not verify.
+%% parent message. Only a device that exports `verify' has a commitment
+%% scheme of its own. If the device's `verify' is a `default' or `handler'
+%% function, it answers with no signature; if it is this module's own,
+%% dispatching would call this function with the same commitment again,
+%% without end. Such a commitment does not verify.
 %% Note: Assumes that the `commitments' key has already been removed from the
 %% message if applicable.
 verify_commitment(Base, Commitment, Opts) ->
@@ -571,8 +571,9 @@ verify_commitment(Base, Commitment, Opts) ->
         <<"verify">>,
         Opts
     ) of
-        {_, ?MODULE, _} -> {ok, false};
-        _ -> hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts)
+        {ok, Dev, _} when Dev =/= ?MODULE ->
+            hb_ao:raw(AttDev, <<"verify">>, Base, Commitment, Opts);
+        _ -> {ok, false}
     end.
 
 %% @doc Attach to the message the commitments whose IDs are listed in the
@@ -788,7 +789,7 @@ commitment_ids_from_request(Base, Req, Opts) ->
                 );
             FinalCommitmentIDs -> FinalCommitmentIDs
         end,
-    ?event(
+    ?event_debug(
         debug_commitments,
         {commitment_ids_from_request, {base, Base}, {req, Req}, {res, Res}}
     ),
@@ -1099,7 +1100,7 @@ remove(Base, #{ <<"items">> := Keys }, Opts) ->
         Opts
     ).
 
-%% @doc Get the public keys of a message.
+%% @doc Get the public keys of a message, in sorted order.
 keys(Msg) ->
 	keys(Msg, #{}).
 
@@ -1113,7 +1114,7 @@ keys(Msg, Opts) ->
         ok,
         lists:filter(
             fun(Key) -> not hb_private:is_private(Key) end,
-            hb_maps:keys(hb_message:uncommitted(Msg, Opts), Opts)
+            hb_util:to_sorted_keys(hb_message:uncommitted(Msg, Opts), Opts)
         )
     }.
 
@@ -1167,7 +1168,38 @@ is_private_mod_test() ->
 %%% Device functionality tests:
 
 keys_from_device_test() ->
-    ?assertEqual({ok, [<<"a">>]}, hb_ao:resolve(#{ <<"a">> => 1 }, keys, #{})).
+    ?assertEqual({ok, [<<"a">>]}, hb_ao:resolve(#{ <<"a">> => 1 }, keys, #{})),
+    % The keys of a wide message are in sorted order.
+    Keys =
+        lists:sort(
+            [<<"k", (integer_to_binary(N))/binary>> || N <- lists:seq(1, 40)]
+        ),
+    ?assertEqual({ok, Keys}, hb_ao:resolve(maps:from_keys(Keys, 1), keys, #{})).
+
+%% @doc The committers of a message are in sorted order.
+committers_order_test() ->
+    Committers =
+        [<<"committer-", (integer_to_binary(N))/binary>> || N <- lists:seq(1, 40)],
+    ?assertEqual(
+        {ok, lists:sort(Committers)},
+        hb_ao:resolve(
+            #{
+                <<"commitments">> =>
+                    maps:from_list(
+                        [
+                            {
+                                hb_util:human_id(hb_crypto:sha256(Committer)),
+                                #{ <<"committer">> => Committer }
+                            }
+                        ||
+                            Committer <- Committers
+                        ]
+                    )
+            },
+            committers,
+            #{}
+        )
+    ).
 
 private_keys_are_filtered_test() ->
     ?assertEqual(
@@ -1492,8 +1524,9 @@ test_verify(KeyType) ->
     ),
     % A commitment relabelled `json@1.0' is verified by the `httpsig@1.0'
     % codec its device names -- `true' for an `httpsig@1.0' signature. A
-    % commitment relabelled `message@1.0' or `meta@1.0' has a device
-    % with no commitment scheme of its own and does not verify.
+    % commitment relabelled `message@1.0', `meta@1.0', `apply@1.0' or
+    % `local-name@1.0' has a device with no commitment scheme of its own and
+    % does not verify.
     [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Signed)),
     Relabelled =
         fun(Device) ->
@@ -1511,7 +1544,12 @@ test_verify(KeyType) ->
         fun(Device) ->
             ?assertNot(hb_message:verify(Relabelled(Device), all))
         end,
-        [<<"message@1.0">>, <<"meta@1.0">>]
+        [
+            <<"message@1.0">>,
+            <<"meta@1.0">>,
+            <<"apply@1.0">>,
+            <<"local-name@1.0">>
+        ]
     ).
 
 %% @doc A commitment of no keys verifies after a round trip through

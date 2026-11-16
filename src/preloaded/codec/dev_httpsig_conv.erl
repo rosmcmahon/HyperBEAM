@@ -130,7 +130,8 @@ from(HTTP, _Req, Opts) ->
             Opts
         ),
     ?event_debug({message_without_commitments, Res, Removed}),
-    {ok, Res}.
+    % Remove the private keys that the encoded message gives, as ingress does.
+    {ok, hb_private:reset(Res)}.
 
 %% @doc Generate the body TABM from the `body' key of the encoded message.
 body_to_tabm(HTTP, Opts) ->
@@ -397,6 +398,15 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
                     % Merge the index message with the original, favoring the 
                     % keys of the original in the event of conflict. Remove the
                     % `priv` message, if present.
+                    % An index key becomes a reply header, so encode it as
+                    % every other key is and leave out the reserved headers
+                    % and `set-cookie`.
+                    Index =
+                        hb_maps:without(
+                            ?RESERVED_HEADERS ++ [<<"set-cookie">>],
+                            encode_keys(hb_private:reset(IndexTABM)),
+                            Opts
+                        ),
                     Merged =
                         hb_maps:merge(
                             % Index values become reply headers, so escape
@@ -408,7 +418,7 @@ to(TABM, Req = #{ <<"index">> := true }, _FormatOpts, Opts) ->
                                         hb_escape:encode_header(Value);
                                    (_Key, Value) -> Value
                                 end,
-                                hb_private:reset(IndexTABM)
+                                Index
                             ),
                             hb_maps:without(
                                 [<<"body">>, <<"content-type">>],
@@ -953,7 +963,8 @@ encode_http_msg(Msg, Opts) ->
 %% @doc Encode a HTTP message into a binary. The input *must* be a raw map of 
 %% binary keys and values.
 encode_http_flat_msg(Httpsig, Opts) ->
-    % Serialize the headers, to be included in the part of the multipart response
+    % Serialize the headers, in the sorted order of their names, to be included
+    % in the part of the multipart response
     HeaderList =
         lists:foldl(
             fun ({HeaderName, RawHeaderVal}, Acc) ->
@@ -962,7 +973,10 @@ encode_http_flat_msg(Httpsig, Opts) ->
                 [<<HeaderName/binary, ": ", HVal/binary>> | Acc]
             end,
             [],
-            hb_maps:to_list(hb_maps:without([<<"body">>, <<"priv">>], Httpsig, Opts), Opts)
+            hb_util:to_sorted_list(
+                hb_maps:without([<<"body">>, <<"priv">>], Httpsig, Opts),
+                Opts
+            )
         ),
     EncodedHeaders = iolist_to_binary(lists:join(?CRLF, lists:reverse(HeaderList))),
     case hb_maps:find(<<"body">>, Httpsig, Opts) of
@@ -1000,11 +1014,13 @@ field_to_http(Httpsig, {Name, Value}, Opts) when is_binary(Value) ->
     end.
 
 %% @doc Return where a value is sent by default: in a header if it is a
-%% binary that fits in one, and does not start or end with whitespace.
-%% Any other value is sent in the body.
+%% binary that fits in one, does not start or end with whitespace, and has
+%% no NUL, which HTTP does not allow in a header value (RFC 9110, section
+%% 5.5). Any other value is sent in the body.
 default_where(Value)
         when is_binary(Value), byte_size(Value) =< ?MAX_HEADER_LENGTH ->
-    case edge_whitespace(Value) of
+    case edge_whitespace(Value) orelse
+            binary:match(Value, <<0>>) =/= nomatch of
         true -> body;
         false -> headers
     end;
@@ -1383,6 +1399,43 @@ index_header_value_escape_test() ->
         hb_maps:get(<<"zzz">>, Encoded, not_found, #{})
     ).
 
+%% @doc Encode an index key that becomes a reply header, and leave out the
+%% reserved headers and `set-cookie`.
+index_header_key_encoding_test() ->
+    Opts = #{
+        <<"default-index">> => #{
+            <<"device">> => #{
+                <<"index">> =>
+                    fun(_, _, _) ->
+                        {ok, #{
+                            <<"set-cookie: marker=1\r\nx">> => <<"value">>,
+                            <<"set-cookie">> => <<"marker=1">>,
+                            <<"transfer-encoding">> => <<"chunked">>,
+                            <<"signature">> => <<"value">>
+                        }}
+                    end
+            }
+        }
+    },
+    {ok, Encoded} =
+        to(
+            #{ <<"foo">> => <<"bar">> },
+            #{ <<"index">> => true },
+            Opts
+        ),
+    ?assertEqual(
+        <<"value">>,
+        hb_maps:get(
+            <<"set-cookie%3a%20marker%3d1%0d%0ax">>,
+            Encoded,
+            not_found,
+            #{}
+        )
+    ),
+    ?assertEqual(false, maps:is_key(<<"set-cookie">>, Encoded)),
+    ?assertEqual(false, maps:is_key(<<"transfer-encoding">>, Encoded)),
+    ?assertEqual(false, maps:is_key(<<"signature">>, Encoded)).
+
 %% @doc A message's own keys with the names of reserved headers are served by
 %% ID and posted as they were written, over HTTP/1.1 and HTTP/2.
 reserved_header_keys_test_() ->
@@ -1445,3 +1498,20 @@ reserved_header_keys_test_() ->
                 {<<"ao-body-key">>, <<"note">>}
             ]
     ].
+
+%% @doc A multipart part with a `priv' key gives no private key.
+from_private_part_test() ->
+    Base = #{ <<"device">> => <<"apply@1.0">> },
+    Req = #{
+        <<"path">> => <<"estimate">>,
+        <<"base">> => <<"~metering@1.0">>,
+        <<"request">> => <<"~httpsig@1.0/from">>,
+        <<"content-type">> => <<"multipart/form-data; boundary=b">>,
+        <<"body">> =>
+            <<"--b\r\nContent-Disposition: form-data; name=\"priv\"\r\n"
+              "hook-caller: kernel\r\n\r\n\r\n--b--">>
+    },
+    ?assertMatch(
+        {error, #{ <<"status">> := 401 }},
+        hb_ao:resolve(Base, Req, #{})
+    ).

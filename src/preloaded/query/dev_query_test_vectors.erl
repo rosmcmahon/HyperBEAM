@@ -75,7 +75,7 @@ test_env_with_blocks(InitialHeight, FinalHeight) ->
         <<
             "/~copycat@1.0/arweave?from=",
                 (hb_util:bin(InitialHeight))/binary, "&to=",
-                (hb_util:bin(FinalHeight))/binary
+                (hb_util:bin(FinalHeight))/binary, "&reindex=true"
         >>,
         Opts
     ),
@@ -1577,7 +1577,118 @@ transactions_unsigned_owner_test_parallel() ->
         <<"key">> => hb_util:encode(ar_wallet:to_pubkey(Wallet))
     }, Owner),
     ?assertEqual(hb_maps:get(<<"signature">>,
-        hb_maps:get(SignedID, hb_maps:get(<<"commitments">>, Signed))), Signature).
+        hb_maps:get(SignedID, hb_maps:get(<<"commitments">>, Signed))), Signature),
+    % Of a message from two signers that commit different keys, the ID of one
+    % commitment gives only its signer and key, and the message's own ID gives
+    % no node.
+    Both =
+        hb_message:commit(
+            hb_message:commit(
+                #{ <<"a">> => <<"1">>, <<"b">> => <<"2">> },
+                Opts,
+                #{
+                    <<"commitment-device">> => <<"httpsig@1.0">>,
+                    <<"committed">> => [<<"a">>]
+                }
+            ),
+            #{ <<"priv-wallet">> => ar_wallet:new() },
+            #{
+                <<"commitment-device">> => <<"httpsig@1.0">>,
+                <<"committed">> => [<<"b">>]
+            }
+        ),
+    {ok, _} = hb_cache:write(Both, Opts),
+    Address = hb:address(Wallet),
+    [FirstID] = hb_maps:keys(hb_message:commitments(Address, Both, Opts)),
+    ?assertMatch(
+        #{ <<"data">> := #{ <<"transactions">> := #{ <<"edges">> := [
+            #{ <<"node">> := #{
+                <<"id">> := FirstID,
+                <<"owner">> := #{ <<"address">> := Address },
+                <<"tags">> := [#{ <<"name">> := <<"a">> }]
+            } }
+        ] } } },
+        post_graphql(Node,
+            <<"query($ids: [ID!]) { transactions(ids: $ids) {",
+                " edges { node { id owner { address } tags { name } } } } }">>,
+            #{ <<"ids">> => [FirstID, hb_message:id(Both, all, Opts)] },
+            #{},
+            Opts
+        )
+    ).
+
+%% @doc The owner of an item signed by a key of any type has the raw address of
+%% the key, and an `owners' query of that address finds the item.
+transactions_owner_of_each_key_type_test_parallel() ->
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => [hb_test_utils:test_store(hb_store_volatile)]
+    },
+    Node = hb_http_server:start_node(Opts),
+    Expected =
+        maps:from_list(
+            [
+                begin
+                    {ok, Bin} =
+                        file:read_file(<<"test/arbundles.js/", File/binary>>),
+                    TX = ar_bundles:deserialize(Bin),
+                    Msg =
+                        hb_message:convert(
+                            TX,
+                            <<"structured@1.0">>,
+                            <<"ans104@1.0">>,
+                            Opts
+                        ),
+                    {ok, _} = hb_cache:write(Msg, Opts),
+                    {
+                        hb_message:id(Msg, all, Opts),
+                        #{
+                            <<"address">> =>
+                                hb_util:human_id(
+                                    ar_wallet:to_address(
+                                        TX#tx.owner,
+                                        TX#tx.signature_type
+                                    )
+                                ),
+                            <<"key">> => hb_util:encode(TX#tx.owner)
+                        }
+                    }
+                end
+            ||
+                File <-
+                    [
+                        <<"ans104-item-ed25519.bin">>,
+                        <<"ans104-item-ethereum.bin">>,
+                        <<"ans104-item-typed-ethereum.bin">>,
+                        <<"ans104-item-solana.bin">>
+                    ]
+            ]
+        ),
+    #{ <<"data">> := #{ <<"transactions">> := #{ <<"edges">> := Edges }}} =
+        post_graphql(Node,
+            <<"query($ids: [ID!]) { transactions(ids: $ids) {",
+                " edges { node { id owner { address key } } } } }">>,
+            #{ <<"ids">> => maps:keys(Expected) }, #{}, Opts),
+    ?assertEqual(
+        Expected,
+        maps:from_list(
+            [{ID, Owner} || #{ <<"node">> := #{ <<"id">> := ID, <<"owner">> := Owner } } <- Edges]
+        )
+    ),
+    maps:foreach(
+        fun(ID, #{ <<"address">> := Address }) ->
+            ?assertMatch(
+                #{ <<"data">> := #{ <<"transactions">> := #{ <<"edges">> := [
+                    #{ <<"node">> := #{ <<"id">> := ID } }
+                ] } } },
+                post_graphql(Node,
+                    <<"query($owners: [String!]) { transactions(owners: $owners) {",
+                        " edges { node { id } } } }">>,
+                    #{ <<"owners">> => [Address] }, #{}, Opts)
+            )
+        end,
+        Expected
+    ).
 
 %% @doc Preserve original tags, or exclude native fields from normalized keys.
 transaction_tags_exclude_fields_test_parallel() ->

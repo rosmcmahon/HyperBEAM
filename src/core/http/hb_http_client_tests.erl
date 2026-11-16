@@ -3,6 +3,55 @@
 -include("include/hb_http_client.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% @doc HTTP/2 keepalive preserves a request longer than its peer's idle limit.
+http2_keepalive_test_() ->
+    {timeout, 30, fun() ->
+        application:ensure_all_started(hb),
+        lists:foreach(
+            fun(KeepAlive) ->
+                Test = self(),
+                Peer = hb_http_server:start_node(#{
+                    <<"priv-wallet">> => ar_wallet:new(),
+                    <<"idle-timeout">> => 200,
+                    <<"test-key">> => <<"keepalive">>,
+                    <<"on">> => #{
+                        <<"request">> => #{
+                            <<"device">> => #{
+                                <<"request">> => fun(_, Req, _) ->
+                                    Test ! request_started,
+                                    timer:sleep(600),
+                                    {ok, Req}
+                                end
+                            }
+                        }
+                    }
+                }),
+                Server = hb_opts:get(http_server, undefined,
+                    hb_http_server:get_opts()),
+                try
+                    Result = hb_http_client:request(#{
+                        peer => Peer, method => <<"GET">>,
+                        path => <<"/~meta@1.0/info/test-key">>,
+                        headers => #{}, body => <<>>
+                    }, #{
+                        <<"http-client">> => gun, <<"protocol">> => http2,
+                        <<"http-retry">> => 0,
+                        <<"http-client-keepalive">> => KeepAlive,
+                        <<"http-client-send-timeout">> => 10000
+                    }),
+                    receive request_started -> ok
+                    after 1000 -> error(request_not_started)
+                    end,
+                    case KeepAlive of
+                        60000 -> ?assertMatch({error, _}, Result);
+                        _ -> ?assertMatch({ok, 200, _, <<"keepalive">>}, Result)
+                    end
+                after cowboy:stop_listener(Server) end
+            end,
+            [20, 60000]
+        )
+    end}.
+
 %% @doc A peer's pool has the limits of the request that starts it, and keeps
 %% them when its supervisor restarts it.
 hackney_pool_restart_test_() ->
@@ -289,9 +338,10 @@ gun_final_frame_limit_test() ->
             }, #{ <<"http-client">> => gun, <<"protocol">> => http1 })
         ),
         % The peer sends `101' with `upgrade: websocket', which the request
-        % does not ask for: the request returns an error.
+        % does not ask for: the request returns an error. Gun 2.7 rejects the
+        % unexpected upgrade as a protocol error instead of returning it.
         ?assertMatch(
-            {error, {upgrade, [<<"websocket">>], _}},
+            {error, {connection_error, {connection_error, protocol_error, _}}},
             hb_http_client:request(#{
                 peer => Peer, path => <<"/upgrade">>, method => <<"GET">>,
                 headers => #{}, body => <<>>
@@ -333,6 +383,159 @@ redirect_blocked_host_test_() ->
             )
         )
     end}.
+
+%% @doc A request to a peer that the node's routes name, directly or through a
+%% route reference, is recorded in that peer's histogram. A request to any
+%% other peer has no histogram, and is not recorded.
+peer_duration_test_() ->
+    {timeout, 30, fun() ->
+        application:ensure_all_started(hb),
+        Direct = hb_http_server:start_node(#{}),
+        Referenced = hb_http_server:start_node(#{}),
+        Unrouted = hb_http_server:start_node(#{}),
+        hb_http_server:start_node(#{
+            <<"prometheus">> => true,
+            <<"peer-test-routes">> => [
+                #{
+                    <<"template">> => <<"/referenced">>,
+                    <<"nodes">> => [
+                        #{
+                            <<"match">> => <<"^/referenced">>,
+                            <<"with">> => Referenced
+                        }
+                    ]
+                }
+            ],
+            <<"routes">> => [
+                #{ <<"template">> => <<"/direct">>, <<"node">> => Direct },
+                <<"~meta@1.0/info/peer-test-routes">>
+            ]
+        }),
+        Before = peer_counts(),
+        lists:foreach(fun peer_request/1, [Unrouted, Direct, Referenced]),
+        await_peer_counts(
+            Before,
+            #{ peer_label(Direct) => 1, peer_label(Referenced) => 1 },
+            100
+        ),
+        ?assertNot(maps:is_key(peer_label(Unrouted), peer_counts()))
+    end}.
+
+%% @doc A node that routes to many peers has a histogram for the first
+%% `http-client-max-peer-metrics' of them only. The requests to the rest, here
+%% including the one peer that answers, are not recorded.
+peer_duration_bounded_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        Max = 8,
+        % Peers that refuse each connection: ports that were free a moment ago.
+        Refused =
+            [
+                begin
+                    {ok, Socket} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
+                    {ok, Port} = inet:port(Socket),
+                    gen_tcp:close(Socket),
+                    <<"http://127.0.0.1:", (hb_util:bin(Port))/binary>>
+                end
+            ||
+                _ <- lists:seq(1, 100)
+            ],
+        Live = hb_http_server:start_node(#{}),
+        Peers = Refused ++ [Live],
+        hb_http_server:start_node(#{
+            <<"prometheus">> => true,
+            <<"http-client-max-peer-metrics">> => Max,
+            <<"routes">> => [
+                #{
+                    <<"template">> => <<"/many">>,
+                    <<"nodes">> =>
+                        [ #{ <<"prefix">> => Peer } || Peer <- Peers ]
+                }
+            ]
+        }),
+        Before = peer_counts(),
+        lists:foreach(fun peer_request/1, Peers),
+        await_peer_counts(
+            Before,
+            maps:from_list(
+                [ {peer_label(Peer), 1} || Peer <- lists:sublist(Peers, Max) ]
+            ),
+            200
+        ),
+        % Give the requests past the first `Max' peers the time to be recorded,
+        % were they to be.
+        timer:sleep(200),
+        Counts = peer_counts(),
+        ?assertEqual(
+            lists:sublist(Peers, Max),
+            [ Peer || Peer <- Peers, maps:is_key(peer_label(Peer), Counts) ]
+        )
+    end}.
+
+%% @doc Make one request to a peer with the metrics enabled.
+peer_request(Peer) ->
+    hb_http_client:request(
+        #{
+            peer => Peer,
+            path => <<"/~meta@1.0/info/address">>,
+            method => <<"GET">>,
+            headers => #{},
+            body => <<>>
+        },
+        #{ <<"prometheus">> => true, <<"http-retry">> => 0 }
+    ).
+
+%% @doc The `peer' label of a peer's histogram.
+peer_label(Peer) ->
+    #{ scheme := Scheme, host := Host, port := Port } = uri_string:parse(Peer),
+    <<Scheme/binary, "://", Host/binary, ":", (hb_util:bin(Port))/binary>>.
+
+%% @doc The number of requests recorded for each `peer' label, as Prometheus
+%% exposes them.
+peer_counts() ->
+    Counts =
+        case re:run(
+            prometheus_text_format:format(),
+            <<"^http_client_peer_\\w+_duration_seconds_count"
+                "\\{.*peer=\"([^\"]*)\".*\\} (\\d+)$">>,
+            [global, multiline, {capture, all_but_first, binary}]
+        ) of
+            {match, Matches} -> Matches;
+            nomatch -> []
+        end,
+    lists:foldl(
+        fun([Peer, Count], Acc) ->
+            Acc#{ Peer => maps:get(Peer, Acc, 0) + hb_util:int(Count) }
+        end,
+        #{},
+        Counts
+    ).
+
+%% @doc Wait for each label to have at least its expected number of requests
+%% more than it had before. Durations are recorded by a process of their own.
+await_peer_counts(Before, Expected, 0) ->
+    error(
+        {peer_counts,
+            {before, Before},
+            {expected, Expected},
+            {now, peer_counts()}
+        }
+    );
+await_peer_counts(Before, Expected, Attempts) ->
+    Now = peer_counts(),
+    Recorded =
+        lists:all(
+            fun({Label, N}) ->
+                maps:get(Label, Now, 0) - maps:get(Label, Before, 0) >= N
+            end,
+            maps:to_list(Expected)
+        ),
+    case Recorded of
+        true -> Now;
+        false ->
+            timer:sleep(10),
+            await_peer_counts(Before, Expected, Attempts - 1)
+    end.
 
 summarize({caught, C, R}) when is_tuple(R) ->
     {caught, C, element(1, R)};

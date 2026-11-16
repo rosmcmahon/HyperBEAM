@@ -94,16 +94,20 @@ do_verify(OnlyWithCommitment, Req, Opts) ->
     Res =
         tx_verifies(TX, Req, OnlyWithCommitment) andalso
             lib_arweave_common:verify_identity(TX, OnlyWithCommitment, Opts) andalso
+            lib_arweave_common:verify_original_tags(
+                TX, OnlyWithCommitment, Opts) andalso
             lib_arweave_common:verify_committed_keys(
                 ?BASE_FIELDS, TX, fun dev_tx_from:fields/3,
                 OnlyWithCommitment, Opts),
     {ok, Res}.
 
 %% @doc An unsigned commitment verifies when the transaction's unsigned ID is
-%% the ID of the commitment; a signed one when its signature verifies.
+%% the ID of the commitment and its data matches its `data-root' and
+%% `data-size'; a signed one when its signature verifies.
 tx_verifies(TX, #{ <<"type">> := <<"unsigned-sha256">> }, Msg) ->
     [ID] = maps:keys(maps:get(<<"commitments">>, Msg, #{})),
-    hb_util:human_id(ar_tx:id(TX, unsigned)) =:= hb_util:human_id(ID);
+    hb_util:human_id(ar_tx:id(TX, unsigned)) =:= hb_util:human_id(ID) andalso
+        ar_tx:verify_v2_data(TX);
 tx_verifies(TX, _Req, _Msg) ->
     ar_tx:verify(TX).
 
@@ -489,6 +493,54 @@ data_tag_with_data_test() ->
     },
     do_tx_roundtrips(TX, UnsignedTABM, SignedCommitment).
 
+%% @doc An unsigned transaction verifies only when its data matches its
+%% `data-root' and `data-size', and its commitment carries no committer, owner
+%% or signature.
+unsigned_commitment_test() ->
+    Data = <<"myrealdata">>,
+    Other = <<"your-data!">>,
+    Root = ar_tx:data_root(arweavejs, Data),
+    Size = byte_size(Data),
+    TX = #tx{
+        format = 2,
+        tags = [{<<"data">>, <<"tagdata">>}],
+        data = Data,
+        data_size = Size,
+        data_root = Root
+    },
+    ID = ar_tx:generate_id(TX, unsigned),
+    Commitment = #{
+        <<"commitment-device">> => <<"tx@1.0">>,
+        <<"committed">> => [<<"data">>],
+        <<"type">> => <<"unsigned-sha256">>,
+        <<"bundle">> => <<"false">>,
+        <<"field-data-root">> => hb_util:encode(Root),
+        <<"original-tags">> =>
+            #{
+                <<"1">> =>
+                    #{ <<"name">> => <<"data">>, <<"value">> => <<"tagdata">> }
+            }
+    },
+    Msg = #{
+        <<"data">> => Data,
+        <<"commitments">> => #{hb_util:encode(ID) => Commitment}
+    },
+    ?assert(hb_message:verify(Msg)),
+    ?assertNot(hb_message:verify(Msg#{ <<"data">> => Other })),
+    ?assertNot(
+        hb_message:verify(
+            Msg#{
+                <<"commitments">> =>
+                    #{
+                        hb_util:encode(ID) => Commitment#{
+                            <<"owner">> => <<"caller-owner">>,
+                            <<"signature">> => <<"caller-signature">>
+                        }
+                    }
+            }
+        )
+    ).
+
 data_tag_no_data_test() ->
     Data = <<"myrealdata">>,
     DataRoot = ar_tx:data_root(arweavejs, Data),
@@ -657,7 +709,7 @@ tags_and_fields_test() ->
     },
     UnsignedID = ar_tx:generate_id(TX, unsigned),
     UnsignedTABM = #{
-        <<"anchor">> => hb_util:encode(AnchorField),
+        <<"anchor">> => hb_util:encode(AnchorTag),
         <<"commitments">> => #{
             hb_util:encode(UnsignedID) => #{
                 <<"commitment-device">> => <<"tx@1.0">>,
@@ -704,11 +756,11 @@ tags_and_fields_test() ->
                 <<"bundle">> => <<"false">>
             }
         },
-        <<"quantity">> => <<"5">>,
-        <<"reward">> => <<"6">>,
-        <<"target">> => hb_util:encode(TargetField),
-        <<"data-root">> => hb_util:encode(DataRootField),
-        <<"data-size">> => <<"7">>,
+        <<"quantity">> => <<"1000">>,
+        <<"reward">> => <<"2000">>,
+        <<"target">> => hb_util:encode(TargetTag),
+        <<"data-root">> => hb_util:encode(DataRootTag),
+        <<"data-size">> => <<"100">>,
         <<"format">> => <<"1">>
     },
     SignedCommitment = #{
@@ -1384,6 +1436,25 @@ modified_committed_value_test() ->
     ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
     ModifiedField = Structured#{ <<"quantity">> => <<"1">> },
     ?assertNot(hb_message:verify(ModifiedField, all, #{})),
+    % A `public-key' that is not the item's `owner' does not verify.
+    #{ <<"owner">> := OtherOwner } = ar_wallet:new(),
+    [{ID, Commitment}] = maps:to_list(
+        maps:get(<<"commitments">>, Structured)),
+    ?assertMatch(
+        {ok, false},
+        ?MODULE:verify(
+            Structured#{
+                <<"commitments">> =>
+                    #{
+                        ID => Commitment#{
+                            <<"public-key">> => hb_util:encode(OtherOwner)
+                        }
+                    }
+            },
+            #{},
+            #{}
+        )
+    ),
     % Commit refuses a request `field-quantity' that differs from the key.
     ?assertThrow(
         {request_field_differs, <<"quantity">>},

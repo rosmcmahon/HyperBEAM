@@ -124,6 +124,7 @@ request(Base, HookReq, Opts) ->
         {ok, Request} ?= hb_maps:find(<<"request">>, HookReq, Opts),
         {ok, OrigMessages} ?= hb_maps:find(<<"body">>, HookReq, Opts),
         true ?= is_relevant(Base, Request, OrigMessages, Opts),
+        true ?= hb_http:is_own_origin(Request, Opts),
         ?event(auth_hook_is_relevant),
         % Call the key provider to normalize authentication (generate if needed)
         {ok, IntermediateProvider, NormReq} ?=
@@ -173,6 +174,12 @@ request(Base, HookReq, Opts) ->
         {error, AuthError} ->
             ?event({auth_hook_auth_error, {priv_error, AuthError}}),
             {error, AuthError};
+        false ->
+            {error,
+                #{
+                    <<"status">> => 403,
+                    <<"body">> => <<"Request is not from the node's origin.">>
+                }};
         {skip, {committers, Committers}, {keys, Keys}} ->
             ?event({auth_hook_skipping, {committers, Committers}, {keys, Keys}}),
             {ok, HookReq};
@@ -248,15 +255,15 @@ is_relevant_from_keys(Base, Request, Opts) ->
         <<"always">> -> true;
         RelevantKeys ->
             lists:any(
-                fun(Key) ->
-                    case hb_maps:find(Key, Request, Opts) of
-                        {ok, _} -> true;
-                        error -> false
-                    end
-                end,
+                fun(Key) -> is_relevant_key(Key, Request, Opts) end,
                 RelevantKeys
             )
     end.
+
+%% @doc Whether the request has the key, in public or in `priv'.
+is_relevant_key(Key, Request, Opts) ->
+    hb_maps:is_key(Key, Request, Opts) orelse
+        hb_maps:is_key(Key, hb_private:from_message(Request), Opts).
 
 %% @doc Normalize authentication credentials, generating new ones if needed.
 generate_secret(Provider, Request, Opts) ->
@@ -593,6 +600,21 @@ http_auth_test() ->
     ?assertMatch(
         {ok, #{ <<"status">> := 200 }},
         Resp2
+    ),
+    % A request that a page on another site sends is not signed.
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"//commitments">>,
+                <<"body">> => <<"Test data">>,
+                <<"authorization">> => AuthStr,
+                <<"origin">> => <<"http://other.example">>,
+                <<"sec-fetch-site">> => <<"cross-site">>
+            },
+            #{}
+        )
     ),
     % Filter the response to only include signed commitments.
     Signers = signers_from_commitments_response(hb_util:ok(Resp2), ServerWallet),

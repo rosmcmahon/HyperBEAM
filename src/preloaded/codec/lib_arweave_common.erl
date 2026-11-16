@@ -3,7 +3,7 @@
 -export([from/3]).
 -export([fields/3, tags/2, data/5, committed/6, base/5, verify_identity/3]).
 -export([sign/4, order_tags/3]).
--export([verify_committed_keys/5]).
+-export([verify_committed_keys/5, verify_original_tags/3]).
 -export([add_commitment/4]).
 -export([with_commitments/8]).
 -export([bundle_hint/4, data/4, tags/5, excluded_tags/3]).
@@ -146,10 +146,14 @@ anchor_field(Item, Prefix, _Opts) ->
 %% @doc Return a TABM of the raw tags of the item, including all metadata
 %% (e.g. `ao-type', `ao-data-key', etc.)
 tags(Item, Opts) ->
-    hb_ao:normalize_keys(
+    Tags = hb_ao:normalize_keys(
         deduplicating_from_list(Item#tx.tags, Opts),
         Opts
-    ).
+    ),
+    % The codec's commitment replaces a tag with the same key.
+    maps:is_key(<<"commitments">>, Tags) andalso
+        throw({invalid_field, tag_name, <<"commitments">>}),
+    Tags.
 
 %% @doc Normalize a tag name as `structured@1.0' normalizes a key.
 normalize_key(Key) -> hb_util:lowercase_key(hb_ao:normalize_key(Key)).
@@ -162,6 +166,7 @@ data(Item, Req, Tags, FromFun, Opts) ->
     % the raw data value. This handles unbundling nested messages, as well as
     % applying the `ao-data-key' tag if given.
     DataKey = maps:get(<<"ao-data-key">>, Tags, <<"data">>),
+    refuse_reserved_data_key(DataKey, Item#tx.data),
     case {DataKey, Item#tx.data} of
         {_, ?DEFAULT_DATA} -> #{};
         {DataKey, Empty} when Empty =:= #{}, Item#tx.manifest =:= undefined ->
@@ -184,6 +189,37 @@ data(Item, Req, Tags, FromFun, Opts) ->
             );
         {DataKey, Data} -> #{ DataKey => Data }
     end.
+
+%% @doc Throw if an item puts its data under a key that the codec keeps for
+%% itself. A data map gives its own keys, so only a commitment or a private
+%% key is refused there.
+refuse_reserved_data_key(_DataKey, Data) when is_map(Data) ->
+    lists:foreach(
+        fun(Key) ->
+            is_codec_key(Key) andalso throw({invalid_field, data_key, Key})
+        end,
+        maps:keys(Data)
+    );
+refuse_reserved_data_key(DataKey, _Data) ->
+    (is_codec_key(DataKey) orelse is_field_key(DataKey)) andalso
+        throw({invalid_field, data_key, DataKey}).
+
+%% @doc Whether a key is one that the codec adds to the message: its
+%% commitment or a private key.
+is_codec_key(Key) ->
+    Key =:= <<"commitments">> orelse hb_private:is_private(Key).
+
+%% @doc Whether a key is a field of an ANS-104 item or a TX, or a key that the
+%% codec reads its data with.
+is_field_key(Key) ->
+    lists:member(
+        Key,
+        [
+            <<"ao-data-key">>, <<"ao-types">>, <<"target">>, <<"anchor">>,
+            <<"owner">>, <<"signature">>, <<"id">>, <<"format">>,
+            <<"quantity">>, <<"reward">>, <<"data-root">>, <<"data-size">>
+        ]
+    ).
 
 %% @doc Calculate the list of committed keys for an item, based on its
 %% components (fields, tags, and data).
@@ -239,20 +275,19 @@ tag_keys(Item, _Opts) ->
     ).
 
 %% @doc Return the complete message for an item, less its commitments. Each
-%% committed key takes its value from `Data', then `Fields', then `Tags'. A
-%% field in `Fields' takes precedence over a tag of the same name, and the tag
-%% stays only in the commitment's `original-tags'. A field with its default
-%% value is not in `Fields', so a tag of the same name gives the key's value.
-%% Section 5.5 of `specs/tx@1.0.md' gives each case in a table.
+%% committed key takes its value from `Data', then `Tags', then `Fields'. A tag
+%% takes precedence over a field of the same name, and the field's value stays
+%% only in the commitment's `field-<name>'. A field with its default value is
+%% not in `Fields'. Section 5.5 of `specs/tx@1.0.md' gives each case in a table.
 base(CommittedKeys, Fields, Tags, Data, Opts) ->
     hb_maps:from_list(
         lists:map(
             fun(Key) ->
                 case hb_maps:find(Key, Data, Opts) of
                     error ->
-                        case hb_maps:find(Key, Fields, Opts) of
+                        case hb_maps:find(Key, Tags, Opts) of
                             error ->
-                                case hb_maps:find(Key, Tags, Opts) of
+                                case hb_maps:find(Key, Fields, Opts) of
                                     error -> throw({missing_key, Key});
                                     {ok, Value} -> {Key, Value}
                                 end;
@@ -273,9 +308,20 @@ base(CommittedKeys, Fields, Tags, Data, Opts) ->
 verify_identity(Item, TABM, Opts) ->
     [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
     case maps:get(<<"type">>, Commitment) of
-        <<"unsigned-sha256">> -> not maps:is_key(<<"committer">>, Commitment);
+        <<"unsigned-sha256">> ->
+            % An unsigned commitment carries no committer, owner or signature.
+            not maps:is_key(<<"committer">>, Commitment) andalso
+                not maps:is_key(<<"owner">>, Commitment) andalso
+                not maps:is_key(<<"signature">>, Commitment);
         _ ->
-            hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
+            % A `signature' is a binary: `hb_util:decode/1' takes a list too.
+            % The `public-key' of a commitment is its `owner', the key that
+            % verifies its signature.
+            is_binary(maps:get(<<"signature">>, Commitment)) andalso
+                maps:get(<<"public-key">>, Commitment,
+                    hb_util:encode(Item#tx.owner)) =:=
+                    hb_util:encode(Item#tx.owner) andalso
+                hb_util:human_id(ID) =:= hb_util:human_id(Item#tx.id) andalso
                 maps:get(<<"committer">>, Commitment, unset) =:=
                     committer(Item, Opts)
     end.
@@ -374,6 +420,17 @@ verify_committed_keys(FieldKeys, Item, FieldsFun, TABM, Opts) ->
             hb_maps:without([<<"commitments">>], TABM, Opts),
             Opts
         ) =:= CommittedKeys.
+
+%% @doc Check that the item's tags are the commitment's `original-tags'. A
+%% reader of `original-tags' then reads only tags that the item's ID or
+%% signature covers.
+verify_original_tags(Item, TABM, Opts) ->
+    [{_ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, TABM)),
+    case hb_maps:find(<<"original-tags">>, Commitment, Opts) of
+        {ok, OriginalTags} ->
+            Item#tx.tags =:= original_tags_to_tags(OriginalTags);
+        error -> true
+    end.
 
 %% @doc Return a message with the appropriate commitments added to it.
 with_commitments(
@@ -595,8 +652,10 @@ bundle_hint(Device, Msg, Req, Opts) ->
         _ -> not_found
     end.
 
-%% @doc Apply `bundle_hint/4' for an item codec, and name the committed keys of
-%% the commitment, which its item holds alone: `structured@1.0' encodes the
+%% @doc Give the bundling and the committed keys of an item codec's commitment.
+%% The item is bundled as verification reads it: as the commitment's `bundle'
+%% gives, or not when the commitment gives none, whatever the request gives.
+%% The item has only the committed keys: `structured@1.0' encodes the
 %% message over those keys, so keys given to it after signing do not reach the
 %% item. Returns `not_found' when no commitment for `Device' exists.
 item_hint(Device, Msg, Req, Opts) ->
@@ -612,13 +671,9 @@ item_hint(Device, Msg, Req, Opts) ->
                     hb_maps:get(<<"committed">>, Commitment, [], Opts),
                     Opts
                 ),
-            {ok,
-                with_bundle(
-                    Commitment,
-                    Req#{ <<"committed">> => Committed },
-                    Opts
-                )
-            };
+            Bundle =
+                hb_util:atom(hb_maps:get(<<"bundle">>, Commitment, false, Opts)),
+            {ok, Req#{ <<"committed">> => Committed, <<"bundle">> => Bundle }};
         _ -> not_found
     end.
 
@@ -731,22 +786,30 @@ commitment_to_tx(Message, Data, Commitment, FieldsFun, Opts) ->
         tags = Tags,
         avro_form = AvroForm
     },
-    case holds_signed_values(Commitment, Tags, Message, Data, Opts) of
+    case holds_signed_values(
+            Commitment, Tags, Message, Data, FieldsFun, Opts) of
         true -> FieldsFun(TX, ?FIELD_PREFIX, Commitment, Opts);
         false ->
             FieldsFun(TX#tx{ tags = [], avro_form = <<>> }, <<>>, Message, Opts)
     end.
 
 %% @doc Check that a message still contains the values of the fields and tags
-%% that its commitment restores. Keys added after signing are not compared.
-holds_signed_values(Commitment, OriginalTags, TABM, Data, Opts) ->
+%% that its commitment restores. Keys added after signing are not compared. A
+%% field key that does not give a base field its own value is not a field, and
+%% a field with the name of a tag is not compared: decoding takes the tag's
+%% value.
+holds_signed_values(Commitment, OriginalTags, TABM, Data, FieldsFun, Opts) ->
+    Default = FieldsFun(#tx{}, ?FIELD_PREFIX, #{}, Opts),
     Fields =
         maps:from_list(
             [
                 {Key, Value}
             ||
-                {<<"field-", Key/binary>>, Value}
-                    <- hb_maps:to_list(Commitment, Opts)
+                {<<"field-", Key/binary>> = FieldKey, Value}
+                    <- hb_maps:to_list(Commitment, Opts),
+                FieldsFun(
+                    #tx{}, ?FIELD_PREFIX, #{ FieldKey => Value }, Opts
+                ) =/= Default
             ]
         ),
     % The data root of a TX with data is not a key of its message: only its
@@ -756,16 +819,16 @@ holds_signed_values(Commitment, OriginalTags, TABM, Data, Opts) ->
             ?DEFAULT_DATA -> Fields;
             _ -> maps:remove(<<"data-root">>, Fields)
         end,
-    holds(MessageFields, TABM, Opts) andalso
-        holds_tags(OriginalTags, maps:keys(MessageFields), TABM, Opts).
+    TagKeys = tag_keys(#tx{ tags = OriginalTags }, Opts),
+    holds(maps:without(TagKeys, MessageFields), TABM, Opts) andalso
+        holds_tags(OriginalTags, TABM, Opts).
 
 %% @doc Check that a message contains the values of its commitment's tags. A tag
-%% with the name of a field is skipped: decoding takes the field's value. So is
-%% a tag with the name of a nested message, such as a list bundle's tag `1':
-%% decoding takes the item in the data.
-holds_tags([], _FieldKeys, _TABM, _Opts) ->
+%% with the name of a nested message, such as a list bundle's tag `1', is
+%% skipped: decoding takes the item in the data.
+holds_tags([], _TABM, _Opts) ->
     true;
-holds_tags(OriginalTags, FieldKeys, TABM, Opts) ->
+holds_tags(OriginalTags, TABM, Opts) ->
     Tags = deduplicating_from_list(OriginalTags, Opts),
     Nested =
         maps:keys(
@@ -776,7 +839,7 @@ holds_tags(OriginalTags, FieldKeys, TABM, Opts) ->
         ),
     Keys =
         hb_util:list_without(
-            FieldKeys ++ Nested,
+            Nested,
             tag_keys(#tx{ tags = OriginalTags }, Opts)
         ),
     holds(maps:with(Keys, Tags), TABM, Opts).
@@ -853,7 +916,14 @@ data(MaybeCommitment, TABM, Req, Opts) ->
         {?DEFAULT_DATA, _} ->
             NestedMsgs;
         {DataVal, _} ->
-            NestedMsgs#{ DataKey => hb_util:ok(to(DataVal, Req, Opts)) }
+            % A data key other than `data' can be in `NestedMsgs' already,
+            % encoded from the same value if it is not a link.
+            Encoded =
+                case {maps:find(DataKey, NestedMsgs), maps:get(DataKey, TABM)} of
+                    {{ok, Item}, Value} when not ?IS_LINK(Value) -> Item;
+                    _ -> hb_util:ok(to(DataVal, Req, Opts))
+                end,
+            NestedMsgs#{ DataKey => Encoded }
     end.
 
 %% @doc Calculate data messages for large tag values or nested messages. A

@@ -500,6 +500,28 @@ transport_codec(Ctx = #{broker := Broker, first := First, caller := Opts}) ->
         {<<"/~tunnel@1.0/register">>, <<"httpsig@1.0">>},
         {<<"/~tunnel@1.0/response">>, <<"httpsig@1.0">>}
     ], Envelopes),
+    % A reply costs three signatures: the broker's on its work message and on
+    % the hashpath of its reply, and the origin's on its response, with which
+    % it registers again. The broker verifies the request on arrival and once
+    % it removes the routing keys, and the response on arrival and with its
+    % controls. The origin verifies the work message and its reply, and the
+    % caller the reply.
+    erlang:trace_pattern({ar_wallet, sign, 3}, true, [call_count]),
+    erlang:trace_pattern({hb_message, deep_verify, 2}, true, [call_count]),
+    lists:foreach(
+        fun(_) ->
+            success(get(Ctx, First, <<"/~meta@1.0/info/address">>), Opts)
+        end,
+        lists:seq(1, 10)
+    ),
+    {call_count, Signatures} =
+        erlang:trace_info({ar_wallet, sign, 3}, call_count),
+    {call_count, Verifications} =
+        erlang:trace_info({hb_message, deep_verify, 2}, call_count),
+    erlang:trace_pattern({ar_wallet, sign, 3}, false, [call_count]),
+    erlang:trace_pattern({hb_message, deep_verify, 2}, false, [call_count]),
+    ?assertEqual(30, Signatures),
+    ?assertEqual(70, Verifications),
     drained(Ctx).
 
 %% @doc Check that a `tunnel-host' routes only the hosts that are its direct
@@ -1176,7 +1198,16 @@ authorization(Ctx = #{
             maps:without([<<"priv-wallet">>, <<"identities">>], OwnerOpts)
         )
     ),
-    Signed = signed(#{<<"peer">> => URL, <<"workers">> => 2}, OwnerOpts),
+    Created = erlang:system_time(second),
+    Signed =
+        signed(
+            #{
+                <<"peer">> => URL,
+                <<"workers">> => 2,
+                <<"created">> => Created
+            },
+            OwnerOpts
+        ),
     success(
         hb_http:post(
             maps:get(url, First),
@@ -1187,8 +1218,22 @@ authorization(Ctx = #{
         Opts
     ),
     await(fun() -> registered(URL, maps:get(id, First), Opts) =:= 2 end),
+    Replayed =
+        response(
+            hb_http:post(
+                maps:get(url, First),
+                <<"/~tunnel@1.0/connect">>,
+                Signed,
+                Opts
+            ),
+            Opts
+        ),
+    ?assertEqual(403, hb_maps:get(<<"status">>, Replayed, not_found, Opts)),
     PeerOnly =
-        (signed(#{ <<"peer">> => URL }, OwnerOpts))#{ <<"workers">> => 9 },
+        (signed(
+            #{ <<"peer">> => URL, <<"created">> => Created + 1 },
+            OwnerOpts
+        ))#{ <<"workers">> => 9 },
     Kept =
         success(
             hb_http:post(

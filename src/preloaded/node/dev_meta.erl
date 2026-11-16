@@ -63,7 +63,8 @@ build_info() ->
 
 %% @doc Get/set the node message. If the request is a `POST', we check that the
 %% request is signed by the owner of the node. If not, we return the node message
-%% as-is, aside all keys that are private (according to `hb_private').
+%% over the defaults that `hb_opts:get' falls back to, aside all keys that are
+%% private (according to `hb_private').
 -spec info(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 info(_, Request, NodeMsg) ->
     {ErlStatus, Res} = case hb_ao:get(<<"method">>, Request, NodeMsg) of
@@ -82,8 +83,16 @@ info(_, Request, NodeMsg) ->
             end;
         _ ->
             ?event({get_config_req, Request, NodeMsg}),
-            DynamicKeys = add_dynamic_keys(NodeMsg),
-            {ok, filter_node_msg(DynamicKeys, NodeMsg)}
+            DynamicKeys =
+                add_dynamic_keys(
+                    hb_maps:merge(hb_opts:default_message_with_env(), NodeMsg)
+                ),
+            {ok,
+                lib_meta:without_credentials(
+                    filter_node_msg(DynamicKeys, NodeMsg),
+                    NodeMsg
+                )
+            }
     end,
     {ErlStatus, Res#{ <<"cache-control">> => <<"no-store">> }}.
 
@@ -137,26 +146,36 @@ update_node_message(Request, NodeMsg) ->
             ?event({set_node_message_fail, Request}),
             {error, #{ <<"body">> => not_authorized }};
         {ok, Authorized} ->
-            case adopt_node_message(Authorized, NodeMsg) of
-                {ok, NewNodeMsg} ->
-                    NewH = hb_opts:get(node_history, [], NewNodeMsg),
-                    {ok,
-                        #{
-                            <<"body">> =>
-                                iolist_to_binary(
-                                    io_lib:format(
-                                        "Node message updated. History: ~p"
-                                            "updates.",
-                                        [length(NewH)]
-                                    )
-                                ),
-                            <<"history-length">> => length(NewH)
-                        }
-                    };
-                {error, Reason} ->
-                    ?event({set_node_message_fail, Request, Reason}),
-                    {error, #{ <<"body">> => Reason }}
-            end
+            % An admin's update applies once for each of its `created' times.
+            lib_meta:ratcheted_apply(
+                <<"~meta@1.0/info">>,
+                <<"admin">>,
+                Authorized,
+                fun() -> adopt_authorized(Request, Authorized, NodeMsg) end,
+                NodeMsg
+            )
+    end.
+
+adopt_authorized(Request, Authorized, NodeMsg) ->
+    case adopt_node_message(Authorized, NodeMsg) of
+        {ok, NewNodeMsg} ->
+            NewH = hb_opts:get(node_history, [], NewNodeMsg),
+            {ok,
+                #{
+                    <<"body">> =>
+                        iolist_to_binary(
+                            io_lib:format(
+                                "Node message updated. History: ~p"
+                                    "updates.",
+                                [length(NewH)]
+                            )
+                        ),
+                    <<"history-length">> => length(NewH)
+                }
+            };
+        {error, Reason} ->
+            ?event({set_node_message_fail, Request, Reason}),
+            {error, #{ <<"body">> => Reason }}
     end.
 
 %% @doc Attempt to adopt changes to a node message.
@@ -498,7 +517,18 @@ uninitialized_node_test() ->
     Node = hb_http_server:start_node(#{ <<"initialized">> => false }),
     {error, Res} = hb_http:get(Node, <<"/key1?1.key1=value1">>, #{}),
     ?event({res, Res}),
-    ?assertEqual(<<"Node must be initialized before use.">>, Res).
+    ?assertEqual(<<"Node must be initialized before use.">>, Res),
+    % An uncommitted `path` header cannot select another request.
+    ?assertEqual(
+        {error, <<"Node must be initialized before use.">>},
+        hb_http:request(
+            <<"GET">>,
+            Node,
+            <<"/~meta@1.0/info">>,
+            #{ <<"path">> => <<"/~message@1.0/id?1.a=1">> },
+            #{}
+        )
+    ).
 
 %% @doc Test that a permanent node message cannot be changed.
 permanent_node_message_test() ->

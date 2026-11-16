@@ -113,6 +113,8 @@ do_verify(OnlyWithCommitment, Req, Opts) ->
     Res =
         item_verifies(TX, Req, OnlyWithCommitment) andalso
             lib_arweave_common:verify_identity(TX, OnlyWithCommitment, Opts) andalso
+            lib_arweave_common:verify_original_tags(
+                TX, OnlyWithCommitment, Opts) andalso
             lib_arweave_common:verify_committed_keys(
                 ?BASE_FIELDS, TX, fun lib_arweave_common:fields/3,
                 OnlyWithCommitment, Opts),
@@ -290,7 +292,37 @@ modified_committed_value_test() ->
     ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
     ModifiedField =
         Msg#{ <<"target">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
-    ?assertNot(hb_message:verify(ModifiedField, all, #{})).
+    ?assertNot(hb_message:verify(ModifiedField, all, #{})),
+    % A `signature' given as a list does not verify.
+    [{ID, Commitment}] = maps:to_list(maps:get(<<"commitments">>, Msg)),
+    ListSignature = binary_to_list(maps:get(<<"signature">>, Commitment)),
+    ?assertNot(
+        hb_message:verify(
+            Msg#{
+                <<"commitments">> =>
+                    #{ ID => Commitment#{ <<"signature">> => ListSignature } }
+            },
+            all,
+            #{}
+        )
+    ),
+    % A `public-key' that is not the item's `owner' does not verify.
+    #{ <<"owner">> := OtherOwner } = ar_wallet:new(),
+    ?assertMatch(
+        {ok, false},
+        ?MODULE:verify(
+            Msg#{
+                <<"commitments">> =>
+                    #{
+                        ID => Commitment#{
+                            <<"public-key">> => hb_util:encode(OtherOwner)
+                        }
+                    }
+            },
+            #{},
+            #{}
+        )
+    ).
 
 %% @doc Committing a message with 126 keys and a nested message throws
 %% `too_many_keys': its item would have 129 tags, and ANS-104 allows 128.
@@ -526,7 +558,27 @@ ao_data_key_test() ->
             <<"ans104@1.0">>
         ),
     ?assert(hb_message:verify(Own, all, #{})).
-        
+
+reserved_key_test() ->
+    Wallet = ar_wallet:new(),
+    Items = [
+        #tx{ tags = [{<<"ao-data-key">>, Key}], data = <<"marker">> }
+    ||
+        Key <- [<<"commitments">>, <<"priv">>, <<"target">>]
+    ] ++ [
+        #tx{ tags = [{<<"commitments">>, <<"marker">>}] },
+        #tx{ data = #{ <<"commitments">> => <<"marker">> } }
+    ],
+    lists:foreach(
+        fun(Item) ->
+            ?assertThrow(
+                {invalid_field, _, _},
+                from(ar_bundles:sign_item(Item, Wallet), #{}, #{})
+            )
+        end,
+        Items
+    ).
+
 simple_signed_to_httpsig_test() ->
     Structured =
         hb_message:commit(

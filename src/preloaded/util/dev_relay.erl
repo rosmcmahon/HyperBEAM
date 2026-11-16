@@ -174,7 +174,14 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
             true ->
                 case hb_opts:get(relay_allow_commit_request, false, Opts) of
                     true ->
-                        Committed = hb_message:commit(TargetMod4, Opts),
+                        % The node signs keys that the caller gives, so it gives
+                        % them its own `type': a relayed request is never the
+                        % operator's message or a device implementation.
+                        Committed =
+                            hb_message:commit(
+                                TargetMod4#{ <<"type">> => <<"Relay-Request">> },
+                                Opts
+                            ),
                         ?event(debug_relay, {relay_recommitted, Committed}, Opts),
                         true = hb_message:verify(Committed, all),
                         Committed;
@@ -225,44 +232,46 @@ do_call(RelayPath, BaseTarget, M1, RawM2, Opts) ->
                         {Node, relay_destination(not_found, RelayRoute), NodeOpts}
                 end
         end,
-    RequestOpts = RouteOpts#{ <<"http-redirects">> => 0 },
-    case hb_hostname:is_blocked(Destination, Opts) of
-        true -> {error, blocked_host};
-        false ->
-            Res =
-                case RelayPeer of
-                    not_found ->
-                        hb_http:request(TargetMod5, RequestOpts);
-                    _ ->
-                        ?event(debug_relay, {relaying_to_peer, RelayPeer}),
-                        hb_http:request(
-                            RelayMethod,
-                            RelayPeer,
-                            RelayPath,
-                            TargetMod5,
-                            RequestOpts
-                        )
-                end,
-            case Res of
-                {ok, R} ->
-                    % A reply that carries commitments is the message that the
-                    % peer sent: the result keeps the keys that they cover, so
-                    % the `status' that the client adds to the reply is not one.
-                    {ok, Sent} = hb_message:with_only_committed(R, any, Opts),
-                    % The reply's links name messages in the peer's stores, and
-                    % a client reads them from this node: load them here.
-                    Loaded = hb_cache:ensure_all_loaded(Sent, Opts),
-                    {ok, strip_cookies(Loaded, Opts)};
-                Err -> Err
-            end
+    % The client validates a host that the request chose where it connects to
+    % it, so the connection reaches an address that the host policy accepted.
+    RequestOpts =
+        RouteOpts#{
+            <<"http-redirects">> => 0,
+            <<"http-client-validate-accessible">> => Destination =/= undefined
+        },
+    Res =
+        case RelayPeer of
+            not_found ->
+                hb_http:request(TargetMod5, RequestOpts);
+            _ ->
+                ?event(debug_relay, {relaying_to_peer, RelayPeer}),
+                hb_http:request(
+                    RelayMethod,
+                    RelayPeer,
+                    RelayPath,
+                    TargetMod5,
+                    RequestOpts
+                )
+        end,
+    case Res of
+        {ok, R} ->
+            % A reply that carries commitments is the message that the peer
+            % sent: the result keeps the keys that they cover, so the `status'
+            % that the client adds to the reply is not one.
+            {ok, Sent} = hb_message:with_only_committed(R, any, Opts),
+            % The reply's links give messages in the peer's stores, and a client
+            % reads them from this node: load them here.
+            Loaded = hb_cache:ensure_all_loaded(Sent, Opts),
+            {ok, strip_cookies(Loaded, Opts)};
+        Err -> Err
     end.
 
 %% @doc Returns the destination the relay will contact: the `peer' when the
 %% request gives one, otherwise an absolute `route-path', `relay-path' or
 %% `relay-route'. If a relative path gives an authority, joining it to a route
 %% prefix makes the prefix userinfo and the path chooses the host, so return the
-%% path with a scheme for `hb_hostname:is_blocked/2' to check that host. Any
-%% other relative path gives no host and returns `undefined'.
+%% path with a scheme, as a host that the request chose. Any other relative
+%% path gives no host and returns `undefined'.
 relay_destination(not_found, <<"http://", _/binary>> = Path) -> Path;
 relay_destination(not_found, <<"https://", _/binary>> = Path) -> Path;
 relay_destination(not_found, <<"/", _/binary>>) -> undefined;
@@ -615,6 +624,36 @@ relay_relative_routed_test() ->
             #{ <<"http-only-result">> => false }
         ),
     ?assertEqual(Address, hb_ao:get(<<"body">>, Res, #{})).
+
+%% @doc A chunk upload relayed through the node's default Arweave routes, as a
+%% gateway relays `POST /chunk', is accepted by the nodes that sync the tip.
+%% The upload is a chunk that the network holds already (the 22 bytes of
+%% transaction `A7TGD0bktXYkQSrz4UWfPqgcb8A4TAOEsKQU5_zAu7g'), which a node
+%% accepts again.
+relay_chunk_upload_test_() ->
+    {timeout, 60, fun relay_chunk_upload/0}.
+relay_chunk_upload() ->
+    Opts = #{ <<"http-only-result">> => false },
+    Relay =
+        hb_http_server:start_node(#{
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"routes">> => [<<"~meta@1.0/info/arweave-routes">>]
+        }),
+    {ok, Res} =
+        hb_http:post(
+            Relay,
+            #{
+                <<"path">> => <<"/~relay@1.0/call?relay-path=/arweave/chunk">>,
+                <<"content-type">> => <<"application/json">>,
+                <<"body">> =>
+                    <<"{\"data_root\":\"oQKhNnXBWbOvjI2edcEXDCnB7BUvDeZsZ4zTn2R95TI\","
+                        "\"data_size\":\"22\",\"data_path\":\"LCdnBIZXnavBo4CnAfMwu5kGK4"
+                        "GD43WIemSeN_h_mlsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFg\","
+                        "\"offset\":\"21\",\"chunk\":\"QmF6YXIgY29sbGVjdGlvbiBpbmRleA\"}">>
+            },
+            Opts
+        ),
+    ?assertEqual(200, hb_ao:get(<<"status">>, Res, Opts)).
 
 %% @doc A relayed request's `multirequest-*' keys configure the node's own
 %% multirequest, so the relay removes them: a request on a `nodes' route cannot

@@ -15,7 +15,8 @@
 %%% Library functions. Each exported function is _automatically_ added to the
 %%% Lua environment, except for the `install/3' and `reinstall/3' functions,
 %%% which install the library in a new Lua state and in a restored one.
--export([get/3, resolve/3, set/3, event/3, install/3, reinstall/3]).
+-export([get/3, resolve/3, set/3, event/3, id/3, signers/3]).
+-export([install/3, reinstall/3]).
 -include("include/hb.hrl").
 
 %%% The set of devices that must be included in the device sandbox for an
@@ -26,7 +27,9 @@
     {get, fun get/3},
     {resolve, fun resolve/3},
     {set, fun set/3},
-    {event, fun event/3}
+    {event, fun event/3},
+    {id, fun id/3},
+    {signers, fun signers/3}
 ]).
 
 %% @doc Install the library into the given Lua environment.
@@ -204,9 +207,24 @@ committers(<<"committers">>, Committers) when is_list(Committers) ->
 committers(_Key, Res) ->
     Res.
 
-%% @doc Converts any `as' terms from Lua to their HyperBEAM equivalents.
+%% @doc The ID of a message with its commitments, as `hb_message:id/3' gives
+%% it.
+id([Base], ExecState, ExecOpts) ->
+    {[hb_message:id(Base, all, ExecOpts)], ExecState}.
+
+%% @doc The signers of a message, from its commitments rather than from its
+%% device.
+signers([Base], ExecState, ExecOpts) ->
+    Signers = hb_message:signers(Base, ExecOpts),
+    {[committers(<<"committers">>, Signers)], ExecState}.
+
+%% @doc Converts any `as' terms from Lua to their HyperBEAM equivalents. The
+%% message in an `as' term and each map in a path are caller input from Lua, so
+%% their private keys are removed.
 convert_as([<<"as">>, Device, RawMsg]) ->
-    {as, Device, RawMsg};
+    {as, Device, hb_private:reset(RawMsg)};
+convert_as(List) when is_list(List) ->
+    hb_private:reset(lists:map(fun convert_as/1, List));
 convert_as(Other) ->
     Other.
 
@@ -216,7 +234,7 @@ set([Base, Key, nil], ExecState, ExecOpts) ->
     set([Base, Key, unset], ExecState, ExecOpts);
 set([Base, Key, Value], ExecState, ExecOpts) ->
     ?event({ao_core_set, {base, Base}, {key, Key}, {value, Value}}),
-    NewRes = hb_ao:set(Base, Key, Value, ExecOpts),
+    NewRes = hb_ao:set(Base, convert_as(Key), Value, ExecOpts),
     ?event({ao_core_set_result, {result, NewRes}}),
     {[NewRes], ExecState};
 set([Base, NewValues], ExecState, ExecOpts) ->

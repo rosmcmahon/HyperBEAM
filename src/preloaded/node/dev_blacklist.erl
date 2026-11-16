@@ -26,7 +26,7 @@
 %%%     loaded.
 %%% - blacklist-whitelist: List of endpoint path that are always whitelisted.
 -module(dev_blacklist).
--export([request/3]).
+-export([request/3, query/3]).
 
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -59,25 +59,37 @@ request(_Base, HookReq, Opts) ->
             case is_match(HookReq, Opts) of
                 {blocked_txid, ID} ->
                     ?event(blacklist, {blocked, ID}, Opts),
+                    % The refusal ends the `request' hook, so that no later
+                    % handler, such as `router@1.0/preprocess', executes it.
                     {
-                        ok,
-                        HookReq#{
+                        error,
+                        #{
+                            <<"status">> => 451,
+                            <<"reason">> => <<"content-policy">>,
+                            <<"blocked-id">> => ID,
                             <<"body">> =>
-                                [#{
-                                    <<"status">> => 451,
-                                    <<"reason">> => <<"content-policy">>,
-                                    <<"blocked-id">> => ID,
-                                    <<"body">> =>
-                                        <<
-                                            "Requested message blocked by this node's ",
-                                            "content policy. Blocked ID: ", ID/binary
-                                        >>
-                                }]
+                                <<
+                                    "Requested message blocked by this node's ",
+                                    "content policy. Blocked ID: ", ID/binary
+                                >>
                         }
                     };
                 Response ->
                     Response
             end
+    end.
+
+%% @doc Return the IDs of the request's `query' list that the blacklist
+%% gives. A device that reads messages by IDs that the request hook did not see,
+%% such as `query@1.0', asks for all of them at once. Before the blacklist
+%% loads, it gives none.
+query(_Base, Req, Opts) ->
+    Table = cache_table_name(Opts),
+    case is_initialized(Table) of
+        true ->
+            {ok, blocked(hb_maps:get(<<"query">>, Req, [], Opts), Table)};
+        false ->
+            {ok, []}
     end.
 
 %% @doc Check if the message contains any blacklisted IDs.
@@ -90,8 +102,7 @@ is_match(Msg, Opts) ->
             case ensure_cache_table(Msg, Opts) of 
                 {ok, Msg1} ->
                     IDs = collect_ids(Msg1, Opts),
-                    MatchesFromIDs = fun(ID) -> ets:lookup(cache_table_name(Opts), ID) =/= [] end,
-                    case lists:filter(MatchesFromIDs, IDs) of
+                    case blocked(IDs, cache_table_name(Opts)) of
                         [] -> {ok, Msg1};
                         [ID|_] -> {blocked_txid, ID}
                     end;
@@ -339,6 +350,10 @@ is_initialized(TableName) ->
     ets:info(TableName) =/= undefined
         andalso ets:lookup(TableName, <<"meta/last-refresh">>) =/= [].
 
+%% @doc Return the IDs of a list that the cache table gives.
+blocked(IDs, Table) ->
+    [ID || ID <- IDs, ets:lookup(Table, ID) =/= []].
+
 %% @doc Loop that periodically refreshes the blacklist cache. Runs on the 
 %% singleton process that is responsible for the cache ets table.
 refresh_loop(Opts) ->
@@ -406,6 +421,26 @@ setup_test_env() ->
         blacklist => BlacklistID
     }}.
 
+%% @doc Opaque content is not a list of references, but an ID value is checked.
+opaque_content_test() ->
+    {ok, #{opts := Opts0, signed1 := ID,
+        blacklist := BlacklistID}} = setup_test_env(),
+    Opts = Opts0#{ <<"blacklist-providers">> => [BlacklistID] },
+    Base = #{ <<"device">> => <<"blacklist@1.0">> },
+    Req = #{
+        <<"path">> => <<"request">>,
+        <<"request">> => #{ <<"path">> => <<"/fixture">> }
+    },
+    Body = <<"Opaque content mentioning ", ID/binary, ", with %00 bytes.">>,
+    ?assertMatch(
+        {ok, #{ <<"body">> := Body }},
+        hb_ao:resolve(Base, Req#{ <<"body">> => Body }, Opts)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 451, <<"blocked-id">> := ID }},
+        hb_ao:resolve(Base, Req#{ <<"body">> => ID }, Opts)
+    ).
+
 %% @doc Test the blacklist device with a static blacklist that is in the local
 %% store.
 basic_test() ->
@@ -428,6 +463,11 @@ basic_test() ->
                 <<"reason">> := <<"content-policy">>
             }},
         hb_http:get(Node, SignedID1, Opts1)
+    ),
+    % `query' gives the blocked IDs of a list, at once.
+    ?assertEqual(
+        {ok, [SignedID1]},
+        query(#{}, #{ <<"query">> => [SignedID1, UnsignedID3] }, Opts1)
     ),
     % A blocked ID inside a parenthesized path part is blocked too.
     ?assertMatch(
@@ -486,6 +526,63 @@ basic_test() ->
     ),
     hb_name:unregister(Table),
     ok.
+
+%% @doc A blocked request ends the `request' hook, so that a later handler does
+%% not relay it: a routed request with a blocked ID is refused, and one without
+%% is relayed to the route's node.
+routed_request_test() ->
+    {ok, #{
+        opts := Opts0,
+        signed1 := SignedID1,
+        blacklist := BlacklistID
+    }} = setup_test_env(),
+    Backend =
+        hb_http_server:start_node(
+            #{
+                <<"store">> => hb_test_utils:test_store(),
+                <<"priv-wallet">> => BackendWallet = ar_wallet:new()
+            }
+        ),
+    Opts1 =
+        Opts0#{
+            <<"blacklist-providers">> => [BlacklistID],
+            <<"on">> =>
+                #{
+                    <<"request">> =>
+                        [
+                            #{ <<"device">> => <<"blacklist@1.0">> },
+                            #{
+                                <<"device">> => <<"router@1.0">>,
+                                <<"path">> => <<"preprocess">>
+                            }
+                        ]
+                },
+            <<"routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"^/~meta@1\\.0/info/address">>,
+                        <<"node">> =>
+                            #{
+                                <<"match">> => <<"^/.*">>,
+                                <<"with">> =>
+                                    <<Backend/binary, "~apply@1.0/user-path">>
+                            }
+                    }
+                ]
+        },
+    Node = hb_http_server:start_node(Opts1),
+    ?assertEqual(
+        {ok, hb_util:human_id(ar_wallet:to_address(BackendWallet))},
+        hb_http:get(Node, <<"/~meta@1.0/info/address">>, Opts1)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 451, <<"blocked-id">> := SignedID1 }},
+        hb_http:get(
+            Node,
+            <<"/~meta@1.0/info/address?ref=", SignedID1/binary>>,
+            Opts1
+        )
+    ).
 
 %% @doc Ensure that the default provider does not block any requests.
 first_request_always_return_503_test() ->

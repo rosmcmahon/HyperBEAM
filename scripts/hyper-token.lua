@@ -85,33 +85,23 @@ local function log_result(base, status, message)
     return base
 end
 
--- Normalize a quantity value to ensure it is a proper integer.
--- Returns either the normalized integer value or nil and an error message.
+-- Normalize a quantity value to an integer. A string must be an optional `-'
+-- and digits, with a value that a number holds exactly; a number must be
+-- whole. Returns nil for any other value.
 local function normalize_int(value)
-    local num
-    -- Handle string conversion
     if type(value) == "string" then
-        -- Check for decimal part (not allowed)
-        if string.find(value, "%.") then
+        if not string.match(value, "^%-?%d+$") then
             return nil
         end
-        -- Convert to number
-        num = tonumber(value)
-        if not num then
+        local num = math.tointeger(tonumber(value))
+        if not num or string.format("%d", num) ~= value then
             return nil
         end
-    elseif type(value) == "number" then
-        num = value
-        -- Check if it's an integer
-        if num ~= math.floor(num) then
-            return nil
-        end
-    else
-        -- Any other type is invalid.
-        return nil
+        return num
+    elseif type(value) == "number" and value == math.floor(value) then
+        return math.tointeger(value)
     end
-    
-    return num
+    return nil
 end
 
 -- Count the number of elements in `a' that are also in `b'.
@@ -120,11 +110,16 @@ function count_common(a, b)
     if type(a) ~= "table" then a = { a } end
     if type(b) ~= "table" then b = { b } end
 
-    local count = 0
+    -- Each value counts once, however often a list gives it.
+    local seen, count = {}, 0
     for _, v in ipairs(a) do
-        for _, w in ipairs(b) do
-            if v == w then
-                count = count + 1
+        if not seen[v] then
+            seen[v] = true
+            for _, w in ipairs(b) do
+                if v == w then
+                    count = count + 1
+                    break
+                end
             end
         end
     end
@@ -185,7 +180,11 @@ end
 local function satisfies_list_constraints(subject, all, required, match)
     -- Normalize the fields to tables, aside from the match count.
     subject = normalize_table(subject)
-    all = normalize_table(all)
+    all = normalize_table(all or {})
+    -- An empty list admits no signer.
+    if #all == 0 then
+        return false
+    end
     required = normalize_table(required or {})
     -- Normalize the match count.
     match = match or #all
@@ -243,7 +242,7 @@ local function satisfies_constraints(message, assess, all, required, match)
     -- If the assessment message is not present, check the signatures against
     -- the requirements list and specifiers.
     local satisfies_auth = satisfies_list_constraints(
-        ao.get("committers", message),
+        ao.signers(message),
         all,
         required,
         match
@@ -303,6 +302,13 @@ local function validate_new_peer_ledger(base, request)
             request = request
         })
         return true
+    end
+
+    -- A new peer is a process whose message a trusted authority pushed, which
+    -- `validate_request' then gives as `from'. A message that only its sender
+    -- signed gives no peer.
+    if (not request["from-process"]) or request.from ~= request["from-process"] then
+        return false
     end
 
     -- Calculate the expected base ID from the process's own `process` message,
@@ -500,9 +506,7 @@ function validate_request(incoming_base, assignment)
         return "error", log_result(base, "error", {
             message = "Deduplication failure.",
             assignment = assignment,
-            status = status,
-            incoming_base = incoming_base,
-            resulting_base = base
+            status = status
         })
     end
 
@@ -512,6 +516,15 @@ function validate_request(incoming_base, assignment)
         return "error", log_result(base, "error", {
             message = "Assignment is not trusted.",
             details = details
+        })
+    end
+
+    -- A message must give the ledger's signed process ID as its target.
+    if (not assignment.process) or (assignment.body.target ~= assignment.process) then
+        return "error", log_result(base, "error", {
+            message = "Message target is not the ledger's signed process ID.",
+            target = assignment.body.target,
+            process = assignment.process
         })
     end
 
@@ -530,7 +543,7 @@ function validate_request(incoming_base, assignment)
     else
         -- If the request is not proxied, we set the `from' field to the address
         -- that signed the request.
-        local committers = ao.get("committers", assignment.body)
+        local committers = ao.signers(assignment.body)
         if #committers == 0 then
             return "error", log_result(base, "error", {
                 message = "No request signers found."
@@ -868,7 +881,7 @@ end
 --- Index function, called by the `~process@1.0` device for scheduled messages.
 --- We route any `action' to the appropriate function based on the request path.
 function compute(base, assignment)
-    local action = string.lower(assignment.body.action or "")
+    local action = string.lower(assignment.body.action or assignment.body.path or "")
     ao.event(
         {
             "compute called",
@@ -888,6 +901,8 @@ function compute(base, assignment)
         return register(base, assignment)
     elseif action == "register-remote" then
         return _G["register-remote"](base, assignment)
+    elseif action == "charge" and charge then
+        return charge(base, assignment)
     else
         -- Handle unknown `action' values.
         _, base = ensure_initialized(base, assignment)

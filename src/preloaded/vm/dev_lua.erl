@@ -44,7 +44,21 @@
 %% which are `message@1.0' core functions, and Lua public utility functions.
 device_info(Base) ->
     #{
-        default => fun compute/4,
+        default =>
+            fun(Key, Msg, Req, Opts) ->
+                KeyForm =
+                    fun(K) ->
+                        Norm = hb_ao:normalize_key(K),
+                        try hb_util:to_lower(hb_util_string:dash_chars(Norm))
+                        catch error:_ -> Norm
+                        end
+                    end,
+                BaseKeys = lists:map(KeyForm, maps:keys(Msg)),
+                case lists:member(KeyForm(Key), BaseKeys) of
+                    true -> hb_ao:raw(<<"message@1.0">>, Key, Msg, Req, Opts);
+                    false -> compute(Key, Msg, Req, Opts)
+                end
+            end,
         excludes =>
             [
                 <<"id">>,
@@ -58,7 +72,18 @@ device_info(Base) ->
                 <<"encode">>,
                 <<"decode">>
             ] ++
-            maps:keys(Base)
+            [
+                Key
+            ||
+                Key <-
+                    [
+                        <<"init">>,
+                        <<"snapshot">>,
+                        <<"normalize">>,
+                        <<"functions">>
+                    ],
+                is_map_key(Key, Base)
+            ]
     }.
 
 %% @doc Initialize the device state, loading the script into memory if it is 
@@ -353,16 +378,18 @@ compute(Key, RawBase, RawReq, Opts) ->
 %% @doc Call a function of the Lua state with the parameters that the request
 %% or the base gives, or else with the base and the request.
 call_function(Function, Base, Req, OldPriv, State, Opts) ->
+    % The default arguments carry no private keys from the base or the request.
+    % A message in the request's `body', as a process's assignment carries,
+    % gives no arguments: they would replace the base, the process's state.
     Params =
         hb_ao:get_first(
             [
-                {Req, <<"body/parameters">>},
                 {Req, <<"parameters">>},
                 {{as, <<"message@1.0">>, Base}, <<"parameters">>}
             ],
             [
                 hb_private:reset(Base),
-                Req,
+                hb_private:reset(Req),
                 #{}
             ],
             Opts#{ <<"hashpath">> => ignore }
@@ -1126,6 +1153,50 @@ invoke_non_compute_key_test() ->
         {error, not_found},
         hb_ao:resolve(Base, <<"no_function">>, #{})
     ).
+
+fresh_base_keys_test() ->
+    Node = hb_http_server:start_node(#{ <<"priv-wallet">> => ar_wallet:new() }),
+    Keys =
+        [
+            <<"k", (integer_to_binary(rand:uniform(1 bsl 60)))/binary>>
+        ||
+            _ <- lists:seq(1, 3)
+        ],
+    Path =
+        iolist_to_binary(
+            [
+                <<"/~lua@5.3a">>,
+                [[<<"&">>, Key, <<"=v">>] || Key <- Keys],
+                <<"/">>,
+                hd(Keys)
+            ]
+        ),
+    Res = hb_http:get(Node, Path, #{}),
+    lists:foreach(
+        fun(Key) -> ?assertError(badarg, binary_to_existing_atom(Key)) end,
+        Keys
+    ),
+    ?assertEqual({ok, <<"v">>}, Res).
+
+%% @doc A Lua function reads the request without its private keys.
+request_private_keys_test() ->
+    Script = <<
+        "function has_priv(base, req)\n"
+        "  return tostring(req.priv ~= nil)\n"
+        "end\n"
+    >>,
+    Base = #{
+        <<"device">> => <<"lua@5.3a">>,
+        <<"module">> => #{
+            <<"content-type">> => <<"application/lua">>,
+            <<"body">> => Script
+        }
+    },
+    Req = #{
+        <<"path">> => <<"has_priv">>,
+        <<"priv">> => #{ <<"cookie">> => <<"marker">> }
+    },
+    ?assertEqual({ok, <<"false">>}, hb_ao:resolve(Base, Req, #{})).
 
 %% @doc Use a Lua module as a hook on the HTTP server via `~meta@1.0'.
 lua_http_hook_test() ->

@@ -150,9 +150,11 @@ schemas, the resolved-key contracts, and the result-mapping rules are normative.
      an `id` field (its full message id), and — if it is signed — an `owner`
      field (the primary signer's human-readable address) and a `signature` field
      (the primary commitment's signature).
-  2. Build the **message structure** JSON from the denormalised message (§5.1)
-     and extend it with `Module => <process image>` and
-     `Block-Height => <block-height>`. Serialise to a JSON string.
+  2. Build the **message structure** JSON from the denormalised message (§5.1),
+     without a `module`, `block-height`, `id`, `signature` or `publickey` tag
+     in any case, and extend it with `Module => <process image>` and
+     `Block-Height => <block-height>`: an AOS process reads a tag over the
+     field with its name. Serialise to a JSON string.
   3. Build the **process structure** JSON: `{ "Process": <message-structure(process)> }`.
      Serialise to a JSON string.
   4. **Stage** both strings into the execution environment as the legacy call
@@ -252,9 +254,13 @@ For a subject message, emit a JSON object with **exactly** these members
 Field-derivation rules (MUST):
 
 - **Primary signer.** The "primary" committer is the first element of the
-  message's signer (committer) list. If the message has no signers, `Owner`,
+  message's signer (committer) list (`message@1.0` `committers`, in bytewise
+  order). If the message has no signers, `Owner`,
   `Signature`, and `PublicKey` are all `""`, and `From` defaults from the
-  (empty) owner.
+  (empty) owner. Of two or more commitments by the primary signer, the
+  primary commitment is the one with the lowest ID. Of a signed message, every
+  field but `Id` gives only the primary signer's commitments and the keys that
+  they commit.
 - **`Owner` encoding.** With the `owner-as-address` rule (used by both the
   compute staging path and the `to` key), `Owner` is
   `hb_util:committer_address/1` of the signer: the address of a `did-ar@1.0`
@@ -383,9 +389,10 @@ A message's `Tags` array is produced as follows (MUST):
     (e.g. `block-height` → `Block-Height`, `from-process` → `From-Process`,
     `action` → `Action`);
   - values are emitted as-is (binary → JSON string).
-  - The order of non-`original-tags` entries is **unspecified** (derived from
-    map iteration); consumers MUST NOT depend on it. Only the `original-tags`
-    path guarantees order.
+  - the entries are first the keys that the `committed` list of the message's
+    ANS-104 commitment gives, or else that of its primary commitment (§5.1), in
+    the order of that list; then the other keys, in the bytewise order of the
+    keys. A message with neither commitment gives every key in bytewise order.
 
 The **inverse** (folding a JSON message's `Tags` back into a flat map, used in
 §5.2 step 4a and for patches) is: take the message's `Tags` list, and produce a
@@ -416,9 +423,8 @@ key-removal mechanism. Non-string and nested-map values are passed through
 ## 6. Ordering, freshness & caching
 
 - **Determinism.** Given the same subject message, `to` and the message-structure
-  builder are deterministic **except** for the order of the `Tags` array on the
-  non-`original-tags` path (map-iteration order). The `original-tags` path is
-  fully ordered. `outbox` numeric keys preserve `Messages` input order.
+  builder are deterministic. The `Tags` array follows §5.5. `outbox` numeric
+  keys preserve `Messages` input order.
 - The device performs **no result caching of its own**; it is a pure transform
   over the supplied message/request (the compute path's only state is read/write
   through the cooperating WASM environment, which it does not own).
@@ -522,8 +528,10 @@ a key against a constructed message (or by parsing a known JSON input):
 4. **Pass-1 staging.** After pass 1, the base message has `function => handle`
    and `parameters` is a 2-element list with the **message** argument first and
    the **process** argument second. With no write hook, those arguments are the
-   JSON strings; the message JSON is the message structure (§5.1) extended with
-   `Module` (= `process/image`) and `Block-Height` (= request `block-height`),
+   JSON strings; the message JSON is the message structure (§5.1), without a
+   `module`, `block-height`, `id`, `signature` or `publickey` tag, extended with
+   `Module` (= `process/image`) and
+   `Block-Height` (= request `block-height`),
    and the process JSON is `{ "Process": <message-structure(process)> }`.
 5. **Message-structure fields.** `to` (and the staging builder) emit a JSON
    object whose members are exactly `Id`, `Anchor`, `Owner`, `From`, `Tags`,
@@ -547,7 +555,7 @@ a key against a constructed message (or by parsing a known JSON input):
    one header-cased `{name,value}` per remaining field (one per element of a
    field whose value is a list), **excluding** `id`, `anchor`, `owner`, `data`,
    `target`, `signature`, `commitments`; keys are rendered in `Header-Case`
-   (e.g. `block-height` → `Block-Height`).
+   (e.g. `block-height` → `Block-Height`), in the order that §5.5 gives.
 10. **Result mapping (`from`).** A result structure with `Output`/`Messages`/
     `patches` maps to `{ outbox, patches, data }`: `outbox` is keyed by 1-based
     integer position over `Messages` (input order preserved); `data` is
@@ -611,10 +619,6 @@ a key against a constructed message (or by parsing a known JSON input):
   not handled at all. A spec consumer relying on separate `Spawns`/`Assignments`
   arrays would diverge — confirm whether the legacy contract truly folds these
   into `Messages` or whether this device intentionally drops them.
-- **Non-`original-tags` `Tags` order is unspecified.** When a message has no
-  ANS-104 `original-tags`, the `Tags` array order is map-iteration order. If a
-  legacy handler is order-sensitive on tags, this is a latent incompatibility;
-  consider mandating a sorted order on that path.
 - **`Signature` for non-512-byte committers.** A non-RSA (e.g. ECDSA/Ethereum)
   signature is passed through **as-is** rather than base64url-encoded. Confirm
   the legacy handler's expectation for such signatures, or mandate base64url for

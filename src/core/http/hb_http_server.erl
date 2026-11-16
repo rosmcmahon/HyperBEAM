@@ -52,9 +52,10 @@
 %%% We reply to the client with the result as follows:
 %%%
 %%% 1. The HTTP status of the reply is the result's `status' key, if it is an
-%%%    integer from 100 to 599, or the binary encoding of one. Otherwise, it is
-%%%    the code that `hb_http:status_code/2' gives for the result's Erlang
-%%%    status. We do not add a `status' key to the reply.
+%%%    integer from 200 to 599, or the binary encoding of one. A reply is never
+%%%    informational. Otherwise, it is the code that `hb_http:status_code/2'
+%%%    gives for the result's Erlang status. We do not add a `status' key to the
+%%%    reply.
 %%% 2. If the result is a literal or a list, we send it as the `body' of a
 %%%    message, with `ao-result' set to `body'.
 %%% 3. We find the codec of the reply from the request's `accept', read as RFC
@@ -81,9 +82,13 @@
 %%%    body, and the result's own `content-type' as its `content-type', so a
 %%%    stored page or image is served as itself. A `content-type' of the result
 %%%    of the form `application/x.ao.<name>' is sent in a body part instead. If
-%%%    the request does not have `accept-bundle: true', we add the node's index
-%%%    page to the reply as its `body' and `content-type'. We only do this if
-%%%    the message has neither key, as a value or as a link.
+%%%    the most preferred range of the request's `accept' is `text/html', as a
+%%%    browser's is, and the request does not have `accept-bundle: true', we
+%%%    add the node's index page to the reply as its `body' and `content-type'.
+%%%    We only do this if the message has neither key, as a value or as a
+%%%    link, and the node has `generate-index' set, as it does by default. A
+%%%    request that prefers any other range, such as `*/*' or `text/*', gets
+%%%    the reply as it is.
 %%% 6. A reply in any other codec sends the result as its body, encoded by the
 %%%    codec, with the type and subtype of the range as its `content-type': a
 %%%    request for `application/json' gets `application/json'. The codec
@@ -108,6 +113,7 @@
 -export([update_opts/2, set_default_opts/1, set_proc_server_id/1]).
 -export([static/3, static/4]).
 -export([start_node/0, start_node/1]).
+-export([install_tls/2]).
 -export([resolve_request/3, error_reply/4, commit_reply/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
@@ -118,6 +124,11 @@
     <<"GET">>, <<"HEAD">>, <<"POST">>, <<"PUT">>,
     <<"DELETE">>, <<"OPTIONS">>, <<"PATCH">>
 ]).
+%% A 128 MiB body bound leaves room for the bundler's default 100 MB items.
+-define(DEFAULT_MAX_BODY, 128 * 1024 * 1024).
+%% Read at most this many body fragments before any hook runs, so that a body
+%% sent as many tiny fragments has a bounded cost.
+-define(MAX_BODY_FRAGMENTS, 1_048_576).
 %% Define the max size we can return in 500 error details field.
 -define(DEFAULT_ERROR_DETAILS_MAX_SIZE, 32*1024).
 %% At most this many media ranges in `accept' are considered.
@@ -362,7 +373,7 @@ new_server(RawNodeMsg) ->
                 )
         end,
     % Put server ID into node message so it's possible to update current server
-    hb_http:start(),
+    hb_http:start(NodeMsg),
     init_prometheus(),
     Wallet = hb_opts:get(priv_wallet, no_wallet, NodeMsg),
     ServerID = hb_util:human_id(ar_wallet:to_address(Wallet)),
@@ -414,7 +425,10 @@ new_server(RawNodeMsg) ->
                 ),
                 ProtoOpts
         end,
-    TLSOpts = prepare_tls(TLS, Wallet, ServerID, NodeMsg),
+    TLSOpts = case TLS of
+        #{ <<"port">> := _ } -> stop_tls(ServerID), [];
+        _ -> prepare_tls(TLS, Wallet, ServerID, NodeMsg)
+    end,
     {Port, Listener} = try
         case case {Protocol, TLSOpts} of
                 {http3, []} -> start_http3(ServerID, PrometheusOpts, NodeMsg);
@@ -435,6 +449,11 @@ new_server(RawNodeMsg) ->
     % that the OS assigned a different port. This happens, for example, when we
     % use port 0.
     set_opts(NodeMsg#{ <<"port">> => Port }),
+    case TLS of
+        #{ <<"port">> := _ } ->
+            tls_request(NodeMsgWithID, ServerID);
+        _ -> ok
+    end,
     ?event(http,
         {http_server_started,
             {listener, Listener},
@@ -450,7 +469,7 @@ new_server(RawNodeMsg) ->
 prepare_tls(false, _Wallet, ServerID, _NodeMsg) ->
     stop_tls(ServerID),
     [];
-prepare_tls(TLS, Wallet, ServerID, NodeMsg) ->
+prepare_tls(TLS, _Wallet, ServerID, NodeMsg) ->
     ACME = hb_maps:get(<<"acme">>, TLS, #{}, NodeMsg),
     stop_tls(ServerID),
     try
@@ -471,33 +490,53 @@ prepare_tls(TLS, Wallet, ServerID, NodeMsg) ->
             {false, <<"dns-01">>} -> ok;
             _ -> error('invalid-acme-challenge-type')
         end,
-        PrivateTLS = #{
-            <<"server-id">> => ServerID,
-            <<"lifecycle-capability">> => make_ref()
-        },
-        Private = #{ <<"tls">> => PrivateTLS },
-        Request = hb_private:set(
-            #{ <<"path">> => <<"obtain">> }, Private, NodeMsg
-        ),
-        ResolveOpts = hb_private:set(NodeMsg, Private, NodeMsg),
-        {ok, BootstrapResult} = hb_ao:resolve(
-            #{ <<"device">> => <<"tls@1.0">> },
-            Request,
-            ResolveOpts#{
-                <<"only">> => local,
-                <<"hashpath">> => ignore,
-                <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
-            }
-        ),
+        {ok, BootstrapResult} = tls_request(NodeMsg, ServerID),
         Chain = hb_maps:get(
             <<"certificate-chain">>, BootstrapResult, not_found, NodeMsg
         ),
-        {ok, TLSOpts} = hb_tls:socket_options(Wallet, Chain),
+        {ok, TLSWallet} = hb_tls:wallet(NodeMsg),
+        {ok, TLSOpts} = hb_tls:socket_options(TLSWallet, Chain),
         TLSOpts
     catch
         Class:Reason:Stack ->
             stop_tls(ServerID),
             erlang:raise(Class, Reason, Stack)
+    end.
+
+%% @doc Give the TLS device a private, one-call listener lifecycle capability.
+tls_request(NodeMsg, ServerID) ->
+    Private = #{ <<"tls">> => #{
+        <<"server-id">> => ServerID,
+        <<"lifecycle-capability">> => make_ref()
+    } },
+    hb_ao:resolve(
+        #{ <<"device">> => <<"tls@1.0">> },
+        hb_private:set(#{ <<"path">> => <<"obtain">> }, Private, NodeMsg),
+        (hb_private:set(NodeMsg, Private, NodeMsg))#{
+            <<"only">> => local,
+            <<"hashpath">> => ignore,
+            <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+        }
+    ).
+
+%% @doc Add or update HTTPS against the existing node's request pipeline.
+%% The admission listener and its live node options remain authoritative.
+install_tls(Opts, Chain) ->
+    ServerID = hb_opts:get(http_server, no_server, Opts),
+    Ref = {tls, ServerID},
+    TLS = hb_tls:config(Opts),
+    {ok, Wallet} = hb_tls:wallet(Opts),
+    case catch ranch:get_port(Ref) of
+        Port when is_integer(Port) -> hb_tls:install(Ref, Wallet, Chain);
+        _ ->
+            {ok, TLSOpts} = hb_tls:socket_options(Wallet, Chain),
+            case start_http2(Ref,
+                    ranch:get_protocol_options(ServerID),
+                    Opts#{ <<"port">> => maps:get(<<"port">>, TLS) },
+                    TLSOpts) of
+                {ok, _, _} -> ok;
+                {error, _} = Error -> Error
+            end
     end.
 
 challenge_node(ACME, ServerID, NodeMsg) ->
@@ -517,7 +556,12 @@ challenge_node(ACME, ServerID, NodeMsg) ->
     ).
 
 listener_protocol_options(ServerID, NodeMsg) ->
-    Dispatcher = cowboy_router:compile([{'_', [{'_', ?MODULE, ServerID}]}]),
+    MaxBody = hb_util:int(
+        hb_opts:get(http_max_body, ?DEFAULT_MAX_BODY, NodeMsg)
+    ),
+    Dispatcher = cowboy_router:compile(
+        [{'_', [{'_', ?MODULE, {ServerID, MaxBody}}]}]
+    ),
     #{
         env => #{ dispatch => Dispatcher, node_msg => NodeMsg },
         stream_handlers => [cowboy_stream_h],
@@ -543,6 +587,7 @@ stop_tls(ServerID) ->
         undefined -> ok
     end,
     cowboy:stop_listener({tls_http_01, ServerID}),
+    cowboy:stop_listener({tls, ServerID}),
     ok.
 
 start_http3(ServerID, ProtoOpts, NodeMsg) ->
@@ -642,25 +687,58 @@ start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts) ->
 
 %%% Request/response lifecycle.
 
-%% @doc Entrypoint for all HTTP requests. Receives the Cowboy request option and
-%% the server ID, which can be used to lookup the node message.
-init(Req, ServerID) ->
+%% @doc Entrypoint for all HTTP requests. Receives the Cowboy request option
+%% and the dispatch state: the server ID, which looks up the node message, and
+%% the body bound that the listener read when it started.
+init(Req, {ServerID, MaxBody}) ->
     case {cowboy_req:method(Req), ServerID} of
         {<<"OPTIONS">>, {tls_http_01, _}} ->
-            {ok, Body} = read_body(Req),
-            handle_request(Req, Body, ServerID);
+            request_body(Req, ServerID, MaxBody);
         {<<"OPTIONS">>, _} -> cors_reply(Req, ServerID);
         _ ->
-            {ok, Body} = read_body(Req),
-            handle_request(Req, Body, ServerID)
+            request_body(Req, ServerID, MaxBody)
     end.
 
-%% @doc Helper to grab the full body of a HTTP request, even if it's chunked.
-read_body(Req) -> read_body(Req, <<>>).
-read_body(Req0, Acc) ->
-    case cowboy_req:read_body(Req0) of
-        {ok, Data, _Req} -> {ok, << Acc/binary, Data/binary >>};
-        {more, Data, Req} -> read_body(Req, << Acc/binary, Data/binary >>)
+%% @doc Read and handle a request body within the node's limits.
+request_body(Req, ServerID, MaxBody) ->
+    case read_body(Req, MaxBody) of
+        {ok, Body} -> handle_request(Req, Body, ServerID);
+        {too_large, Req2} ->
+            {ok, cowboy_req:reply(
+                413, #{}, <<"Request body too large.">>, Req2
+            ), no_state};
+        {too_many_fragments, Req2} ->
+            {ok, cowboy_req:reply(
+                413, #{}, <<"Request body has too many fragments.">>, Req2
+            ), no_state}
+    end.
+
+%% @doc Helper to grab the full body of an HTTP request within the byte and
+%% fragment bounds, even if it is chunked.
+read_body(Req, Max) ->
+    case cowboy_req:body_length(Req) of
+        Length when is_integer(Length), Length > Max -> {too_large, Req};
+        _ -> read_body(Req, Max, 0, 0, [])
+    end.
+read_body(Req, _Max, _Size, Fragments, _Acc)
+        when Fragments >= ?MAX_BODY_FRAGMENTS ->
+    {too_many_fragments, Req};
+read_body(Req0, Max, Size, Fragments, Acc) ->
+    % Read one fragment at a time so Cowboy's buffer cannot hide the count.
+    case cowboy_req:read_body(Req0, #{ length => 1 }) of
+        {ok, Data, Req} ->
+            case Size + byte_size(Data) =< Max of
+                true -> {ok, iolist_to_binary(lists:reverse([Data | Acc]))};
+                false -> {too_large, Req}
+            end;
+        {more, Data, Req} ->
+            NewSize = Size + byte_size(Data),
+            case NewSize =< Max of
+                true -> read_body(
+                    Req, Max, NewSize, Fragments + 1, [Data | Acc]
+                );
+                false -> {too_large, Req}
+            end
     end.
 
 %% @doc Reply to CORS preflight requests.
@@ -739,10 +817,12 @@ handle_request(RawReq, Body, ServerID) ->
 %% that does not receive the request through Cowboy must decode and verify the
 %% singleton before it calls this function.
 resolve_request(Path, Singleton, NodeMsg) ->
+    [RequestPath | _] =
+        binary:split(hb_maps:get(<<"path">>, Singleton, Path, NodeMsg), <<"?">>),
     maybe
         true ?=
             hb_opts:get(initialized, false, NodeMsg) =/= false orelse
-                Path == <<"/~meta@1.0/info">> orelse
+                RequestPath == <<"/~meta@1.0/info">> orelse
                 {Singleton,
                     {error, <<"Node must be initialized before use.">>}},
         Msgs =
@@ -851,6 +931,7 @@ handle_error(Req, Singleton, Type, Details, Stacktrace, NodeMsg) ->
         },
         NodeMsg
     ),
+    record_exception(Type, Details, Stacktrace),
     reply(Req, Singleton, Reply, NodeMsg).
 
 %% @doc Return the status and the message of the reply to an exception: the
@@ -915,7 +996,8 @@ set_opts(Opts) ->
             ok;
         ServerRef ->
             % `Opts' from a request contain no key material: keep the node's.
-            ok = cowboy:set_env(ServerRef, node_msg, with_node_committer(Opts))
+            ok = cowboy:set_env(ServerRef, node_msg, with_node_committer(Opts)),
+            hb_tls:notify(ServerRef)
     end.
 set_opts(Request, Opts) ->
     PreparedRequest = hb_message:uncommitted(Request),
@@ -1030,6 +1112,7 @@ start_node(Opts) ->
 
 scheme(NodeMsg) ->
     case hb_tls:config(NodeMsg) of
+        #{ <<"port">> := _ } -> <<"http">>;
         TLS when is_map(TLS) -> <<"https">>;
         false -> <<"http">>
     end.
@@ -1038,7 +1121,9 @@ scheme(NodeMsg) ->
 %% HTTP status comes from the result and is not added to the message, which is
 %% sent with the node's signature on its hashpath (`maybe_sign/3'). A list is
 %% the `body' of the reply, which its `ao-result' key selects. If a request hook
-%% gives the reply (`{reply, Result}'), send `Result'.
+%% or a device gives the reply (`{reply, ...}'), send it as it is.
+reply(InitReq, TABMReq, {reply, Msg}, Opts) when is_map(Msg) ->
+    reply(InitReq, TABMReq, {ok, Msg}, Opts);
 reply(InitReq, TABMReq, {reply, Result}, Opts) ->
     reply(InitReq, TABMReq, Result, Opts);
 reply(InitReq, TABMReq, {ErlStatus, List}, Opts) when is_list(List) ->
@@ -1078,7 +1163,7 @@ reply(InitReq, TABMReq, Result, Opts) ->
                 }
         end,
     EncodedHeaders = hb_private:reset(ReplyHeaders),
-    ?event(debug_http,
+    ?event_debug(debug_http,
         {http_replying,
             {status, {explicit, Status}},
             {path, hb_maps:get(<<"path">>, Req, undefined_path, Opts)},
@@ -1103,7 +1188,7 @@ reply(InitReq, TABMReq, Result, Opts) ->
         ReplyDuration * 1000000,
         Status
     ),
-    ?event(debug_http, {reply_headers, {explicit, PostStreamReq}}),
+    ?event_debug(debug_http, {reply_headers, {explicit, PostStreamReq}}),
     ?event(http_server_short,
         {sent,
             {status, Status},
@@ -1123,10 +1208,9 @@ reply(InitReq, TABMReq, Result, Opts) ->
     ),
     {ok, PostStreamReq, no_state}.
 
-%% @doc Whether a reply to this method and status carries no body. A `1xx'
-%% reply is informational and a `205' resets content, so both end at headers.
+%% @doc Whether a reply to this method and status carries no body. A `HEAD'
+%% request and the `204', `205' and `304' statuses all end at their headers.
 is_bodyless_reply(<<"HEAD">>, _Status) -> true;
-is_bodyless_reply(_Method, Status) when Status >= 100, Status < 200 -> true;
 is_bodyless_reply(_Method, Status)
         when Status == 204; Status == 205; Status == 304 -> true;
 is_bodyless_reply(_Method, _Status) -> false.
@@ -1190,7 +1274,7 @@ commit_reply(TABMReq, Msg, Opts) ->
 %% viable sources of cookies.
 reply_handle_cookies(Req, Message, Opts) ->
     {ok, Cookies} = hb_http:cookie(<<"extract">>, Message, #{}, Opts),
-    ?event(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
+    ?event_debug(debug_cookie, {encoding_reply_cookies, {explicit, Cookies}}),
     case Cookies of
         NoCookies when map_size(NoCookies) == 0 -> {ok, Req, Message};
         _ ->
@@ -1257,9 +1341,19 @@ add_cors_headers(Msg, ReqHdr, Opts) ->
                 hb_escape:encode_header(ReqHdr)
         }
     end,
-    % Keys in the given message will overwrite the defaults listed below if 
-    % included, due to `hb_maps:merge''s precidence order.
-    hb_maps:merge(WithAllowHeaders, Msg, Opts).
+    % A reply's CORS headers come from the request and the defaults, not from
+    % the keys of its result message.
+    WithoutResultCors =
+        hb_maps:without(
+            [Key || Key <- maps:keys(Msg), is_cors_key(Key)],
+            Msg,
+            Opts
+        ),
+    hb_maps:merge(WithoutResultCors, WithAllowHeaders, Opts).
+
+%% @doc Whether a header key is part of the CORS policy.
+is_cors_key(<<"access-control-", _/binary>>) -> true;
+is_cors_key(_) -> false.
 
 %% @doc Generate the headers and body for a HTTP response message.
 encode_reply(Status, TABMReq, RawMessage, Opts) ->
@@ -1268,12 +1362,12 @@ encode_reply(Status, TABMReq, RawMessage, Opts) ->
     % Verify the result while it is still in `structured@1.0' form, before it is
     % converted to the target wire codec, if paranoid mode enables http_result.
     hb_message:paranoid_verify(http_result, Message, Opts),
-    ?event(debug_http, {encoding_reply, {codec, Codec}, {message, Message}}),
+    ?event_debug(debug_http, {encoding_reply, {codec, Codec}, {message, Message}}),
     AcceptBundle =
         hb_util:bool(
             hb_maps:get(<<"accept-bundle">>, TABMReq, false, Opts)
         ),
-    ?event(debug_http,
+    ?event_debug(debug_http,
         {encoding_reply,
             {status, Status},
             {codec, Codec},
@@ -1337,7 +1431,8 @@ encode_reply(Status, TABMReq, RawMessage, Opts) ->
                                 <<"device">> => <<"httpsig@1.0">>,
                                 <<"path">> => <<"to">>,
                                 <<"index">> =>
-                                    hb_opts:get(generate_index, true, Opts)
+                                    prefers_html(TABMReq, Opts) andalso
+                                        hb_opts:get(generate_index, true, Opts)
                             }
                     end,
                     <<"structured@1.0">>,
@@ -1354,10 +1449,14 @@ encode_reply(Status, TABMReq, RawMessage, Opts) ->
         _ ->
             % A codec other than `httpsig@1.0' sends the message as the body,
             % with the type and subtype of the media range that asked for the
-            % codec as its `content-type'.
+            % codec as its `content-type', and its `cache-control' as a header.
+            Headers = #{ <<"content-type">> => ContentType },
             {
                 Status,
-                #{ <<"content-type">> => ContentType },
+                case cache_control_header(Message, Opts) of
+                    <<>> -> Headers;
+                    CacheControl -> Headers#{ <<"cache-control">> => CacheControl }
+                end,
                 hb_http:encode(
                     Codec,
                     Message,
@@ -1366,6 +1465,27 @@ encode_reply(Status, TABMReq, RawMessage, Opts) ->
                 )
             }
     end.
+
+%% @doc The `cache-control' of a result as a header value: its directives, as
+%% `hb_cache_control' reads them, or `<<>>' without any. A directive with a
+%% control byte, which would end the header, is left out.
+cache_control_header(Message, Opts) ->
+    Directives =
+        hb_cache_control:directives(
+            hb_maps:get(<<"cache-control">>, Message, [], Opts)
+        ),
+    iolist_to_binary(
+        lists:join(
+            <<", ">>,
+            [
+                Directive
+            ||
+                Directive <- Directives,
+                lists:all(fun(Byte) -> Byte >= 32 andalso Byte =/= 127 end,
+                    binary_to_list(Directive))
+            ]
+        )
+    ).
 
 %% @doc Find the codec of the reply to a request from its `accept', read as RFC
 %% 9110 gives, and the `content-type' of a reply in that codec. The media ranges
@@ -1379,17 +1499,6 @@ encode_reply(Status, TABMReq, RawMessage, Opts) ->
 %% We pass over any other range, such as `*/*' and `text/html'. If no range can
 %% be served, or the `accept' is not a valid HTTP field, we use `httpsig@1.0'.
 accept_to_codec(TABMReq, Msg, Opts) ->
-    Accept = hb_maps:get(<<"accept">>, TABMReq, <<"*/*">>, Opts),
-    ?event(debug_accept,
-        {accept_to_codec,
-            {original_req, TABMReq},
-            {accept, Accept}
-        }
-    ),
-    MediaRanges =
-        try cow_http_hd:parse_accept(Accept)
-        catch error:_ -> []
-        end,
     Own =
         try
             {Type, SubType, _Params} =
@@ -1399,6 +1508,23 @@ accept_to_codec(TABMReq, Msg, Opts) ->
             {Type, SubType}
         catch error:_ -> undefined
         end,
+    preferred_codec(accept_ranges(TABMReq, Opts), Own, Opts).
+
+%% @doc The media ranges of the request's `accept' in order of preference, by
+%% q-value and then by their order, without those of q-value 0. An `accept'
+%% that is not a valid HTTP field has none.
+accept_ranges(TABMReq, Opts) ->
+    Accept = hb_maps:get(<<"accept">>, TABMReq, <<"*/*">>, Opts),
+    ?event_debug(debug_accept,
+        {accept_ranges,
+            {original_req, TABMReq},
+            {accept, Accept}
+        }
+    ),
+    MediaRanges =
+        try cow_http_hd:parse_accept(Accept)
+        catch error:_ -> []
+        end,
     Ranges = [Range || Range = {_, Quality, _} <- MediaRanges, Quality > 0],
     Sorted = lists:sort(
         fun({_, QualityA, _}, {_, QualityB, _}) ->
@@ -1406,7 +1532,15 @@ accept_to_codec(TABMReq, Msg, Opts) ->
         end,
         Ranges
     ),
-    preferred_codec(lists:sublist(Sorted, ?MAX_ACCEPT_RANGES), Own, Opts).
+    lists:sublist(Sorted, ?MAX_ACCEPT_RANGES).
+
+%% @doc Whether the most preferred media range of the request's `accept' is
+%% `text/html', as a browser's is. A range such as `*/*' or `text/*' is not.
+prefers_html(TABMReq, Opts) ->
+    case accept_ranges(TABMReq, Opts) of
+        [{{<<"text">>, <<"html">>, _}, _, _} | _] -> true;
+        _ -> false
+    end.
 
 %% @doc Return the codec of the first media range that the node can serve, and
 %% the `content-type' of a reply in it, or `httpsig@1.0' if there is none.
@@ -1473,7 +1607,7 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                 ContentType = maps:get(<<"content-type">>, Headers),
                 throw({'unsupported-media-type', ContentType})
         end,
-    ?event(debug_http,
+    ?event_debug(debug_http,
         {parsing_req,
             {path, FullPath},
             {query, QueryKeys},
@@ -1588,7 +1722,7 @@ normalize_method(Method) ->
 %% 1. The path in the message
 %% 2. The path and query of the request URI
 normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
-    ?event(debug_http, {adding_method_and_path_from_request, {explicit, Req}}),
+    ?event_debug(debug_http, {adding_method_and_path_from_request, {explicit, Req}}),
     Method = cowboy_req:method(Req),
     MsgPath =
         hb_maps:get(
@@ -1653,11 +1787,26 @@ normalize_unsigned(PrimMsg, Req = #{ headers := RawHeaders }, Msg, Opts) ->
                     Opts
                 )
         end,
+    % Move an unsigned `authorization' header to `priv', as we do with cookies,
+    % so that the request the node stores does not carry it.
+    WithPrivAuth =
+        case maps:get(<<"authorization">>, WithCookie, undefined) of
+            undefined -> WithCookie;
+            Authorization ->
+                hb_private:set(
+                    hb_message:without_unless_signed(
+                        <<"authorization">>, WithCookie, Opts
+                    ),
+                    <<"authorization">>,
+                    Authorization,
+                    Opts
+                )
+        end,
     % If the body is empty and unsigned, we remove it.
     NormalBody =
-        case hb_maps:get(<<"body">>, WithCookie, undefined, Opts) of
-            <<"">> -> hb_message:without_unless_signed(<<"body">>, WithCookie, Opts);
-            _ -> WithCookie
+        case hb_maps:get(<<"body">>, WithPrivAuth, undefined, Opts) of
+            <<"">> -> hb_message:without_unless_signed(<<"body">>, WithPrivAuth, Opts);
+            _ -> WithPrivAuth
         end,
     RealIP = real_ip(Req, Opts),
     WithPeer = case hb_maps:get(<<"ao-peer-port">>, NormalBody, undefined, Opts) of
@@ -1732,7 +1881,16 @@ init_prometheus() ->
 			help,
 			"The total duration of an hb_http_server request call." 
 		}
-	]).
+	]),
+    hb_prometheus:declare(counter, [
+        {name, http_server_exceptions_total},
+        {labels, [class, reason, function]},
+        {
+            help,
+            "The exceptions that the node answered requests with, by their"
+            " class, reason and the function that raised them."
+        }
+    ]).
 
 record_request_metric(TotalDuration, ReplyDuration, StatusCode) ->
     spawn(
@@ -1749,6 +1907,43 @@ record_request_metric(TotalDuration, ReplyDuration, StatusCode) ->
             )
         end
     ).
+
+%% @doc Count an exception that the node answers a request with, by its class,
+%% its reason and the function at the top of its stacktrace. No label holds the
+%% data of a request, so the labels are bounded by the node's code.
+record_exception(Class, Reason, Stacktrace) ->
+    spawn(
+        fun() ->
+            hb_prometheus:inc(
+                counter,
+                http_server_exceptions_total,
+                [
+                    hb_util:bin(Class),
+                    exception_reason(Reason),
+                    exception_function(Stacktrace)
+                ]
+            )
+        end
+    ).
+
+%% @doc The `reason' label of an exception: its atom, or the atom that its tuple
+%% starts with. Any other reason may hold the data of a request.
+exception_reason(Reason) when is_atom(Reason) -> hb_util:bin(Reason);
+exception_reason(Reason) when is_tuple(Reason), is_atom(element(1, Reason)) ->
+    hb_util:bin(element(1, Reason));
+exception_reason(_Reason) -> <<"other">>.
+
+%% @doc The `function' label of an exception: the function of the top frame of
+%% its stacktrace, as `module:function/arity'.
+exception_function([{Mod, Func, Args, Location} | _]) when is_list(Args) ->
+    exception_function([{Mod, Func, length(Args), Location}]);
+exception_function([{Mod, Func, Arity, _Location} | _]) ->
+    <<
+        (hb_format:pretty_mod(Mod))/binary, ":",
+        (hb_util:bin(Func))/binary, "/",
+        (hb_util:bin(Arity))/binary
+    >>;
+exception_function(_Stacktrace) -> <<"unknown">>.
 
 %%% Tests
 
@@ -1983,6 +2178,73 @@ read_missing_link_test() ->
             #{}
         )
     ).
+
+%% @doc An exception that the node answers a request with is counted by its
+%% class, its reason and the function that raised it. A relay to a route that
+%% chooses its nodes by `Shuffled-Range', for a request without the `route-by'
+%% that the strategy reads, raises in `choose/5' of `router@1.0', whose module
+%% is named for its device and version.
+exception_metric_test() ->
+    Peer = start_node(isolated_test_opts()),
+    Opts = isolated_test_opts(),
+    Node =
+        start_node(
+            Opts#{
+                <<"routes">> => [
+                    #{
+                        <<"template">> =>
+                            #{
+                                <<"path">> => <<"^/arweave/chunk">>,
+                                <<"method">> => <<"POST">>
+                            },
+                        <<"nodes">> => [#{ <<"prefix">> => Peer }],
+                        <<"strategy">> => <<"Shuffled-Range">>
+                    }
+                ]
+            }
+        ),
+    Router =
+        hb_device:message_to_device(#{ <<"device">> => <<"router@1.0">> }, Opts),
+    Function = <<(hb_format:pretty_mod(Router))/binary, ":choose/5">>,
+    Labels = [<<"error">>, <<"function_clause">>, Function],
+    Before = exception_count(Labels),
+    ?assertMatch(
+        {failure, #{ <<"status">> := 500 }},
+        hb_http:post(
+            Node,
+            <<"/~relay@1.0/call?relay-path=/arweave/chunk">>,
+            #{ <<"body">> => <<"chunk">> },
+            Opts
+        )
+    ),
+    ?assert(
+        hb_util:wait_until(
+            fun() -> exception_count(Labels) == Before + 1 end,
+            1000
+        )
+    ).
+
+%% @doc The `reason' of an exception is an atom of it, never the data that it
+%% carries, and the `function' is its top frame.
+exception_labels_test() ->
+    ?assertEqual(<<"badarg">>, exception_reason(badarg)),
+    ?assertEqual(<<"badmatch">>, exception_reason({badmatch, {error, x}})),
+    ?assertEqual(<<"other">>, exception_reason(<<"/a/path?with=data">>)),
+    ?assertEqual(<<"other">>, exception_reason({<<"id">>, badarg})),
+    ?assertEqual(
+        <<"lists:nth/2">>,
+        exception_function(
+            [{lists, nth, [1, []], []}, {?MODULE, f, 0, []}]
+        )
+    ),
+    ?assertEqual(<<"unknown">>, exception_function([])).
+
+%% @doc The number of exceptions that the node answered with the given labels.
+exception_count(Labels) ->
+    case prometheus_counter:value(http_server_exceptions_total, Labels) of
+        undefined -> 0;
+        Count -> Count
+    end.
 
 test_opts() ->
     #{ <<"store">> => hb_test_utils:test_store(), <<"priv-wallet">> => hb:wallet() }.
@@ -2370,6 +2632,16 @@ binary_codec_reply_headers_test() ->
         Message,
         hb_message:convert(Body, <<"structured@1.0">>, <<"json@1.0">>, Opts)
     ),
+    % A result's `cache-control' is given as a header.
+    ?assertMatch(
+        {200, #{ <<"cache-control">> := <<"no-cache, no-store">> }, _},
+        encode_reply(
+            200,
+            #{ <<"accept">> => <<"application/json">> },
+            Message#{ <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] },
+            Opts
+        )
+    ),
     % A reply in `flat@1.0' has the keys of the result, without its `priv'.
     ?assertMatch(
         {200, _, <<"body: value\nresult: ok\n">>},
@@ -2384,7 +2656,22 @@ binary_codec_reply_headers_test() ->
 %% @doc The first media range of the request's `accept', by q-value and then by
 %% order, that the node can serve gives the codec of the reply.
 accept_precedence_test() ->
-    Opts = test_opts(),
+    % The node resolves names through a JSON snapshot, as a production node
+    % does. A media range selects only a device that the node holds, so only
+    % the lookup of a name decodes the snapshot.
+    BaseOpts = test_opts(),
+    {ok, Names} =
+        hb_cache:write(
+            #{ <<"data">> => hb_json:encode(#{ <<"hello">> => <<"world">> }) },
+            BaseOpts
+        ),
+    Opts =
+        BaseOpts#{
+            <<"name-resolvers">> =>
+                [<<Names/binary, "~json@1.0/deserialize&target=data">>]
+        },
+    erlang:trace_pattern({json, decode, 1}, true, [call_time]),
+    erlang:trace(self(), true, [call]),
     Codec =
         fun(Accept, Msg) ->
             {Res, _} = accept_to_codec(#{ <<"accept">> => Accept }, Msg, Opts),
@@ -2421,7 +2708,18 @@ accept_precedence_test() ->
             <<"application/json, */*">>,
             #{ <<"content-type">> => <<"application/json">> }
         )
-    ).
+    ),
+    ?assertEqual(
+        {ok, <<"world">>},
+        hb_ao:resolve(
+            #{ <<"device">> => <<"name@1.0">> },
+            #{ <<"path">> => <<"hello">>, <<"load">> => false },
+            Opts
+        )
+    ),
+    {call_time, Decodes} = erlang:trace_info({json, decode, 1}, call_time),
+    erlang:trace_pattern({json, decode, 1}, false, [call_time]),
+    ?assertEqual(1, lists:sum([Calls || {_, Calls, _, _} <- Decodes])).
 
 cors_get_test() ->
     % The node's request hook asks for the reply in `json@1.0'.
@@ -2473,7 +2771,10 @@ index_test() ->
                 peer => NodeURL,
                 path => <<"/~test-device@1.0/load">>,
                 method => <<"GET">>,
-                headers => #{ <<"accept-bundle">> => <<"false">> },
+                headers => #{
+                    <<"accept">> => <<"text/html">>,
+                    <<"accept-bundle">> => <<"false">>
+                },
                 body => <<>>
             },
             #{}
@@ -2503,7 +2804,10 @@ index_test() ->
                 peer => NodeURL,
                 path => <<"/", ID/binary>>,
                 method => <<"GET">>,
-                headers => #{ <<"accept-bundle">> => <<"false">> },
+                headers => #{
+                    <<"accept">> => <<"text/html">>,
+                    <<"accept-bundle">> => <<"false">>
+                },
                 body => <<>>
             },
             #{}
@@ -2518,12 +2822,97 @@ index_request_test() ->
                 peer => URL,
                 path => <<"/~test-device@1.0/load?name=dogs">>,
                 method => <<"GET">>,
-                headers => #{ <<"accept-bundle">> => <<"false">> },
+                headers => #{
+                    <<"accept">> => <<"text/html">>,
+                    <<"accept-bundle">> => <<"false">>
+                },
                 body => <<>>
             },
             #{}
         ),
     ?assertEqual(<<"i like dogs!">>, Body).
+
+%% @doc The index page is added to a reply only for a request whose `accept'
+%% prefers HTML, as a browser's does. Any other request gets the reply as it
+%% is, and a reply with a body is sent as itself for every `accept'.
+index_only_for_html_test() ->
+    URL = start_node(),
+    Get =
+        fun(Path, Headers) ->
+            {ok, 200, _, Body} =
+                hb_http_client:request(
+                    #{
+                        peer => URL,
+                        path => Path,
+                        method => <<"GET">>,
+                        headers => Headers#{ <<"accept-bundle">> => <<"false">> },
+                        body => <<>>
+                    },
+                    #{}
+                ),
+            Body
+        end,
+    Browser =
+        <<"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8">>,
+    PrefersHTML =
+        [
+            #{ <<"accept">> => <<"text/html">> },
+            #{ <<"accept">> => <<"text/html;q=0.9, */*;q=0.8">> },
+            #{ <<"accept">> => Browser }
+        ],
+    Others =
+        [
+            #{},
+            #{ <<"accept">> => <<"*/*">> },
+            #{ <<"accept">> => <<"text/*">> },
+            #{ <<"accept">> => <<"*/*, text/html;q=0.5">> },
+            #{ <<"accept">> => <<"text/html;q=0, */*">> },
+            #{ <<"accept">> => <<"application/octet-stream">> }
+        ],
+    % A reply with neither `body' nor `content-type' gets the index page only
+    % for a request that prefers HTML.
+    lists:foreach(
+        fun(Headers) ->
+            ?assertEqual(
+                <<"i like turtles!">>,
+                Get(<<"/~test-device@1.0/load">>, Headers)
+            )
+        end,
+        PrefersHTML
+    ),
+    lists:foreach(
+        fun(Headers) ->
+            ?assertEqual(<<>>, Get(<<"/~test-device@1.0/load">>, Headers))
+        end,
+        Others
+    ),
+    % A request that prefers a codec gets the reply in that codec.
+    ?assertMatch(
+        #{ <<"device">> := <<"test-device@1.0">> },
+        hb_json:decode(
+            Get(
+                <<"/~test-device@1.0/load">>,
+                #{ <<"accept">> => <<"application/json, text/html;q=0.5">> }
+            )
+        )
+    ),
+    % The node's `default-index' is the index page of a message whose device
+    % has none.
+    {ok, ID} = hb_cache:write(#{ <<"key">> => <<"value">> }, get_opts()),
+    Page = Get(<<"/~hyperbuddy@1.0/index">>, #{}),
+    ?assertNotEqual(<<>>, Page),
+    ?assertEqual(Page, Get(<<"/", ID/binary>>, #{ <<"accept">> => Browser })),
+    ?assertEqual(<<>>, Get(<<"/", ID/binary>>, #{ <<"accept">> => <<"*/*">> })),
+    % A reply with a body is sent as itself for every `accept'.
+    lists:foreach(
+        fun(Headers) ->
+            ?assertEqual(
+                <<"hello">>,
+                Get(<<"/~test-device@1.0/load?body=hello">>, Headers)
+            )
+        end,
+        PrefersHTML ++ Others
+    ).
 
 %% @doc A query parameter overrides a request header of the same name, so the
 %% keys that a request sets in its path keep working beside headers.

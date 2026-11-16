@@ -5,7 +5,8 @@
 %%% 
 %%% The routes for the router are defined in the `routes' key of the `Opts',
 %%% as a precidence-ordered list of maps. The first map that matches the
-%%% message will be used to determine the route.
+%%% message will be used to determine the route. An entry of the list may be
+%%% a reference to a route or a list of routes (see `match_route/6').
 %%% 
 %%% Multiple nodes can be specified as viable for a single route, with the
 %%% `Choose' key determining how many nodes to choose from the list (defaulting
@@ -124,8 +125,28 @@ routes(M1, M2, Opts) ->
                         {ok, Signed} ->
                             Route =
                                 hb_maps:get(<<"route">>, Signed, Signed, Opts),
-                            ok = insert_route(Route, Opts),
-                            {ok, <<"Route added.">>};
+                            % A message that the owner signed for another
+                            % use, such as a receipt, gives no `node'.
+                            IsRoute =
+                                hb_maps:is_key(<<"node">>, Route, Opts) orelse
+                                    hb_maps:is_key(<<"nodes">>, Route, Opts),
+                            case IsRoute of
+                                true ->
+                                    % An owner's route applies once for each
+                                    % of its `created' times.
+                                    lib_meta:ratcheted_apply(
+                                        <<"~router@1.0/routes">>,
+                                        <<"route-owner">>,
+                                        Signed,
+                                        fun() ->
+                                            ok = insert_route(Route, Opts),
+                                            {ok, <<"Route added.">>}
+                                        end,
+                                        Opts
+                                    );
+                                false ->
+                                    {error, <<"The route gives no node.">>}
+                            end;
                         {error, _} -> {error, not_authorized}
                     end;
                 Registrar ->
@@ -157,7 +178,7 @@ routes(M1, M2, Opts) ->
                     end
             end;
         _ ->
-            {ok, Routes}
+            {ok, lib_meta:without_credentials(Routes, Opts)}
     end.
 
 %% @doc Add a route to the routes of the node message, and sort them by
@@ -357,26 +378,56 @@ do_apply_route(#{ <<"route-path">> := Path }, R, Opts) ->
 do_apply_route(_, #{ <<"uri">> := URI }, _Opts) ->
     {ok, URI};
 do_apply_route(#{ <<"path">> := RawPath }, #{ <<"prefix">> := RawPrefix }, Opts) ->
-    Path = hb_cache:ensure_loaded(RawPath, Opts),
+    Path = normalize_route_path(hb_cache:ensure_loaded(RawPath, Opts)),
     Prefix = hb_cache:ensure_loaded(RawPrefix, Opts),
     {ok, join_prefix(Prefix, Path)};
 do_apply_route(#{ <<"path">> := RawPath }, #{ <<"suffix">> := RawSuffix }, Opts) ->
-    Path = hb_cache:ensure_loaded(RawPath, Opts),
+    Path = normalize_route_path(hb_cache:ensure_loaded(RawPath, Opts)),
     Suffix = hb_cache:ensure_loaded(RawSuffix, Opts),
     {ok, <<Path/binary, Suffix/binary>>};
 do_apply_route(
         #{ <<"path">> := RawPath },
         #{ <<"match">> := RawMatch, <<"with">> := RawWith },
         Opts) ->
-    Path = hb_cache:ensure_loaded(RawPath, Opts),
+    Path = normalize_route_path(hb_cache:ensure_loaded(RawPath, Opts)),
     Match = hb_cache:ensure_loaded(RawMatch, Opts),
     With = hb_cache:ensure_loaded(RawWith, Opts),
-    % Apply the regex to the path and replace the first occurrence.
+    % Apply the regex to the path and replace the first occurrence. The route
+    % gives the host: the rest of the caller's path may not change it.
     case re:replace(Path, Match, With, [global, {return, binary}]) of
         NewPath when is_binary(NewPath) ->
-            {ok, NewPath};
+            case url_host(NewPath) =:= url_host(routed(Path, Match, With)) of
+                true -> {ok, NewPath};
+                false -> {error, <<"The path changes the host of its route.">>}
+            end;
         _ ->
             {error, invalid_replace_args}
+    end.
+
+%% @doc Return the URL that a route gives for the part of a path that its
+%% `match' matches.
+routed(Path, Match, With) ->
+    case re:run(Path, Match, [{capture, first, binary}]) of
+        {match, [Matched]} -> re:replace(Matched, Match, With, [{return, binary}]);
+        nomatch -> Path
+    end.
+
+%% @doc Return the host and port of a URL, or `undefined' for a path.
+url_host(URL) ->
+    case uri_string:parse(URL) of
+        #{ host := Host } = Parsed -> {Host, maps:get(port, Parsed, undefined)};
+        _ -> undefined
+    end.
+
+%% @doc Return a path with its dot segments resolved, before a route applies
+%% it. The route prefix and the path then reach the same path that the route
+%% template matched.
+normalize_route_path(Path) ->
+    BinPath = hb_ao:normalize_key(Path),
+    try uri_string:normalize(BinPath) of
+        Normalized when is_binary(Normalized) -> Normalized;
+        _ -> BinPath
+    catch _:_ -> BinPath
     end.
 
 %% @doc Join a route's prefix to a path. A prefix that ends in `/' adds no
@@ -448,6 +499,24 @@ match_routes(_, _, [], _) -> no_matches;
 match_routes(ToMatch, Routes, [XKey|Keys], Opts) ->
     NormRoutes = hb_ao:normalize_keys(Routes, Opts),
     XM = hb_maps:get(hb_ao:normalize_key(XKey), NormRoutes, not_found, Opts),
+    match_route(ToMatch, XM, XKey, Routes, Keys, Opts).
+
+%% @doc Match a route of a list against a message. A route may be a reference:
+%% a binary, resolved with `hb_ao:raw/2' each time that it is reached, to a
+%% route or a list of routes. These are matched in its place, before the
+%% routes after it.
+match_route(ToMatch, Ref, _XKey, Routes, Keys, Opts) when is_binary(Ref) ->
+    Resolved =
+        case hb_ao:raw(Ref, Opts) of
+            {ok, List} when is_list(List) -> List;
+            {ok, Route} when is_map(Route) -> [Route];
+            Res -> throw({unresolved_route_reference, Ref, Res})
+        end,
+    case match_routes(ToMatch, Resolved, Opts) of
+        no_matches -> match_routes(ToMatch, Routes, Keys, Opts);
+        Match -> Match
+    end;
+match_route(ToMatch, XM, XKey, Routes, Keys, Opts) ->
     Template =
         hb_maps:get(
             <<"template">>,
@@ -763,11 +832,6 @@ preprocess(Base, RawReq, Opts) ->
                         Opts
                     )
                 ),
-            MaybeCommit =
-                case CommitRequest of
-                    true -> #{ <<"commit-request">> => true };
-                    false -> #{}
-                end,
             % Construct a request to `relay@1.0/call' which will proxy a request
             % to `apply@1.0/body' with the original request body as the argument.
             % This allows us to potentially sign the request before sending it,
@@ -808,7 +872,21 @@ preprocess(Base, RawReq, Opts) ->
                     <<"user-path">> => UserPath,
                     <<"user-message">> => UserReqWithCommit
                 },
-            ?event(debug_preprocess, {prepared_relay_req, RelayReq}),
+            % With `commit-request', the router signs the request that it routes
+            % here, as a relayed request, so the relay only forwards it.
+            ProxyMsg =
+                case CommitRequest of
+                    true ->
+                        hb_message:commit(
+                            RelayReq#{
+                                <<"method">> => <<"POST">>,
+                                <<"type">> => <<"Relay-Request">>
+                            },
+                            Opts
+                        );
+                    false -> RelayReq
+                end,
+            ?event(debug_preprocess, {prepared_relay_req, ProxyMsg}),
             % This request matched a route, so rather than name a peer that the
             % relay would check, give the relay the user's path to route: it
             % picks the destination from the same routes, a destination the
@@ -818,7 +896,7 @@ preprocess(Base, RawReq, Opts) ->
                 RawReq#{
                     <<"body">> =>
                         [
-                            MaybeCommit#{
+                            #{
                                 <<"device">> => <<"relay@1.0">>,
                                 <<"relay-device">> => <<"apply@1.0">>,
                                 <<"method">> => <<"POST">>,
@@ -827,7 +905,7 @@ preprocess(Base, RawReq, Opts) ->
                             #{
                                 <<"path">> => <<"call">>,
                                 <<"relay-subject">> => <<"proxy-message">>,
-                                <<"proxy-message">> => RelayReq
+                                <<"proxy-message">> => ProxyMsg
                             }
                         ]
                 }
@@ -1750,6 +1828,10 @@ route_regex_matches_test_parallel() ->
         #{
             <<"template">> => <<"/.*/schedule">>,
             <<"node">> => <<"correct">>
+        },
+        #{
+            <<"template">> => <<"/result/.*">>,
+            <<"node">> => <<"incorrect">>
         }
     ],
     ?assertEqual(
@@ -1763,6 +1845,22 @@ route_regex_matches_test_parallel() ->
     ?assertEqual(
         {error, no_matches},
         route(#{ <<"path">> => <<"/a/b/c/bad-key">> }, #{ <<"routes">> => Routes })
+    ),
+    % A query parameter does not select a route.
+    ?assertEqual(
+        {error, no_matches},
+        route(
+            #{ <<"path">> => <<"/adm1n?x=/a/b/c/schedule">> },
+            #{ <<"routes">> => Routes }
+        )
+    ),
+    % An encoded separator does not select a route.
+    ?assertEqual(
+        {error, no_matches},
+        route(
+            #{ <<"path">> => <<"/result/..%2Fsecret">> },
+            #{ <<"routes">> => Routes }
+        )
     ).
 
 explicit_route_test_parallel() ->
@@ -1799,6 +1897,89 @@ explicit_route_test_parallel() ->
             #{}
         )
     ).
+
+%% @doc A route may be a reference, resolved when matching reaches it, to a
+%% route or a list of routes that are matched in its place. Any AO-Core path
+%% is a reference: here, a key of the node message, and a message in the
+%% cache.
+route_reference_test_parallel() ->
+    Ref =
+        fun(Key) ->
+            <<"~meta@1.0/info/whatever-else-they-want/", Key/binary>>
+        end,
+    Listed = [
+        #{ <<"template">> => <<"/a">>, <<"node">> => <<"a">> },
+        #{ <<"template">> => <<"/b">>, <<"node">> => <<"b">> }
+    ],
+    Opts =
+        #{
+            <<"whatever-else-they-want">> =>
+                #{
+                    <<"list">> => Listed,
+                    <<"one">> =>
+                        #{ <<"template">> => <<"/c">>, <<"node">> => <<"c">> },
+                    <<"nested">> => [Ref(<<"one">>)]
+                },
+            <<"routes">> => [
+                Ref(<<"list">>),
+                #{ <<"template">> => <<"/b">>, <<"node">> => <<"after-b">> },
+                Ref(<<"nested">>),
+                #{ <<"template">> => <<"/d">>, <<"node">> => <<"after-d">> },
+                Ref(<<"missing">>)
+            ]
+        },
+    % The routes of a list are matched in its place, before those after it.
+    ?assertEqual({ok, <<"b">>}, route(#{ <<"path">> => <<"/b">> }, Opts)),
+    % A route is matched in place of its reference, here through a list.
+    ?assertEqual({ok, <<"c">>}, route(#{ <<"path">> => <<"/c">> }, Opts)),
+    % A match ends before a later reference is resolved.
+    ?assertEqual({ok, <<"after-d">>}, route(#{ <<"path">> => <<"/d">> }, Opts)),
+    % A reference that does not resolve is an error, not a missing route.
+    ?assertThrow(
+        {unresolved_route_reference, _, {error, not_found}},
+        route(#{ <<"path">> => <<"/e">> }, Opts)
+    ),
+    % The `match' key reads the routes of its base, with their references.
+    ?assertMatch(
+        {ok, #{ <<"node">> := <<"a">> }},
+        hb_ao:resolve(
+            #{
+                <<"device">> => <<"router@1.0">>,
+                <<"routes">> => [Ref(<<"list">>)]
+            },
+            #{ <<"path">> => <<"match">>, <<"route-path">> => <<"/a">> },
+            Opts
+        )
+    ),
+    % A path into a message in the cache is a reference too.
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"route-reference">>),
+    StoreOpts = #{ <<"store">> => Store },
+    {ok, ID} = hb_cache:write(#{ <<"routes">> => Listed }, StoreOpts),
+    ?assertEqual(
+        {ok, <<"a">>},
+        route(
+            #{ <<"path">> => <<"/a">> },
+            StoreOpts#{ <<"routes">> => [<<ID/binary, "/routes">>] }
+        )
+    ).
+
+%% @doc The default routes keep the Arweave node routes behind a reference to
+%% `arweave-routes'. A node adds its own routes and keeps them the same way.
+arweave_routes_reference_test_parallel() ->
+    Defaults = hb_opts:default_message_with_env(),
+    Arweave = #{ <<"path">> => <<"/arweave/info">> },
+    {ok, Default} = route(Arweave, Defaults),
+    Opts =
+        Defaults#{
+            <<"routes">> => [
+                #{ <<"template">> => <<"/custom">>, <<"node">> => <<"custom">> },
+                <<"~meta@1.0/info/arweave-routes">>
+            ]
+        },
+    ?assertEqual({ok, <<"custom">>}, route(#{ <<"path">> => <<"/custom">> }, Opts)),
+    ?assertEqual({ok, Default}, route(Arweave, Opts)),
+    % Only Arweave node routes are behind the reference: no GraphQL relay.
+    ?assertEqual({error, no_matches}, route(#{ <<"path">> => <<"/graphql">> }, Opts)).
 
 device_call_from_singleton_test_parallel() ->
     % Try with a real-world example, taken from a GET request to the router.
@@ -1912,6 +2093,21 @@ add_route() ->
     ?assertEqual(
         {ok, <<"signed">>},
         hb_http:get(Node, <<"/~router@1.0/routes/4/node">>, #{})
+    ),
+    % A message that the owner signed with no `node' or `nodes' is no route.
+    ?assertMatch(
+        {error, _},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~router@1.0/routes">>,
+                    <<"template">> => <<"/no/node">>
+                },
+                #{ <<"priv-wallet">> => Owner }
+            ),
+            #{}
+        )
     ).
 
 %% @doc Test that the `preprocess/3' function re-routes a request to remote

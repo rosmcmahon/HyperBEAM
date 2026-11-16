@@ -200,6 +200,16 @@ function recalculate(state, _, opts)
     return "ok", state
 end
 
+-- Whether the node pushed the message for a process. `push@1.0' sets these
+-- keys before it signs, so the signature covers them.
+local function is_pushed(req)
+    return req["from-process"] ~= nil
+        or req["from-uncommitted"] ~= nil
+        or req["from-base"] ~= nil
+        or req["from-scheduler"] ~= nil
+        or req["from-authority"] ~= nil
+end
+
 -- Register a new host to a route.
 function register(state, assignment, opts)
     state = ensure_defaults(state)
@@ -207,9 +217,11 @@ function register(state, assignment, opts)
     local req = assignment.body
 
     -- If the message is signed by an explicitly trusted peer, we can skip the
-    -- is-admissible check.
-    if state["trusted-peer"] then
-        local committers = ao.get("committers", req)
+    -- is-admissible check. A message that the node pushed for a process is
+    -- that process's computed result, not a request from the peer, so the
+    -- is-admissible check decides on it.
+    if state["trusted-peer"] and not is_pushed(req) then
+        local committers = ao.signers(req)
         for _, committer in ipairs(committers) do
             if committer == state["trusted-peer"] then
                 state = add_node(state, req)
@@ -284,11 +296,12 @@ function duration(state, assignment, opts)
 end
 
 function compute(state, assignment, opts)
-    if assignment.body.action == "register" then
+    local action = assignment.body.action or assignment.body.path
+    if action == "register" then
         return register(state, assignment, opts)
-    elseif assignment.body.action == "recalculate" then
+    elseif action == "recalculate" then
         return recalculate(state, assignment, opts)
-    elseif assignment.body.action == "performance" then
+    elseif action == "performance" then
         return duration(state, assignment, opts)
     else
         -- If we have been called without a relevant path, simply ensure that

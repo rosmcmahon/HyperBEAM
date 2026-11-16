@@ -287,15 +287,16 @@ query(Msg, <<"owner">>, _Args, Opts) ->
                     {ok, Commitment} = hb_maps:find(CommID, Commitments, Opts),
                     {ok, Committer} =
                         hb_maps:find(<<"committer">>, Commitment, Opts),
+                    Key =
+                        hb_maps:get(
+                            <<"public-key">>,
+                            Commitment,
+                            hb_maps:get(<<"owner">>, Commitment, null, Opts),
+                            Opts
+                        ),
                     {ok, #{
-                        <<"address">> => hb_util:committer_address(Committer),
-                        <<"key">> =>
-                            hb_maps:get(
-                                <<"public-key">>,
-                                Commitment,
-                                hb_maps:get(<<"owner">>, Commitment, null, Opts),
-                                Opts
-                            )
+                        <<"address">> => hb_util:raw_address(Committer),
+                        <<"key">> => Key
                     }}
             end
     end;
@@ -480,7 +481,12 @@ indexed_l1_size(ID, Opts) ->
 %% results.
 connection(Ordered, Args, Opts) ->
     ResultsCount = length(Ordered),
-    Remaining = drop_to_cursor(Args, Ordered, Opts),
+    Remaining =
+        unblocked(
+            drop_to_cursor(Args, Ordered, Opts),
+            fun(Annotated) -> maps:get(<<"id">>, Annotated, undefined) end,
+            Opts
+        ),
     CountToReturn = page_size(Args, Opts),
     ResultsPagePlusOne = read_ids(Remaining, CountToReturn + 1, Opts),
     ResultsPage = block_edges(lists:sublist(ResultsPagePlusOne, CountToReturn), Opts),
@@ -1096,7 +1102,7 @@ index_predicates(Args, Opts) ->
     Get = fun(Filter) -> hb_maps:get(Filter, Args, null, Opts) end,
     Fields =
         [
-            {<<"committer">>, owner_committers(Get(<<"owners">>))},
+            {<<"committer">>, owner_committers(Get(<<"owners">>), Opts)},
             {<<"field-target">>, Get(<<"recipients">>)}
         ],
     maybe
@@ -1397,8 +1403,30 @@ match_edges(Matches, Opts) ->
                 ),
                 false
         end,
-        lists:zip(Matches, Read)
+        unblocked(
+            lists:zip(Matches, Read),
+            fun({Match, Result}) -> match_id(Match, Result, Opts) end,
+            Opts
+        )
     ), Opts).
+
+%% @doc Return the ID of a match: its own, or the ID of the message that the
+%% read at its offset gives.
+match_id(#{ <<"id">> := ID }, _Result, _Opts) when ID =/= <<>> -> ID;
+match_id(_Match, {ok, Msg}, Opts) -> hb_message:id(Msg, signed, Opts);
+match_id(_Match, _Error, _Opts) -> undefined.
+
+%% @doc Drop the items whose IDs the node's blacklist blocks, with one call to
+%% `blacklist@1.0' for all of them.
+unblocked(Items, ToID, Opts) ->
+    IDs = lists:map(ToID, Items),
+    Blocked = dev_query_graphql:is_blacklisted(IDs, Opts),
+    [
+        Item
+    ||
+        {Item, ID} <- lists:zip(Items, IDs),
+        not lists:member(ID, Blocked)
+    ].
 
 %% @doc Preserve block-page cursors, or encode a match index member.
 match_cursor(#{ <<"cursor">> := Cursor }) -> Cursor;
@@ -1410,8 +1438,29 @@ read_match(Match, Opts) ->
     case match_message(Match, Opts) of
         {error, not_found} -> {error, not_found};
         {error, _} = Error -> throw(Error);
+        {ok, Msg} when is_map(Msg) -> match_view(Match, Msg, Opts);
         Read -> Read
     end.
+
+%% @doc The part of a message that the ID of a match gives. Of a signed message,
+%% a commitment's ID gives only that commitment and the keys that it commits,
+%% and another ID is not found.
+match_view(#{ <<"id">> := ID }, Msg, Opts) when ID =/= <<>> ->
+    case hb_message:signers(Msg, Opts) of
+        [_ | _] ->
+            Commitments = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
+            case hb_maps:is_key(ID, Commitments, Opts) of
+                true ->
+                    hb_message:with_only_committed(
+                        hb_message:with_commitments(ID, Msg, Opts),
+                        Opts
+                    );
+                false -> {error, not_found}
+            end;
+        _ -> {ok, Msg}
+    end;
+match_view(_Match, Msg, _Opts) ->
+    {ok, Msg}.
 
 %% @doc L1 metadata needs only its native header, not an expanded bundle.
 %% Other messages read by ID, or decode their header at a weave offset.
@@ -1577,10 +1626,20 @@ match(<<"tags">>, Tags, Opts) ->
             )
     end;
 match(<<"owners">>, Owners, Opts) ->
-    {ok, matching_commitments(<<"committer">>, owner_committers(Owners), Opts)};
+    {ok,
+        matching_commitments(
+            <<"committer">>,
+            owner_committers(Owners, Opts),
+            Opts
+        )
+    };
 match(<<"owner">>, Owner, Opts) ->
     Res =
-        matching_commitments(<<"committer">>, hb_committer:uri(Owner), Opts),
+        matching_commitments(
+            <<"committer">>,
+            owner_committers([Owner], Opts),
+            Opts
+        ),
     ?event({match_owner, Owner, Res}),
     {ok, Res};
 match(<<"recipients">>, Recipients, Opts) ->
@@ -1693,10 +1752,27 @@ do_filter_offset_annotated(AnnotatedIDs, Heights, Opts) ->
     ?event({filtered_out_of_range, length(AnnotatedIDs) - length(Filtered)}),
     Filtered.
 
-%% @doc Convert the owners of a GraphQL query, which are Arweave addresses, to
-%% the URIs of their committers.
-owner_committers(null) -> null;
-owner_committers(Owners) -> [hb_committer:uri(Owner) || Owner <- Owners].
+%% @doc The committers that the owners of a GraphQL query can be. An owner is
+%% the raw address of a key (`hb_util:raw_address/1'): an Arweave address, `0x'
+%% and the hex of an Ethereum account, or the base58 key of a Solana account.
+%% `hb_committer:uri/1' reads a 43-character owner as an Arweave address, so
+%% such an owner also gives the committer of the Solana key it can be.
+owner_committers(null, _Opts) -> null;
+owner_committers(Owners, _Opts) ->
+    lists:flatmap(
+        fun(Owner = <<_:43/binary>>) ->
+                [
+                    hb_committer:uri(Owner),
+                    hb_committer:uri(
+                        <<"did:pkh:solana:", ?SOLANA_MAINNET/binary, ":",
+                            Owner/binary>>
+                    )
+                ];
+           (Owner) ->
+                [hb_committer:uri(Owner)]
+        end,
+        Owners
+    ).
 
 %% @doc Return the IDs of the messages whose commitments carry a field:
 %% their committer, or their target.

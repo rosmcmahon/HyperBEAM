@@ -1,15 +1,23 @@
 %%% @doc A lightweight in-memory HyperBEAM store backed by a single ETS
 %%% `ordered_set`. The store is volatile: it does not persist data to disk
-%%% ever, and -- critically -- can be configured to expire all data
-%%% periodically. This is useful for testing and as a short-term in-memory
+%%% ever, and -- critically -- can be configured to expire each entry
+%%% after a fixed TTL. This is useful for testing and as a short-term in-memory
 %%% cache, not for instances where an `ok` from the `write` function should
 %%% imply data persistence.
 %%%
-%%% Each entry is stored as `{Path, {raw, Bin} | group}`. Group membership is
-%%% discovered by a lexicographic range scan over the `Path ++ "/"` prefix,
-%%% mirroring the LMDB and FS store layouts. An explicit `group` marker is
-%%% inserted at every ancestor path, so that a single lookup tells whether a
-%%% path has keys below it.
+%%% Each entry is stored as `{Path, {raw, Bin} | group, Expiry}`. Group
+%%% membership is discovered by a lexicographic range scan over the
+%%% `Path ++ "/"` prefix, mirroring the LMDB and FS store layouts. An explicit
+%%% `group` marker is inserted at every ancestor path, so that a single lookup
+%%% tells whether a path has keys below it.
+%%%
+%%% `Expiry` is the monotonic time in milliseconds at which the entry expires:
+%%% the time of its write plus the store's `max-ttl-ms` (or `max-ttl`, in
+%%% seconds), or `infinity` if the store has neither. Reads and lists treat an
+%%% expired entry as missing, and the owner process deletes expired entries
+%%% `?SWEEPS_PER_TTL` times in each TTL. A write gives its ancestor group
+%%% markers its own expiry, so a group expires with the last entry written
+%%% below it.
 -module(hb_store_volatile).
 -export([start/3, stop/3, reset/3, scope/0, scope/1]).
 -export([write/3, read/3, list/3]).
@@ -17,6 +25,8 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(ROOT_GROUP, <<"/">>).
+%% The number of sweeps for expired entries in each TTL.
+-define(SWEEPS_PER_TTL, 10).
 
 %% @doc Start the ETS-backed store and return the store instance message.
 start(StoreOpts = #{ <<"name">> := Name }, _Req, _Opts) ->
@@ -43,15 +53,15 @@ start(StoreOpts = #{ <<"name">> := Name }, _Req, _Opts) ->
     end.
 
 %% @doc Owner loop for the ETS store. Supervised long-lived server: blocks
-%% indefinitely on stop/reset/other messages; the table stays alive until
+%% indefinitely on stop/sweep/other messages; the table stays alive until
 %% the owner exits.
 owner_loop(StoreOpts) ->
     receive
         {stop, From, Ref} ->
             From ! {ok, Ref},
             exit(normal);
-        reset ->
-            reset_store(StoreOpts),
+        sweep ->
+            sweep_store(StoreOpts),
             maybe_start_ttl_timer(StoreOpts, self()),
             owner_loop(StoreOpts);
         _ ->
@@ -59,15 +69,31 @@ owner_loop(StoreOpts) ->
     end.
 
 maybe_start_ttl_timer(StoreOpts, PID) ->
+    case max_ttl_ms(StoreOpts) of
+        infinity -> skip;
+        MaxTTLMs ->
+            timer:send_after(MaxTTLMs div ?SWEEPS_PER_TTL, PID, sweep)
+    end.
+
+%% @doc The store's TTL in milliseconds, from `max-ttl-ms` or `max-ttl` (in
+%% seconds), or `infinity` if it has neither.
+max_ttl_ms(StoreOpts) ->
     case maps:get(<<"max-ttl-ms">>, StoreOpts, undefined) of
         undefined ->
             case maps:get(<<"max-ttl">>, StoreOpts, infinity) of
-                infinity -> skip;
-                MaxTTL ->
-                    timer:send_after(hb_util:int(MaxTTL) * 1000, PID, reset)
+                infinity -> infinity;
+                MaxTTL -> hb_util:int(MaxTTL) * 1000
             end;
         MaxTTLMs ->
-            timer:send_after(hb_util:int(MaxTTLMs), PID, reset)
+            hb_util:int(MaxTTLMs)
+    end.
+
+%% @doc The expiry of an entry written now: the current monotonic time plus
+%% the store's TTL, or `infinity` if it has none.
+expiry(StoreOpts) ->
+    case max_ttl_ms(StoreOpts) of
+        infinity -> infinity;
+        MaxTTLMs -> erlang:monotonic_time(millisecond) + MaxTTLMs
     end.
 
 %% @doc Stop the ETS owner process (which also drops the table).
@@ -94,19 +120,47 @@ reset_store(Opts) ->
     ?event(store_volatile, {reset, {table, Table}}),
     ok.
 
-%% @doc Write one or more entries. Request maps are folded into individual
-%% writes. Any raw entry at an ancestor path is converted to a group marker
-%% (raw entries have no descendants, so no subtree purge is needed). If the
-%% target key is a group, its descendants are deleted first.
+%% @doc Delete every entry whose expiry has passed.
+sweep_store(Opts) ->
+    Table = table(Opts),
+    Now = erlang:monotonic_time(millisecond),
+    Swept =
+        ets:select_delete(
+            Table,
+            [{{'_', '_', '$1'}, [{'=<', '$1', Now}], [true]}]
+        ),
+    ?event(store_volatile, {swept, {table, Table}, {entries, Swept}}),
+    ok.
+
+%% @doc Write one or more entries, and a `group` marker once at each of
+%% their ancestor paths. The rows of a request share one expiry. A raw entry
+%% at an ancestor path is converted to a group marker (raw entries have no
+%% descendants, so no subtree purge is needed). If a key written is a group,
+%% its descendants are deleted first. Rows are inserted one at a time: a
+%% multi-object `ets:insert/2` locks the whole of a `write_concurrency`
+%% ordered_set, stalling every reader.
 write(Opts, Req, _NodeOpts) when is_map(Req) ->
-    maps:fold(
-        fun(Path, Value, ok) ->
-            put_entry(Opts, Path, {raw, Value});
-           (_Path, _Value, Error) ->
-            Error
+    Table = table(Opts),
+    Expiry = expiry(Opts),
+    Entries =
+        maps:from_list(
+            [
+                {hb_path:to_binary(Path), {raw, Value}}
+            ||
+                {Path, Value} <- maps:to_list(Req)
+            ]
+        ),
+    lists:foreach(
+        fun(Key) ->
+            maybe_delete_subtree(Table, Key),
+            sample_event(put)
         end,
-        ok,
-        Req
+        maps:keys(Entries)
+    ),
+    Groups = lists:foldl(fun parent_groups/2, #{}, maps:keys(Entries)),
+    lists:foreach(
+        fun({Key, Entry}) -> ets:insert(Table, {Key, Entry, Expiry}) end,
+        maps:to_list(maps:merge(Entries, Groups))
     ).
 
 %% @doc Read a value. Group paths return `{composite, Children}`: their
@@ -115,19 +169,30 @@ read(Opts, #{ <<"read">> := RawKey }, _NodeOpts) ->
     Key = hb_path:to_binary(RawKey),
     case lookup_entry(Opts, Key) of
         {raw, Value} ->
-            ?event(store_volatile, {hit, {key, Key}}),
+            sample_event(hit),
             {ok, Value};
         group ->
-            ?event(store_volatile, {hit, {key, Key}}),
-            Table = table(Opts),
+            sample_event(hit),
             Children = immediate_children(Opts, Key),
-            {composite, [ child(Table, Key, Name) || Name <- Children ]};
+            {composite, [ child(Name, Entry) || {Name, Entry} <- Children ]};
         _ ->
             ?event(store_volatile, {miss, {key, Key}}),
             {error, not_found}
     end.
 
-%% @doc List immediate child names under a group path.
+%% @doc Count a `hit` or `put` event for about one in every 1,024 of them,
+%% chosen by the low bits of the monotonic clock, and credit it with 1,024,
+%% as `hb_store_lmdb` samples its reads: the counters keep their approximate
+%% totals at a thousandth of the cost of an event each.
+sample_event(Name) ->
+    sample_event(Name, erlang:monotonic_time()).
+sample_event(_Name, Time) when (Time band 1023) =/= 0 ->
+    ok;
+sample_event(Name, _Time) ->
+    hb_event:record(store_volatile, Name, #{}, 1024).
+
+%% @doc List immediate child names under a group path. An ascending list
+%% walks from its `from' child and ends at its limit.
 list(Opts, Req = #{ <<"list">> := RawPath }, _NodeOpts) ->
     list_path(Opts, hb_path:to_binary(RawPath), Req).
 
@@ -136,8 +201,18 @@ list_path(Opts, <<"">>, Req) ->
 list_path(Opts, Path, Req) ->
     case lookup_entry(Opts, Path) of
         group ->
-            Children = immediate_children(Opts, Path),
-            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
+            Children =
+                case hb_store_utils:list_request_bounds(Req, Opts) of
+                    #{
+                        <<"from">> := From,
+                        <<"limit">> := Limit,
+                        <<"direction">> := asc
+                    } when is_binary(From) ->
+                        immediate_children(Opts, Path, From, Limit);
+                    _ -> immediate_children(Opts, Path)
+                end,
+            Names = [ Name || {Name, _} <- Children ],
+            {ok, hb_store_utils:apply_list_bounds(Names, Req, Opts)};
         _ ->
             % A path with a value has no children to list. An empty
             % store returns `not_found` for the root too, so that a chained
@@ -147,57 +222,45 @@ list_path(Opts, Path, Req) ->
 
 %% @doc Return a listed child with its value if it has one, or its name if
 %% it is a group.
-child(Table, Path, Name) ->
-    case lookup_entry(Table, next_group_path(Path, Name)) of
-        {raw, Value} -> {Name, Value};
-        _ -> Name
-    end.
-
-%% @doc Install an entry at Key, purging any prior group subtree and
-%% ensuring ancestor group markers exist.
-put_entry(Opts, RawKey, Entry) ->
-    Key = hb_path:to_binary(RawKey),
-    Table = table(Opts),
-    maybe_delete_subtree(Table, Key),
-    ensure_parent_groups(Table, Key),
-    ?event(store_volatile, {put, {key, Key}}),
-    ets:insert(Table, {Key, Entry}),
-    ok.
+child(Name, {raw, Value}) -> {Name, Value};
+child(Name, group) -> Name.
 
 table(Opts) ->
     #{ <<"ets-table">> := Table } = hb_store:find(Opts),
     Table.
 
+%% @doc Return the entry at Key, or `nil` if it is missing or expired.
 lookup_entry(Opts, Key) when is_map(Opts) ->
     lookup_entry(table(Opts), Key);
 lookup_entry(Table, Key) ->
+    Now = erlang:monotonic_time(millisecond),
     case ets:lookup(Table, Key) of
-        [] -> nil;
-        [{_, Entry}] -> Entry
+        [{_, Entry, Expiry}] when Expiry > Now -> Entry;
+        _ -> nil
     end.
 
-%% @doc Walk ancestor paths from root to parent, inserting a `group` marker
-%% via unconditional `ets:insert/2` at each. A raw entry sitting at an
-%% intermediate path is converted to a group — such an entry has no
-%% descendants, so no subtree purge is required.
-ensure_parent_groups(Table, Key) ->
+%% @doc Add a `group` marker for the root and for each ancestor path of Key,
+%% from root to parent, to Groups. A parent that Groups has already has its
+%% own ancestors there too.
+parent_groups(Key, Groups) ->
     case filename:dirname(Key) of
         <<".">> ->
-            ets:insert(Table, {?ROOT_GROUP, group});
+            Groups#{ ?ROOT_GROUP => group };
+        ParentDir when is_map_key(ParentDir, Groups) ->
+            Groups;
         ParentDir ->
-            ensure_dir(Table, ParentDir)
+            parent_groups(
+                ?ROOT_GROUP,
+                hb_path:term_to_path_parts(ParentDir),
+                Groups#{ ?ROOT_GROUP => group }
+            )
     end.
 
-ensure_dir(Table, Path) ->
-    ets:insert(Table, {?ROOT_GROUP, group}),
-    ensure_dir(Table, ?ROOT_GROUP, hb_path:term_to_path_parts(Path)).
-
-ensure_dir(_Table, _CurrentGroup, []) ->
-    ok;
-ensure_dir(Table, CurrentGroup, [Next | Rest]) ->
+parent_groups(_CurrentGroup, [], Groups) ->
+    Groups;
+parent_groups(CurrentGroup, [Next | Rest], Groups) ->
     NextGroup = next_group_path(CurrentGroup, Next),
-    ets:insert(Table, {NextGroup, group}),
-    ensure_dir(Table, NextGroup, Rest).
+    parent_groups(NextGroup, Rest, Groups#{ NextGroup => group }).
 
 next_group_path(?ROOT_GROUP, Next) ->
     hb_path:to_binary(Next);
@@ -212,7 +275,7 @@ maybe_delete_subtree(Table, Key) ->
             Prefix = <<Key/binary, $/>>,
             PLen = byte_size(Prefix),
             ets:select_delete(Table, [
-                {{'$1', '_'},
+                {{'$1', '_', '_'},
                  [{'=:=', {binary_part, '$1', 0, PLen}, {const, Prefix}}],
                  [true]}
             ]);
@@ -220,81 +283,120 @@ maybe_delete_subtree(Table, Key) ->
             ok
     end.
 
-%% @doc Return immediate child names under GroupPath. Walks the ordered_set
-%% with `ets:next/2`, jumping past each child's own subtree after it has
-%% been recorded (see `advance_past_child/4`). Cost is O(immediate
+%% @doc Return the immediate children under GroupPath, each as
+%% `{Name, Entry}`. Walks the ordered_set with `ets:next_lookup/2`, which
+%% gives each key with its row, jumping past each child's own subtree after
+%% it has been recorded (see `advance_past_child/4`). Cost is O(immediate
 %% children), not O(descendants). For root listings the scan must start
 %% from the true beginning of the table — `ets:next(Table, ?ROOT_GROUP)`
 %% would skip any top-level key whose binary sort order is less than
 %% `<<"/">>` (for example base64url paths starting with `-`) — so the
 %% root marker row itself is skipped explicitly inside the loop instead.
+%%
+%% With a `From' child and a `Limit', the walk starts at the first key at
+%% or after `From' and ends after `Limit' names, so a seek costs O(Limit).
+%% Every child has a row of its own, before any row below it, so the names
+%% are recorded in ascending order. A name before `From', whose subtree the
+%% walk may start inside, is skipped like a recorded one.
+%%
+%% Each child is recorded with the entry of its first row in the walk (see
+%% `child_entry/2'), and only live ones are, so an expired child does not
+%% count toward `Limit'. The walk passes over an expired child with its
+%% subtree: a group marker expires with the last entry written below it, so
+%% the subtree of an expired child has expired too.
 immediate_children(Opts, GroupPath) ->
+    immediate_children(Opts, GroupPath, <<>>, all).
+immediate_children(Opts, GroupPath, From, Limit) ->
     Table = table(Opts),
     Seen =
         case GroupPath of
             ?ROOT_GROUP ->
                 collect_immediate_children(
-                    Table, <<>>, ets:first(Table), #{});
+                    Table, <<>>, ets:first_lookup(Table), #{}, {From, Limit});
             _ ->
                 Prefix = <<GroupPath/binary, $/>>,
+                First = lookup_from(Table, <<Prefix/binary, From/binary>>),
                 collect_immediate_children(
-                    Table, Prefix, ets:next(Table, Prefix), #{})
+                    Table, Prefix, First, #{}, {From, Limit})
         end,
-    maps:keys(Seen).
+    maps:to_list(Seen).
 
-collect_immediate_children(_Table, _Prefix, '$end_of_table', Seen) ->
+collect_immediate_children(_Table, _Prefix, _Next, Seen, {_From, Limit})
+        when map_size(Seen) =:= Limit ->
     Seen;
-collect_immediate_children(Table, <<>> = Prefix, ?ROOT_GROUP, Seen) ->
-    collect_immediate_children(Table, Prefix, ets:next(Table, ?ROOT_GROUP), Seen);
-collect_immediate_children(Table, Prefix, Key, Seen) ->
+collect_immediate_children(_Table, _Prefix, '$end_of_table', Seen, _Bounds) ->
+    Seen;
+collect_immediate_children(Table, <<>> = Prefix, {?ROOT_GROUP, _}, Seen, Bounds) ->
+    collect_immediate_children(
+        Table, Prefix, ets:next_lookup(Table, ?ROOT_GROUP), Seen, Bounds);
+collect_immediate_children(Table, Prefix, {Key, [Row]}, Seen, Bounds = {From, _}) ->
     PLen = byte_size(Prefix),
     case Key of
         <<Prefix:PLen/binary, Rest/binary>> ->
-            [Name | _] = binary:split(Rest, <<"/">>),
-            case is_map_key(Name, Seen) of
+            [Name | Below] = binary:split(Rest, <<"/">>),
+            case is_map_key(Name, Seen) orelse Name < From of
                 true ->
                     %% Re-entered a subtree we already recorded (possible
                     %% when a sibling like `<<Name, X>>` with X < $/ is
-                    %% interleaved in ordered_set iteration). Jump past
+                    %% interleaved in ordered_set iteration), or entered
+                    %% the subtree of a name before `From'. Jump past
                     %% Name's subtree in one step.
-                    NextKey = skip_subtree(Table, Prefix, Name),
-                    collect_immediate_children(Table, Prefix, NextKey, Seen);
-                false ->
-                    NextKey = advance_past_child(Table, Prefix, Name, Key),
+                    Next = skip_subtree(Table, Prefix, Name),
                     collect_immediate_children(
-                        Table, Prefix, NextKey, Seen#{Name => true})
+                        Table, Prefix, Next, Seen, Bounds);
+                false ->
+                    Next = advance_past_child(Table, Prefix, Name, Key),
+                    NextSeen =
+                        case child_entry(Row, Below) of
+                            nil -> Seen;
+                            Entry -> Seen#{Name => Entry}
+                        end,
+                    collect_immediate_children(
+                        Table, Prefix, Next, NextSeen, Bounds)
             end;
         _ ->
             Seen
     end.
 
-%% @doc Advance to the next sibling of Name under Prefix. Plain `ets:next`
-%% handles the shallow case at one-op cost; if it lands inside Name's own
-%% subtree, jump past it via `skip_subtree/3`.
+%% @doc The entry that the first row of a child in the walk gives it: the
+%% row's own entry, `group` if the row is below the child, or `nil` if the
+%% row has expired.
+child_entry(Row, Below) ->
+    child_entry(Row, Below, erlang:monotonic_time(millisecond)).
+child_entry({_, _, Expiry}, _Below, Now) when Expiry =< Now -> nil;
+child_entry({_, Entry, _}, [], _Now) -> Entry;
+child_entry(_Row, _Below, _Now) -> group.
+
+%% @doc Advance to the next sibling of Name under Prefix. Plain
+%% `ets:next_lookup` handles the shallow case at one-op cost; if it lands
+%% inside Name's own subtree, jump past it via `skip_subtree/3`.
 advance_past_child(Table, Prefix, Name, Key) ->
-    case ets:next(Table, Key) of
+    case ets:next_lookup(Table, Key) of
         '$end_of_table' ->
             '$end_of_table';
-        NextKey ->
+        Next = {NextKey, _} ->
             SubtreePrefix = <<Prefix/binary, Name/binary, $/>>,
             SPLen = byte_size(SubtreePrefix),
             case NextKey of
                 <<SubtreePrefix:SPLen/binary, _/binary>> ->
                     skip_subtree(Table, Prefix, Name);
                 _ ->
-                    NextKey
+                    Next
             end
     end.
 
 %% @doc Jump past every key under `<<Prefix, Name, $/>>`. The lex successor
 %% of that prefix is `<<Prefix, Name, $0>>` (since $0 = $/ + 1); an explicit
-%% `ets:member` probe preserves a literal sibling named `<<Name/binary, "0">>`
-%% if one exists (possible with hex-TXID-shaped keys).
+%% lookup probe (see `lookup_from/2`) preserves a literal sibling named
+%% `<<Name/binary, "0">>` if one exists (possible with hex-TXID-shaped keys).
 skip_subtree(Table, Prefix, Name) ->
-    SkipPast = <<Prefix/binary, Name/binary, $0>>,
-    case ets:member(Table, SkipPast) of
-        true -> SkipPast;
-        false -> ets:next(Table, SkipPast)
+    lookup_from(Table, <<Prefix/binary, Name/binary, $0>>).
+
+%% @doc The first key at or after Key, with its row.
+lookup_from(Table, Key) ->
+    case ets:lookup(Table, Key) of
+        [] -> ets:next_lookup(Table, Key);
+        Rows -> {Key, Rows}
     end.
 
 %%% Tests
@@ -316,6 +418,126 @@ max_ttl_test() ->
     timer:sleep(200),
     ?assertEqual({error, not_found}, hb_store:read(StoreOpts, <<"a">>, #{})),
     ok = hb_store:stop(StoreOpts).
+
+entry_expiry_test() ->
+    % Each entry expires a TTL after its own write: an entry written late in
+    % the store's first TTL is still read after it, and one written at its
+    % start is not.
+    S = (hb_test_utils:test_store(?MODULE, <<"entry-expiry-test">>))#{
+        <<"max-ttl">> => 1
+    },
+    hb_store:start(S),
+    ok = hb_store:write(S, #{ <<"early">> => <<"1">> }, #{}),
+    timer:sleep(600),
+    ok = hb_store:write(S, #{ <<"late">> => <<"2">> }, #{}),
+    timer:sleep(600),
+    ?assertEqual({error, not_found}, hb_store:read(S, <<"early">>, #{})),
+    ?assertEqual({ok, <<"2">>}, hb_store:read(S, <<"late">>, #{})),
+    timer:sleep(600),
+    ?assertEqual({error, not_found}, hb_store:read(S, <<"late">>, #{})),
+    ok = hb_store:stop(S).
+
+sweep_test() ->
+    % The owner process deletes expired entries from the table, and keeps
+    % those that have not expired.
+    S = (hb_test_utils:test_store(?MODULE, <<"sweep-test">>))#{
+        <<"max-ttl-ms">> => 1000
+    },
+    hb_store:start(S),
+    Table = table(S),
+    Old = maps:from_list(
+        [
+            {<<"old/", (integer_to_binary(I))/binary>>, <<"v">>}
+        ||
+            I <- lists:seq(1, 100)
+        ]
+    ),
+    ok = hb_store:write(S, Old, #{}),
+    timer:sleep(600),
+    ok = hb_store:write(S, #{ <<"new">> => <<"v">> }, #{}),
+    % The old entries, the `old` and root markers, and the new entry.
+    ?assertEqual(103, ets:info(Table, size)),
+    timer:sleep(750),
+    % The root marker, given the new entry's expiry, and the new entry.
+    ?assertEqual(2, ets:info(Table, size)),
+    ok = hb_store:stop(S).
+
+group_expiry_test() ->
+    % A group lasts as long as the last entry written below it, and reads and
+    % lists of it give only the children that have not expired.
+    S = (hb_test_utils:test_store(?MODULE, <<"group-expiry-test">>))#{
+        <<"max-ttl-ms">> => 1000
+    },
+    hb_store:start(S),
+    ok = hb_store:write(S,
+        #{ <<"g/a">> => <<"1">>,
+           <<"g/b/leaf">> => <<"2">> }, #{}),
+    timer:sleep(600),
+    ok = hb_store:write(S,
+        #{ <<"g/b-">> => <<"3">>,
+           <<"g/c">> => <<"4">> }, #{}),
+    timer:sleep(600),
+    {ok, Children} = hb_store:list(S, <<"g">>, #{}),
+    ?assertEqual([<<"b-">>, <<"c">>], lists:sort(Children)),
+    {composite, Composite} = hb_store:read(S, <<"g">>, #{}),
+    ?assertEqual(
+        [{<<"b-">>, <<"3">>}, {<<"c">>, <<"4">>}],
+        lists:sort(Composite)
+    ),
+    ?assertEqual({error, not_found}, hb_store:list(S, <<"g/b">>, #{})),
+    ?assertEqual({ok, [<<"g">>]}, hb_store:list(S, <<"/">>, #{})),
+    timer:sleep(600),
+    ?assertEqual({error, not_found}, hb_store:read(S, <<"g">>, #{})),
+    ?assertEqual({error, not_found}, hb_store:list(S, <<"/">>, #{})),
+    ok = hb_store:stop(S).
+
+list_from_limit_expiry_test() ->
+    % An ascending list with `from' and `limit' passes over the children that
+    % have expired, swept or not: they do not count toward the limit.
+    S = (hb_test_utils:test_store(?MODULE, <<"list-from-expiry-test">>))#{
+        <<"max-ttl-ms">> => 3600000
+    },
+    hb_store:start(S),
+    ok = hb_store:write(S,
+        #{ <<"p/a">> => <<"1">>,
+           <<"p/b">> => <<"2">>,
+           <<"p/c">> => <<"3">>,
+           <<"p/d">> => <<"4">> }, #{}),
+    % Expire the first two children in place, as a sweep finds them before
+    % it deletes them.
+    Past = erlang:monotonic_time(millisecond) - 1,
+    true = ets:update_element(table(S), <<"p/a">>, {3, Past}),
+    true = ets:update_element(table(S), <<"p/b">>, {3, Past}),
+    List =
+        fun(From, Limit) ->
+            hb_store:list(
+                S,
+                #{
+                    <<"list">> => <<"p">>,
+                    <<"from">> => From,
+                    <<"limit">> => Limit
+                },
+                #{}
+            )
+        end,
+    ?assertEqual({ok, [<<"c">>, <<"d">>]}, List(<<"a">>, 2)),
+    ?assertEqual({ok, [<<"c">>]}, List(<<"b">>, 1)),
+    ?assertEqual({error, not_found}, hb_store:read(S, <<"p/a">>, #{})),
+    ok = hb_store:stop(S).
+
+no_max_ttl_test() ->
+    % Without a TTL every entry, group marker included, never expires.
+    S = hb_test_utils:test_store(?MODULE, <<"no-max-ttl-test">>),
+    hb_store:start(S),
+    ok = hb_store:write(S, #{ <<"a">> => <<"1">>, <<"g/b">> => <<"2">> }, #{}),
+    timer:sleep(300),
+    ?assertEqual({ok, <<"1">>}, hb_store:read(S, <<"a">>, #{})),
+    ?assertEqual({ok, [<<"b">>]}, hb_store:list(S, <<"g">>, #{})),
+    ?assertEqual(
+        [infinity, infinity, infinity, infinity],
+        [ Expiry || {_, _, Expiry} <- ets:tab2list(table(S)) ]
+    ),
+    ok = hb_store:stop(S).
 
 empty_root_reports_not_found_test() ->
     %% A fresh store with no writes must report `{error, not_found}` on
@@ -394,6 +616,21 @@ implicit_group_conversion_test() ->
     ?assertEqual([<<"b">>], Children),
     ok = hb_store:stop(S).
 
+same_request_group_test() ->
+    % A key written in the same request as keys below it is a group, as it
+    % is when they are written one after the other.
+    S = hb_test_utils:test_store(?MODULE, <<"same-request-group-test">>),
+    hb_store:start(S),
+    ok = hb_store:write(S,
+        #{ <<"a">> => <<"raw_val">>,
+           <<"a/b">> => <<"child_val">>,
+           <<"a/c/d">> => <<"deep_val">> }, #{}),
+    {composite, Composite} = hb_store:read(S, <<"a">>, #{}),
+    ?assertEqual([{<<"b">>, <<"child_val">>}, <<"c">>], lists:sort(Composite)),
+    ?assertEqual({ok, [<<"d">>]}, hb_store:list(S, <<"a/c">>, #{})),
+    ?assertEqual({ok, [<<"a">>]}, hb_store:list(S, <<"/">>, #{})),
+    ok = hb_store:stop(S).
+
 list_deep_subtree_test() ->
     S = hb_test_utils:test_store(?MODULE, <<"list-deep-test">>),
     hb_store:start(S),
@@ -449,4 +686,33 @@ prefixed_sibling_no_duplicate_test() ->
            <<"p/a-">> => <<"2">> }, #{}),
     {ok, Children} = hb_store:list(S, <<"p">>, #{}),
     ?assertEqual([<<"a">>, <<"a-">>], lists:sort(Children)),
+    ok = hb_store:stop(S).
+
+list_from_limit_test() ->
+    %% An ascending list with `from' and `limit' gives the first children at
+    %% or after `from', including when the walk starts inside the subtree of
+    %% a child before it (`a.' sorts between `a-' and `a/leaf').
+    S = hb_test_utils:test_store(?MODULE, <<"list-from-limit-test">>),
+    hb_store:start(S),
+    ok = hb_store:write(S,
+        #{ <<"p/a/leaf">> => <<"1">>,
+           <<"p/a-">> => <<"2">>,
+           <<"p/b">> => <<"3">>,
+           <<"p/c/leaf">> => <<"4">> }, #{}),
+    List =
+        fun(From, Limit) ->
+            hb_store:list(
+                S,
+                #{
+                    <<"list">> => <<"p">>,
+                    <<"from">> => From,
+                    <<"limit">> => Limit
+                },
+                #{}
+            )
+        end,
+    ?assertEqual({ok, [<<"a">>, <<"a-">>]}, List(<<"a">>, 2)),
+    ?assertEqual({ok, [<<"b">>]}, List(<<"a.">>, 1)),
+    ?assertEqual({ok, [<<"b">>, <<"c">>]}, List(<<"b">>, 5)),
+    ?assertEqual({ok, []}, List(<<"d">>, 1)),
     ok = hb_store:stop(S).

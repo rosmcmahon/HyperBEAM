@@ -20,7 +20,7 @@
 %%% Public Utility Functions.
 -export([escape_format/1, short_id/1, trace_to_list/1]).
 -export([get_trace/1, print_trace/4, trace_macro_helper/5, print_trace_short/4]).
--export([process_from_trace/1]).
+-export([process_from_trace/1, pretty_mod/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -153,7 +153,8 @@ do_term({as, undefined, Msg}, Opts, Indent) ->
 do_term({as, DevID, Msg}, Opts, Indent) ->
     "\n" ++ indent("Subresolve as ~s => ", [DevID], Opts, Indent) ++
         maybe_multiline(Msg, Opts, Indent + 1);
-do_term({X, Y}, Opts, Indent) when is_atom(X) and is_atom(Y) ->
+do_term({X, Y}, Opts, Indent)
+        when is_atom(X) and (is_atom(Y) or is_integer(Y)) ->
     indent("~p: ~p", [X, Y], Opts, Indent);
 do_term({X, Y}, Opts, Indent) when is_record(Y, tx) ->
     indent("~p: [TX item]~n~s",
@@ -389,7 +390,11 @@ removing_trailing_noise(BinList, Noise) when is_list(BinList) ->
 indent(Str, Indent) -> indent(Str, #{}, Indent).
 indent(Str, Opts, Indent) -> indent(Str, [], Opts, Indent).
 indent(FmtStr, Terms, Opts, Ind) ->
-    IndentSpaces = hb_opts:get(debug_print_indent, Opts),
+    IndentSpaces =
+        case Ind of
+            0 -> 0;
+            _ -> hb_opts:get(debug_print_indent, Opts)
+        end,
     EscapedFmt = escape_format(FmtStr),
     lists:droplast(
         lists:flatten(
@@ -401,13 +406,19 @@ indent(FmtStr, Terms, Opts, Ind) ->
         )
     ).
 
-%% @doc Escape a string for use as an io_lib:format specifier.
+%% @doc Escape a string for use as an io_lib:format specifier. Only a string
+%% that contains `@' can name a device, so only such a string is matched.
 escape_format(Str) when is_list(Str) ->
-    re:replace(
-        Str,
-        "~([a-z\\-_]+@[0-9]+\\.[0-9]+)", "~~\\1",
-        [global, {return, list}]
-    );
+    Bin = iolist_to_binary(Str),
+    case binary:match(Bin, <<"@">>) of
+        nomatch -> binary_to_list(Bin);
+        _ ->
+            re:replace(
+                Bin,
+                "~([a-z\\-_]+@[0-9]+\\.[0-9]+)", "~~\\1",
+                [global, {return, list}]
+            )
+    end;
 escape_format(Else) -> Else.
 
 %% @doc Format an error message as a string.
@@ -1209,7 +1220,8 @@ bounded_format(Render) ->
     end.
 
 %% @doc A nested list is formatted once for each list element, not once per
-%% branch of the list formatter.
+%% branch of the list formatter, and without matching its format strings,
+%% which name no device, against the device-name pattern.
 nested_list_format_calls_test() ->
     Nested = fun(Depth) ->
         lists:foldl(fun(_, Acc) -> [Acc] end, 1, lists:seq(1, Depth))
@@ -1221,11 +1233,17 @@ nested_list_format_calls_test() ->
     ),
     try
         erlang:trace_pattern({?MODULE, list_item, 4}, true, [call_count]),
+        erlang:trace_pattern({re, replace, 4}, true, [call_time]),
+        erlang:trace(self(), true, [call]),
         _ = term(Nested(26), #{}, 0),
         {call_count, Calls} =
             erlang:trace_info({?MODULE, list_item, 4}, call_count),
-        ?assert(Calls < 1000)
+        ?assert(Calls < 1000),
+        {call_time, Regexes} = erlang:trace_info({re, replace, 4}, call_time),
+        ?assertEqual(0, lists:sum([N || {_, N, _, _} <- Regexes]))
     after
+        erlang:trace(self(), false, [call]),
+        erlang:trace_pattern({re, replace, 4}, false, [call_time]),
         erlang:trace_pattern({?MODULE, list_item, 4}, false, [call_count])
     end.
 

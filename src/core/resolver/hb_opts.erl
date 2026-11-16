@@ -81,6 +81,49 @@
     <<"from-value">> =>
         <<"~bits@1.0/from=_:77,start:49+integer,length:34+integer">>
 }).
+%% Additional ANS-104 data items, including nested Redstone messages.
+-define(DEFAULT_REDSTONE_OFFSET_INDEX, #{
+    <<"store-module">> => hb_store_arlmdb,
+    <<"name">> => <<"published-redstone-offset-index">>,
+    <<"root">> => <<"aOlX-irO0DEKk1U0dP4ZEoBNd2LyKVXFqaEUuxpihLI">>,
+    <<"prefix">> => <<"~arweave@2.9/offset=">>,
+    <<"to-key">> => <<"~base64url@1.0/decode/~bits@1.0/take=77">>,
+    <<"from-value">> =>
+        <<"~bits@1.0/from=_:77,start:49+integer,length:34+integer"
+            "/set&codec=ans104@1.0">>
+}).
+%% L1 transaction offsets retain their data lengths and transaction codec.
+-define(DEFAULT_L1_OFFSET_INDEX, #{
+    <<"store-module">> => hb_store_arlmdb,
+    <<"name">> => <<"published-l1-offset-index">>,
+    <<"root">> => <<"_BjLm7-qslpbSLcqNBQepUZMFoxgdeIbOdnRsaPAnuQ">>,
+    <<"prefix">> => <<"~arweave@2.9/offset=">>,
+    <<"to-key">> => <<"~base64url@1.0/decode/~bits@1.0/take=71">>,
+    <<"from-value">> =>
+        <<"~bits@1.0/from=_:71,start:49+integer,length:40+integer"
+            "/set&codec=tx@1.0">>
+}).
+%% The published `~match@1.0' index of ANS-104 data items to block 1,988,355,
+%% without Redstone messages: a predicate's packed rows give the weave offsets
+%% of the items that carry it. Its committers are raw addresses
+%% (`hb_util:raw_address/1'), so its `row' hashes a committer's URI as one.
+-define(DEFAULT_MATCH_INDEX, #{
+    <<"store-module">> => hb_store_arlmdb,
+    <<"name">> => <<"published-match-index">>,
+    <<"root">> => <<"oWRzBr3KHhULAL-s5ULeXac1mb_WQOX5uFBRea16iRI">>,
+    <<"access">> => [<<"read">>],
+    <<"return-row">> => true,
+    <<"prefix">> => <<"~match@1.0/">>,
+    <<"to-key">> =>
+        <<"~match@1.0/row&key-hash-size=39&value-hash-size=40&offset-size=49"
+            "&committer-format=raw">>,
+    <<"from-key">> =>
+        <<"~match@1.0/member&key-hash-size=39&value-hash-size=40&offset-size=49"
+            "/set&commitment-device=ans104@1.0">>,
+    <<"from-list">> =>
+        <<"~match@1.0/members&key-hash-size=39&value-hash-size=40"
+            "&offset-size=49&commitment-device=ans104@1.0">>
+}).
 -define(DEFAULT_GATEWAY, <<"https://arweave.net">>).
 -define(
     DEFAULT_HTTP_OPTS,
@@ -327,23 +370,6 @@ raw_default_message() ->
         <<"name-resolvers">> => ?DEFAULT_NAME_RESOLVERS,
         <<"name-reserved-host-labels">> => [],
         <<"routes">> => [
-            % Local CU routes.
-            #{
-                <<"template">> => <<"/result/.*">>,
-                <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
-            },
-            #{
-                <<"template">> => <<"/snapshot/.*">>,
-                <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
-            },
-            #{
-                <<"template">> => <<"/dry-run.*">>,
-                <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
-            },
-            #{
-                <<"template">> => <<"/state.*">>,
-                <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
-            },
             % GraphQL: send queries to the default gateway.
             #{
                 <<"template">> => <<"/graphql">>,
@@ -355,12 +381,45 @@ raw_default_message() ->
                         }
                     ]
             },
-            % chunk requests: route to the nearest data nodes by
-            % partition midpoint (byte offset).
+            % The routes to Arweave nodes, given once under `arweave-routes'.
+            % A node's own `routes' keep them with this same reference.
+            <<"~meta@1.0/info/arweave-routes">>,
+            % Message offsets from an index node. Read over HTTP/2, whose
+            % header names are always lower-case, such that the typed fields of
+            % the response survive intermediaries and decode.
+            #{
+                <<"template">> =>
+                    #{
+                        <<"path">> => <<"^/~arweave@2.9/raw">>,
+                        <<"method">> => <<"HEAD">>
+                    },
+                <<"node">> =>
+                    #{
+                        <<"prefix">> => ?DEFAULT_GATEWAY,
+                        <<"opts">> =>
+                            #{
+                                <<"http-client">> => gun,
+                                <<"protocol">> => http2
+                            }
+                    }
+            },
+            % Raw data requests via arweave.net gateway. TODO: Update later.
+            #{
+                <<"template">> => <<"/raw">>,
+                <<"node">> =>
+                    #{
+                        <<"prefix">> => ?DEFAULT_GATEWAY,
+                        <<"opts">> => ?DEFAULT_HTTP_OPTS
+                    }
+            }
+        ],
+        <<"arweave-routes">> => [
+            % chunk and transaction data requests: route to the nearest data
+            % nodes by partition midpoint (byte offset).
             #{
                 <<"template">> => 
                     #{
-                        <<"path">> => <<"^/arweave/chunk">>,
+                        <<"path">> => <<"^/arweave/(chunk|tx/[^/]+/data\\.bin)">>,
                         <<"method">> => <<"GET">>
                     },
                 <<"nodes">> => add_opts(?ARWEAVE_BOOTSTRAP_DATA_NODES ++ ?ARWEAVE_BOOTSTRAP_TIP_NODES),
@@ -388,22 +447,31 @@ raw_default_message() ->
                 <<"stop-after">> => true,
                 <<"admissible-status">> => 200
             },
+            % Chunk uploads: an upload gives its offset in its transaction, not
+            % in the weave, so it cannot be routed by range. Its chunks are new
+            % data at the tip: post them to every node that syncs the tip, as
+            % the JSON that an Arweave node parses, and reply after 3x 200s.
             #{
                 <<"template">> => 
                     #{
                         <<"path">> => <<"^/arweave/chunk">>,
                         <<"method">> => <<"POST">>
                     },
-                <<"nodes">> => add_opts(?ARWEAVE_BOOTSTRAP_DATA_NODES ++ ?ARWEAVE_BOOTSTRAP_TIP_NODES),
-                <<"strategy">> => <<"Shuffled-Range">>,
+                <<"nodes">> =>
+                    add_opts(
+                        ?ARWEAVE_BOOTSTRAP_TIP_NODES
+                            ++ ?ARWEAVE_BOOTSTRAP_TIP_SYNC_NODES,
+                        ?DEFAULT_HTTP_OPTS#{ <<"http-codec">> => <<"json@1.0">> }
+                    ),
+                <<"strategy">> => <<"Random">>,
                 <<"choose">> =>
                     length(
-                        ?ARWEAVE_BOOTSTRAP_DATA_NODES
-                            ++ ?ARWEAVE_BOOTSTRAP_TIP_NODES
+                        ?ARWEAVE_BOOTSTRAP_TIP_NODES
+                            ++ ?ARWEAVE_BOOTSTRAP_TIP_SYNC_NODES
                     ),
-                <<"parallel">> => 5,
-                <<"responses">> => 3, %% keep going until we get 3x 200s
-                <<"stop-after">> => true,
+                <<"parallel">> => true,
+                <<"responses">> => 3,
+                <<"stop-after">> => false,
                 <<"admissible-status">> => 200
             },
             #{
@@ -436,34 +504,6 @@ raw_default_message() ->
                 <<"parallel">> => true,
                 <<"stop-after">> => true,
                 <<"admissible-status">> => 200
-            },
-            % Message offsets from an index node. Read over HTTP/2, whose
-            % header names are always lower-case, such that the typed fields of
-            % the response survive intermediaries and decode.
-            #{
-                <<"template">> =>
-                    #{
-                        <<"path">> => <<"^/~arweave@2.9/raw">>,
-                        <<"method">> => <<"HEAD">>
-                    },
-                <<"node">> =>
-                    #{
-                        <<"prefix">> => ?DEFAULT_GATEWAY,
-                        <<"opts">> =>
-                            #{
-                                <<"http-client">> => gun,
-                                <<"protocol">> => http2
-                            }
-                    }
-            },
-            % Raw data requests via arweave.net gateway. TODO: Update later.
-            #{
-                <<"template">> => <<"/raw">>,
-                <<"node">> =>
-                    #{
-                        <<"prefix">> => ?DEFAULT_GATEWAY,
-                        <<"opts">> => ?DEFAULT_HTTP_OPTS
-                    }
             }
         ],
         <<"store">> =>
@@ -477,12 +517,17 @@ raw_default_message() ->
                     <<"store-module">> => hb_store_arweave,
                     <<"name">> => <<"cache-mainnet/arweave">>,
                     <<"index-store">> =>
-                        [?DEFAULT_PRIMARY_STORE, ?DEFAULT_OFFSET_INDEX],
+                        [
+                            ?DEFAULT_PRIMARY_STORE,
+                            ?DEFAULT_OFFSET_INDEX,
+                            ?DEFAULT_REDSTONE_OFFSET_INDEX,
+                            ?DEFAULT_L1_OFFSET_INDEX
+                        ],
                     <<"local-store">> => [?DEFAULT_PRIMARY_STORE],
                     <<"remote-index">> => true
                 }
             ],
-        <<"match-index">> => [?DEFAULT_PRIMARY_STORE],
+        <<"match-index">> => [?DEFAULT_PRIMARY_STORE, ?DEFAULT_MATCH_INDEX],
         <<"attested-store">> =>
             #{
                 <<"store-module">> => hb_store_lmdb,
@@ -509,6 +554,15 @@ raw_default_message() ->
         <<"ans104-trust-gql">> => false,
         % Number of chunks to fetch in parallel when loading a TX or dataitem.
         <<"arweave-chunk-fetch-concurrency">> => 5,
+        % Store of the weave chunks that the node reads, so that bytes in a
+        % chunk that it has read before are not downloaded again. The table
+        % keeps each chunk for five minutes; `[]' keeps no chunks.
+        <<"arweave-chunk-store">> =>
+            #{
+                <<"store-module">> => hb_store_volatile,
+                <<"name">> => <<"arweave-chunks">>,
+                <<"max-ttl">> => 300
+            },
         <<"http-extra-opts">> =>
             #{
                 <<"force-message">> => true,
@@ -769,12 +823,10 @@ load_bin(Device, Bin, Opts) ->
     end.
 
 %% @doc Decode a config file to a message, with its private keys. A JSON file
-%% is decoded from the TABM that `json@1.0''s `deserialize' gives, as
-%% `hb_http:decode/3' decodes a JSON request body: `json@1.0''s `from' gives
-%% the TABM without the private keys.
+%% is decoded with `hb_json:decode/1': a codec removes the private keys that a
+%% message over the wire gives.
 decode(<<"json@1.0">>, Bin, Opts) ->
-    {ok, TABM} = hb_ao:raw(<<"json@1.0">>, <<"deserialize">>, Bin, #{}, Opts),
-    decode_tabm(TABM, Opts);
+    decode_tabm(hb_json:decode(Bin), Opts);
 decode(Device, Bin, Opts) ->
     hb_message:convert(
         Bin,

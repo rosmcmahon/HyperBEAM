@@ -177,10 +177,24 @@
 -module(dev_secret).
 -device_libraries([lib_meta, lib_process, lib_secret]).
 -export([generate/3, import/3, list/3, commit/3, export/3, sync/3]).
+-export([device_info/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
 -define(DEFAULT_AUTH_DEVICE, <<"cookie@1.0">>).
+
+%% @doc Return the options of the device. Only `generate` makes a new wallet,
+%% so only it needs an execution of its own.
+device_info(_Base) ->
+    #{ grouper => fun group/3 }.
+
+%% @doc Keep each `generate` request out of the in-flight groups, so that two
+%% callers never share one new wallet. Group every other request by its inputs.
+group(Base, Req, Opts) ->
+    case hb_path:matches(<<"generate">>, hb_path:hd(Req, Opts)) of
+        true -> ungrouped_exec;
+        false -> hb_persistent:default_grouper(Base, Req, Opts)
+    end.
 
 %% @doc Generate a new wallet for a user and register it on the node. If the
 %% request references a wallet that it may access, we return the wallet's
@@ -357,12 +371,20 @@ register_wallet(Wallet, Base, Request, Opts) ->
 persist_registered_wallet(WalletDetails, Opts) ->
     persist_registered_wallet(WalletDetails, #{}, Opts).
 persist_registered_wallet(WalletDetails, RespBase, Opts) ->
-    % Add the wallet address as the body of the response.
-    Address = hb_maps:get(<<"address">>, WalletDetails, undefined, Opts),
-    ?event({resp_base, {auth_resp, RespBase}, {priv_wallet_details, WalletDetails}}),
     % The wallet is keyed by the `keyid' of its access secret.
     Committer = hb_maps:get(<<"committer">>, WalletDetails, undefined, Opts),
     KeyID = <<"secret:", Committer/binary>>,
+    case is_keyid(KeyID) of
+        true ->
+            persist_registered_wallet(WalletDetails, RespBase, KeyID, Opts);
+        false ->
+            {error, <<"Wallet keyid must be one path part.">>}
+    end.
+
+persist_registered_wallet(WalletDetails, RespBase, KeyID, Opts) ->
+    % Add the wallet address as the body of the response.
+    Address = hb_maps:get(<<"address">>, WalletDetails, undefined, Opts),
+    ?event({resp_base, {auth_resp, RespBase}, {priv_wallet_details, WalletDetails}}),
     Base = RespBase#{
         <<"body">> => KeyID, <<"cache-control">> => <<"no-store">>
     },
@@ -427,10 +449,19 @@ list(_Base, _Request, Opts) ->
 
 %% @doc Sign a message with a wallet.
 -spec commit(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
-    {ok, #{ _ => _ }} | {error, binary()}.
+    {ok, #{ _ => _ }} | {error, _}.
 commit(Base, Request, Opts) ->
     ?event({commit_invoked, {priv_base, Base}, {priv_request, Request}}),
-    case request_to_wallets(Base, Request, Opts) of
+    case
+        hb_http:is_own_origin(Request, Opts)
+            andalso request_to_wallets(Base, Request, Opts)
+    of
+        false ->
+            {error,
+                #{
+                    <<"status">> => 403,
+                    <<"body">> => <<"Request is not from the node's origin.">>
+                }};
         [] -> {error, <<"No wallets found to sign with.">>};
         WalletDetailsList ->
             ?event(
@@ -539,9 +570,10 @@ load_and_verify({secret, KeyID, _}, _Base, Request, Opts) ->
     end.
 
 %% @doc Validate if a calling message has the required `controllers' for the
-%% given wallet. Count a controller only if it signed `keyids', and `keyids'
-%% contains the wallet's `keyid' or is `all'. A commitment over other keys,
-%% such as `hashpath', does not authorize an export.
+%% given wallet. Count a controller only if it signed `keyids', `keyids'
+%% contains the wallet's `keyid' or is `all', and its signature has not
+%% expired. A commitment over other keys, such as `hashpath', does not
+%% authorize an export.
 verify_controllers(WalletDetails, KeyID, Request, Opts) ->
     RequiredControllers =
         hb_util:int(hb_maps:get(<<"required-controllers">>, WalletDetails, 1, Opts)),
@@ -561,7 +593,8 @@ verify_controllers(WalletDetails, KeyID, Request, Opts) ->
         ||
             Controller <- lists:usort(Controllers),
             {ok, Signed} <- [lib_meta:authorized([Controller], Request, Opts)],
-            is_listed_key(KeyID, hb_maps:get(<<"keyids">>, Signed, [], Opts))
+            is_listed_key(KeyID, hb_maps:get(<<"keyids">>, Signed, [], Opts)),
+            not is_expired(Signed, Opts)
         ],
     length(SigningControllers) >= RequiredControllers.
 
@@ -569,6 +602,20 @@ verify_controllers(WalletDetails, KeyID, Request, Opts) ->
 is_listed_key(_KeyID, <<"all">>) -> true;
 is_listed_key(KeyID, KeyIDs) when is_list(KeyIDs) -> lists:member(KeyID, KeyIDs);
 is_listed_key(_KeyID, _KeyIDs) -> false.
+
+%% @doc Whether a commitment on the message gives an `expires' that has passed.
+%% A commitment without one does not expire.
+is_expired(Msg, Opts) ->
+    Now = os:system_time(second),
+    lists:any(
+        fun(Commitment) ->
+            case hb_maps:get(<<"expires">>, Commitment, undefined, Opts) of
+                undefined -> false;
+                Expires -> hb_util:int(Expires) < Now
+            end
+        end,
+        hb_maps:values(hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts)
+    ).
 
 %% @doc Verify a wallet for a given request.
 verify_auth(WalletDetails, Req, Opts) ->
@@ -623,7 +670,7 @@ commit_message(Message, #{ <<"wallet">> := Key }, Opts) ->
     #{ _ => _ },
     #{ keyids => [binary()] | binary(), _ => _ },
     #{ _ => _ }
-) -> {ok, [_]} | {error, binary()}.
+) -> {ok, #{ _ => _ }} | {error, binary()}.
 export(Base, Request, Opts) ->
     % A reply that is not a bundle gives each wallet as a link, which writes
     % the wallet, with its key, to the node's cache.
@@ -645,17 +692,19 @@ do_export(Base, Request, Opts) ->
     case request_to_wallets(Base, ModReq, Opts) of
         [] -> {error, <<"No wallets found to export.">>};
         Wallets ->
-            {
-                ok,
+            Exported =
                 lists:map(
                     fun(Wallet) ->
-                        Loaded = hb_cache:ensure_all_loaded(Wallet, PrivOpts),
+                        Loaded = load_wallet(Wallet, PrivOpts),
                         ?event({exported, {priv_wallet, Loaded}}),
                         Loaded#{ <<"cache-control">> => <<"no-store">> }
                     end,
                     Wallets
-                )
-            }
+                ),
+            {ok,
+                (hb_util:list_to_numbered_message(Exported))#{
+                    <<"cache-control">> => <<"no-store">>
+                }}
     end.    
 
 %% @doc Sync wallets from a remote node. Returns the `keyid's of the imported
@@ -773,11 +822,19 @@ store_wallet(non_volatile, KeyID, Details, Opts) ->
     % Link the wallet to the store.
     ok = hb_cache:link(Msg, <<"wallet@1.0/", KeyID/binary>>, PrivOpts).
 
+is_keyid(KeyID) ->
+    % A keyid is one path part of the private store.
+    binary:match(KeyID, <<"/">>) =:= nomatch.
+
 %% @doc Find the wallet by name or address in the node's options.
 find_wallet(KeyID, Opts) ->
-    case find_wallet(in_memory, KeyID, Opts) of
-        not_found -> find_wallet(non_volatile, KeyID, Opts);
-        Wallet -> Wallet
+    case is_keyid(KeyID) of
+        true ->
+            case find_wallet(in_memory, KeyID, Opts) of
+                not_found -> find_wallet(non_volatile, KeyID, Opts);
+                Wallet -> Wallet
+            end;
+        false -> not_found
     end.
 
 %% @doc Loop over the wallets and find the reference to the wallet.
@@ -792,11 +849,36 @@ find_wallet(non_volatile, KeyID, Opts) ->
     PrivOpts = priv_store_opts(Opts),
     case hb_cache:read(<<"wallet@1.0/", KeyID/binary>>, PrivOpts) of
         {ok, Wallet} ->
-            WalletDetails = hb_maps:get(KeyID, Wallet, not_found, PrivOpts),
-            hb_cache:ensure_all_loaded(WalletDetails, PrivOpts);
+            load_wallet(
+                hb_maps:get(KeyID, Wallet, not_found, PrivOpts),
+                PrivOpts
+            );
         _ ->
             not_found
     end.
+
+%% @doc Load a wallet's record from the private store: its `wallet' key, and its
+%% `access-control' message one layer deep. The links in the `access-control'
+%% message stay links, without the private store, so a caller's link reads no
+%% private entry.
+load_wallet(not_found, _PrivOpts) -> not_found;
+load_wallet(Wallet, PrivOpts) ->
+    Loaded = hb_cache:ensure_loaded(Wallet, PrivOpts),
+    maps:map(
+        fun
+            (<<"wallet">>, Value) ->
+                hb_cache:ensure_loaded(Value, PrivOpts);
+            (<<"access-control">>, Value) ->
+                hb_link:normalize(
+                    hb_cache:ensure_loaded(Value, PrivOpts),
+                    keep,
+                    PrivOpts
+                );
+            (_Key, Value) ->
+                Value
+        end,
+        Loaded
+    ).
 
 %% @doc Generate a list of all hosted wallets.
 list_wallets(Opts) ->
@@ -840,6 +922,18 @@ binary_to_addresses(Addresses) when is_list(Addresses) ->
 
 
 %%% Tests
+
+%% @doc Only a `generate` request gets an execution of its own, so a second
+%% caller does not share the wallet that it makes.
+generate_is_ungrouped_test() ->
+    Opts = #{ <<"await-inprogress">> => true },
+    Base = #{ <<"device">> => <<"secret@1.0">> },
+    Generate = #{ <<"path">> => <<"generate">> },
+    ?assertEqual(ungrouped_exec, hb_persistent:group(Base, Generate, Opts)),
+    ?assertNotEqual(
+        ungrouped_exec,
+        hb_persistent:group(Base, Generate#{ <<"path">> => <<"list">> }, Opts)
+    ).
 
 %% @doc Helper function to test wallet generation and verification flow.
 test_wallet_generate_and_verify(GeneratePath, ExpectedName, CommitParams) ->
@@ -924,6 +1018,38 @@ non_volatile_persist_generate_and_verify_test() ->
             #{ <<"store">> => [Public], <<"priv-store">> => [Private] }
         ),
     ?assertEqual([Private], hb_opts:get(store, [], Opts)).
+
+%% @doc A committer with a `/` cannot make a keyid that is more than one path
+%% part of the private store, when the node stores a wallet or reads one.
+keyid_with_slash_refused_test() ->
+    Node = hb_http_server:start_node(#{ <<"priv-wallet">> => ar_wallet:new() }),
+    Generate =
+        fun(C) ->
+            hb_http:post(
+                Node,
+                #{
+                    <<"path">> => <<"/~secret@1.0/generate?persist=non-volatile">>,
+                    <<"type">> => <<"unsigned">>,
+                    <<"access-control">> =>
+                        #{ <<"device">> => <<"message@1.0">>, <<"committer">> => C },
+                    <<"controllers">> => [],
+                    <<"required-controllers">> => 0
+                },
+                #{}
+            )
+        end,
+    ?assertMatch({error, _}, Generate(<<"slashmarker/">>)),
+    {ok, #{ <<"body">> := KeyID }} = Generate(<<"slashmarker">>),
+    ?assertNotMatch(
+        {ok, _},
+        hb_http:get(
+            Node,
+            #{ <<"path">> => <<"/~secret@1.0/export/1">>,
+               <<"accept-bundle">> => <<"true">>,
+               <<"keyids">> => [<<KeyID/binary, "/">>] },
+            #{}
+        )
+    ).
 
 import_wallet_with_key_test() ->
     Node = hb_http_server:start_node(#{
@@ -1014,6 +1140,15 @@ commit_with_cookie_wallet_test() ->
         SignedMessage,
         hb_committer:uri(WalletName),
         <<"Test data">>
+    ),
+    % A page on another origin does not get the wallet's signature.
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:post(
+            Node,
+            TestMessage#{ <<"origin">> => <<"http://other.example">> },
+            #{}
+        )
     ).
 
 export_wallet_test() ->

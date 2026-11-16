@@ -67,7 +67,7 @@ message_to_fun(Dev, Msg, Key, Opts) ->
     Info = device_info(Dev, Msg, Opts),
     % Is the key exported by the device?
     Exported = is_exported(Info, Key, Opts),
-	?event(
+	?event_debug(
         ao_devices,
         {message_to_fun,
             {dev, Dev},
@@ -89,7 +89,7 @@ message_to_fun(Dev, Msg, Key, Opts) ->
             {Status, Dev, Func};
 		_ ->
 			?event_debug(ao_devices, {no_override_handler, {dev, Dev}, {key, Key}}),
-			case {find_exported_function(Msg, Dev, Key, 3, 1, Opts), Exported} of
+			case {find_exported_function(Info, Dev, Key, 3, 1, Opts), Exported} of
 				{{ok, Func}, true} ->
 					% Case 3: The device has a function of the name `Key'.
 					{ok, Dev, Func};
@@ -139,14 +139,21 @@ message_to_fun(Dev, Msg, Key, Opts) ->
 %% internal module-loading path.
 message_to_device(Msg, Opts) ->
     DevID = hb_maps:get(<<"device">>, Msg, ?DEFAULT_DEVICE, Opts),
+    Excluded = hb_opts:get(<<"exclude-devices">>, [], Opts),
     % Refuse a device in `exclude-devices' before `hb_device_load' resolves it.
-    case lists:member(DevID, hb_opts:get(exclude_devices, [], Opts)) of
+    case lists:member(DevID, Excluded) of
         true -> throw({device_not_loadable, DevID, <<"device-excluded">>});
         false -> ok
     end,
     case hb_device_load:reference(DevID, Opts) of
         {error, Reason} -> throw({device_not_loadable, DevID, Reason});
-        {ok, DevMod} -> DevMod
+        {ok, DevMod} ->
+            case hb_device_load:is_excluded(DevMod, Excluded, Opts) of
+                true ->
+                    throw({device_not_loadable, DevID, <<"device-excluded">>});
+                false ->
+                    DevMod
+            end
     end.
 
 %% @doc A device in `exclude-devices' is refused, with or without an
@@ -180,7 +187,15 @@ excluded_cached_device_test() ->
     Ref = <<"message@1.0">>,
     Msg = #{ <<"device">> => Ref },
     Mod = message_to_device(Msg, #{}),
+    % A lookup of a resolved device reads its options by their binary keys.
+    erlang:trace_pattern({hb_opts, canonical_key, 1}, true, [call_count]),
+    erlang:trace(self(), true, [call]),
     ?assertEqual(Mod, message_to_device(Msg, #{ <<"exclude-devices">> => [] })),
+    erlang:trace(self(), false, [call]),
+    {call_count, Conversions} =
+        erlang:trace_info({hb_opts, canonical_key, 1}, call_count),
+    erlang:trace_pattern({hb_opts, canonical_key, 1}, false, [call_count]),
+    ?assertEqual(0, Conversions),
     ?assertThrow(
         {device_not_loadable, Ref, <<"device-excluded">>},
         message_to_device(Msg, #{ <<"exclude-devices">> => [Ref] })
@@ -190,6 +205,19 @@ excluded_cached_device_test() ->
         message_to_device(#{}, #{ <<"exclude-devices">> => [Ref] })
     ),
     ?assertEqual(Mod, message_to_device(#{}, #{})).
+
+%% @doc A device function is found with one read of the device's `device_info'.
+message_to_fun_device_info_test() ->
+    Msg = #{ <<"device">> => <<"message@1.0">> },
+    erlang:trace_pattern({?MODULE, device_info, 3}, true, [call_count]),
+    erlang:trace(self(), true, [call]),
+    {ok, _, Fun} = message_to_fun(Msg, <<"committers">>, #{}),
+    erlang:trace(self(), false, [call]),
+    {call_count, Infos} =
+        erlang:trace_info({?MODULE, device_info, 3}, call_count),
+    erlang:trace_pattern({?MODULE, device_info, 3}, false, [call_count]),
+    ?assertEqual({arity, 3}, erlang:fun_info(Fun, arity)),
+    ?assertEqual(1, Infos).
 
 %% @doc Parse a handler key given by a device's `device_info'.
 info_handler_to_fun(Handler, _Msg, _Key, _Opts) when is_function(Handler) ->
@@ -212,7 +240,8 @@ info_handler_to_fun(HandlerMap, Msg, Key, Opts) ->
 	end.
 
 %% @doc Find the function with the highest arity that has the given name, if it
-%% exists.
+%% exists and the device exports it. `find_exported_function/6' takes the
+%% device's `device_info' in place of the message.
 %%
 %% If the device is a module, we look for a function with the given name.
 %%
@@ -220,52 +249,52 @@ info_handler_to_fun(HandlerMap, Msg, Key, Opts) ->
 %% the key using its literal value. If that fails, we cast the key to an atom
 %% and try again.
 find_exported_function(Msg, Mod, Key, Arity, Opts) ->
-    find_exported_function(Msg, Mod, Key, Arity, 0, Opts).
-find_exported_function(_Msg, _Dev, Key, _MaxArity, _MinArity, _Opts)
+    find_exported_function(device_info(Mod, Msg, Opts), Mod, Key, Arity, 0, Opts).
+find_exported_function(_Info, _Dev, Key, _MaxArity, _MinArity, _Opts)
         when Key =:= device_info; Key =:= <<"device_info">> ->
     % `device_info' gives the kernel the options of a device: it is never a key
     % of the device.
     not_found;
-find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev) ->
+find_exported_function(Info, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev) ->
     NormKey = hb_ao:normalize_key(Key),
     NormDev = hb_ao:normalize_keys(Dev, Opts),
 	case hb_maps:get(NormKey, NormDev, not_found, Opts) of
 		not_found when not is_atom(Key) ->
 			try hb_util:key_to_atom(Key, false) of
-				KeyAtom -> find_exported_function(Msg, Dev, KeyAtom, MaxArity, MinArity, Opts)
+				KeyAtom -> find_exported_function(Info, Dev, KeyAtom, MaxArity, MinArity, Opts)
 			catch _:_ -> not_found
 			end;
 		not_found -> not_found;
 		Fun when is_function(Fun) ->
 			case erlang:fun_info(Fun, arity) of
 				{arity, Arity} when Arity >= MinArity andalso Arity =< MaxArity ->
-					case is_exported(Msg, Dev, Key, Opts) of
+					case is_exported(Info, Key, Opts) of
 						true -> {ok, Fun};
 						false -> not_found
 					end;
 				_ -> not_found
 			end
 	end;
-find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) when not is_atom(Key) ->
+find_exported_function(Info, Mod, Key, Arity, MinArity, Opts) when not is_atom(Key) ->
 	try hb_util:key_to_atom(Key, false) of
-		KeyAtom -> find_exported_function(Msg, Mod, KeyAtom, Arity, MinArity, Opts)
+		KeyAtom -> find_exported_function(Info, Mod, KeyAtom, Arity, MinArity, Opts)
 	catch _:_ -> not_found
 	end;
-find_exported_function(_Msg, _Mod, _Key, Arity, MinArity, _Opts) when Arity < MinArity ->
+find_exported_function(_Info, _Mod, _Key, Arity, MinArity, _Opts) when Arity < MinArity ->
     not_found;
-find_exported_function(_Msg, _Mod, module_info, _Arity, _MinArity, _Opts) ->
+find_exported_function(_Info, _Mod, module_info, _Arity, _MinArity, _Opts) ->
     % The Erlang compiler exports `module_info' from every module: it is
     % never a key of a device.
     not_found;
-find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) ->
+find_exported_function(Info, Mod, Key, Arity, MinArity, Opts) ->
 	case erlang:function_exported(Mod, Key, Arity) of
 		true ->
-			case is_exported(Msg, Mod, Key, Opts) of
+			case is_exported(Info, Key, Opts) of
 				true -> {ok, fun Mod:Key/Arity};
 				false -> not_found
 			end;
 		false ->
-			find_exported_function(Msg, Mod, Key, Arity - 1, MinArity, Opts)
+			find_exported_function(Info, Mod, Key, Arity - 1, MinArity, Opts)
 	end.
 
 %% @doc Check if a device is guarding a key via its `exports' list. Defaults to

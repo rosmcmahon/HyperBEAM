@@ -63,10 +63,11 @@ The device defines no content-addressed artefacts of its own beyond reusing
 
 ## 3. Device interface
 
-- **Dispatch shape:** **explicit-keys.** The device answers two resolved keys:
-  **`push`** and **`schedule`** (§4.5). It is not a default-handler device and
-  imposes no `excludes`; message-manipulation keys (`set`, `keys`, …) resolve
-  through the base `message@1.0` device as for any message.
+- **Dispatch shape:** **explicit-keys.** The device answers three resolved keys:
+  **`push`**, **`schedule`** (§4.5), and **`pending`** (§4.6). It is not a
+  default-handler device and imposes no `excludes`; message-manipulation keys
+  (`set`, `keys`, …) resolve through the base `message@1.0` device as for any
+  message.
 
 - **Base message.** `push` operates on a **process** as its base. The base is
   treated as a `process@1.0` message (its `device` is interpreted as
@@ -81,7 +82,7 @@ The device defines no content-addressed artefacts of its own beyond reusing
 
   | key | type | meaning |
   |---|---|---|
-  | `slot` | integer (or decimal binary) | Push the **already-scheduled** message at this slot of the base process. Selects the *push existing slot* mode. |
+  | `slot` | integer (or decimal binary), or `all` | Push the **already-scheduled** message at this slot, or all indexed pending slots of the base process. `push` is an alias when `slot` is absent. |
   | `body` | message | Schedule this message (or process) onto the base **first**, then push the resulting slot. Selects the *schedule-then-push* mode. Used when `slot` is absent. |
   | `result-depth` | non-negative integer | How deep the **full** computed result is inlined into the trace. Default `1`. Decrements by 1 at each recursion level (§5.5, §6.2). |
   | `max-depth` | non-negative integer (or decimal binary), or `infinity` | Bounds the **recursive fan-out**; it can only lower the node's `push-max-depth` (§6.3). Absent ⇒ the node's `push-max-depth`. `0` ⇒ schedule each target but do not drive its compute/push. `N>0` ⇒ recurse, inner push inheriting `N−1` (§4, §6.3). |
@@ -108,7 +109,24 @@ scheduled. In Mode B a `body` with a `target` is scheduled before the id is
 derived. The gate is a property of id derivation, inherited by any push that
 delegates to the process device, not a separate pre-dispatch gate.
 
-The two request modes:
+The request modes:
+
+#### Mode C — drain pending slots (`slot = all`)
+
+Read the source process's pending index (§4.6), collect its distinct slots,
+and run the ordinary push loop for each in ascending numeric order. The result
+has `process`, `count` (slots attempted), `slots` (traces keyed by source slot),
+and `cache-control: no-store`. A failed slot has `response: error` and `reason`;
+other slots are still attempted. Failed deliveries remain pending. Successful
+assignments retain the ordinary repeat-delivery protection (§4.5).
+
+This is a snapshot of pending work, not a background loop or a request to compute
+the latest schedule. Compose a read first to include newly scheduled output:
+`/ID/now/push=all&max-depth=0&async=false`. Alternatively,
+`/ID/compute&max-age=10/push=all&max-depth=0&async=false` permits a cached state
+up to ten seconds old. Both drain previously computed pending slots even when
+the read returns cached state. `max-depth=0` delivers one hop; `async=false`
+waits for the drain and supplies backpressure to a cron worker.
 
 #### Mode A — push an existing slot (`slot` present)
 - **Reads:** `slot` from `Req` (the source slot); `result-depth`, `max-depth`,
@@ -134,7 +152,7 @@ The two request modes:
        loop (§4.2) for the base process at that slot — i.e. continue exactly as
        Mode A.
 
-In both modes the loop result is returned per §4.1 (sync vs async).
+In all modes the loop result is returned per §4.1 (sync vs async).
 
 #### 4.1 Sync vs async dispatch
 - Determine **async** as: the value of `async` taken from the **request** first,
@@ -274,6 +292,24 @@ Given the loaded target process `T`, the message-to-schedule `Msg` (target id
    On a downstream failure it is an error placeholder
    `{ response = error, id, target = TARGET, slot = NEXTSLOT,
       reason = <error> }` (§8).
+
+#### 4.6 Discover pending deliveries
+
+`/~push@1.0/pending` lists this node's computed, addressed outbox entries
+without a cached `schedule` assignment. An optional `process` request key
+restricts the list to one source process. The response has `count`, a numbered
+`entries` map, and `cache-control: no-store`. Each entry contains
+`process`, `slot`, and `outbox-key`, ordered by process ID, numeric slot,
+then outbox order.
+
+Computation records empty markers at `~push@1.0/outbox/P/S/K` in the process
+store before publishing its cached slot. These discovery markers are separate
+from the existing resolver-cached assignments: re-indexing cannot undo a
+delivery. An entry stays pending until its assignment is available; failed
+scheduling does not clear it. The query performs no computation or delivery.
+Callers can drain an entry with `schedule`, or its entire slot with `push`.
+The index covers slot results written by this implementation. It does not
+backfill older computed slots or start a background delivery loop.
 
 ## 5. Data formats & encodings
 

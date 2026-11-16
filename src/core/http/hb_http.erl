@@ -48,17 +48,19 @@
 %%% sets are placed in `priv/cookie'. If `http-only-result' is set, as it is by
 %%% default, we return only the value of the key in the response's `ao-result'.
 -module(hb_http).
--export([start/0]).
+-export([start/1]).
 -export([get/2, get/3, post/3, post/4, request/2, request/4, request/5]).
--export([message_to_request/2, status_code/2, cookie/4]).
+-export([message_to_request/2, status_code/2, is_own_origin/2, cookie/4]).
 -export([codec/2, message_codec/2, media_type/1, encode/4, decode/3]).
 -export([only_result/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-start() ->
+%% @doc Set up the HTTP clients for a node, with a duration histogram for each
+%% peer that its routes name (`hb_http_client:init_peer_metrics/1').
+start(Opts) ->
     httpc:set_options([{max_keep_alive_length, 0}]),
-    ok.
+    hb_http_client:init_peer_metrics(Opts).
 
 %% @doc Gets a URL via HTTP and returns the resulting message in deserialized
 %% form.
@@ -215,7 +217,7 @@ request_response(Method, Peer, Path, Request, Response, Duration, Opts) ->
             false -> HeaderMap
         end,
     NormHeaderMap = hb_ao:normalize_keys(BodyHeaderMap, Opts),
-    ?event(debug_http_outbound,
+    ?event_debug(debug_http_outbound,
         {normalized_response_headers, {norm_header_map, NormHeaderMap}},
         Opts
     ),
@@ -269,7 +271,7 @@ only_result({ResponseStatus, Msg}, Opts) ->
         hb_maps:get(<<"ao-result">>, Msg, false, Opts),
     case ReturnAOResult of
         Key when is_binary(Key) ->
-            ?event(
+            ?event_debug(
                 debug_http_outbound,
                 {result_is_single_key, {key, Key}, {msg, Msg}},
                 Opts
@@ -367,15 +369,16 @@ http_response_to_httpsig(HeaderMap, Body, Opts) ->
         Opts
     ).
 
-%% @doc The HTTP status of a result: its message's `status' if that is an
-%% integer from 100 to 599 or the binary encoding of one. Otherwise an `error'
-%% or `failure' whose `body' is an atom with a code of its own takes that code,
-%% and any other result the code of its Erlang status.
+%% @doc The HTTP status of a result. A message `status' that is an integer
+%% from 200 to 599, or the binary encoding of one, gives the code. A reply is
+%% never informational. An `error' or `failure' result with an atom `body'
+%% takes the code that the atom gives, if it gives one. Any other result takes
+%% the code of its Erlang status.
 status_code({ErlStatus, Msg}, Opts) ->
     ParsedStatus =
         hb_util:safe_int(hb_maps:get(<<"status">>, Msg, undefined, Opts)),
     case {ParsedStatus, Msg} of
-        {{ok, Status}, _} when Status >= 100, Status =< 599 ->
+        {{ok, Status}, _} when Status >= 200, Status =< 599 ->
             Status;
         {_, #{ <<"body">> := Error }} when is_atom(Error), ErlStatus == error;
                 is_atom(Error), ErlStatus == failure ->
@@ -397,6 +400,30 @@ status_code(unauthorized, _Opts) -> 401;
 status_code(forbidden, _Opts) -> 403;
 status_code(not_authorized, _Opts) -> 403;
 status_code(_, _Opts) -> 200.
+
+%% @doc Whether a request comes from a page on the node's own origin, or from
+%% no page. A browser sends a saved credential with a request from any page,
+%% and it gives the page in `sec-fetch-site', or in `origin' if it is older.
+is_own_origin(Req, Opts) ->
+    case hb_maps:get(<<"sec-fetch-site">>, Req, not_found, Opts) of
+        not_found ->
+            is_origin_host(
+                hb_maps:get(<<"origin">>, Req, not_found, Opts),
+                hb_maps:get(<<"host">>, Req, not_found, Opts)
+            );
+        Site -> lists:member(Site, [<<"same-origin">>, <<"none">>])
+    end.
+
+%% A page on another host, including a host label of the node, is another
+%% origin.
+is_origin_host(not_found, _Host) -> true;
+is_origin_host(Origin, Host) when is_binary(Origin), is_binary(Host) ->
+    case uri_string:parse(Origin) of
+        #{ host := OriginHost } ->
+            hb_util:to_lower(OriginHost) =:= hb_util:to_lower(Host);
+        _ -> false
+    end;
+is_origin_host(_Origin, _Host) -> false.
 
 %% @doc Given a message, return the information needed to make the request.
 message_to_request(M, Opts) ->
@@ -549,7 +576,7 @@ prepare_request(Format, Method, Peer, Path, RawMessage, Opts) ->
             Body = hb_maps:get(<<"body">>, FullEncoding, <<>>, Opts),
             Headers = hb_maps:without([<<"body">>], FullEncoding, Opts),
 			?event(debug_http, {request_headers, {explicit, {headers, Headers}}}),
-			?event(debug_http, {request_body, {explicit, {body, Body}}}),
+			?event_debug(debug_http, {request_body, {explicit, {body, Body}}}),
             hb_maps:merge(
                 ReqBase,
                 #{ headers => maps:merge(MaybeCookie, Headers), body => Body },
@@ -643,9 +670,11 @@ reply_codec(Fields, Path, Request, Opts) ->
     end.
 
 %% @doc Return the codec that a media type gives, by the forms in the module
-%% documentation. The device must be in the node's local stores, so that a
-%% media type never loads a device from a remote source, and it must export
-%% `to', `from', `serialize' and `deserialize'. A device without these
+%% documentation. The device must be one that the node holds, found in its
+%% local stores without its name resolvers, so that a media type never loads a
+%% device from a remote source, it must export `to', `from', `serialize' and
+%% `deserialize', and it must not be one that `exclude-devices' gives. A device
+%% without these
 %% functions returns ``{error, 'not-codec'}'', and a media type that gives no
 %% device that the node has returns any other error. A media type is a binary,
 %% or the `{Type, SubType, Params}' that `cow_http_hd' parses.
@@ -653,7 +682,16 @@ codec(MediaType, Opts) ->
     maybe
         {ok, Name} ?= device_name(MediaType),
         {ok, Device} ?=
-            hb_device_load:reference(Name, hb_store:scope(Opts, local)),
+            hb_device_load:reference(
+                Name,
+                (hb_store:scope(Opts, local))#{ <<"name-resolvers">> => [] }
+            ),
+        true ?=
+            not hb_device_load:is_excluded(
+                Device,
+                hb_opts:get(<<"exclude-devices">>, [], Opts),
+                Opts
+            ) orelse {error, 'device-excluded'},
         true ?=
             lists:all(
                 fun(Key) ->

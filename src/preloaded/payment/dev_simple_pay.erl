@@ -333,15 +333,14 @@ topup(_, Req, NodeMsg) ->
             end
     end.
 
-%% @doc Check if the request is from the operator, as `meta@1.0' finds it.
+%% @doc Check if the request is from the operator, as `lib_meta' finds it. The
+%% operator's request gives no `type': a message that the node signed for
+%% another use, such as an assignment or its location record, has one.
 is_operator(Req, NodeMsg) ->
-    {ok, IsOperator} =
-        hb_ao:resolve(
-            #{ <<"device">> => <<"meta@1.0">> },
-            #{ <<"path">> => <<"is-operator">>, <<"body">> => Req },
-            NodeMsg#{ <<"hashpath">> => ignore }
-        ),
-    IsOperator.
+    case lib_meta:authorized(lib_meta:role(operator, NodeMsg), Req, NodeMsg) of
+        {ok, Keys} -> not hb_maps:is_key(<<"type">>, Keys, NodeMsg);
+        {error, _} -> false
+    end.
 
 %%% Tests
 

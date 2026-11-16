@@ -993,11 +993,21 @@ vary_loaded(Base, Req, Opts) ->
     % Commit to the varied inputs for the receipt, the context, the lookup and
     % the store of the result. If the execution generates no receipts or
     % context, it stores nothing: only remove their unsigned commitments, and
-    % a lookup computes their IDs from their content.
+    % a lookup computes their IDs from their content. A direct key read that
+    % does not store does the same: its lookup reads the base, and a receipt
+    % computes the IDs of its inputs from their content.
     Mode =
         case {hb_opts:get(hashpath, update, Opts),
                 hb_opts:get(return_context, false, Opts)} of
             {ignore, false} -> strip;
+            {_, false} ->
+                Direct =
+                    hb_device:is_direct_key_access(VariedBase, VariedReq, UserOpts),
+                case Direct andalso
+                        hb_cache_control:derive_cache_settings([Req], Opts) of
+                    #{ <<"store">> := false } -> strip;
+                    _ -> root
+                end;
             _ -> root
         end,
     {Resolver,
@@ -1223,7 +1233,7 @@ set(RawBase, RawReq, Opts) when is_map(RawReq) ->
         end,
         Base,
         lists:filter(
-            fun(Key) -> not hb_private:is_private(Key) end,
+            fun(Key) -> not hb_private:is_private_path(Key, Opts) end,
             hb_maps:keys(hb_message:uncommitted(Req, Opts), Opts)
         )
     ).
@@ -1317,7 +1327,7 @@ device_set(Msg, Key, Value, Mode, Opts) ->
             <<"deep">> -> ReqWithoutMode;
             <<"explicit">> -> ReqWithoutMode#{ <<"set-mode">> => Mode }
         end,
-    ?event(
+    ?event_debug(
         debug_set,
         {
             calling_device_set,
@@ -1449,7 +1459,7 @@ execution_opts(Opts) ->
     % Unless the user has explicitly requested recursive spawning, we
     % unset the spawn-worker option so that we do not spawn a new worker
     % for every resulting execution.
-    case hb_opts:get(spawn_worker, false, Opts) of
+    case hb_opts:get(<<"spawn-worker">>, false, Opts) of
         recursive -> Opts1#{ <<"spawn-worker">> => recursive };
         _ -> Opts1
     end.

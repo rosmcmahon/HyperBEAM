@@ -33,7 +33,12 @@ route and then perform the transport themselves.
 - **Routing table / routes:** an ordered collection of **route** messages. May
   be supplied as an Erlang/AO-Core **list**, or as a **numbered map** (keys
   `1`, `2`, … contiguous from 1) which is treated as a list in that numeric
-  order. Lower index = higher precedence (checked first).
+  order. Lower index = higher precedence (checked first). An entry may be a
+  **reference** instead of a route: a binary AO-Core path, resolved with
+  `hb_ao:raw/2` when matching reaches it, to a route or a list of routes. These
+  are matched in its place, before the entries after it, and the `reference`
+  of a route matched among them gives its index in the resolved list. The
+  resolution adds its cost to each match that reaches it.
 - **Route:** a message describing one routing rule. Recognised keys:
   - `template` — the matcher (see **Template**). Absent template means "match
     everything" (an empty-map template matches every request).
@@ -116,7 +121,10 @@ Read or mutate the routing table.
       `<<"Routes come from the provider.">>` and change nothing. Otherwise
       insert as the new route the request's `route` (`register` sends the
       offered route as `route`), else the request itself; it contains only the
-      keys that the owner's commitments cover. Then **re-sort the whole table
+      keys that the owner's commitments cover. A route that gives no `node` or
+      `nodes` is refused with error `<<"The route gives no node.">>`, as is a
+      message that the owner signed for another use, such as a receipt or a
+      location record. Then **re-sort the whole table
       ascending by each route's `priority`** (§6 ordering), install the new
       table as the node's routes, and return `{ok, <<"Route added.">>}`.
     - **Registrar configured:** do not insert locally; instead forward the
@@ -248,16 +256,16 @@ that relays it to the matched upstream, or run it locally if no route matches.
     normative):
     1. **Stage 1** binds the relay: `#{ <<"device">> => <<"relay@1.0">>,
        <<"relay-device">> => <<"apply@1.0">>, <<"method">> => <<"POST">>,
-       <<"relay-route">> => <the user's path> }`, **plus**
-       `<<"commit-request">> => true`
-       **iff** the base's `commit-request` was true (omit the key entirely when
-       false).
+       <<"relay-route">> => <the user's path> }`.
     2. **Stage 2** invokes `call`: `#{ <<"path">> => <<"call">>,
        <<"target">> => <<"proxy-message">>, <<"proxy-message">> => ProxyMsg }`
        where `ProxyMsg = #{ <<"device">> => <<"apply@1.0">>,
        <<"path">> => <<"//user-path">>, <<"source">> => <<"user-message">>,
        <<"user-path">> => <the user's path>,
        <<"user-message">> => <the user request (committed per below)> }`.
+       **Iff** the base's `commit-request` is true, `ProxyMsg` is signed here
+       with the node's key, with `method => POST` and `type => Relay-Request`
+       added, and the relay forwards it as it is.
     The user's inbound request is **committed first if it is unsigned** (an
     unsigned `httpsig@1.0` commitment is added — `commitment-device =>
     httpsig@1.0`, `type => unsigned`) so headers the relaying node adds are not
@@ -521,8 +529,7 @@ HTTP:
     `status: 404` message when it is `error`.
 24. `preprocess` with a matching route returns a two-element `body` list: stage 1
     binds `relay@1.0` (`relay-device => apply@1.0`, `method => POST`,
-    `relay-route => <path>`, and `commit-request => true` iff the base requested
-    it); stage 2 is `#{ path => call, target => proxy-message, proxy-message =>
+    `relay-route => <path>`); stage 2 is `#{ path => call, target => proxy-message, proxy-message =>
     #{ device => apply@1.0, path => //user-path, source => user-message,
     user-path => <path>, user-message => <user request> } }` (§4 `preprocess`).
     An unsigned user request is committed (unsigned httpsig) before relay and

@@ -508,8 +508,15 @@ import_authorities(Opts) ->
 %% authority and is for a `ao.TN.1' process or has `execution-device' set to
 %% `genesis-wasm@1.0', then normalize into a state snapshot.
 %% Save the state snapshot into the store.
-do_import(Proc, CheckpointMessage, Opts) ->
+do_import(Base, CheckpointMessage, Opts) ->
     maybe
+        % The imported state has only the committed keys of the process,
+        % whether the request gives the process itself or carries it.
+        {ok, Proc} =
+            hb_message:with_only_committed(
+                hb_maps:get(<<"process">>, Base, Base, Opts),
+                Opts
+            ),
         % Validate that the process is a valid target for importing a checkpoint.
         Variant = hb_maps:get(<<"variant">>, Proc, false, Opts),
         ExecutionDevice = hb_maps:get(<<"execution-device">>, Proc, false, Opts),
@@ -526,19 +533,41 @@ do_import(Proc, CheckpointMessage, Opts) ->
                 fun(Signer) -> lists:member(Signer, TrustedSigners) end,
                 CheckpointSigners
             ) orelse untrusted,
-        true ?= hb_message:verify(CheckpointMessage, all, Opts) orelse unverified,
-        CheckpointTargetProcID = hb_maps:get(<<"process">>, CheckpointMessage, Opts),
-        ProcID = lib_process:process_id(Proc, #{}, Opts),
+        % The checkpoint has only the keys that a trusted snapshot authority
+        % committed.
+        {ok, Checkpoint} =
+            hb_message:with_only_committed(
+                hb_message:with_only_committers(
+                    CheckpointMessage,
+                    TrustedSigners,
+                    Opts
+                ),
+                any,
+                Opts
+            ),
+        true ?= hb_message:verify(Checkpoint, all, Opts) orelse unverified,
+        % Import only a message that an import authority signed as a
+        % checkpoint.
+        true ?=
+            hb_maps:get(<<"type">>, Checkpoint, not_found, Opts) ==
+                <<"Checkpoint">>
+            orelse not_checkpoint,
+        CheckpointTargetProcID = hb_maps:get(<<"process">>, Checkpoint, Opts),
+        ProcID = lib_process:process_id(Base, #{}, Opts),
+        % Keep the state and the ID on the same process message, so a base
+        % whose device gives another process cannot store this message under
+        % that process.
+        true ?= hb_message:id(Proc, signed, Opts) == ProcID orelse process_mismatch,
         true ?= CheckpointTargetProcID == ProcID orelse process_mismatch,
         % Normalize the checkpoint message into a process state message with 
         % a state snapshot.
-        {ok, SlotBin} ?= hb_maps:find(<<"nonce">>, CheckpointMessage, Opts),
+        {ok, SlotBin} ?= hb_maps:find(<<"nonce">>, Checkpoint, Opts),
         Slot = hb_util:int(SlotBin),
         InitializedProc = lib_process:ensure_process_key(Proc, Opts),
         WithSnapshot =
             InitializedProc#{
                 <<"at-slot">> => Slot,
-                <<"snapshot">> => CheckpointMessage
+                <<"snapshot">> => Checkpoint
             },
         % Save the state snapshot into the store.
         {ok, _} ?= lib_process_cache:write(ProcID, Slot, WithSnapshot, Opts),
@@ -559,6 +588,12 @@ do_import(Proc, CheckpointMessage, Opts) ->
                 <<"status">> => 400,
                 <<"body">> =>
                     <<"Checkpoint message targets a different process.">>
+            }};
+        not_checkpoint ->
+            {error, #{
+                <<"status">> => 400,
+                <<"body">> =>
+                    <<"Message is not a checkpoint.">>
             }};
         unverified ->
             {error, #{
@@ -714,24 +749,56 @@ instance_routing() ->
         lists:foreach(
             fun({Device, Peer, RoutedPeer}) ->
                 #{port := Port} = uri_string:parse(Peer),
+                Wallet = ar_wallet:new(),
                 Opts = #{
                     <<"store">> => [hb_test_utils:test_store()],
-                    <<"priv-wallet">> => ar_wallet:new(),
+                    <<"priv-wallet">> => Wallet,
                     <<"genesis-wasm-port">> => Port,
+                    <<"genesis-wasm-import-authorities">> =>
+                        [hb_test_utils:committer(Wallet)],
                     <<"cache-control">> => [<<"no-store">>, <<"no-cache">>],
                     <<"routes">> => [#{
                         <<"template">> => <<"/.*">>,
                         <<"node">> => #{ <<"prefix">> => RoutedPeer }
                     }]
                 },
-                Process = hb_message:commit(#{ <<"type">> => <<"Process">> }, Opts),
+                Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+                Process = hb_message:commit(#{
+                    <<"type">> => <<"Process">>,
+                    <<"scheduler">> => Address
+                }, Opts),
                 ProcID = hb_message:id(Process, signed, Opts),
                 Base = #{ <<"device">> => Device, <<"process">> => Process },
+                Checkpoint = hb_message:commit(#{
+                    <<"type">> => <<"Checkpoint">>,
+                    <<"process">> => ProcID,
+                    <<"nonce">> => <<"1">>,
+                    <<"content-type">> => <<"application/octet-stream">>,
+                    <<"data">> => <<"checkpoint">>
+                }, Opts),
+                Assignment = hb_message:commit(#{
+                    <<"type">> => <<"Assignment">>,
+                    <<"process">> => ProcID,
+                    <<"slot">> => 0,
+                    <<"body">> => hb_message:commit(
+                        #{ <<"data">> => <<"test">> }, Opts
+                    )
+                }, Opts),
+                UncommittedCheckpoint =
+                    hb_message:uncommitted(Checkpoint, Opts),
+                UncommittedAssignment =
+                    hb_message:uncommitted(Assignment, Opts),
                 % Warm the real HTTP endpoint before Genesis's bounded probe.
                 {ok, _} = hb_http:get(Peer, <<"/status">>, Opts),
                 erase(genesis_wasm_pid),
                 lists:foreach(
-                    fun({State, Req, Path}) ->
+                    fun({State, Req, no_request}) ->
+                        ?assertNotMatch(
+                            {ok, _},
+                            hb_ao:resolve(State, Req, Opts)
+                        ),
+                        assert_no_request();
+                       ({State, Req, Path}) ->
                         {ok, _} = hb_ao:resolve(State, Req, Opts),
                         Received = receive
                             {routing_request, ActualPeer, #{
@@ -745,21 +812,17 @@ instance_routing() ->
                     [
                         {Base, #{ <<"path">> => <<"snapshot">> },
                             <<"/snapshot/", ProcID/binary>>},
-                        {Base#{ <<"snapshot">> => #{
-                            <<"type">> => <<"Checkpoint">>,
-                            <<"content-type">> => <<"application/octet-stream">>,
-                            <<"data">> => <<"checkpoint">>
-                        }}, #{ <<"path">> => <<"normalize">> }, <<"/state">>},
+                        {Base#{ <<"snapshot">> => Checkpoint },
+                            #{ <<"path">> => <<"normalize">> }, <<"/state">>},
                         {Base, #{ <<"path">> => <<"compute">> },
                             <<"/dry-run?process-id=", ProcID/binary>>},
-                        {Base, #{
-                            <<"path">> => <<"compute">>,
-                            <<"type">> => <<"Assignment">>,
-                            <<"slot">> => 0,
-                            <<"body">> => hb_message:commit(
-                                #{ <<"data">> => <<"test">> }, Opts
-                            )
-                        }, <<"/result/0?process-id=", ProcID/binary>>}
+                        {Base, Assignment#{ <<"path">> => <<"compute">> },
+                            <<"/result/0?process-id=", ProcID/binary>>},
+                        {Base#{ <<"snapshot">> => UncommittedCheckpoint },
+                            #{ <<"path">> => <<"normalize">> }, no_request},
+                        {Base, UncommittedAssignment#{
+                            <<"path">> => <<"compute">>
+                        }, no_request}
                     ]
                 )
             end,
@@ -772,6 +835,18 @@ instance_routing() ->
     after
         erase(genesis_wasm_pid),
         lists:foreach(fun({_, ID}) -> cowboy:stop_listener(ID) end, Nodes)
+    end.
+
+%% @doc Refuse a checkpoint or assignment request that reaches the unit.
+assert_no_request() ->
+    receive
+        {routing_request, _, #{ <<"path">> := Path }} ->
+            case Path of
+                <<"/state">> -> error(caller_state_reached_unit);
+                <<"/result/", _/binary>> -> error(caller_state_reached_unit);
+                _ -> assert_no_request()
+            end
+    after 200 -> ok
     end.
 
 %% @doc Use isolated HyperBEAM HTTP nodes to observe the outgoing requests.

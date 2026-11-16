@@ -1,9 +1,15 @@
 %%% @doc A `~copycat@1.0' engine that fetches block data from an Arweave node for
 %%% replication. This engine works in _reverse_ chronological order by default.
 %%% If `to' is omitted, it keeps moving downward from `from' until it reaches a
-%%% block that is already indexed at the requested mode. If `to' is provided,
-%%% every block in the range is processed.
-%%% `reindex' defaults to true and bypasses cached block headers.
+%%% block that is already indexed at the requested mode and, unless `reindex'
+%%% is `false', is the `previous-block' of the block above it. A height whose
+%%% indexed block a reorg replaced is read again, past cached headers, and
+%%% indexed. If `to' is provided, every block in the range that is not indexed
+%%% is processed. A block-header request reads at most `?MAX_LIST_BLOCKS'
+%%% heights.
+%%% `reindex' defaults to `forks'. `forks' and `false' read cached headers, and
+%%% skip the indexed blocks of a range. `true' bypasses cached block headers and
+%%% processes every block of a range, so it re-indexes given heights.
 %%% `mode=blocks' stores only block headers in `arweave-block-store' (or `store'),
 %%% irrespective of `arweave-index-blocks', and does not process pending TXs.
 %%% `include-proofs=false' omits block proofs from the returned/cached headers.
@@ -21,6 +27,8 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(ARWEAVE_DEVICE, <<"~arweave@2.9">>).
+% The most heights one request may read.
+-define(MAX_LIST_BLOCKS, 1000).
 
 % GET /~cron@1.0/once&cron-path=~copycat@1.0/arweave
 
@@ -140,6 +148,9 @@ index_range(Request, _IncludePending, From, To, block_index, Opts) ->
     hb_ao:resolve(
         Request#{ <<"path">> => <<?ARWEAVE_DEVICE/binary, "/block-index">>,
             <<"from">> => From, <<"to">> => To }, Opts);
+index_range(_Request, _IncludePending, From, To, _IndexMode, _Opts)
+        when is_integer(To), From - To + 1 > ?MAX_LIST_BLOCKS ->
+    {error, <<"Copycat range exceeds the node limit.">>};
 index_range(Request, _IncludePending, From, To, blocks, Opts) ->
     fetch_blocks(Request, From, To, blocks,
         Opts#{ <<"arweave-index-blocks">> => true });
@@ -195,6 +206,9 @@ list_index(_Request, From, To, _Opts) when From < To ->
         <<"content-type">> => <<"application/json">>,
         <<"body">> => hb_json:encode(#{})
     }};
+list_index(_Request, From, To, _Opts)
+        when From - To + 1 > ?MAX_LIST_BLOCKS ->
+    {error, <<"`mode=list` range exceeds the node limit.">>};
 list_index(Request, From, To, Opts) ->
     % A list reports the index state, so it does not refetch cached headers.
     Result =
@@ -237,6 +251,11 @@ list_index_blocks(Request, Current, To, Opts, Acc) ->
     end.
 
 fetch_block_header(Height, Request, Opts) ->
+    fetch_block_header(Height, Request, false, Opts).
+
+%% @doc Fetch a block. With `TXHeaders', the block carries the headers of its
+%% transactions where the node gives them (see `~arweave@2.9/block').
+fetch_block_header(Height, Request, TXHeaders, Opts) ->
     ?event(debug_copycat, {fetching_block, Height}),
     CacheControl =
         lists:flatten([hb_maps:get(<<"cache-control">>, Request, [], Opts)]),
@@ -247,10 +266,12 @@ fetch_block_header(Height, Request, Opts) ->
                 <<"cache-control">> =>
                     case reindex(Request, Opts) of
                         true -> [<<"no-cache">> | CacheControl];
-                        false -> CacheControl
+                        false -> CacheControl;
+                        forks -> CacheControl
                     end,
                 <<"include-proofs">> => hb_maps:get(<<"include-proofs">>, Request, true, Opts),
-                <<"include-block-index">> => include_block_index(Request, Opts) },
+                <<"include-block-index">> => include_block_index(Request, Opts),
+                <<"include-tx-headers">> => TXHeaders },
             Opts
         )
     end).
@@ -274,8 +295,9 @@ classify_txs(TXIDs, Opts) ->
 
 %% @doc Fetch blocks from an Arweave node while moving downward from `Current'.
 %% If `To' is provided, every block in [`To', `Current'] is processed (unless
-%% `reindex' is disabled, in which case already-indexed blocks are skipped). If
-%% `To' is omitted, stop at the first block indexed to the target mode.
+%% `reindex' is `forks', the default, or `false', in which case already-indexed
+%% blocks are skipped). If `To' is omitted, stop at the first block indexed to
+%% the target mode, or refuse after `?MAX_LIST_BLOCKS' heights.
 fetch_blocks(Req, Current, To, _IndexMode, _Opts) when is_integer(To), Current < To ->
     ?event(copycat_short,
         {arweave_block_indexing_completed,
@@ -284,37 +306,100 @@ fetch_blocks(Req, Current, To, _IndexMode, _Opts) when is_integer(To), Current <
         }
     ),
     {ok, To};
-fetch_blocks(_Req, Current, undefined, _IndexMode, _Opts) when Current < 0 ->
-    {ok, 0};
 fetch_blocks(Req, Current, undefined, IndexMode, Opts) ->
-    case is_block_indexed(Current, IndexMode, Req, Opts) of
+    fetch_to_indexed_block(
+        Req, Current, IndexMode, Current - ?MAX_LIST_BLOCKS, none, Opts);
+fetch_blocks(Req, Current, To, IndexMode, Opts) ->
+    % Unless `reindex' is `true', skip blocks already indexed at this mode, so
+    % overlapping ranges from different callers are not re-fetched.
+    (reindex(Req, Opts) =:= true
+        orelse not is_block_indexed(Current, IndexMode, Req, Opts))
+        andalso observe_event(<<"block_indexed">>, fun() ->
+            process_block(
+                fetch_block_header(Current, Req, IndexMode =/= blocks, Opts),
+                Current,
+                To,
+                IndexMode,
+                Opts
+            )
+        end),
+    fetch_blocks(Req, Current - 1, To, IndexMode, Opts).
+
+%% @doc Fetch down to the first indexed block, or refuse after the module limit.
+%% `Previous' is the `previous-block' of the block fetched above `Current', or
+%% `none'. Unless `reindex' is `false', an indexed block that is not that block
+%% was replaced by a reorg, so its height is read again, past its cached
+%% header, and indexed.
+fetch_to_indexed_block(_Req, Current, _IndexMode, _Lowest, _Previous, _Opts)
+        when Current < 0 ->
+    {ok, 0};
+fetch_to_indexed_block(Req, Current, IndexMode, Lowest, Previous, Opts) ->
+    Indexed = is_block_indexed(Current, IndexMode, Req, Opts),
+    case Indexed andalso (reindex(Req, Opts) =:= false
+            orelse is_previous_block(Current, Previous, Opts)) of
         true ->
             stop_at_indexed_block(Req, Current);
+        false when Current =< Lowest ->
+            {error, <<"Copycat range exceeds the node limit.">>};
         false ->
-            BlockRes = fetch_block_header(Current, Req, Opts),
-            case IndexMode =:= shallow andalso is_already_indexed(BlockRes, Opts) of
+            BlockRes =
+                fetch_block_header(
+                    Current,
+                    case Indexed of
+                        true -> Req#{ <<"reindex">> => true };
+                        false -> Req
+                    end,
+                    IndexMode =/= blocks,
+                    Opts
+                ),
+            case IndexMode =:= shallow andalso not Indexed
+                    andalso is_already_indexed(BlockRes, Opts) of
                 true ->
                     stop_at_indexed_block(Req, Current);
                 false ->
                     observe_event(<<"block_indexed">>, fun() ->
                         process_block(BlockRes, Current, undefined, IndexMode, Opts)
                     end),
-                    fetch_blocks(Req, Current - 1, undefined, IndexMode, Opts)
+                    fetch_to_indexed_block(
+                        Req,
+                        Current - 1,
+                        IndexMode,
+                        Lowest,
+                        previous_block(BlockRes, Opts),
+                        Opts
+                    )
             end
-    end;
-fetch_blocks(Req, Current, To, IndexMode, Opts) ->
-    % Unless `reindex' is set (the default), skip blocks already indexed at
-    % this mode, so overlapping ranges from different callers are not re-fetched.
-    (reindex(Req, Opts) orelse not is_block_indexed(Current, IndexMode, Req, Opts))
-        andalso observe_event(<<"block_indexed">>, fun() ->
-            process_block(fetch_block_header(Current, Req, Opts), Current, To, IndexMode, Opts)
-        end),
-    fetch_blocks(Req, Current - 1, To, IndexMode, Opts).
+    end.
 
-%% @doc Whether a bounded index run should reprocess blocks that are already
-%% indexed. Defaults to `true' (`~copycat@1.0/arweave&reindex=false' opts out).
+%% @doc Whether the block cached at a height is `Previous'. Without a block
+%% above it to name one, or without a cached header, the indexed block stands.
+is_previous_block(_Height, none, _Opts) ->
+    true;
+is_previous_block(Height, Previous, Opts) ->
+    case hb_ao:resolve(
+        #{ <<"device">> => <<"arweave@2.9">> },
+        #{ <<"path">> => <<"block">>, <<"block">> => Height,
+            <<"include-proofs">> => false,
+            <<"cache-control">> => [<<"only-if-cached">>] },
+        Opts#{ <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] }
+    ) of
+        {ok, Block} ->
+            hb_maps:get(<<"indep-hash">>, Block, Previous, Opts) =:= Previous;
+        _ ->
+            true
+    end.
+
+%% @doc The `previous-block' of a fetched block, or `none'.
+previous_block({ok, Block}, Opts) ->
+    hb_maps:get(<<"previous-block">>, Block, none, Opts);
+previous_block({error, _}, _Opts) ->
+    none.
+
+%% @doc Whether an index run should reprocess blocks that are already indexed:
+%% `forks' (the default) only a block that a walk finds a reorg replaced,
+%% `true' every block of a bounded range as well, and `false' none.
 reindex(Req, Opts) ->
-    hb_util:atom(hb_maps:get(<<"reindex">>, Req, true, Opts)).
+    hb_util:atom(hb_maps:get(<<"reindex">>, Req, forks, Opts)).
 
 stop_at_indexed_block(Req, Current) ->
     ?event(copycat_short,
@@ -459,7 +544,7 @@ maybe_index_ids(Block, IndexMode, Opts) ->
             BlockSize = hb_util:int(
                 hb_maps:get(<<"block-size">>, Block, 0, Opts)),
             BlockStartOffset = BlockEndOffset - BlockSize,
-            case resolve_tx_headers(TXIDs, Opts) of
+            case block_tx_headers(Block, TXIDs, Opts) of
                 error ->
                     % Skip entire block if any transaction errors
                     {block_skipped, #{
@@ -527,8 +612,7 @@ process_tx({{TX, _TXDataRoot}, EndOffset}, BlockStartOffset, IndexMode, Opts) ->
                     counters(0, 0, 0);
                 true when IndexMode =/= shallow ->
                     try
-                        case hb_store_arweave:read_chunks(
-                            TXStartOffset, TX#tx.data_size, Opts) of
+                        case read_tx_data(TX, TXStartOffset, Opts) of
                             {ok, BundleData} ->
                                 {TotalTime, IndexRes} = timer:tc(
                                     fun() ->
@@ -1020,6 +1104,42 @@ download_bundle_header(EndOffset, Size, Opts) ->
     observe_event(<<"bundle_header">>, fun() ->
         lib_arweave_common:bundle_header(EndOffset - Size, Size, Opts)
     end).
+
+%% @doc Read the data of a confirmed transaction: in one request when it hashes
+%% to the transaction's data root (see `~arweave@2.9/chunk'), chunk by chunk
+%% otherwise.
+read_tx_data(TX, StartOffset, Opts) ->
+    hb_ao:resolve(
+        #{ <<"device">> => <<"arweave@2.9">> },
+        #{
+            <<"path">> => <<"chunk">>,
+            <<"offset">> => StartOffset + 1,
+            <<"length">> => TX#tx.data_size,
+            <<"tx">> => hb_util:encode(TX#tx.id),
+            <<"data-root">> => hb_util:encode(TX#tx.data_root)
+        },
+        Opts
+    ).
+
+%% @doc The headers of a block's transactions, as `tx@1.0' records: those that
+%% the block carries in `tx-headers', or each read by its ID.
+block_tx_headers(Block, TXIDs, Opts) ->
+    case hb_maps:find(<<"tx-headers">>, Block, Opts) of
+        {ok, Headers} ->
+            {ok,
+                [
+                    hb_message:convert(
+                        Header,
+                        <<"tx@1.0">>,
+                        <<"structured@1.0">>,
+                        Opts
+                    )
+                ||
+                    Header <- Headers
+                ]};
+        error ->
+            resolve_tx_headers(TXIDs, Opts)
+    end.
 
 resolve_tx_headers(TXIDs, Opts) ->
     Results = parallel_map(
@@ -1733,8 +1853,17 @@ block_cache_control_test_() ->
         Request = #{ <<"reindex">> => false,
             <<"cache-control">> => [<<"only-if-cached">>] },
         try
-            {ok, _} = fetch_block_header(2003806, #{}, Opts),
+            {ok, _} =
+                fetch_block_header(2003806, #{ <<"reindex">> => true }, Opts),
             ?assertMatch({ok, _}, fetch_block_header(2003806, Request, Opts)),
+            ?assertMatch(
+                {ok, _},
+                fetch_block_header(
+                    2003806,
+                    maps:remove(<<"reindex">>, Request),
+                    Opts
+                )
+            ),
             lists:foreach(
                 fun(Req) ->
                     ?assertEqual({error, not_found},
@@ -1742,7 +1871,7 @@ block_cache_control_test_() ->
                 end,
                 [
                     Request#{ <<"reindex">> => true },
-                    maps:remove(<<"reindex">>, Request),
+                    Request#{ <<"reindex">> => <<"true">> },
                     Request#{ <<"cache-control">> =>
                         [<<"no-cache">>, <<"only-if-cached">>] },
                     Request#{ <<"reindex">> => true,
@@ -1874,7 +2003,8 @@ explicit_to_reindexes_all_test_parallel() ->
                 "~copycat@1.0/arweave&"
                 "from=", (hb_util:bin(IndexedBlock+1))/binary, "&"
                 "to=", (hb_util:bin(LowerBlock))/binary, "&"
-                "mode=shallow"
+                "mode=shallow&"
+                "reindex=true"
             >>,
             Opts
         ),
@@ -1902,6 +2032,149 @@ auto_stop_partial_index_test_parallel() ->
     ?assert(has_any_indexed_tx(IndexedBlock, Opts)),
     ?assertNot(has_any_indexed_tx(IndexedBlock-1, Opts)),
     ok.
+
+%% @doc Under `reindex=forks' a walk down from a new tip indexes a height again
+%% when the block that the index holds there is not the `previous-block' of the
+%% block above it, and stops at a height whose indexed block is.
+reorg_replaced_block_test_() ->
+    {timeout, 120, fun() ->
+        {StoreOpts, Opts} = reorg_opts(),
+        Walk = <<"&reindex=forks&mode=full&include-block-index=true",
+            "&include-proofs=false">>,
+        ?assertEqual(
+            {ok, 2036550},
+            hb_ao:resolve(
+                <<"~copycat@1.0/arweave&from=2036552", Walk/binary>>,
+                Opts
+            )
+        ),
+        assert_reorg_canonical(StoreOpts, Opts),
+        % 2036552 is the block that 2036553 names, so it is not read again.
+        ?assertEqual(
+            {ok, 2036552},
+            hb_ao:resolve(
+                <<"~copycat@1.0/arweave&from=2036553", Walk/binary>>,
+                Opts
+            )
+        )
+    end}.
+
+%% @doc Under `reindex=false' a walk stops at the orphan, as at any indexed
+%% height. A bounded run under `reindex=true' then indexes the canonical block.
+reorg_reindex_modes_test_() ->
+    {timeout, 120, fun() ->
+        {StoreOpts, Opts} = reorg_opts(),
+        Index = <<"&mode=full&include-block-index=true&include-proofs=false">>,
+        ?assertEqual(
+            {ok, 2036551},
+            hb_ao:resolve(
+                <<"~copycat@1.0/arweave&from=2036552&reindex=false",
+                    Index/binary>>,
+                Opts
+            )
+        ),
+        ?assertEqual(
+            not_found,
+            hb_store_arweave:read_index_offset(
+                StoreOpts,
+                <<"8yH2i6VeTZ809ISBmvh48Wdpmf95M7pFQd_5cjnl490">>
+            )
+        ),
+        ?assertEqual(
+            {ok, 2036551},
+            hb_ao:resolve(
+                <<"~copycat@1.0/arweave&from=2036551&to=2036551&reindex=true",
+                    Index/binary>>,
+                Opts
+            )
+        ),
+        assert_reorg_canonical(StoreOpts, Opts)
+    end}.
+
+%% @doc Index 2036550, then the orphan `vBwS...' at 2036551, as a walk indexes
+%% it while it is the tip. The orphan holds two of the three transactions of
+%% the canonical block `kVAE...', which the chain grows from. The third is the
+%% bundle `8yH2...', which holds the AO message `SEG1...'.
+reorg_opts() ->
+    {_TestStore, StoreOpts, BaseOpts} = setup_index_opts(),
+    Blocks = hb_test_utils:test_store(),
+    Opts = BaseOpts#{
+        <<"arweave-block-store">> => Blocks,
+        <<"gateway">> => <<"http://chain-3.arweave.xyz:1984">>
+    },
+    Orphan =
+        <<"vBwS63t0FrQbroNhbkK6TG3X8o7FeFChsFqyo-hgK3u_nSpue3g1t9UAclB9FHhi">>,
+    {ok, 2036550} =
+        hb_ao:resolve(
+            <<"~copycat@1.0/arweave&from=2036550&to=2036550&mode=full",
+                "&include-block-index=true&include-proofs=false">>,
+            Opts
+        ),
+    {ok, Block} =
+        hb_ao:resolve(
+            #{
+                <<"path">> => <<"~arweave@2.9/block">>,
+                <<"block">> => Orphan,
+                <<"include-proofs">> => false,
+                <<"include-tx-headers">> => true
+            },
+            Opts
+        ),
+    {ok, BlockID} = hb_cache:write(Block, #{ <<"store">> => Blocks }),
+    hb_cache:link(
+        BlockID,
+        <<"~arweave@2.9/block/height/2036551">>,
+        #{ <<"store">> => Blocks }
+    ),
+    {ok, 2036551} =
+        hb_ao:resolve(
+            <<"~copycat@1.0/arweave&mode=blocks&from=2036551&to=2036551",
+                "&include-proofs=false&include-block-index=true",
+                "&reindex=false">>,
+            Opts
+        ),
+    process_block({ok, Block}, 2036551, undefined, full, Opts),
+    ?assert(
+        is_block_indexed(
+            2036551,
+            full,
+            #{ <<"include-block-index">> => true },
+            Opts
+        )
+    ),
+    {StoreOpts, Opts}.
+
+%% @doc Assert that the index holds the canonical block at 2036551, and the
+%% offsets of the bundle that only it holds and of the AO message in it.
+assert_reorg_canonical(StoreOpts, Opts) ->
+    {ok, Indexed} =
+        hb_ao:resolve(
+            #{
+                <<"path">> => <<"~arweave@2.9/block">>,
+                <<"block">> => 2036551,
+                <<"include-proofs">> => false,
+                <<"cache-control">> => [<<"only-if-cached">>]
+            },
+            Opts#{ <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] }
+        ),
+    ?assertEqual(
+        <<"kVAEoMY0L2Z_wSTm6JywWwbBgi1ayq3P4zz9GrqQjB0vMDlWmI1jzU-g2VqB1uSL">>,
+        hb_maps:get(<<"indep-hash">>, Indexed, Opts)
+    ),
+    ?assertMatch(
+        {ok, #{ <<"start">> := 392952291565814 }},
+        hb_store_arweave:read_index_offset(
+            StoreOpts,
+            <<"8yH2i6VeTZ809ISBmvh48Wdpmf95M7pFQd_5cjnl490">>
+        )
+    ),
+    ?assertMatch(
+        {ok, #{ <<"start">> := 392952291575295 }},
+        hb_store_arweave:read_index_offset(
+            StoreOpts,
+            <<"SEG1vWWQOzPwiOSTG2qhqVShR5SbJC67155BPGEseZY">>
+        )
+    ).
 
 negative_parse_range_test_parallel() ->
     {_TestStore, _StoreOpts, NetworkOpts} = setup_index_opts(),
@@ -2590,6 +2863,31 @@ small_block_full_mode_test() ->
     ?assert(hb_message:verify(L3Header, all, Opts), {verify_failed, L3ID}),
     ?assertEqual(L3ID, hb_message:id(L3Header, signed, Opts)),
     ok.
+
+%% @doc A block within 50 of the tip is indexed from the transaction headers
+%% that its block read carries.
+tip_block_shallow_mode_test_() ->
+    {timeout, 120, fun() ->
+        {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
+        {ok, Tip} = hb_ao:resolve(<<"~arweave@2.9/current">>, Opts),
+        Height = hb_maps:get(<<"height">>, Tip, Opts) - 5,
+        {ok, Block} = fetch_block_header(Height, #{}, true, Opts),
+        ?assert(hb_maps:is_key(<<"tx-headers">>, Block, Opts)),
+        {ok, Height} =
+            hb_ao:resolve(
+                <<
+                    "~copycat@1.0/arweave&"
+                    "from=", (hb_util:bin(Height))/binary, "&"
+                    "to=", (hb_util:bin(Height))/binary, "&"
+                    "mode=shallow"
+                >>,
+                Opts
+            ),
+        lists:foreach(
+            fun(TXID) -> ?assert(is_tx_indexed(TXID, Opts), TXID) end,
+            hb_maps:get(<<"txs">>, Block, [], Opts)
+        )
+    end}.
 
 %% @doc Every index mode caches L1 transaction headers in the local store, so a
 %% transaction's committed fields -- here its `target' -- are matchable from the

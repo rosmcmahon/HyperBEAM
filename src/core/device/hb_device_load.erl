@@ -27,7 +27,7 @@
 %%% specification of a preloaded device (`spec/2'), and every implementation
 %%% of a specification in its sources (`implementations/2').
 -module(hb_device_load).
--export([reference/2, schema/2, store/1, spec/2, implementations/2]).
+-export([reference/2, is_excluded/3, schema/2, store/1, spec/2, implementations/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -46,6 +46,27 @@ reference(Ref, Opts) when is_binary(Ref) ->
         {error, Err} -> {error, Err}
     end.
 
+%% @doc Return whether a device is one that `exclude-devices' gives, by any
+%% reference to it: its name, its specification ID or its module. An excluded
+%% reference resolves only from the node's own and high-trust sources, so the
+%% check loads no device from a low-trust source.
+is_excluded(_Dev, [], _Opts) ->
+    false;
+is_excluded(Dev, Excluded, Opts) when is_list(Excluded) ->
+    lists:any(
+        fun(Ref) -> excluded_device(Ref, Opts) =:= {ok, Dev} end,
+        Excluded
+    ).
+
+excluded_device(Ref, Opts) when is_binary(Ref), Ref =/= <<>> ->
+    NormRef = hb_ao:normalize_key(Ref),
+    case from_forge_bootstrap(NormRef, Opts) of
+        {ok, Dev} -> {ok, Dev};
+        _ -> resolve_cached(NormRef, fun resolve_trusted/2, Opts)
+    end;
+excluded_device(_Ref, _Opts) ->
+    {error, not_found}.
+
 do_not_try_to_load_empty_device_test() ->
     ?assertEqual({error, not_found}, reference(<<>>, #{})),
     % `false' is not a device, and `name@1.0' gets the name `%zz' as it is.
@@ -55,16 +76,49 @@ do_not_try_to_load_empty_device_test() ->
         reference(<<"%zz">>, #{})
     ).
 
+excluded_by_any_reference_test() ->
+    Name = <<"meta@1.0">>,
+    Store = store(#{}),
+    PreOpts = #{ <<"store">> => Store, <<"cache-read-mode">> => raw },
+    {ok, SpecID} = preloaded_spec(Name, Store, PreOpts),
+    Mod = hb_device:message_to_device(#{ <<"device">> => Name }, #{}),
+    ?assertEqual(
+        Mod,
+        hb_device:message_to_device(#{ <<"device">> => SpecID }, #{})
+    ),
+    lists:foreach(
+        fun({Excluded, Requested}) ->
+            ?assertThrow(
+                {device_not_loadable, Requested, <<"device-excluded">>},
+                hb_device:message_to_device(
+                    #{ <<"device">> => Requested },
+                    #{ <<"exclude-devices">> => [Excluded] }
+                )
+            )
+        end,
+        [{Name, SpecID}, {SpecID, Name}]
+    ),
+    ?assertEqual(
+        Mod,
+        hb_device:message_to_device(
+            #{ <<"device">> => Name },
+            #{ <<"exclude-devices">> => [<<"lua@5.3a">>] }
+        )
+    ).
+
 %% @doc Resolve and memoise a reference, refusing re-entrant resolutions:
 %% a reference whose resolution requires resolving itself (for example,
 %% `name@1.0' resolving its own name when it is absent from every
 %% high-trust source) can never succeed, only recurse. The references
 %% being resolved are carried in `Opts', scoping them to this resolution
-%% tree.
+%% tree. A reference that the process has resolved is returned from its
+%% process dictionary.
 resolve_cached(Ref, Opts) ->
+    resolve_cached(Ref, fun resolve/2, Opts).
+resolve_cached(Ref, Resolve, Opts) ->
     Resolving = maps:get(<<"resolving-devices">>, Opts, []),
-    case lists:member(Ref, Resolving) of
-        true ->
+    case {lists:member(Ref, Resolving), erlang:get({?MODULE, Ref})} of
+        {true, _} ->
             {error,
                 <<
                     "Circular device resolution detected for reference `",
@@ -72,9 +126,11 @@ resolve_cached(Ref, Opts) ->
                     "`. Check `preloaded-store` viability."
                 >>
             };
-        false ->
+        {false, Mod} when is_atom(Mod), Mod =/= undefined ->
+            {ok, Mod};
+        {false, _} ->
             ResOpts = Opts#{ <<"resolving-devices">> => [Ref | Resolving] },
-            case resolve(Ref, ResOpts) of
+            case Resolve(Ref, ResOpts) of
                 {cached, Mod} -> {ok, Mod};
                 {ok, Mod} = Ok -> put_resolved_device(Ref, Mod, Opts), Ok;
                 {error, Err} -> {error, Err}
@@ -91,30 +147,50 @@ resolve(Ref, Opts) ->
         from_low_trust(Ref, Opts)
     end.
 
-%% @doc Look up an already-resolved module: the process dictionary
-%% first, then the node's `loaded-device-store'. The first process to
-%% resolve a device spares every other the index read and archive
-%% extraction. The store defaults to `[]', which `hb_store' treats as
-%% no viable store, so the shared tier disables itself with no branch.
-get_resolved_device(Ref, Opts) ->
-    case erlang:get({?MODULE, Ref}) of
-        Mod when is_atom(Mod), Mod =/= undefined ->
-            {cached, Mod};
-        _ ->
-            maybe
-                {ok, Bin} ?=
-                    hb_store:read(
-                        loaded_device_store(Opts),
-                        store_key(Ref),
-                        Opts
-                    ),
-                Mod = hb_util:atom(Bin),
-                % We always stash in the process dictionary, despite the fact
-                % the reference was already in the global store.
-                erlang:put({?MODULE, Ref}, Mod),
-                {cached, Mod}
-            end
+%% @doc The resolved-device store, then the high-trust sources.
+resolve_trusted(Ref, Opts) ->
+    maybe
+        {error, not_found} ?= get_resolved_device(Ref, Opts),
+        from_high_trust(Ref, Opts)
     end.
+
+%% @doc Look up a resolved module in the node's `loaded-device-store'. The
+%% first process to resolve a device spares every other the index read and
+%% archive extraction. The store defaults to `[]', which `hb_store' treats
+%% as no viable store, so the shared tier disables itself with no branch.
+get_resolved_device(Ref, Opts) ->
+    maybe
+        {ok, Bin} ?=
+            hb_store:read(
+                loaded_device_store(Opts),
+                store_key(Ref),
+                Opts
+            ),
+        Mod = hb_util:atom(Bin),
+        % We always stash in the process dictionary, despite the fact
+        % the reference was already in the global store.
+        erlang:put({?MODULE, Ref}, Mod),
+        {cached, Mod}
+    end.
+
+%% @doc A reference that the process has resolved is returned without a
+%% resolution, except within a resolution of itself.
+memoised_reference_test() ->
+    Ref = <<"message@1.0">>,
+    {ok, Mod} = reference(Ref, #{}),
+    erlang:trace_pattern({?MODULE, resolve, 2}, true, [call_count]),
+    erlang:trace(self(), true, [call]),
+    Res = reference(Ref, #{}),
+    erlang:trace(self(), false, [call]),
+    {call_count, Resolutions} =
+        erlang:trace_info({?MODULE, resolve, 2}, call_count),
+    erlang:trace_pattern({?MODULE, resolve, 2}, false, [call_count]),
+    ?assertEqual({ok, Mod}, Res),
+    ?assertEqual(0, Resolutions),
+    ?assertMatch(
+        {error, <<"Circular device resolution", _/binary>>},
+        reference(Ref, #{ <<"resolving-devices">> => [Ref] })
+    ).
 
 %% @doc Memoise a resolved device in the process dictionary and the
 %% shared `loaded-device-store'.
@@ -126,7 +202,7 @@ put_resolved_device(Ref, Mod, Opts) ->
         Opts
     ).
 
-loaded_device_store(Opts) -> hb_opts:get(loaded_device_store, [], Opts).
+loaded_device_store(Opts) -> hb_opts:get(<<"loaded-device-store">>, [], Opts).
 
 store_key(Ref) -> <<"~meta@1.0/devices/", Ref/binary>>.
 
@@ -142,7 +218,7 @@ from_high_trust(Ref, Opts) ->
 
 %% @doc Forge-only map from seed device name to source module atom.
 from_forge_bootstrap(Ref, Opts) ->
-    case hb_opts:get(forge_bootstrap, #{}, Opts) of
+    case hb_opts:get(<<"forge-bootstrap">>, #{}, Opts) of
         #{ Ref := Mod } when is_atom(Mod) -> {ok, Mod};
         Seeds when is_map(Seeds), map_size(Seeds) > 0 ->
             {error, {forge_bootstrap_device_not_found, Ref}};
@@ -294,20 +370,32 @@ resolve_spec(Ref, Opts) ->
         _ -> {error, <<"device-name-not-resolvable">>}
     end.
 
-%% @doc A low-trust implementation must be signed by a trusted signer,
-%% implement the requested specification, and be machine-compatible.
+%% @doc A low-trust implementation is what a trusted signer signed: a
+%% `Device-Implementation' that implements the requested specification and is
+%% machine-compatible.
 verify_and_load(Ref, SpecID, ID, Opts) ->
     maybe
-        {ok, Msg} ?= hb_cache:read(ID, Opts),
-        Signers = signers(Msg, Opts),
+        {ok, Read} ?= hb_cache:read(ID, Opts),
+        Trusted =
+            [
+                Signer
+            ||
+                Signer <- signers(Read, Opts),
+                lists:member(Signer, trusted_signers(Ref, SpecID, Opts))
+            ],
+        true ?= Trusted =/= [] orelse {error, <<"device-signer-untrusted">>},
         true ?=
-            hb_message:verify(Msg, Signers, Opts)
+            hb_message:verify(Read, Trusted, Opts)
                 orelse {error, <<"implementation-signature-invalid">>},
+        % Only the keys that a trusted signer signed make the implementation.
+        {ok, Msg} ?=
+            hb_message:with_only_committed(
+                hb_message:with_only_committers(Read, Trusted, Opts),
+                Opts
+            ),
         true ?=
-            lists:any(
-                fun(S) -> lists:member(S, trusted_signers(Ref, SpecID, Opts)) end,
-                Signers
-            ) orelse {error, <<"device-signer-untrusted">>},
+            is_implementation(Msg, Opts)
+                orelse {error, <<"not-a-device-implementation">>},
         ok ?= implements(SpecID, Msg, Opts),
         ok ?= compatible(Msg, Opts),
         load_archive_message(Msg, Opts)
@@ -454,6 +542,13 @@ implements(SpecID, Msg, Opts) ->
         SpecID -> ok;
         Other -> {error, {<<"wrong-device-specification">>, Other}}
     end.
+
+%% @doc Return whether a message is a device implementation. `push@1.0' gives
+%% each message that it signs with the node's key `type: Message', so that
+%% signature never makes a message an implementation.
+is_implementation(Msg, Opts) ->
+    hb_maps:get(<<"type">>, Msg, undefined, Opts)
+        == <<"Device-Implementation">>.
 
 %% @doc The commitment signers, read inline rather than via
 %% `hb_message:signers/2' to avoid invoking `message@1.0'.

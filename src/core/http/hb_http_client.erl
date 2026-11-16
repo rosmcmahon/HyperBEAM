@@ -10,7 +10,13 @@
 %% GenServer
 -export([start_link/1, init/1]).
 -export([handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
--export([init_prometheus/0]).
+-export([init_prometheus/0, init_peer_metrics/1, record_multirequest/4]).
+
+%% The buckets of the request duration histograms, in seconds.
+-define(
+    DURATION_BUCKETS,
+    [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 20, 25, 30]
+).
 
 -record(state, {
 	opts = #{}
@@ -51,32 +57,69 @@ request(Args, RemainingRetries, Opts) ->
 %% @doc Make a request, following a `307' or `308' response to the absolute URL
 %% in its `location' with the same method, headers and body, up to
 %% `http-redirects' times. One more redirect is `{error, 'too-many-redirects'}'.
-%% With `http-redirects' at 0, the redirect is the response. If
-%% `hb_hostname:is_blocked/2' blocks the host of a `location', return
-%% `{error, blocked_host}' without following it.
+%% With `http-redirects' at 0, the redirect is the response. The host of a
+%% `location' is validated as one that a caller chose: if the host policy
+%% blocks it, return `{error, blocked_host}' without following it.
 redirect(Args, Redirects, Opts) ->
     Response =
-        request(Args, hb_opts:get(http_retry, ?DEFAULT_RETRIES, Opts), Opts),
+        case validate_accessible(Args, Opts) of
+            {ok, Accessible} ->
+                request(
+                    Accessible,
+                    hb_opts:get(http_retry, ?DEFAULT_RETRIES, Opts),
+                    Opts
+                );
+            Blocked -> Blocked
+        end,
     MaxRedirects = hb_opts:get(http_redirects, ?DEFAULT_REDIRECTS, Opts),
     Location = location(Response),
     case uri_string:parse(Location) of
         URI = #{ scheme := _, host := _ } when Redirects < MaxRedirects ->
             Path = uri_string:recompose(maps:with([path, query], URI)),
-            case hb_hostname:is_blocked(Location, Opts) of
-                true -> {error, blocked_host};
-                false ->
-                    redirect(
-                        Args#{
-                            peer => Location,
-                            path => hb_path:normalize(Path)
-                        },
-                        Redirects + 1,
-                        Opts
-                    )
-            end;
+            redirect(
+                Args#{
+                    peer => Location,
+                    path => hb_path:normalize(Path)
+                },
+                Redirects + 1,
+                Opts#{ <<"http-client-validate-accessible">> => true }
+            );
         #{ scheme := _, host := _ } when MaxRedirects > 0 ->
             {error, 'too-many-redirects'};
         _ -> Response
+    end.
+
+%% @doc Return the arguments of a request to a host that a caller chose, which
+%% `http-client-validate-accessible' marks. The host must give addresses that
+%% the host policy accepts (`hb_hostname:to_ips/2'). A `http' peer is then given
+%% as one of those IPv4 addresses, with its own host in `host', so that the
+%% client does not resolve the host again and connects to the address that the
+%% policy accepted; a host with no such address is blocked. A `https' peer keeps
+%% its host: the certificate check binds the connection to it.
+validate_accessible(Args = #{ peer := Peer, headers := Headers }, Opts) ->
+    maybe
+        true ?= hb_opts:get(http_client_validate_accessible, false, Opts),
+        {ok, [_ | _] = IPs} ?= hb_hostname:to_ips(Peer, Opts),
+        {ok, {<<"http">>, Host, Port}} ?= parse_peer(Peer, Opts),
+        [IP | _] ?= [Vetted || Vetted <- IPs, tuple_size(Vetted) =:= 4],
+        PortBin = hb_util:bin(Port),
+        Authority =
+            case Port of
+                80 -> hb_util:bin(Host);
+                _ -> <<(hb_util:bin(Host))/binary, ":", PortBin/binary>>
+            end,
+        {ok,
+            Args#{
+                peer =>
+                    <<"http://", (hb_util:bin(inet:ntoa(IP)))/binary, ":",
+                        PortBin/binary>>,
+                headers => maps:merge(#{ <<"host">> => Authority }, Headers)
+            }
+        }
+    else
+        {error, blocked_host} = Blocked -> Blocked;
+        [] -> {error, blocked_host};
+        _ -> {ok, Args}
     end.
 
 %% @doc The `location' of a `307' or `308' response, else `<<>>'.
@@ -95,6 +138,7 @@ do_request(Args, Opts) ->
             hackney -> hackney_req(Args, Opts)
         end,
     record_duration(
+        maps:get(peer, Args),
         #{
             <<"request-method">> => method_to_bin(maps:get(method, Args)),
             <<"request-path">> => hb_util:bin(maps:get(path, Args)),
@@ -260,7 +304,7 @@ hackney_req(Args, Opts) ->
             Response = case hackney_request(Method, URL, HeaderList, Body, HackneyOpts, SendTimeout) of
                 {ok, Status, RespHeaders, RespBody} ->
                     download_metric(RespBody, Opts),
-                    ?event(debug_http_client, {hackney_resp, Status, RespHeaders, RespBody}),
+                    ?event_debug(debug_http_client, {hackney_resp, Status, RespHeaders, RespBody}),
                     {ok, Status, RespHeaders, RespBody};
                 {ok, Status, RespHeaders} ->
                     ?event(debug_http_client, {hackney_resp, Status, RespHeaders, no_body}),
@@ -419,17 +463,12 @@ open_connection(#{ peer := Peer }, Opts) ->
 
 open_connection_gun(Scheme, Host, Port, Peer, Opts) ->
     ?event(http_outbound, {parsed_peer, {peer, Peer}, {host, Host}, {port, Port}}),
+    KeepAlive = hb_opts:get(
+        http_client_keepalive, ?DEFAULT_KEEPALIVE_TIMEOUT, Opts),
     BaseGunOpts =
         #{
-            http_opts =>
-                #{
-                    keepalive =>
-                        hb_opts:get(
-                            http_client_keepalive,
-                            ?DEFAULT_KEEPALIVE_TIMEOUT,
-                            Opts
-                        )
-                },
+            http_opts => #{keepalive => KeepAlive},
+            http2_opts => #{keepalive => KeepAlive},
             retry => 0,
             connect_timeout =>
                 hb_opts:get(
@@ -662,22 +701,13 @@ init_prometheus() ->
 		{help, "The current number of the open outbound network connections"}]),
 	hb_prometheus:declare(histogram, [
 		{name, http_client_duration_seconds},
-		{buckets, [0.01, 0.1, 0.5, 1, 5, 10, 30, 60]},
+		{buckets, ?DURATION_BUCKETS},
         {labels, [http_method, status_class, category]},
 		{
 			help,
 			"The total duration of an hb_http_client:req call. This includes more than"
             " just the GUN request itself (e.g. establishing a connection, "
             "throttling, etc...)"
-		}
-	]),
-	hb_prometheus:declare(histogram, [
-		{name, http_client_get_chunk_duration_seconds},
-		{buckets, [0.1, 1, 10, 60]},
-        {labels, [status_class, peer]},
-		{
-			help,
-			"The total duration of an HTTP GET chunk request made to a peer."
 		}
 	]),
 	hb_prometheus:declare(counter, [
@@ -698,13 +728,125 @@ init_prometheus() ->
 			"Bytes requested per generate_offsets call"
 			" in dev_arweave chunk loading"}
 	]),
+	hb_prometheus:declare(counter, [
+		{name, http_multirequest_total},
+		{labels, [route, outcome]},
+		{
+			help,
+			"The multirequests to the nodes of a route, by the route and by"
+			" whether they gathered all, some or none of their responses."
+		}
+	]),
     ?event(started),
     ok.
+
+%% @doc Declare a duration histogram for each peer that the node's `routes'
+%% name, with the routes of their references such as
+%% `~meta@1.0/info/arweave-routes'. Each is named for its peer
+%% (`peer_metric/1') and has the peer, `scheme://host:port', as its constant
+%% `peer' label. Peers are taken in the order of the routes, up to
+%% `http-client-max-peer-metrics' of them. Any other peer has no histogram, so
+%% Prometheus refuses the observations of the requests to it: a node that
+%% routes to many peers keeps a bounded number of series. Peers added to the
+%% routes after the node starts have no histogram either.
+init_peer_metrics(Opts) ->
+    case prometheus_enabled(Opts) of
+        true ->
+            Peers = route_peers(hb_opts:get(routes, [], Opts), Opts),
+            lists:foreach(
+                fun declare_peer_metric/1,
+                lists:sublist(
+                    lists:uniq(Peers),
+                    hb_opts:get(
+                        http_client_max_peer_metrics,
+                        ?DEFAULT_MAX_PEER_METRICS,
+                        Opts
+                    )
+                )
+            );
+        false -> ok
+    end.
+
+declare_peer_metric(Peer = {Scheme, Host, Port}) ->
+    hb_prometheus:declare(histogram, [
+        {name, peer_metric(Peer)},
+        {buckets, ?DURATION_BUCKETS},
+        {labels, [status_class]},
+        {constant_labels,
+            #{
+                peer =>
+                    hb_util:list(
+                        <<Scheme/binary, "://", (hb_util:bin(Host))/binary, ":",
+                            (hb_util:bin(Port))/binary>>
+                    )
+            }
+        },
+        {
+            help,
+            "The total duration of an hb_http_client:req call to a peer"
+            " that the node's routes name."
+        }
+    ]).
+
+%% @doc The peers that a list of routes names, in order. A route that is a
+%% reference is resolved as `dev_router' resolves it, to its route or routes.
+route_peers(Routes, Opts) ->
+    lists:flatmap(
+        fun(Route) -> route_peer(Route, Opts) end,
+        hb_util:message_to_ordered_list(Routes, Opts)
+    ).
+
+route_peer(Ref, Opts) when is_binary(Ref) ->
+    case hb_ao:raw(Ref, Opts) of
+        {ok, Routes} when is_list(Routes) -> route_peers(Routes, Opts);
+        {ok, Route} when is_map(Route) -> route_peer(Route, Opts);
+        _ -> []
+    end;
+route_peer(#{ <<"node">> := Node }, Opts) -> node_peers([Node], Opts);
+route_peer(#{ <<"nodes">> := Nodes }, Opts) ->
+    node_peers(hb_util:message_to_ordered_list(Nodes, Opts), Opts);
+route_peer(_Route, _Opts) -> [].
+
+%% @doc The peer of each node of a route that gives one: its `uri', `prefix'
+%% or `with', as `dev_router' applies them.
+node_peers(Nodes, Opts) ->
+    [ Peer || Node <- Nodes, {ok, Peer} <- [node_peer(Node, Opts)] ].
+
+node_peer(URI, Opts) when is_binary(URI) -> parse_peer(URI, Opts);
+node_peer(#{ <<"uri">> := URI }, Opts) -> node_peer(URI, Opts);
+node_peer(#{ <<"prefix">> := Prefix }, Opts) -> node_peer(Prefix, Opts);
+node_peer(#{ <<"with">> := With }, Opts) -> node_peer(With, Opts);
+node_peer(_Node, _Opts) -> {error, no_peer}.
+
+%% @doc The name of a peer's duration histogram: `http_client_peer_', then its
+%% scheme, host and port with `_' for each character that a metric name cannot
+%% hold, then `_duration_seconds'.
+peer_metric({Scheme, Host, Port}) ->
+    Peer =
+        <<Scheme/binary, "_", (hb_util:bin(Host))/binary, "_",
+            (hb_util:bin(Port))/binary>>,
+    <<"http_client_peer_",
+        << <<(metric_char(C))>> || <<C>> <= Peer >>/binary,
+        "_duration_seconds">>.
+
+metric_char(C) when C >= $a, C =< $z; C >= $A, C =< $Z; C >= $0, C =< $9 -> C;
+metric_char(_) -> $_.
+
+%% @doc Record a request's duration in the histogram of its peer. Only the
+%% peers that the node's routes name have one (`init_peer_metrics/1'): for any
+%% other, Prometheus refuses the observation as an unknown metric, and
+%% `hb_prometheus:observe/3' ignores the refusal.
+observe_peer(Peer, Duration, StatusClass, Opts) ->
+    case parse_peer(Peer, Opts) of
+        {ok, Parsed} ->
+            hb_prometheus:observe(Duration, peer_metric(Parsed), [StatusClass]);
+        {error, _} -> ok
+    end.
 
 %% @doc Record the duration of the request in an async process. We write the 
 %% data to prometheus if enabled and invoke `on/http-client-receipt'. The
 %% receipt describes a transport attempt, not application-level acceptance.
-record_duration(Details, Opts) ->
+record_duration(Peer, Details, Opts) ->
     spawn(
         fun() ->
             % Prometheus works only with strings as lists, so we encode the 
@@ -729,6 +871,12 @@ record_duration(Details, Opts) ->
                         maps:get(<<"duration">>, Details),
                         http_client_duration_seconds,
                         Labels
+                    ),
+                    observe_peer(
+                        Peer,
+                        maps:get(<<"duration">>, Details),
+                        GetFormat(<<"status-class">>),
+                        Opts
                     );
                 false ->
                     ok
@@ -740,6 +888,56 @@ record_duration(Details, Opts) ->
             )
         end
     ).
+
+%% @doc Count a multirequest to the nodes of a route, by the route's label
+%% (`route_label/2') and its outcome: `admissible' if it gathered as many
+%% admissible responses as it awaited, `partial' if fewer, and
+%% `no-viable-responses' if none. The count is made in a process of its own, so
+%% that it cannot fail the request.
+record_multirequest(Route, Admissible, Responses, Opts) ->
+    case prometheus_enabled(Opts) of
+        true ->
+            spawn(
+                fun() ->
+                    hb_prometheus:inc(
+                        counter,
+                        http_multirequest_total,
+                        [
+                            hb_util:list(route_label(Route, Opts)),
+                            hb_util:list(
+                                multirequest_outcome(Admissible, Responses)
+                            )
+                        ],
+                        1
+                    )
+                end
+            );
+        false ->
+            ok
+    end.
+
+%% @doc The `route' label of a route: the method and path of its `template',
+%% as the node's routes give them, or its `reference' if the template gives no
+%% path. No label holds the path of a request, so a node has a label for each
+%% of its routes.
+route_label(#{ <<"template">> := Path }, _Opts) when is_binary(Path) -> Path;
+route_label(#{ <<"template">> := Template = #{ <<"path">> := Path } }, Opts)
+        when is_binary(Path) ->
+    case hb_maps:get(<<"method">>, Template, not_found, Opts) of
+        Method when is_binary(Method) -> <<Method/binary, " ", Path/binary>>;
+        _ -> Path
+    end;
+route_label(Route, Opts) ->
+    hb_maps:get(<<"reference">>, Route, <<"unknown">>, Opts).
+
+%% @doc The outcome of a multirequest that gathered `Admissible' of the
+%% `Responses' that it awaited.
+multirequest_outcome(0, _Responses) -> <<"no-viable-responses">>;
+multirequest_outcome(Admissible, Responses) ->
+    case Admissible >= hb_util:int(Responses) of
+        true -> <<"admissible">>;
+        false -> <<"partial">>
+    end.
 
 record_response_status(Method, Response, Path) ->
     record_response_status(Method, Response, Path, #{}).

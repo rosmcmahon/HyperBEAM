@@ -76,6 +76,8 @@ verify(Base, Req, RawOpts) ->
     % Verify the commitment's ID as well as the presence of its committed keys.
     maybe
         [] ?= missing_keys(Base, Req, Opts),
+        % A `signature' is a binary: `hb_util:decode/1' takes a list too.
+        true ?= is_binary(maps:get(<<"signature">>, Req)),
         ID = dev_httpsig_siginfo:derived_commitment_id(
             hb_util:decode(maps:get(<<"signature">>, Req))),
         true ?= maps:is_key(ID, maps:get(<<"commitments">>, Base, #{})),
@@ -170,6 +172,7 @@ committer(#{ <<"committer">> := ?UNSIGNED_COMMITTER }, _Opts) ->
 committer(#{ <<"committer">> := URI }, Opts) when is_binary(URI) ->
     maybe
         {ok, Committer} ?= hb_uri:from(URI, Opts),
+        true ?= is_committer(Committer, Opts),
         committer(#{ <<"committer">> => Committer }, Opts)
     end;
 committer(#{ <<"committer">> := Committer }, Opts) ->
@@ -179,6 +182,16 @@ committer(#{ <<"committer">> := Committer }, Opts) ->
     end;
 committer(_Req, _Opts) ->
     {error, not_found}.
+
+%% @doc Returns whether a message is a committer. Only a device that exports
+%% `verify' checks a signature. If `verify' is a key, or the default handler,
+%% the message checks nothing.
+is_committer(Committer, Opts) ->
+    DefaultDevice = hb_device:message_to_device(#{}, Opts),
+    case hb_device:message_to_fun(Committer, <<"verify">>, Opts) of
+        {ok, Dev, _} when Dev =/= DefaultDevice -> true;
+        _ -> false
+    end.
 
 %% @doc Commit to a message using the HTTP-Signature format. We use the `type'
 %% parameter to determine the type of commitment to use. If the `type' parameter
@@ -211,18 +224,12 @@ commit(MsgToSign, Req = #{ <<"type">> := <<"rsa-pss-sha512">> }, RawOpts) ->
             Error -> throw({cannot_commit, Error, MsgToSign})
         end,
     Owner = hb_maps:get(<<"owner">>, CommitterMsg, <<>>, Opts),
-    % Utilize the hashpath, if present, as the tag for the commitment.
-    MaybeTagMap =
-        case MsgToSign of
-            #{ <<"priv">> := #{ <<"hashpath">> := HP }} -> #{ <<"tag">> => HP };
-            _ -> #{}
-        end,
     % Generate the unsigned commitment and signature base.
     ToCommit = hb_ao:normalize_keys(keys_to_commit(MsgToSign, Req, Opts)),
     ?event_debug({to_commit, ToCommit}),
     UnsignedCommitment =
         maybe_bundle_tag_commitment(
-            MaybeTagMap#{
+            #{
                 <<"commitment-device">> => <<"httpsig@1.0">>,
                 <<"type">> => <<"rsa-pss-sha512">>,
                 <<"keyid">> => KeyID,
@@ -422,7 +429,7 @@ add_content_digest(Msg, _Opts) ->
 %% normalized for encoding. The components of the signature follow the order
 %% of the keys that the commitment lists. When `Ordered' is false, as for a
 %% commitment made without a `committed' list in its request, they follow the
-%% order of the keys of the encoded message. Every key of the message is
+%% sorted order of the keys of the encoded message. Every key of the message is
 %% encoded: the message contains only the keys of the commitment.
 -spec normalize_for_encoding(
     #{ _ => _ },
@@ -463,7 +470,7 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
     % `body' key from the encoded message.
     Encoded = maps:without([<<"body">>], EncodedWithSigInfo),
     % Transform the list of requested keys to their `httpsig@1.0' equivalents.
-    EncodedKeys = maps:keys(Encoded),
+    EncodedKeys = hb_util:to_sorted_keys(Encoded, Opts),
     EncodedKeysWithBodyKey =
         case hb_maps:get(<<"ao-body-key">>, EncodedWithSigInfo, not_found) of
             not_found ->
@@ -700,6 +707,19 @@ commitment_identity_test() ->
             Opts
         )
     ),
+    % A `signature' given as a list does not verify.
+    [{SigID, SigCommitment}] = maps:to_list(maps:get(<<"commitments">>, Signed)),
+    ListSignature = binary_to_list(maps:get(<<"signature">>, SigCommitment)),
+    ?assertNot(
+        hb_message:verify(
+            Signed#{
+                <<"commitments">> =>
+                    #{ SigID => SigCommitment#{ <<"signature">> => ListSignature } }
+            },
+            all,
+            Opts
+        )
+    ),
     % The `keyid' of an unsigned commitment is `?UNSIGNED_COMMITTER'.
     ?assertMatch(
         [#{ <<"keyid">> := ?UNSIGNED_COMMITTER }],
@@ -923,6 +943,38 @@ validate_large_message_from_http_test() ->
             Opts
         ),
     ?assertEqual([<<"hashpath">>], HashpathCommitted).
+
+%% @doc Wide maps and their nested encodings have runtime-independent identities.
+canonical_id_test() ->
+    Wide =
+        maps:from_list(
+            [{integer_to_binary(N), <<"x">>} || N <- lists:seq(1, 40)]
+        ),
+    ?assertEqual(
+        <<"FmPttD7QyZHU6IoBE2iGdnhlPTebuMGb-JKXvFkurvQ">>,
+        hb_message:id(Wide, uncommitted, #{})
+    ),
+    Nested = #{ <<"body">> => Wide },
+    ?assertEqual(
+        <<"kZeeF5Zf505_TMauDEa3d46AGcyB2j9qpK_C9-N1Sqc">>,
+        hb_message:id(Nested, uncommitted, #{})
+    ),
+    HTTP = hb_message:convert(Nested, <<"httpsig@1.0">>, #{}),
+    ?assertEqual(
+        <<"5ic-bzZ6c737RWtn0fR_4YxkbWtUmJVXTgrXlwX2f_c">>,
+        hb_util:human_id(hb_crypto:sha256(maps:get(<<"body">>, HTTP)))
+    ),
+    % The headers of a body part of more than 32 fields are in sorted order.
+    Bundled =
+        hb_message:convert(
+            #{ <<"a">> => Wide },
+            #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true },
+            #{}
+        ),
+    ?assertEqual(
+        <<"VDiBw90CKudoJLuiuHeNOjMwpiTmdrRI5afYbPw4R_g">>,
+        hb_util:human_id(hb_crypto:sha256(maps:get(<<"body">>, Bundled)))
+    ).
 
 committed_id_test() ->
     Msg = #{ <<"basic">> => <<"value">> },

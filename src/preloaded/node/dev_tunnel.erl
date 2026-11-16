@@ -2,8 +2,9 @@
 %%%
 %%% A node signs a long-poll `register' request with its wallet. The broker
 %%% returns a request, which the node executes through its HTTP request hooks,
-%%% then posts to `response'. Each request is dispatched once. A timeout means
-%%% execution may have occurred; the tunnel never retries application work.
+%%% then posts to `response' with its next registration. Each request is
+%%% dispatched once. A timeout means execution may have occurred; the tunnel
+%%% never retries application work.
 %%%
 %%% Install `request' on `on/request' to route a wallet's DNS URI host or
 %%% an explicit `tunnel-target'. `call' accepts the target and a nested request.
@@ -19,6 +20,7 @@
 %%% it to `response' with its Erlang result tag.
 -module(dev_tunnel).
 -specification("../../../specs/tunnel@1.0.md").
+-device_libraries([lib_meta, lib_process]).
 -export([device_info/1, register/3, response/3, call/3, request/3]).
 -export([status/3, connect/3]).
 -include("include/hb.hrl").
@@ -45,24 +47,30 @@ register(_Base, Req, Opts) ->
         true ?=
             Address =:= hb_maps:get(<<"address">>, Control, none, Opts) orelse
                 denied(),
-        Start = erlang:monotonic_time(second),
-        Result =
-            dev_tunnel_server:register(
-                broker(Opts),
-                Address,
-                timeout(tunnel_register_timeout, 45_000, #{}, Control, Opts)
-            ),
-        meter(Start, Opts),
-        case Result of
-            {ok, #{ <<"status">> := 204 }} -> Result;
-            {ok, Work} -> {ok, sign(Work#{ <<"status">> => 200 }, Opts)};
-            Error -> Error
-        end
+        wait(Address, Control, Opts)
+    end.
+
+%% @doc Wait until a request for the address arrives, or until the
+%% registration expires, and charge the wait to `metering@1.0'.
+wait(Address, Control, Opts) ->
+    Start = erlang:monotonic_time(second),
+    Result =
+        dev_tunnel_server:register(
+            broker(Opts),
+            Address,
+            timeout(tunnel_register_timeout, 45_000, #{}, Control, Opts)
+        ),
+    meter(Start, Opts),
+    case Result of
+        {ok, #{ <<"status">> := 204 }} -> Result;
+        {ok, Work} -> {ok, sign(Work#{ <<"status">> => 200 }, Opts)};
+        Error -> Error
     end.
 
 %% @doc Accept a response only from the node to which the request was sent, and
 %% give the caller the origin's reply with its Erlang result tag
-%% (`result-status').
+%% (`result-status'). A response whose controls give the signer's `address'
+%% then waits as its registration.
 response(_Base, Req, Opts) ->
     maybe
         {ok, Address, Control} ?=
@@ -85,7 +93,10 @@ response(_Base, Req, Opts) ->
                     maybe_add_unsigned(Response, Opts)
                 }
             ),
-        {ok, #{ <<"status">> => 202, <<"tunnel-request-id">> => ID }}
+        case hb_maps:get(<<"address">>, Control, none, Opts) of
+            Address -> wait(Address, Control, Opts);
+            _ -> {ok, #{ <<"status">> => 202, <<"tunnel-request-id">> => ID }}
+        end
     end.
 
 %% @doc Queue an explicit request, including when its target is not connected.
@@ -97,13 +108,17 @@ call(Base, Req, Opts) ->
         true ?=
             Request =/= none orelse
                 bad_request(<<"A tunnel request is required.">>),
-        dev_tunnel_server:call(
-            broker(Opts),
-            Address,
-            load(Request, Opts),
-            response_timeout(Base, Req, Opts),
-            explicit
-        )
+        {ok, Reply} ?=
+            dev_tunnel_server:call(
+                broker(Opts),
+                Address,
+                load(Request, Opts),
+                response_timeout(Base, Req, Opts),
+                explicit
+            ),
+        % The tunneled node's reply goes back as it is, without this node's
+        % signature.
+        {reply, Reply}
     end.
 
 %% @doc Route a raw singleton, leaving unrelated hooks and payloads untouched.
@@ -149,7 +164,7 @@ status(_Base, _Req, Opts) ->
 %% workers end their current registrations.
 connect(Base, Req, Opts) ->
     maybe
-        {ok, Control} ?= connect_control(Base, Req, Opts),
+        {ok, Signer, Control} ?= connect_control(Base, Req, Opts),
         Peer = hb_maps:get(<<"peer">>, Control, none, Opts),
         true ?=
             is_binary(Peer) orelse
@@ -168,15 +183,28 @@ connect(Base, Req, Opts) ->
                 bad_request(
                     <<"The tunnel address must be this node's wallet.">>
                 ),
-        dev_tunnel_server:connect(
-            broker(Opts),
-            Peer,
-            Address,
-            Workers,
-            integer(hb_opts:get(tunnel_max_client_workers, 32, Opts)),
-            integer(hb_opts:get(tunnel_client_retire_timeout, 300_000, Opts)),
-            fun(Stop) -> client(Peer, Address, Stop, Opts) end
-        )
+        Connect =
+            fun() ->
+                dev_tunnel_server:connect(
+                    broker(Opts),
+                    Peer,
+                    Address,
+                    Workers,
+                    integer(hb_opts:get(tunnel_max_client_workers, 32, Opts)),
+                    integer(
+                        hb_opts:get(tunnel_client_retire_timeout, 300_000, Opts)
+                    ),
+                    fun(Stop) -> client(Peer, Address, Stop, Opts) end
+                )
+            end,
+        % A signed control applies once for each `created' time of its signer.
+        case Signer of
+            none -> Connect();
+            _ ->
+                lib_meta:ratcheted_apply(
+                    <<"~tunnel@1.0/connect">>, Signer, Control, Connect, Opts
+                )
+        end
     end.
 
 %% @doc Return the controls of a `connect'. A caller whose options contain the
@@ -189,7 +217,7 @@ connect_control(Base, Req, Opts) ->
     of
         no_viable_wallet ->
             maybe
-                {ok, _Signer, Control} ?=
+                {ok, Signer, Control} ?=
                     authenticate(Req, [<<"peer">>], Opts),
                 {ok, IsOperator} =
                     hb_ao:resolve(
@@ -201,9 +229,9 @@ connect_control(Base, Req, Opts) ->
                         Opts#{ <<"hashpath">> => ignore }
                     ),
                 true ?= IsOperator orelse denied(),
-                {ok, Control}
+                {ok, Signer, Control}
             end;
-        _ -> {ok, hb_maps:merge(Base, Req, Opts)}
+        _ -> {ok, none, hb_maps:merge(Base, Req, Opts)}
     end.
 
 %% @doc Select a signed envelope covering all required controls. Unsigned
@@ -245,8 +273,9 @@ load(Message, Opts) ->
 
 %% @doc Sign a control message over all of its keys. It is signed as a bundle,
 %% so that the messages that it contains are not written to the node's store.
+%% The node verified those messages when it loaded them (`load/2').
 sign(Message, Opts) ->
-    Public = hb_private:reset(load(Message, Opts)),
+    Public = hb_private:reset(hb_cache:ensure_all_loaded(Message, Opts)),
     hb_message:commit(
         Public,
         Opts,
@@ -330,7 +359,8 @@ target(Base, Req, Opts) ->
 forward(Mode, Raw, Opts) ->
     try
         Keys = [<<"tunnel-target">>, <<"tunnel-timeout">>],
-        Loaded = load(Raw, Opts),
+        % The commitments are verified once, on the forwarded request.
+        Loaded = hb_cache:ensure_all_loaded(Raw, Opts),
         Committed =
             hb_message:committed(Loaded, #{ <<"ids">> => <<"any">> }, Opts),
         Removed =
@@ -447,12 +477,18 @@ meter(Start, Opts) ->
         Opts
     ).
 
-%% @doc Stop between requests. Reconnection never replays application work.
+%% @doc Stop between requests. Reconnection never replays application work. A
+%% worker posts each response with its next registration, and a worker that
+%% stops posts its last response alone.
 client(Peer, Address, Stop, Opts) ->
+    client(Peer, Address, Stop, none, Opts).
+client(_Peer, _Address, stopped, none, _Opts) -> ok;
+client(Peer, Address, Stop, Reply, Opts) ->
     receive
-        {tunnel_client_stop, Stop} -> ok
+        {tunnel_client_stop, Stop} ->
+            client(Peer, Address, stopped, Reply, Opts)
     after 0 ->
-        try
+        Next = try
             Current = node_opts(Opts),
             Timeout =
                 integer(hb_opts:get(tunnel_register_timeout, 45_000, Current)),
@@ -468,23 +504,24 @@ client(Peer, Address, Stop, Opts) ->
                     <<"http-client-hackney-recv-timeout">> => SendTimeout
                 },
             Registration =
-                sign(
-                    #{
-                        <<"codec-device">> => <<"httpsig@1.0">>,
-                        <<"address">> => Address,
-                        <<"tunnel-timeout">> => Timeout
-                    },
-                    Current
-                ),
-            case
-                hb_http:post(
-                    Peer,
-                    <<"/~tunnel@1.0/register">>,
-                    Registration,
-                    HTTPOpts
-                )
-            of
-                {ok, #{ <<"status">> := 204 }} -> ok;
+                case Stop of
+                    stopped -> #{ <<"codec-device">> => <<"httpsig@1.0">> };
+                    _ ->
+                        #{
+                            <<"codec-device">> => <<"httpsig@1.0">>,
+                            <<"address">> => Address,
+                            <<"tunnel-timeout">> => Timeout
+                        }
+                end,
+            case Reply of
+                none ->
+                    hb_http:post(
+                        Peer,
+                        <<"/~tunnel@1.0/register">>,
+                        sign(Registration, Current),
+                        HTTPOpts
+                    );
+                {ok, #{ <<"status">> := 204 }} -> none;
                 {ok, Work} ->
                     {ok, _, Control} =
                         authenticate(
@@ -517,8 +554,7 @@ client(Peer, Address, Stop, Opts) ->
                         ),
                     Envelope =
                         sign(
-                            #{
-                                <<"codec-device">> => <<"httpsig@1.0">>,
+                            Registration#{
                                 <<"tunnel-request-id">> => ID,
                                 <<"result-status">> => Status,
                                 <<"response">> => Response
@@ -544,21 +580,24 @@ client(Peer, Address, Stop, Opts) ->
                             ResponseOpts
                         )
                     of
-                        {ok, #{ <<"status">> := 202 }} -> ok;
+                        {ok, #{ <<"status">> := 202 }} -> none;
+                        {ok, _} = Registered -> Registered;
                         Error ->
                             ?event(
                                 tunnel,
                                 {response_rejected, ID, {explicit, Error}}
-                            )
+                            ),
+                            none
                     end;
                 Error -> error({'registration-failed', Error})
             end
         catch
             Class:Reason ->
                 ?event(tunnel, {client_failed, Class, Reason}),
-                timer:sleep(hb_opts:get(tunnel_retry_time, 1_000, Opts))
+                timer:sleep(hb_opts:get(tunnel_retry_time, 1_000, Opts)),
+                none
         end,
-        client(Peer, Address, Stop, Opts)
+        client(Peer, Address, Stop, Next, Opts)
     end.
 
 %% @doc Execute through the node's normal HTTP request and response hooks, and
@@ -566,11 +605,25 @@ client(Peer, Address, Stop, Opts) ->
 %% the reply that the HTTP server gives it (`hb_http_server:error_reply/4').
 execute(Request, Opts) ->
     try
-        Singleton = singleton(Request, Opts),
+        Raw = singleton(Request, Opts),
         [Path | _] =
             binary:split(
-                hb_maps:get(<<"path">>, Singleton, <<"/">>, Opts),
+                hb_maps:get(<<"path">>, Raw, <<"/">>, Opts),
                 <<"?">>
+            ),
+        % A tunneled request runs as a request to the node directly does: its
+        % message keeps only the keys that its commitments cover, with no
+        % private keys, and the request line gives its method, path and accept.
+        Singleton =
+            maps:merge(
+                hb_ao:execution_input(
+                    hb_private:reset(hb_message:with_only_committed_deep(Raw, Opts)),
+                    Opts
+                ),
+                maps:with(
+                    [<<"method">>, <<"path">>, <<"accept">>, <<"accept-bundle">>],
+                    Raw
+                )
             ),
         Result =
             maybe
