@@ -1,6 +1,4 @@
-ARG ERLANG_VERSION=27
-
-FROM --platform=linux/amd64 erlang:${ERLANG_VERSION} AS build
+FROM --platform=linux/amd64 erlang:27.3.4.19 AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -30,7 +28,7 @@ RUN touch config.flat \
     BUILD_SOURCE_SHORT="$(printf '%.7s' "$GIT_SHA")" \
     rebar3 release
 
-FROM --platform=linux/amd64 debian:bookworm-slim AS hyperbeam
+FROM --platform=linux/amd64 debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS hyperbeam
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
